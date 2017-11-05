@@ -12,6 +12,26 @@ tags:
 ---
 工具 https://github.com/abcdxyzk/ext4_utils
 
+
+### android5.0以上请用ubuntu自带命令
+```
+	sudo apt-get install android-tools-fsutils
+```
+该工具包含：
+```
+	/usr/bin/ext2simg
+	/usr/bin/ext4fixup
+	/usr/bin/img2simg
+	/usr/bin/make_ext4fs
+	/usr/bin/mkuserimg
+	/usr/bin/simg2img
+	/usr/bin/simg2simg
+	/usr/bin/simg_dump
+	/usr/bin/test_ext4fixup
+	/usr/share/doc/android-tools-fsutils/changelog.Debian.gz
+	/usr/share/doc/android-tools-fsutils/copyright
+```
+
 #### 一、转换源文件为ext4格式
 然后，我们可以使用./simg2img src des命令来转换system.img.ext4格式文件了
 ```
@@ -32,6 +52,10 @@ tags:
 #### 四、打包文件
 当你所有文件搞定后，下来需要一个命令来打包了。
 ```
+	# android5.0 以后用该命令, file_contexts来自"/"目录, 所以要先刷一次一体包提取
+	make_ext4fs -S file_contexts -s -l 2365587456 -a system system.img.ext4 system
+
+	# 老命令
 	./mkuserimg.sh -s sysmain systest.img.ext4 ext4 tmp 512M
 ```
 这里需要注意，temp是我在当前目录新建立的一个目录，后面的512M是这个镜像打包后占用空间大小。如果你不知道你的镜像包应该多大，你查看你景象挂载到目录后，这个景象分区的大小。
