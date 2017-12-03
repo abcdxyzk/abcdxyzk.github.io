@@ -11,6 +11,8 @@ categories:
 tags:
 ---
 
+http://blog.csdn.net/hqzxsc2006/article/details/50547684
+
 -s 静默输出；没有-s的话就是下面的情况，这是在脚本等情况下不需要的信息。
 
 #### 监控首页各项时间指标：

@@ -19,6 +19,27 @@ tags:
 
 -------------
 
+英文：E437: terminal capability "cm" required  
+中文：e437 终端需要能力 cm
+
+这个错误一般是环境变量TERM没有配置或者配置错误所致, 用 export TERM=linux 或者 export TERM=xterm
+
+-------------
+
+上传是用rz -be，并且去掉弹出的对话框中“Upload files as ASCII”前的勾选。
+ -a, –ascii
+ -b, –binary 用binary的方式上传下载，不解释字符为ascii
+ -e, –escape 强制escape 所有控制字符，比如Ctrl+x，DEL等
+
+----------------
+
+nginx
+
+http://nginx.org/packages/rhel/7/x86_64/RPMS/
+
+
+--------------
+
 binkernel.spec
 ```
 	%pre

@@ -11,6 +11,11 @@ categories:
 tags:
 ---
 
+替换 `\n`
+```
+	sed ':a;N;$!ba;s/\n//g' file.txt
+```
+
 http://www.cnblogs.com/dong008259/archive/2011/12/07/2279897.html
 
 sed是一个很好的文件处理工具，本身是一个管道命令，主要是以行为单位进行处理，可以将数据行进行替换、删除、新增、选取等特定工作，下面先了解一下sed的用法
