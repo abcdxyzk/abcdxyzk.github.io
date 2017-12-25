@@ -10,6 +10,12 @@ categories:
 - system~centos
 tags:
 ---
+
+#### 0 centos 系統原包
+```
+	https://buildlogs.centos.org/c7.1611.u/kernel/20170620122143/3.10.0-514.21.2.el7.x86_64/
+```
+
 #### 1、系统包
 ```
 	http://mirror.centos.org/centos/6.5/os/x86_64/Packages/
