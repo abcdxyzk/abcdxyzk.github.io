@@ -1,0 +1,151 @@
+---
+layout: post
+title: "linux 下的浮点运算"
+date: 2018-01-08 00:54:00 +0800
+comments: false
+categories:
+- 2018
+- 2018~01
+- kernel
+- kernel~fpu
+tags:
+---
+
+[linux 下的浮点运算](http://blog.sina.com.cn/s/blog_6e32babb0101o9kf.html)
+
+1.  intel 平台下，如果有浮点计算，都会用专门的浮点指令来执行。但是double/float 类型的加减乘除，gcc 是用的一般指令来做的，没有用浮点指令来做。
+
+2. 还是intel 平台下，一个进程在被cpu调度到之后，运行的第一条浮点指令会触发“no deveice avaible”异常，从而导致执行相应的中断处理程序。后续的不再触发。这个中断处理程序中，一般会做的是，恢复/保存浮点运行相关的环境。如果该时间段内没有浮点操作，那么就不用恢复/保存浮点运行环境，从而减少开销。这也是为什么要设计成这样的原因。
+
+3. 内核也可以执行浮点操作，只需要调用前后用 kernel_fpu_begin() and kernel_fpu_end() 括起来。但是有可能这个的开销已经超过了用浮点指令带来的便捷。所以内核应该尽量少用浮点操作。
+
+
+---------------------
+
+[Linux内核与浮点计算](http://www.lenky.info/archives/2012/10/2001/comment-page-1)
+
+在Linux内核里无法直接进行浮点计算，这是从性能上的考虑，因为这样做可以省去在用户态与内核态之间进行切换时保存/恢复浮点寄存器 FPU的操作，当然，这到底可以提升多少性能我还不得而知，不过就目前而言，Linux内核的确就是这样做的。
+
+比如下面这个测试模块：
+```
+	# Makefile
+	MDIR = $(shell pwd)
+	ifeq (, $(KSRC))
+		KSRC := /usr/src/linux-`uname -r`
+	endif
+
+	ifeq (, $(PROJECT_DIR))
+		PROJECT_DIR := $(PWD)/../
+	endif
+
+	module := float_test
+
+	obj-m := $(module).o
+
+	srcs =  $(wildcard, *.c)
+
+	$(module)-objs := $(addsuffix .o, $(basename $(srcs)))
+
+	EXTRA_CFLAGS += -g $(FLAG) -I$(PROJECT_DIR)/inc -I${SHAREDHDR} -I$(KERNELHDR) -O2 -D__KERNEL__ -DMODULE $(INCLUDE) -DEXPORT_SYMTAB
+
+	TARGET = $(module).ko
+
+	all:
+		make -C $(KSRC) M=$(MDIR) modules
+
+	debug:
+		make EXTRA_FLAGS="${EXTRA_CFLAGS} -DDEBUG" -C $(KSRC) M=$(MDIR) modules
+
+	clean:
+		make -C $(KSRC) M=$(MDIR) clean
+
+	install: all
+		cp -f $(TARGET) $(INSTALL_DIR)
+```
+
+```
+	/**
+	 * float_test.c
+	 */
+	#include <linux/kernel.h>
+	#include <linux/types.h>
+	#include <linux/stddef.h>
+	#include <linux/module.h>
+	#include <linux/fs.h>
+	#include <asm/desc.h>
+	
+	static float float_test(float a, float b)
+	{
+		return a/b;
+	}
+	
+	static int __init test_module_init(void)
+	{
+		float_test(1.0, 1.0);
+		return 0;
+	}
+	
+	static void __exit test_module_fini(void)
+	{
+	
+		//Do Nothing
+		return;
+	}
+	
+	module_init(test_module_init);
+	module_exit(test_module_fini);
+	
+	MODULE_LICENSE("GPL");
+	MODULE_AUTHOR("lenky0401 at gmail dot com");
+```
+
+编译它将得到如下错误提示：
+```
+	[root@localhost t]# make
+	make -C /usr/src/linux-`uname -r` M=/home/gqk/t modules
+	make[1]: Entering directory `/usr/src/linux-2.6.38.8'
+	  CC [M]  /home/gqk/t/float_test.o
+	/home/gqk/t/float_test.c: In function ‘float_test’:
+	/home/gqk/t/float_test.c:12: error: SSE register return with SSE disabled
+	make[2]: *** [/home/gqk/t/float_test.o] Error 1
+	make[1]: *** [_module_/home/gqk/t] Error 2
+	make[1]: Leaving directory `/usr/src/linux-2.6.38.8'
+	make: *** [all] Error 2
+	[root@localhost t]#
+	
+	[root@localhost t]# make V=1
+	make -C /usr/src/linux-`uname -r` M=/home/gqk/t modules
+	make[1]: Entering directory `/usr/src/linux-2.6.38.8'
+	test -e include/generated/autoconf.h -a -e include/config/auto.conf || (        \
+		echo;                               \
+		echo "  ERROR: Kernel configuration is invalid.";       \
+		echo "         include/generated/autoconf.h or include/config/auto.conf are missing.";\
+		echo "         Run 'make oldconfig && make prepare' on kernel src to fix it.";  \
+		echo;                               \
+		/bin/false)
+	mkdir -p /home/gqk/t/.tmp_versions ; rm -f /home/gqk/t/.tmp_versions/*
+	make -f scripts/Makefile.build obj=/home/gqk/t
+	  gcc -Wp,-MD,/home/gqk/t/.float_test.o.d  -nostdinc -isystem /usr/lib/gcc/x86_64-redhat-linux/4.4.4/include -I/usr/src/linux-2.6.38.8/arch/x86/include -Iinclude  -include include/generated/autoconf.h -D__KERNEL__ -Wall -Wundef -Wstrict-prototypes -Wno-trigraphs -fno-strict-aliasing -fno-common -Werror-implicit-function-declaration -Wno-format-security -fno-delete-null-pointer-checks -O1 -m64 -mtune=generic -mno-red-zone -mcmodel=kernel -funit-at-a-time -maccumulate-outgoing-args -fstack-protector -DCONFIG_AS_CFI=1 -DCONFIG_AS_CFI_SIGNAL_FRAME=1 -DCONFIG_AS_CFI_SECTIONS=1 -DCONFIG_AS_FXSAVEQ=1 -pipe -Wno-sign-compare -fno-asynchronous-unwind-tables -mno-sse -mno-mmx -mno-sse2 -mno-3dnow -Wframe-larger-than=2048 -fno-omit-frame-pointer -fno-optimize-sibling-calls -g -Wdeclaration-after-statement -Wno-pointer-sign -fno-strict-overflow -fconserve-stack -DCC_HAVE_ASM_GOTO -g -I/home/gqk/t/..//inc -I -I -O2 -D__KERNEL__ -DMODULE -DEXPORT_SYMTAB  -DMODULE  -D"KBUILD_STR(s)=#s" -D"KBUILD_BASENAME=KBUILD_STR(float_test)"  -D"KBUILD_MODNAME=KBUILD_STR(float_test)" -c -o /home/gqk/t/.tmp_float_test.o /home/gqk/t/float_test.c
+	/home/gqk/t/float_test.c: In function ‘float_test’:
+	/home/gqk/t/float_test.c:12: error: SSE register return with SSE disabled
+	make[2]: *** [/home/gqk/t/float_test.o] Error 1
+	make[1]: *** [_module_/home/gqk/t] Error 2
+	make[1]: Leaving directory `/usr/src/linux-2.6.38.8'
+	make: *** [all] Error 2
+	[root@localhost t]#
+```
+
+注意到其中的gcc编译选项：-mno-sse -mno-mmx -mno-sse2，这几个选项是Linux内核编译模块时自动带上的，就是它们（具体就是-mno-sse）明确禁止了Linux内核无法使用浮点数。
+
+在Linux内核里很少会有使用浮点数的需求，即便是有也大多是通过变通的办法解决，在下面链接里有一些很好的扩展介绍，感兴趣的可以看看：
+
+http://stackoverflow.com/questions/6397430/overhead-of-supporting-floating-point-arithmetic-inside-the-linux-kernel
+
+http://stackoverflow.com/questions/10212892/how-to-avoid-fpu-when-given-float-numbers
+
+http://www.linuxsmiths.com/blog/?p=253
+
+----------------
+
+http://blog.csdn.net/vbskj/article/details/38408467
+
