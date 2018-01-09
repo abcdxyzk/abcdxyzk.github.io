@@ -12,6 +12,11 @@ categories:
 tags:
 ---
 
+如果listen的sk设置了icsk_ca_setsockopt，那么派生的child默认都是sk的cong，而不是系统默认的cong
+
+----------
+
+
 如果：自定义拥塞控制中维护了hash表，且在init时加入hash表，在release时删除或卸载清理hash表。
 
 那么：有些情况会导致分配了拥塞控制模块给sk，但却没调init，导致卸载清理时就找不到模块被哪个sk引用，也就无法清理。
