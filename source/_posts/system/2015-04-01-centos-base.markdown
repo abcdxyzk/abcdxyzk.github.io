@@ -12,6 +12,11 @@ tags:
 ---
 
 
+使用gcc时，总是按中文提示。回归英文的提示，方法是：
+首先使用env查看，发现LANGUAGE=zh_CN.UTF-8，接着执行export LANG=en_US.UTF-8就可以，以后的编译是就按英文来提示
+
+-------------
+
 ```
 	lsattr /etc/passwd /etc/group /etc/shadow /etc/gshadow
 	chattr -i /etc/passwd /etc/group /etc/shadow /etc/gshadow
