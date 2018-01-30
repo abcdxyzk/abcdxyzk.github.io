@@ -4,7 +4,7 @@
   <title><![CDATA[Category: kernel~net | kk Blog —— 通用基础]]></title>
   <link href="http://abcdxyzk.github.io/blog/cats/kernel~net/atom.xml" rel="self"/>
   <link href="http://abcdxyzk.github.io/"/>
-  <updated>2018-01-22T01:18:49+08:00</updated>
+  <updated>2018-01-31T01:54:20+08:00</updated>
   <id>http://abcdxyzk.github.io/</id>
   <author>
     <name><![CDATA[kk]]></name>
@@ -12,6 +12,829 @@
   </author>
   <generator uri="http://octopress.org/">Octopress</generator>
 
+  
+  <entry>
+    <title type="html"><![CDATA[TCP Fast Open(TFO), tcp_fastopen]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2018/01/25/kernel-net-fastopen/"/>
+    <updated>2018-01-25T03:25:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2018/01/25/kernel-net-fastopen</id>
+    <content type="html"><![CDATA[<p><a href="https://www.2cto.com/kf/201701/586043.html">https://www.2cto.com/kf/201701/586043.html</a></p>
+
+<p><a href="http://blog.csdn.net/u011130578/article/details/44515165">http://blog.csdn.net/u011130578/article/details/44515165</a></p>
+
+<p><a href="http://blog.sina.com.cn/s/blog_583f42f101011veh.html">http://blog.sina.com.cn/s/blog_583f42f101011veh.html</a></p>
+
+<pre><code>    #define TFO_CLIENT_ENABLE       1
+    #define TFO_SERVER_ENABLE       2
+    #define TFO_CLIENT_NO_COOKIE    4       /* Data in SYN w/o cookie option */
+
+    /* Process SYN data but skip cookie validation */
+    #define TFO_SERVER_COOKIE_NOT_CHKED     0x100   // 收到cookie也不检查
+    /* Accept SYN data w/o any cookie option */
+    #define TFO_SERVER_COOKIE_NOT_REQD      0x200   // 不需要cookie需要data就能创建fastopen child，默认情况下syn的data会被忽略
+
+    /* Force enable TFO on all listeners, i.e., not requiring the
+     * TCP_FASTOPEN socket option. SOCKOPT1/2 determine how to set max_qlen.
+     */
+    #define TFO_SERVER_WO_SOCKOPT1  0x400       // 调listen后不需要再调setsockopt就开启fastopen
+    #define TFO_SERVER_WO_SOCKOPT2  0x800       // 调listen后不需要再调setsockopt就开启fastopen，backlog=TFO_SERVER_WO_SOCKOPT2&gt;&gt;16
+    /* Always create TFO child sockets on a TFO listener even when
+     * cookie/data not present. (For testing purpose!)
+     */
+    #define TFO_SERVER_ALWAYS       0x1000      // 不需要cookie也不需要data就创建fastopen child, 容易被攻击，不开启
+</code></pre>
+
+<h3>测试</h3>
+
+<h4>开启</h4>
+
+<pre><code>    echo 3 &gt; /proc/sys/net/ipv4/tcp_fastopen   # 1 开启客户端，2 开启服务端，3 都开启
+
+    tc qdisc add dev lo root netem delay 300ms # 设置延迟才能看出效果
+    ifconfig lo mtu 1500
+</code></pre>
+
+<h4>client</h4>
+
+<pre><code>    #include &lt;stdio.h&gt;
+    #include &lt;unistd.h&gt;
+    #include &lt;string.h&gt;
+    #include &lt;errno.h&gt;
+    #include &lt;sys/types.h&gt;
+    #include &lt;sys/socket.h&gt;
+    #include &lt;netinet/in.h&gt;
+
+    #include &lt;netinet/tcp.h&gt;
+
+    #ifndef MSG_FASTOPEN
+    #define MSG_FASTOPEN   0x20000000
+    #endif
+
+    int main(int argc, char *argv[])
+    {
+        int sockfd, n;
+        struct sockaddr_in servaddr;
+        char buf[50000] = "aaabbbccc";
+        int ret = 0, tot;
+
+        if ((sockfd = socket(AF_INET, SOCK_STREAM, 0)) &lt; 0) {
+            printf ("create socket error: %s(errno: %d)\n", strerror (errno), errno);
+            return -1;
+        }
+
+        memset (&amp;servaddr, 0, sizeof (servaddr));
+        servaddr.sin_family = AF_INET;
+        servaddr.sin_port = htons (1935);
+        servaddr.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+    #define FASTOPEN_TEST
+    #ifndef FASTOPEN_TEST
+        if (connect(sockfd, (struct sockaddr *)&amp;servaddr, sizeof(servaddr))) {
+            printf("connect error\n");
+            return -2;
+        }
+        ret = send(sockfd, buf, 1005, 0);
+    #else
+        ret = sendto(sockfd, buf, 1005, MSG_FASTOPEN, (struct sockaddr *)&amp;servaddr, sizeof(servaddr));
+    #endif
+        if (ret &lt; 0) {
+            printf ("send msg error: %s(errno: %d)\n", strerror (errno), errno);
+            // 如果是连接失败会打印：Connection refused(errno: 111)
+            return -2;
+        }
+        printf("client fastopen sendto len=%d\n", ret);
+        if ((ret = send(sockfd, buf, 20000, 0)) &lt; 0) {
+            printf("send error ret = %d\n", ret);
+        }
+        printf("client send len = %d\n", ret);
+        shutdown(sockfd, 1);
+
+        tot = 0;
+        while ((n = recv(sockfd, buf, 1024, 0)) &gt; 0)
+            tot += n;
+        printf("client recv len = %d\n", tot);
+        close (sockfd);
+        return 0;
+    }
+</code></pre>
+
+<h4>server</h4>
+
+<pre><code>    #include &lt;unistd.h&gt;
+    #include &lt;string.h&gt;
+    #include &lt;sys/types.h&gt;
+    #include &lt;sys/socket.h&gt;
+    #include &lt;netinet/in.h&gt;
+    #include &lt;netinet/tcp.h&gt;
+    #include &lt;stdio.h&gt;
+
+    int main()
+    {
+        int serverSock, clientSock;
+        struct sockaddr_in addr, clientAddr;
+        int addrLen;
+
+        char buf[10240];
+        int n, tot;
+
+        serverSock = socket(AF_INET, SOCK_STREAM, 0);
+        if (serverSock == -1) {
+            printf("socket failed!\n");
+            return -1;
+        }
+
+        memset(&amp;addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(1935);
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+        if (bind(serverSock, (struct sockaddr*)&amp;addr, sizeof(addr)) &lt; 0) {
+            printf("bind failed!\n");
+            return -2;
+        }
+
+        int qlen = 5;
+        setsockopt(serverSock, SOL_TCP, TCP_FASTOPEN, &amp;qlen, sizeof(qlen));
+
+        if (listen(serverSock, 511) &lt; 0) {
+            printf("listen failed!\n");
+            return -3;
+        }
+
+        while (1) {
+            addrLen = sizeof(clientAddr);
+            clientSock = accept(serverSock, (struct sockaddr*)&amp;clientAddr, &amp;addrLen);
+            if (clientSock &lt; 0) {
+                printf("accept failed!\n");
+                return -4;
+            }
+
+            if ((n = send(clientSock, buf, 10000, 0)) &lt; 0) {
+                printf("send error ret = %d\n", n);
+                return -5;
+            }
+            printf("server send len = %d\n", n);
+            shutdown(clientSock, 1);
+
+            sleep(1);
+
+            tot = 0;
+            while ((n = recv(clientSock, buf, 1024, 0)) &gt; 0)
+                tot += n;
+            printf("server recv len = %d\n", tot);
+            close(clientSock);
+        }
+
+        return 0;
+    }
+</code></pre>
+
+<h3>原理</h3>
+
+<p>1.客户端发送一个SYN包到服务器，这个包中携带了Fast Open Cookie Request;</p>
+
+<p>2.服务器生成一个cookie，这个cookie是加密客户端的IP地址生成的。服务器给客户端发送SYN+ACK响应，在响应包的选项中包含了这个cookie;</p>
+
+<p>3.客户端存储这个cookie以便将来再次与这个服务器的IP建立TFO连接时使用;</p>
+
+<p>也就是说，第一次TCP连接只是交换cookie信息，无法在SYN包中携带数据。在第一次交换之后，接下来的TCP连接就可以在SYN中携带数据了。流程如下：</p>
+
+<p>4.客户端发送一个SYN包，这个包比较特殊，因为它携带应用数据和cookie;</p>
+
+<p>5.服务器验证这个cookie，如果合法，服务器发送一个SYN+ACK，这个ACK同时确认SYN和数据。然后数据被传递到应用进程;</p>
+
+<p>如果不合法，服务器丢弃数据，发送一个SYN+ACK，这个ACK只确认SYN，接下来走三次握手的普通流程;</p>
+
+<p>6.如果验证合法(接收了SYN包中的数据)，服务器在接收到客户端的第一个ACK前可以发送其它响应数据;</p>
+
+<p>7.如果验证不合法(客户端在SYN中带的数据没被确认)，客户端发送ACK确认服务器的SYN;并且，数据会在ACK包中重传;</p>
+
+<p>8.下面的流程与普通的TCP交互流程无异。</p>
+
+<p><img src="/images/kernel/2018-01-25.jpeg" alt="" /></p>
+
+<h3>源码分析</h3>
+
+<p>TFO功能在Linux 2.6.34内核中开始集成。</p>
+
+<p>下面通过分析内核代码来了解TFO的运行机制。开启TFO功能后，server端进程在调用listen系统调用时会初始化TFO队列：</p>
+
+<pre><code>    int inet_listen(struct socket *sock, int backlog)
+    {
+        struct sock *sk = sock-&gt;sk;
+        unsigned char old_state;
+        int err;
+        ...
+        if (old_state != TCP_LISTEN) {
+        ...
+            if ((sysctl_tcp_fastopen &amp; TFO_SERVER_ENABLE) != 0 &amp;&amp;
+                inet_csk(sk)-&gt;icsk_accept_queue.fastopenq == NULL) {
+                if ((sysctl_tcp_fastopen &amp; TFO_SERVER_WO_SOCKOPT1) != 0)
+                    err = fastopen_init_queue(sk, backlog);
+                else if ((sysctl_tcp_fastopen &amp;
+                      TFO_SERVER_WO_SOCKOPT2) != 0)
+                    err = fastopen_init_queue(sk,
+                        ((uint)sysctl_tcp_fastopen) &gt;&gt; 16);
+                else
+                    err = 0;
+                if (err)
+                    goto out;
+            }
+            err = inet_csk_listen_start(sk, backlog);
+...
+</code></pre>
+
+<p>fastopen_init_queue函数
+```
+    static inline int fastopen_init_queue(struct sock <em>sk, int backlog)
+    {
+        struct request_sock_queue </em>queue =
+            &amp;inet_csk(sk)->icsk_accept_queue;</p>
+
+<pre><code>    if (queue-&gt;fastopenq == NULL) {
+        queue-&gt;fastopenq = kzalloc(
+            sizeof(struct fastopen_queue),
+            sk-&gt;sk_allocation);
+        if (queue-&gt;fastopenq == NULL)
+            return -ENOMEM;
+
+        sk-&gt;sk_destruct = tcp_sock_destruct;
+        spin_lock_init(&amp;queue-&gt;fastopenq-&gt;lock);
+    }
+    queue-&gt;fastopenq-&gt;max_qlen = backlog;
+    return 0;
+}
+</code></pre>
+
+<pre><code>
+如果net.ipv4.tcp_fastopen &amp;&amp; (TFO_SERVER_WO_SOCKOPT1|TFO_SERVER_WO_SOCKOPT2)为假，则TFO队列不会被初始化。但setsockopt函数也可以初始化TFO队列：
+</code></pre>
+
+<pre><code>static int do_tcp_setsockopt(struct sock *sk, int level,
+        int optname, char __user *optval, unsigned int optlen)
+{
+    struct tcp_sock *tp = tcp_sk(sk);
+    struct inet_connection_sock *icsk = inet_csk(sk);
+    int val;
+    int err = 0;
+    ...
+    case TCP_FASTOPEN:
+        if (val &gt;= 0 &amp;&amp; ((1 &lt;&lt; sk-&gt;sk_state) &amp; (TCPF_CLOSE |
+            TCPF_LISTEN)))
+            err = fastopen_init_queue(sk, val);
+        else
+            err = -EINVAL;
+        break;
+    ...
+</code></pre>
+
+<pre><code>
+如果inet_csk(sk)-&gt;icsk_accept_queue.fastopenq为NULL的话意味着TFO功能未开启。
+
+轮到client端出场了！client端的sendto系统调用在内核中对应的TCP函数是tcp_sendmsg：
+</code></pre>
+
+<pre><code>int tcp_sendmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
+        size_t size)
+{
+    struct iovec *iov;
+    struct tcp_sock *tp = tcp_sk(sk);
+    struct sk_buff *skb;
+    int iovlen, flags, err, copied = 0;
+    int mss_now = 0, size_goal, copied_syn = 0, offset = 0;
+    bool sg;
+    long timeo;
+
+    lock_sock(sk);
+
+    flags = msg-&gt;msg_flags;
+    if (flags &amp; MSG_FASTOPEN) {//要使用TFO功能
+        err = tcp_sendmsg_fastopen(sk, msg, &amp;copied_syn);//发送TFO数据
+        if (err == -EINPROGRESS &amp;&amp; copied_syn &gt; 0)
+            goto out;
+        else if (err)
+            goto out_err;
+        offset = copied_syn;
+    }
+</code></pre>
+
+<pre><code>
+tcp_sendmsg_fastopen函数用于发送带TFO请求的SYN或携带数据的SYN：
+</code></pre>
+
+<pre><code>static int tcp_sendmsg_fastopen(struct sock *sk, struct msghdr *msg, int *size)
+{
+    struct tcp_sock *tp = tcp_sk(sk);
+    int err, flags;
+
+    if (!(sysctl_tcp_fastopen &amp; TFO_CLIENT_ENABLE))
+        return -EOPNOTSUPP;
+    if (tp-&gt;fastopen_req != NULL)
+        return -EALREADY; /* Another Fast Open is in progress */
+
+    tp-&gt;fastopen_req = kzalloc(sizeof(struct tcp_fastopen_request),
+                   sk-&gt;sk_allocation);
+    if (unlikely(tp-&gt;fastopen_req == NULL))
+        return -ENOBUFS;
+    tp-&gt;fastopen_req-&gt;data = msg;
+
+    flags = (msg-&gt;msg_flags &amp; MSG_DONTWAIT) ? O_NONBLOCK : 0;
+    err = __inet_stream_connect(sk-&gt;sk_socket, msg-&gt;msg_name,
+                    msg-&gt;msg_namelen, flags);      //发送连接请求
+    *size = tp-&gt;fastopen_req-&gt;copied;　//记录发送了多少数据，如果发送的是TFO请求则*size为0
+    tcp_free_fastopen_req(tp);
+    return err;
+}
+</code></pre>
+
+<pre><code>
+　　`__inet_stream_connect`函数会调用tcp_connect函数发送SYN：
+</code></pre>
+
+<pre><code>int tcp_connect(struct sock *sk)
+{
+    struct tcp_sock *tp = tcp_sk(sk);
+    struct sk_buff *buff;
+    int err;
+    ...
+    /* Send off SYN; include data in Fast Open. */
+    err = tp-&gt;fastopen_req ? tcp_send_syn_data(sk, buff) :
+          tcp_transmit_skb(sk, buff, 1, sk-&gt;sk_allocation); //如果使用TFO，则会调用tcp_send_syn_data发送SYN
+</code></pre>
+
+<pre><code>tcp_send_syn_data函数：
+</code></pre>
+
+<pre><code>static int tcp_send_syn_data(struct sock *sk, struct sk_buff *syn)
+{
+    struct tcp_sock *tp = tcp_sk(sk);
+    struct tcp_fastopen_request *fo = tp-&gt;fastopen_req;
+    int syn_loss = 0, space, i, err = 0, iovlen = fo-&gt;data-&gt;msg_iovlen;
+    struct sk_buff *syn_data = NULL, *data;
+    unsigned long last_syn_loss = 0;
+
+    tp-&gt;rx_opt.mss_clamp = tp-&gt;advmss;  /* If MSS is not cached */
+    tcp_fastopen_cache_get(sk, &amp;tp-&gt;rx_opt.mss_clamp, &amp;fo-&gt;cookie,
+                   &amp;syn_loss, &amp;last_syn_loss);//查询缓存的TFO cookie信息
+    /* Recurring FO SYN losses: revert to regular handshake temporarily */
+    if (syn_loss &gt; 1 &amp;&amp;
+        time_before(jiffies, last_syn_loss + (60*HZ &lt;&lt; syn_loss))) {
+        fo-&gt;cookie.len = -1;
+        goto fallback;
+    }
+
+    if (sysctl_tcp_fastopen &amp; TFO_CLIENT_NO_COOKIE)//无论有没有cookie,都发送携带数据的SYN
+        fo-&gt;cookie.len = -1;
+    else if (fo-&gt;cookie.len &lt;= 0)      //没有cookie,发送携带TFO请求选项的SYN
+        goto fallback;
+
+    /* MSS for SYN-data is based on cached MSS and bounded by PMTU and
+     * user-MSS. Reserve maximum option space for middleboxes that add
+     * private TCP options. The cost is reduced data space in SYN :(
+     */
+    if (tp-&gt;rx_opt.user_mss &amp;&amp; tp-&gt;rx_opt.user_mss &lt; tp-&gt;rx_opt.mss_clamp)
+        tp-&gt;rx_opt.mss_clamp = tp-&gt;rx_opt.user_mss;
+    space = __tcp_mtu_to_mss(sk, inet_csk(sk)-&gt;icsk_pmtu_cookie) -
+        MAX_TCP_OPTION_SPACE;//计算SYN包中的能够携带的数据的最大大小
+
+    syn_data = skb_copy_expand(syn, skb_headroom(syn), space,
+                   sk-&gt;sk_allocation);//复制SYN包中的内容，并扩展SKB中的空间
+    if (syn_data == NULL)
+        goto fallback;
+
+    for (i = 0; i &lt; iovlen &amp;&amp; syn_data-&gt;len &lt; space; ++i) {//将用户态中缓存的数据copy到内核
+        struct iovec *iov = &amp;fo-&gt;data-&gt;msg_iov[i];
+        unsigned char __user *from = iov-&gt;iov_base;
+        int len = iov-&gt;iov_len;
+
+        if (syn_data-&gt;len + len &gt; space)//数据总长度大于SKB中空间的总大小
+            len = space - syn_data-&gt;len;
+        else if (i + 1 == iovlen)
+            /* No more data pending in inet_wait_for_connect() */
+            fo-&gt;data = NULL;//数据全部发送完毕，不需要在inet_wait_for_connect中等待时发送
+
+        if (skb_add_data(syn_data, from, len))//将用户数据copy到SKB中
+            goto fallback;
+    }
+
+    /* Queue a data-only packet after the regular SYN for retransmission */
+    data = pskb_copy(syn_data, sk-&gt;sk_allocation);
+    if (data == NULL)
+        goto fallback;
+    TCP_SKB_CB(data)-&gt;seq++;
+    TCP_SKB_CB(data)-&gt;tcp_flags &amp;= ~TCPHDR_SYN;
+    TCP_SKB_CB(data)-&gt;tcp_flags = (TCPHDR_ACK|TCPHDR_PSH);
+    tcp_connect_queue_skb(sk, data);
+    fo-&gt;copied = data-&gt;len;
+
+    if (tcp_transmit_skb(sk, syn_data, 0, sk-&gt;sk_allocation) == 0) {//发送携带数据的SYN
+        tp-&gt;syn_data = (fo-&gt;copied &gt; 0);
+        NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPFASTOPENACTIVE);
+        goto done;
+    }
+    syn_data = NULL;
+
+fallback:
+    /* Send a regular SYN with Fast Open cookie request option */
+    if (fo-&gt;cookie.len &gt; 0)
+        fo-&gt;cookie.len = 0;
+    err = tcp_transmit_skb(sk, syn, 1, sk-&gt;sk_allocation);
+    if (err)
+        tp-&gt;syn_fastopen = 0;
+    kfree_skb(syn_data);
+done:
+    fo-&gt;cookie.len = -1;  /* Exclude Fast Open option for SYN retries */
+    return err;
+}
+</code></pre>
+
+<pre><code>
+如果client是发送TFO请求，则tcp_send_syn_data函数会发送一个不带数据的SYN包，数据部分则会由tcp_sendmsg函数放入发送队列中，等待三次握手完成后再发送。
+
+tcp_transmit_skb函数会调用tcp_syn_options函数构建选项信息，tcp_options_write函数负责将选项写入TCP报头中：
+</code></pre>
+
+<pre><code>static unsigned int tcp_syn_options(struct sock *sk, struct sk_buff *skb,
+                struct tcp_out_options *opts,
+                struct tcp_md5sig_key **md5)
+{
+    struct tcp_sock *tp = tcp_sk(sk);
+    unsigned int remaining = MAX_TCP_OPTION_SPACE;
+    struct tcp_fastopen_request *fastopen = tp-&gt;fastopen_req;
+    ...
+    if (fastopen &amp;&amp; fastopen-&gt;cookie.len &gt;= 0) {
+        u32 need = TCPOLEN_EXP_FASTOPEN_BASE + fastopen-&gt;cookie.len;
+        need = (need + 3) &amp; ~3U;  /* Align to 32 bits */
+        if (remaining &gt;= need) {
+            opts-&gt;options |= OPTION_FAST_OPEN_COOKIE;
+            opts-&gt;fastopen_cookie = &amp;fastopen-&gt;cookie;
+            remaining -= need;
+            tp-&gt;syn_fastopen = 1;
+        }
+    }
+</code></pre>
+
+<pre><code></code></pre>
+
+<pre><code>static void tcp_options_write(__be32 *ptr, struct tcp_sock *tp,
+                  struct tcp_out_options *opts)
+{
+    u16 options = opts-&gt;options;    /* mungable copy */
+    ...
+    if (unlikely(OPTION_FAST_OPEN_COOKIE &amp; options)) {
+        struct tcp_fastopen_cookie *foc = opts-&gt;fastopen_cookie;
+
+        *ptr++ = htonl((TCPOPT_EXP &lt;&lt; 24) |
+                   ((TCPOLEN_EXP_FASTOPEN_BASE + foc-&gt;len) &lt;&lt; 16) |
+                   TCPOPT_FASTOPEN_MAGIC);
+
+        memcpy(ptr, foc-&gt;val, foc-&gt;len);  //如果找到了TFO cookie，则写入；没有RFO cookie则仅仅是一个TFO请求
+        if ((foc-&gt;len &amp; 3) == 2) {
+            u8 *align = ((u8 *)ptr) + foc-&gt;len;
+            align[0] = align[1] = TCPOPT_NOP;
+        }
+        ptr += (foc-&gt;len + 3) &gt;&gt; 2;
+    }
+</code></pre>
+
+<pre><code>
+client端在每次使用TFO功能时都会在TCP的选项中添加一个TFO选项，与server端进行第一次TFO交互时TFO选项只有4字节长，其值是一个“MAGIC”，这种TFO被称为“TFO请求”；后续的TFO选项长度会增加一个从服务器端获得的TFO cookie的长度值，并且在这个SYN中会携带数据。
+
+server收到SYN后，会在tcp_v4_conn_request中进行处理：
+</code></pre>
+
+<pre><code>int tcp_v4_conn_request(struct sock *sk, struct sk_buff *skb)
+{
+    struct tcp_options_received tmp_opt;
+    struct request_sock *req;
+    struct inet_request_sock *ireq;
+    struct tcp_sock *tp = tcp_sk(sk);
+    struct dst_entry *dst = NULL;
+    __be32 saddr = ip_hdr(skb)-&gt;saddr;
+    __be32 daddr = ip_hdr(skb)-&gt;daddr;
+    __u32 isn = TCP_SKB_CB(skb)-&gt;when;
+    bool want_cookie = false;
+    struct flowi4 fl4;
+    struct tcp_fastopen_cookie foc = { .len = -1 };
+    struct tcp_fastopen_cookie valid_foc = { .len = -1 };
+    struct sk_buff *skb_synack;
+    int do_fastopen;
+    ...
+    tcp_parse_options(skb, &amp;tmp_opt, 0, want_cookie ? NULL : &amp;foc);//解析TFO选项
+    ...
+    do_fastopen = tcp_fastopen_check(sk, skb, req, &amp;foc, &amp;valid_foc);//检查TFO选项的合法性
+    ...
+    skb_synack = tcp_make_synack(sk, dst, req,
+        fastopen_cookie_present(&amp;valid_foc) ? &amp;valid_foc : NULL);//如果客户端发送的是TFO请求则发送TFO cookie，否则不发送
+    ...
+    if (likely(!do_fastopen)) {
+    ...
+    } else if (tcp_v4_conn_req_fastopen(sk, skb, skb_synack, req))//创建子sock，将SYN中的数据放入socekt中的接收队列中
+        goto drop_and_free;
+
+    return 0;
+</code></pre>
+
+<pre><code>
+tcp_fastopen_check函数用于检查SYN中TFO请求的合法性以及生成TFO cookie：
+</code></pre>
+
+<pre><code>static bool tcp_fastopen_check(struct sock *sk, struct sk_buff *skb,
+                   struct request_sock *req,
+                   struct tcp_fastopen_cookie *foc,
+                   struct tcp_fastopen_cookie *valid_foc)
+{
+    bool skip_cookie = false;
+    struct fastopen_queue *fastopenq;
+
+    if (likely(!fastopen_cookie_present(foc))) {//SYN中没有携带TFO选项
+        /* See include/net/tcp.h for the meaning of these knobs */
+        if ((sysctl_tcp_fastopen &amp; TFO_SERVER_ALWAYS) ||
+            ((sysctl_tcp_fastopen &amp; TFO_SERVER_COOKIE_NOT_REQD) &amp;&amp;
+            (TCP_SKB_CB(skb)-&gt;end_seq != TCP_SKB_CB(skb)-&gt;seq + 1)))
+            skip_cookie = true; /* no cookie to validate */  //无需校验cookie，直接允许SYN中携带数据
+        else
+            return false;
+    }
+    fastopenq = inet_csk(sk)-&gt;icsk_accept_queue.fastopenq;
+    ...
+    if ((sysctl_tcp_fastopen &amp; TFO_SERVER_ENABLE) == 0 ||
+        fastopenq == NULL || fastopenq-&gt;max_qlen == 0)//未开启Server端TFO功能
+        return false;
+
+    if (fastopenq-&gt;qlen &gt;= fastopenq-&gt;max_qlen) {//TFO队列已满
+        struct request_sock *req1;
+        spin_lock(&amp;fastopenq-&gt;lock);
+        req1 = fastopenq-&gt;rskq_rst_head;
+        if ((req1 == NULL) || time_after(req1-&gt;expires, jiffies)) {
+            spin_unlock(&amp;fastopenq-&gt;lock);
+            NET_INC_STATS_BH(sock_net(sk),
+                LINUX_MIB_TCPFASTOPENLISTENOVERFLOW);
+            /* Avoid bumping LINUX_MIB_TCPFASTOPENPASSIVEFAIL*/
+            foc-&gt;len = -1;
+            return false;
+        }
+        fastopenq-&gt;rskq_rst_head = req1-&gt;dl_next;//替换队列中最老的一个
+        fastopenq-&gt;qlen--;
+        spin_unlock(&amp;fastopenq-&gt;lock);
+        reqsk_free(req1);
+    }
+    if (skip_cookie) {//不使用cookie，直接接收数据
+        tcp_rsk(req)-&gt;rcv_nxt = TCP_SKB_CB(skb)-&gt;end_seq;
+        return true;
+    }
+    if (foc-&gt;len == TCP_FASTOPEN_COOKIE_SIZE) {//SYN中携带了TFO cookie
+        if ((sysctl_tcp_fastopen &amp; TFO_SERVER_COOKIE_NOT_CHKED) == 0) {
+            tcp_fastopen_cookie_gen(ip_hdr(skb)-&gt;saddr, valid_foc);//生成TFO cookie
+            if ((valid_foc-&gt;len != TCP_FASTOPEN_COOKIE_SIZE) ||　//TFO初始化不成功
+                memcmp(&amp;foc-&gt;val[0], &amp;valid_foc-&gt;val[0],　//TFO cookie不合法
+                TCP_FASTOPEN_COOKIE_SIZE) != 0)
+                return false;
+            valid_foc-&gt;len = -1;
+        }
+        /* Acknowledge the data received from the peer. */
+        tcp_rsk(req)-&gt;rcv_nxt = TCP_SKB_CB(skb)-&gt;end_seq;
+        return true;
+    } else if (foc-&gt;len == 0) { /* Client requesting a cookie */
+        tcp_fastopen_cookie_gen(ip_hdr(skb)-&gt;saddr, valid_foc);//生成一个TFO cookie保存在valid_foc中
+        NET_INC_STATS_BH(sock_net(sk),
+            LINUX_MIB_TCPFASTOPENCOOKIEREQD);
+    } else {
+        /* Client sent a cookie with wrong size. Treat it
+         * the same as invalid and return a valid one.
+         */
+        tcp_fastopen_cookie_gen(ip_hdr(skb)-&gt;saddr, valid_foc);
+    }
+    return false;
+}
+</code></pre>
+
+<pre><code>
+1327：rskq_rst_head为NULL的场景为有很多带TFO的SYN到来但SYN|ACK发送后并没有收到RST包，这意味着之前收到的那些带数据的TFO SYN可能是合法的；如果不为NULL但对立中最老的一个仍然没有超时的话，也不能将其替换
+
+1344-1351：如果clienet端的TFO不是请求，而是cookie，则不设置valid_foc；另外如果server端被设置为不检查cookie的合法性，则生成一个cookie再检查SYN中的TFO cookie的合法性，如果不合法则不使用TFO功能。
+
+tcp_make_synack函数会将tcp_fastopen_check中生成的TFO cookie写入TCP首部中，tcp_synack_options函数用来构建SYN|ACK报文的选项信息：
+</code></pre>
+
+<pre><code>static unsigned int tcp_synack_options(struct sock *sk,
+                   struct request_sock *req,
+                   unsigned int mss, struct sk_buff *skb,
+                   struct tcp_out_options *opts,
+                   struct tcp_md5sig_key **md5,
+                   struct tcp_fastopen_cookie *foc)
+{
+    ...
+    if (foc != NULL) {
+        u32 need = TCPOLEN_EXP_FASTOPEN_BASE + foc-&gt;len;
+        need = (need + 3) &amp; ~3U;  /* Align to 32 bits */
+        if (remaining &gt;= need) {
+            opts-&gt;options |= OPTION_FAST_OPEN_COOKIE;
+            opts-&gt;fastopen_cookie = foc;
+            remaining -= need;
+        }
+    }
+    ...
+</code></pre>
+
+<pre><code>
+将选项信息写入SYN|ACK的方法与client发送SYN时一样，都是调用tcp_options_write函数。可以看出，TCP server端会返回给发送TFO请求的client端一个TFO cookie。client发送的下一个带数据的SYN必须携带这个cookie，而TCP server对这样的SYN回复的SYN|ACK中不会携带TFO选项。
+
+在SYN携带TFO cookie的情况下TCP server会在收到SYN时就创建sock，这个功能由cp_v4_conn_req_fastopen函数完成：
+</code></pre>
+
+<pre><code>static int tcp_v4_conn_req_fastopen(struct sock *sk,
+                    struct sk_buff *skb,
+                    struct sk_buff *skb_synack,
+                    struct request_sock *req)
+{
+    struct tcp_sock *tp = tcp_sk(sk);
+    struct request_sock_queue *queue = &amp;inet_csk(sk)-&gt;icsk_accept_queue;
+    const struct inet_request_sock *ireq = inet_rsk(req);
+    struct sock *child;
+    ...
+
+    child = inet_csk(sk)-&gt;icsk_af_ops-&gt;syn_recv_sock(sk, skb, req, NULL);//生成子socket，其状态为TCP_SYN_RECV
+    ...
+    err = ip_build_and_send_pkt(skb_synack, sk, ireq-&gt;loc_addr,
+                    ireq-&gt;rmt_addr, ireq-&gt;opt);//构建SYN|ACK的IP头并将其发送出去
+    err = net_xmit_eval(err);
+    if (!err)
+        tcp_rsk(req)-&gt;snt_synack = tcp_time_stamp;
+    /* XXX (TFO) - is it ok to ignore error and continue? */
+
+    spin_lock(&amp;queue-&gt;fastopenq-&gt;lock);
+    queue-&gt;fastopenq-&gt;qlen++;//将这个连接计入TFO queue
+    spin_unlock(&amp;queue-&gt;fastopenq-&gt;lock);
+    ...
+    tp = tcp_sk(child);
+
+    tp-&gt;fastopen_rsk = req;
+    /* Do a hold on the listner sk so that if the listener is being
+     * closed, the child that has been accepted can live on and still
+     * access listen_lock.
+     */
+    sock_hold(sk);
+    tcp_rsk(req)-&gt;listener = sk;
+
+    /* RFC1323: The window in SYN &amp; SYN/ACK segments is never
+     * scaled. So correct it appropriately.
+     */
+    tp-&gt;snd_wnd = ntohs(tcp_hdr(skb)-&gt;window);
+
+    /* Activate the retrans timer so that SYNACK can be retransmitted.
+     * The request socket is not added to the SYN table of the parent
+     * because it's been added to the accept queue directly.
+     */
+    inet_csk_reset_xmit_timer(child, ICSK_TIME_RETRANS,
+        TCP_TIMEOUT_INIT, TCP_RTO_MAX);
+
+    /* Add the child socket directly into the accept queue */
+    inet_csk_reqsk_queue_add(sk, req, child);
+
+    /* Now finish processing the fastopen child socket. */
+    inet_csk(child)-&gt;icsk_af_ops-&gt;rebuild_header(child);
+    tcp_init_congestion_control(child);
+    tcp_mtup_init(child);
+    tcp_init_buffer_space(child);
+    tcp_init_metrics(child);
+
+    /* Queue the data carried in the SYN packet. We need to first
+     * bump skb's refcnt because the caller will attempt to free it.
+     *
+     * XXX (TFO) - we honor a zero-payload TFO request for now.
+     * (Any reason not to?)
+     */
+    if (TCP_SKB_CB(skb)-&gt;end_seq == TCP_SKB_CB(skb)-&gt;seq + 1) {//SYN包中没有数据
+        /* Don't queue the skb if there is no payload in SYN.
+         * XXX (TFO) - How about SYN+FIN?
+         */
+        tp-&gt;rcv_nxt = TCP_SKB_CB(skb)-&gt;end_seq;
+    } else {
+        skb = skb_get(skb);
+        skb_dst_drop(skb);
+        __skb_pull(skb, tcp_hdr(skb)-&gt;doff * 4);
+        skb_set_owner_r(skb, child);
+        __skb_queue_tail(&amp;child-&gt;sk_receive_queue, skb);//将数据放入child的接收队列中
+        tp-&gt;rcv_nxt = TCP_SKB_CB(skb)-&gt;end_seq;
+        tp-&gt;syn_data_acked = 1;
+    }
+    sk-&gt;sk_data_ready(sk, 0);//通知持有listening socket的进程调用accept系统调用创建新连接
+    bh_unlock_sock(child);
+    sock_put(child);
+    WARN_ON(req-&gt;sk == NULL);
+    return 0;
+}
+</code></pre>
+
+<pre><code>
+应用进程收到listening socket的可读通告后，使用accept系统调用建立socket，就可以立即从这个新的socket中读到数据，并开始与客户端进行数据交互。
+
+如果client的TFO是cookie，则SYN|ACK的处理过程与不使用TFO的情况是一样的；如果client发送的TFO是请求，则在收到SYN|ACK时需要将包中的TFO cookie保存下来：
+</code></pre>
+
+<pre><code>static int tcp_rcv_synsent_state_process(struct sock *sk, struct sk_buff *skb,
+                     const struct tcphdr *th, unsigned int len)
+{
+    struct inet_connection_sock *icsk = inet_csk(sk);
+    struct tcp_sock *tp = tcp_sk(sk);
+    struct tcp_fastopen_cookie foc = { .len = -1 };
+    int saved_clamp = tp-&gt;rx_opt.mss_clamp;
+
+    tcp_parse_options(skb, &amp;tp-&gt;rx_opt, 0, &amp;foc);//解析TFO选项
+    ...
+        if ((tp-&gt;syn_fastopen || tp-&gt;syn_data) &amp;&amp; //如果发送过TFO选项或在SYN中发送过数据
+            tcp_rcv_fastopen_synack(sk, skb, &amp;foc))//记录SYN｜ACK中的FTO cookie
+            return -1;
+</code></pre>
+
+<pre><code>
+tcp_rcv_fastopen_synack函数检查并保存server端发送的TFO cookie：
+</code></pre>
+
+<pre><code>static bool tcp_rcv_fastopen_synack(struct sock *sk, struct sk_buff *synack,
+                    struct tcp_fastopen_cookie *cookie)
+{
+    struct tcp_sock *tp = tcp_sk(sk);
+    struct sk_buff *data = tp-&gt;syn_data ? tcp_write_queue_head(sk) : NULL;
+    u16 mss = tp-&gt;rx_opt.mss_clamp;
+    bool syn_drop;
+
+    if (mss == tp-&gt;rx_opt.user_mss) {
+        struct tcp_options_received opt;
+
+        /* Get original SYNACK MSS value if user MSS sets mss_clamp */
+        tcp_clear_options(&amp;opt);
+        opt.user_mss = opt.mss_clamp = 0;
+        tcp_parse_options(synack, &amp;opt, 0, NULL);
+        mss = opt.mss_clamp;
+    }
+
+    if (!tp-&gt;syn_fastopen)  /* Ignore an unsolicited cookie */
+        cookie-&gt;len = -1;//如果客户端没有发送TFO请求但服务器给出了TFO cookie，忽略之
+
+    /* The SYN-ACK neither has cookie nor acknowledges the data. Presumably
+     * the remote receives only the retransmitted (regular) SYNs: either
+     * the original SYN-data or the corresponding SYN-ACK is lost.
+     */
+    syn_drop = (cookie-&gt;len &lt;= 0 &amp;&amp; data &amp;&amp; tp-&gt;total_retrans); //客户端认为发生了SYN丢失事件
+
+    tcp_fastopen_cache_set(sk, mss, cookie, syn_drop);//存储SYN｜ACK包中的TFO cookie，并记录发现SYN丢失事件的时间
+
+    if (data) { /* Retransmit unacked data in SYN */
+        tcp_for_write_queue_from(data, sk) {
+            if (data == tcp_send_head(sk) ||
+                __tcp_retransmit_skb(sk, data))
+                break;
+        }
+        tcp_rearm_rto(sk);
+        return true;
+    }
+    tp-&gt;syn_data_acked = tp-&gt;syn_data;
+    return false;
+}
+</code></pre>
+
+<pre><code>
+在保存了TFO cookie后，client在向相同IP地址的server发送SYN时都可以携带数据（这时必须发送TFO cookie）。client在收到SYN|ACK后需要回复ACK报文，服务器端在接收ACK时对TFO的处理如下：
+</code></pre>
+
+<pre><code>int tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb,
+              const struct tcphdr *th, unsigned int len)
+{
+    struct tcp_sock *tp = tcp_sk(sk);
+    struct inet_connection_sock *icsk = inet_csk(sk);
+    struct request_sock *req;
+    ...
+    req = tp-&gt;fastopen_rsk;//找到在SYN请求到来后创建子socket时使用的request sock
+    if (req != NULL) {
+        WARN_ON_ONCE(sk-&gt;sk_state != TCP_SYN_RECV &amp;&amp;
+            sk-&gt;sk_state != TCP_FIN_WAIT1);
+
+        if (tcp_check_req(sk, skb, req, NULL, true) == NULL)//检查包的合法性
+            goto discard;
+    }
+    ...
+        switch (sk-&gt;sk_state) {
+        case TCP_SYN_RECV:
+            if (acceptable) {
+                /* Once we leave TCP_SYN_RECV, we no longer
+                 * need req so release it.
+                 */
+                if (req) {//使用了TFO cookie
+                    tcp_synack_rtt_meas(sk, req);
+                    tp-&gt;total_retrans = req-&gt;num_retrans;
+
+                    reqsk_fastopen_remove(sk, req, false);//将request sock从TFO queue中删除，TFO流程全部结束
+                } else {
+    ...
+</code></pre>
+
+<p>```</p>
+
+<p>综上，TFO在收到SYN的时候就创建socket并将数据提交给应用进程，这样就比普通模式节省了SYN|ACK与ACK的交互时间，减小了通信延迟。</p>
+]]></content>
+  </entry>
   
   <entry>
     <title type="html"><![CDATA[sk 的锁，spin_lock_bh、lock_sock]]></title>
@@ -1360,619 +2183,6 @@ netif_carrier_ok都返回非0（真）值，即本地网卡检查通过，仍然
 <p>max_bonds 配置的bond口个数</p>
 
 <p>mode bond模式，主要有以下几种，在一般的实际应用中，0和1用的比较多。</p>
-]]></content>
-  </entry>
-  
-  <entry>
-    <title type="html"><![CDATA[socket建立连接 sys_connect]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2016/02/29/kernel-net-connect/"/>
-    <updated>2016-02-29T22:52:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2016/02/29/kernel-net-connect</id>
-    <content type="html"><![CDATA[<p><a href="http://blog.csdn.net/chensichensi/article/details/5272346">http://blog.csdn.net/chensichensi/article/details/5272346</a></p>
-
-<p><a href="http://blog.csdn.net/qy532846454/article/details/7882819">http://blog.csdn.net/qy532846454/article/details/7882819</a></p>
-
-<p><a href="http://www.2cto.com/kf/201303/198459.html">http://www.2cto.com/kf/201303/198459.html</a></p>
-
-<pre><code>    connect(fd, servaddr, addrlen);
-    -&gt; SYSCALL_DEFINE3()
-    -&gt; sock-&gt;ops-&gt;connect() == inet_stream_connect (sock-&gt;ops即inet_stream_ops)
-    -&gt; tcp_v4_connect()
-        -&gt; inet_hash_connect()
-            -&gt; __inet_hash_connect()
-                -&gt; check_established()
-                    -&gt; __inet_check_established()
-</code></pre>
-
-<pre><code>    SYSCALL_DEFINE3(connect, int, fd, struct sockaddr __user *, uservaddr,
-            int, addrlen)
-    {
-        struct socket *sock;
-        struct sockaddr_storage address;
-        int err, fput_needed;
-        /* 找到文件描述符对应的BSD socket结构，在前面的socket调用中建立*/
-        sock = sockfd_lookup_light(fd, &amp;err, &amp;fput_needed);
-        if (!sock)
-            goto out;
-        /* copy对端的地址到内核空间 */
-        err = move_addr_to_kernel(uservaddr, addrlen, (struct sockaddr *)&amp;address);
-        if (err &lt; 0)
-            goto out_put;
-
-        err =
-            security_socket_connect(sock, (struct sockaddr *)&amp;address, addrlen);
-        if (err)
-            goto out_put;
-        /* 调用该BSD socket对应的connect调用 */
-        err = sock-&gt;ops-&gt;connect(sock, (struct sockaddr *)&amp;address, addrlen,
-                     sock-&gt;file-&gt;f_flags);
-    out_put:
-        /* 释放文件的引用 */
-        fput_light(sock-&gt;file, fput_needed);
-    out:
-        return err;
-    }
-</code></pre>
-
-<pre><code>    /*
-     *  Connect to a remote host. There is regrettably still a little
-     *  TCP 'magic' in here.
-     */
-    int inet_stream_connect(struct socket *sock, struct sockaddr *uaddr,
-                int addr_len, int flags)
-    {
-        struct sock *sk = sock-&gt;sk;
-        int err;
-        long timeo;
-
-        lock_sock(sk);
-
-        if (uaddr-&gt;sa_family == AF_UNSPEC) {
-            err = sk-&gt;sk_prot-&gt;disconnect(sk, flags);
-            sock-&gt;state = err ? SS_DISCONNECTING : SS_UNCONNECTED;
-            goto out;
-        }
-
-        switch (sock-&gt;state) {
-        default:
-            err = -EINVAL;
-            goto out;
-        case SS_CONNECTED:     /* 该BSD socket已连接*/
-            err = -EISCONN;
-            goto out;
-        case SS_CONNECTING:   /* 该BSD socket正在连接*/
-            err = -EALREADY;
-            /* Fall out of switch with err, set for this state */
-            break;
-        case SS_UNCONNECTED:
-            err = -EISCONN;
-            if (sk-&gt;sk_state != TCP_CLOSE)
-                goto out;
-                /* INET SOCKET 调用协议特有connect操作符 */
-            err = sk-&gt;sk_prot-&gt;connect(sk, uaddr, addr_len);
-            if (err &lt; 0)
-                goto out;
-                /* 上面的调用完成后，连接并没有完成，*/
-            sock-&gt;state = SS_CONNECTING;
-
-            /* Just entered SS_CONNECTING state; the only
-             * difference is that return value in non-blocking
-             * case is EINPROGRESS, rather than EALREADY.
-             */
-            err = -EINPROGRESS;
-            break;
-        }
-        /* 获取连接超时时间*/
-        timeo = sock_sndtimeo(sk, flags &amp; O_NONBLOCK);
-
-        if ((1 &lt;&lt; sk-&gt;sk_state) &amp; (TCPF_SYN_SENT | TCPF_SYN_RECV)) {
-            /* Error code is set above 进入定时等待 */
-            if (!timeo || !inet_wait_for_connect(sk, timeo))
-                goto out;
-
-            err = sock_intr_errno(timeo);
-            if (signal_pending(current))
-                goto out;
-        }
-
-        /* Connection was closed by RST, timeout, ICMP error
-         * or another process disconnected us.
-         */
-        if (sk-&gt;sk_state == TCP_CLOSE)
-            goto sock_error;
-
-        /* sk-&gt;sk_err may be not zero now, if RECVERR was ordered by user
-         * and error was received after socket entered established state.
-         * Hence, it is handled normally after connect() return successfully.
-         */
-
-        sock-&gt;state = SS_CONNECTED;
-        err = 0;
-    out:
-        release_sock(sk);
-        return err;
-
-    sock_error:
-        err = sock_error(sk) ? : -ECONNABORTED;
-        sock-&gt;state = SS_UNCONNECTED;
-        if (sk-&gt;sk_prot-&gt;disconnect(sk, flags))
-            sock-&gt;state = SS_DISCONNECTING;
-        goto out;
-    }
-</code></pre>
-
-<pre><code>    /* This will initiate an outgoing connection. */
-    int tcp_v4_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)
-    {
-        struct inet_sock *inet = inet_sk(sk);
-        struct tcp_sock *tp = tcp_sk(sk);
-        struct sockaddr_in *usin = (struct sockaddr_in *)uaddr;
-        struct rtable *rt;
-        __be32 daddr, nexthop;
-        int tmp;
-        int err;
-
-        if (addr_len &lt; sizeof(struct sockaddr_in))
-            return -EINVAL;
-
-        if (usin-&gt;sin_family != AF_INET)
-            return -EAFNOSUPPORT;
-        /* 开始准备路由 */
-        nexthop = daddr = usin-&gt;sin_addr.s_addr;
-        if (inet-&gt;opt &amp;&amp; inet-&gt;opt-&gt;srr) {
-            if (!daddr)
-                return -EINVAL;
-            nexthop = inet-&gt;opt-&gt;faddr;
-        }
-        /* 调用路由模块获取出口信息，这里不深入 */
-        tmp = ip_route_connect(&amp;rt, nexthop, inet-&gt;saddr,
-                       RT_CONN_FLAGS(sk), sk-&gt;sk_bound_dev_if,
-                       IPPROTO_TCP,
-                       inet-&gt;sport, usin-&gt;sin_port, sk, 1);
-        if (tmp &lt; 0) {
-            if (tmp == -ENETUNREACH)
-                IP_INC_STATS_BH(sock_net(sk), IPSTATS_MIB_OUTNOROUTES);
-            return tmp;
-        }
-        /* 如果获取的路由是广播或多播域， 返回网络不可达，tcp不支持多播与广播 */
-        if (rt-&gt;rt_flags &amp; (RTCF_MULTICAST | RTCF_BROADCAST)) {
-            ip_rt_put(rt);
-            return -ENETUNREACH;
-        }
-
-        if (!inet-&gt;opt || !inet-&gt;opt-&gt;srr)
-            daddr = rt-&gt;rt_dst;
-
-        if (!inet-&gt;saddr)
-            inet-&gt;saddr = rt-&gt;rt_src;
-        inet-&gt;rcv_saddr = inet-&gt;saddr;
-
-        if (tp-&gt;rx_opt.ts_recent_stamp &amp;&amp; inet-&gt;daddr != daddr) {
-            /* Reset inherited state */
-            tp-&gt;rx_opt.ts_recent       = 0;
-            tp-&gt;rx_opt.ts_recent_stamp = 0;
-            tp-&gt;write_seq          = 0;
-        }
-
-        if (tcp_death_row.sysctl_tw_recycle &amp;&amp;
-            !tp-&gt;rx_opt.ts_recent_stamp &amp;&amp; rt-&gt;rt_dst == daddr) {
-            struct inet_peer *peer = rt_get_peer(rt);
-            /*
-             * VJ's idea. We save last timestamp seen from
-             * the destination in peer table, when entering state
-             * TIME-WAIT * and initialize rx_opt.ts_recent from it,
-             * when trying new connection.
-             */
-            if (peer != NULL &amp;&amp;
-                peer-&gt;tcp_ts_stamp + TCP_PAWS_MSL &gt;= get_seconds()) {
-                tp-&gt;rx_opt.ts_recent_stamp = peer-&gt;tcp_ts_stamp;
-                tp-&gt;rx_opt.ts_recent = peer-&gt;tcp_ts;
-            }
-        }
-
-        inet-&gt;dport = usin-&gt;sin_port;
-        inet-&gt;daddr = daddr;
-
-        inet_csk(sk)-&gt;icsk_ext_hdr_len = 0;
-        if (inet-&gt;opt)
-            inet_csk(sk)-&gt;icsk_ext_hdr_len = inet-&gt;opt-&gt;optlen;
-        /* mss_clamp */
-        tp-&gt;rx_opt.mss_clamp = 536;
-
-        /* Socket identity is still unknown (sport may be zero).
-         * However we set state to SYN-SENT and not releasing socket
-         * lock select source port, enter ourselves into the hash tables and
-         * complete initialization after this.
-         */
-        tcp_set_state(sk, TCP_SYN_SENT);
-        err = inet_hash_connect(&amp;tcp_death_row, sk);
-        if (err)
-            goto failure;
-
-        err = ip_route_newports(&amp;rt, IPPROTO_TCP,
-                    inet-&gt;sport, inet-&gt;dport, sk);
-        if (err)
-            goto failure;
-
-        /* OK, now commit destination to socket.  */
-        sk-&gt;sk_gso_type = SKB_GSO_TCPV4;
-        sk_setup_caps(sk, &amp;rt-&gt;u.dst);
-
-        if (!tp-&gt;write_seq)
-            tp-&gt;write_seq = secure_tcp_sequence_number(inet-&gt;saddr,
-                                   inet-&gt;daddr,
-                                   inet-&gt;sport,
-                                   usin-&gt;sin_port);
-        /* id是IP包头的id域 */
-        inet-&gt;id = tp-&gt;write_seq ^ jiffies;
-
-        err = tcp_connect(sk);
-        rt = NULL;
-        if (err)
-            goto failure;
-
-        return 0;
-
-    failure:
-        /*
-         * This unhashes the socket and releases the local port,
-         * if necessary.
-         */
-        tcp_set_state(sk, TCP_CLOSE);
-        ip_rt_put(rt);
-        sk-&gt;sk_route_caps = 0;
-        inet-&gt;dport = 0;
-        return err;
-    }
-</code></pre>
-
-<p>当snum==0时，表明此时源端口没有指定，此时会随机选择一个空闲端口作为此次连接的源端口。low和high分别表示可用端口的下限和上限，remaining表示可用端口的数，注意这里的可用只是指端口可以用作源端口，其中部分端口可能已经作为其它socket的端口号在使用了，所以要循环1~remaining，直到查找到空闲的源端口。</p>
-
-<p>下面来看下对每个端口的检查，即//choose a valid port部分的代码。这里要先了解下tcp的内核表组成，udp的表内核表udptable只是一张hash表，tcp的表则稍复杂，它的名字是tcp_hashinfo，在tcp_init()中被初始化，这个数据结构定义如下(省略了不相关的数据)：</p>
-
-<pre><code>    struct inet_hashinfo {
-        struct inet_ehash_bucket *ehash;
-        ……
-        struct inet_bind_hashbucket *bhash;
-        ……
-        struct inet_listen_hashbucket  listening_hash[INET_LHTABLE_SIZE]
-                        ____cacheline_aligned_in_smp;
-    };
-</code></pre>
-
-<p>从定义可以看出，tcp表又分成了三张表ehash, bhash, listening_hash，其中ehash, listening_hash对应于socket处在TCP的ESTABLISHED, LISTEN状态，bhash对应于socket已绑定了本地地址。三者间并不互斥，如一个socket可同时在bhash和ehash中，由于TIME_WAIT是一个比较特殊的状态，所以ehash又分成了chain和twchain，为TIME_WAIT的socket单独形成一张表。</p>
-
-<p>回到刚才的代码，现在还只是建立socket连接，使用的就应该是tcp表中的bhash。首先取得内核tcp表的bind表 – bhash，查看是否已有socket占用：</p>
-
-<p>如果没有，则调用inet_bind_bucket_create()创建一个bind表项tb，并插入到bind表中，跳转至goto ok代码段；
-如果有，则跳转至goto ok代码段。</p>
-
-<p>进入ok代码段表明已找到合适的bind表项(无论是创建的还是查找到的)，调用inet_bind_hash()赋值源端口inet_num。</p>
-
-<p>inet_hash_connect()函数只是对<code>__inet_hash_connect()</code>函数进行了简单的封装。在<code>__inet_hash_connect()</code>中如果已绑定了端口号，并且是和其他传输控制块共享绑定的端口号，则会调用check_established参数指向的函数来检查这个绑定的端口号是否可用，代码如下所示：</p>
-
-<pre><code>    int __inet_hash_connect(struct inet_timewait_death_row *death_row,
-            struct sock *sk, u32 port_offset,
-            int (*check_established)(struct inet_timewait_death_row *,
-            struct sock *, __u16, struct inet_timewait_sock **),
-            void (*hash)(struct sock *sk))
-    {
-        struct inet_hashinfo *hinfo = death_row-&gt;hashinfo;
-        const unsigned short snum = inet_sk(sk)-&gt;num;
-        struct inet_bind_hashbucket *head;
-        struct inet_bind_bucket *tb;
-        int ret;
-        struct net *net = sock_net(sk);
-
-        if (!snum) {
-            int i, remaining, low, high, port;
-            static u32 hint;
-            u32 offset = hint + port_offset;
-            struct hlist_node *node;
-            struct inet_timewait_sock *tw = NULL;
-
-            inet_get_local_port_range(&amp;low, &amp;high);
-            remaining = (high - low) + 1;
-
-            local_bh_enable();
-            for (i = 1; i &lt;= remaining; i++) {
-                port = low + (i + offset) % remaining;
-                if (inet_is_reserved_local_port(port)
-                    continue;
-                head = &amp;hinfo-&gt;bhash[inet_bhashfn(net, port, hinfo-&gt;bhash_size)];
-                spin_lock(&amp;head-&gt;lock);
-                inet_bind_bucket_for_each(tb, node, &amp;head-&gt;chain) {
-                    if (net_eq(ib_net(tb), net) &amp;&amp; tb-&gt;port == port) {
-                        if (tb-&gt;fastreuse &gt;= 0)
-                            goto next_port;
-                        WARN_ON(hlist_empty(&amp;tb-&gt;owners));
-                        if (!check_established(death_row, sk, port, &amp;tw))
-                            goto ok;
-                        goto next_port;
-                    }
-                }
-
-                tb = inet_bind_bucket_create(hinfo-&gt;bind_bucket_cachep, net, head, port);
-                if (!tb) {
-                    spin_unlock(&amp;head-&gt;lock);
-                    break;
-                }
-                tb-&gt;fastreuse = -1;
-                tb-&gt;fastreuseport = -1;
-                goto ok;
-            next_port:
-                spin_unlock(&amp;head-&gt;lock);
-            }
-            local_bh_enable();
-
-            return -EADDRNOTAVAIL;
-
-    ok:
-            hint += i;
-
-            inet_bind_hash(sk, tb, port);
-            if (sk_unhashed(sk)) {
-                inet_sk(sk)-&gt;sport = htons(port);
-                hash(sk);
-            }
-            spin_unlock(&amp;head-&gt;lock);
-            if (tw) {
-                inet_twsk_deschedule(tw, death_row);
-                inet_twsk_put(tw);
-            }
-
-            ret = 0;
-            goto out;
-        }
-
-        head = &amp;hinfo-&gt;bhash[inet_bhashfn(net, snum, hinfo-&gt;bhash_size)];
-        tb  = inet_csk(sk)-&gt;icsk_bind_hash;
-        spin_lock_bh(&amp;head-&gt;lock);
-        if (sk_head(&amp;tb-&gt;owners) == sk &amp;&amp; !sk-&gt;sk_bind_node.next) {
-            hash(sk);
-            spin_unlock_bh(&amp;head-&gt;lock);
-            return 0;
-        } else {
-            spin_unlock(&amp;head-&gt;lock);
-            /* No definite answer... Walk to established hash table */
-            ret = check_established(death_row, sk, snum, NULL);
-    out:
-            local_bh_enable();
-            return ret;
-        }
-    }
-</code></pre>
-
-<p>(sk_head(&amp;tb->owners) == sk &amp;&amp; !sk->sk_bind_node.next)这个判断条件就是用来判断是不是只有当前传输控制块在使用已绑定的端口，条件为false时，会执行else分支，检查是否可用。这么看来，调用bind()成功并不意味着这个端口就真的可以用。</p>
-
-<p>check_established参数对应的函数是<code>__inet_check_established()</code>，在inet_hash_connect()中可以看到。在上面的代码中我们还注意到调用check_established()时第三个参数为NULL，这在后面的分析中会用到。</p>
-
-<p><code>__inet_check_established()</code>函数中，会分别在TIME_WAIT传输控制块和除TIME_WIAT、LISTEN状态外的传输控制块中查找是已绑定的端口是否已经使用，代码片段如下所示：
-```
-    /<em> called with local bh disabled </em>/
-    static int <strong>inet_check_established(struct inet_timewait_death_row <em>death_row,
-                struct sock </em>sk, </strong>u16 lport,
-                struct inet_timewait_sock <em><em>twp)
-    {
-        struct inet_hashinfo </em>hinfo = death_row->hashinfo;
-        struct inet_sock </em>inet = inet_sk(sk);
-        <strong>be32 daddr = inet->rcv_saddr;
-        </strong>be32 saddr = inet->daddr;
-        int dif = sk->sk_bound_dev_if;
-        INET_ADDR_COOKIE(acookie, saddr, daddr)
-        const __portpair ports = INET_COMBINED_PORTS(inet->dport, lport);
-        struct net <em>net = sock_net(sk);
-        unsigned int hash = inet_ehashfn(net, daddr, lport, saddr, inet->dport);
-        struct inet_ehash_bucket </em>head = inet_ehash_bucket(hinfo, hash);
-        spinlock_t <em>lock = inet_ehash_lockp(hinfo, hash);
-        struct sock </em>sk2;
-        const struct hlist_nulls_node <em>node;
-        struct inet_timewait_sock </em>tw;</p>
-
-<pre><code>    spin_lock(lock);
-
-    /* Check TIME-WAIT sockets first. */
-    sk_nulls_for_each(sk2, node, &amp;head-&gt;twchain) {
-        tw = inet_twsk(sk2);
-
-
-        if (INET_TW_MATCH(sk2, net, hash, acookie,
-                saddr, daddr, ports, dif)) {
-            if (twsk_unique(sk, sk2, twp))
-                goto unique;
-            else
-                goto not_unique;
-        }
-    }
-    tw = NULL;
-
-    /* And established part... */
-    sk_nulls_for_each(sk2, node, &amp;head-&gt;chain) {
-        if (INET_MATCH(sk2, net, hash, acookie,
-                saddr, daddr, ports, dif))
-            goto not_unique;
-    }
-
-unique:
-    ......
-    return 0;
-
-not_unique:
-    spin_unlock(lock);
-    return -EADDRNOTAVAIL;
-}
-</code></pre>
-
-<pre><code>
-如果是TCP套接字，twsk_uniqueue()中会调用tcp_twsk_uniqueue()来判断，返回true的条件如下所示：
-</code></pre>
-
-<pre><code>int tcp_twsk_unique(struct sock *sk, struct sock *sktw, void *twp)
-{
-    const struct tcp_timewait_sock *tcptw = tcp_twsk(sktw);
-    struct tcp_sock *tp = tcp_sk(sk);
-
-    if (tcptw-&gt;tw_ts_recent_stamp &amp;&amp;
-            (twp == NULL || (sysctl_tcp_tw_reuse &amp;&amp;
-            get_seconds() - tcptw-&gt;tw_ts_recent_stamp &gt; 1))) {
-        ......
-        return 1;
-    }
-
-    return 0;
-}
-</code></pre>
-
-<pre><code></code></pre>
-
-<pre><code>/*
- * Build a SYN and send it off.
- */
-int tcp_connect(struct sock *sk)
-{
-    struct tcp_sock *tp = tcp_sk(sk);
-    struct sk_buff *buff;
-    /* 初始化连接对应的INET socket结构的参数，为连接做准备 */
-    tcp_connect_init(sk);
-    /* 获取一个skb，由于是syn包，没有数据，所以大小是MAX_TCP_HEADER的16位对齐 */
-    buff = alloc_skb_fclone(MAX_TCP_HEADER + 15, sk-&gt;sk_allocation);
-    if (unlikely(buff == NULL))
-        return -ENOBUFS;
-
-    /* Reserve space for headers. */
-    skb_reserve(buff, MAX_TCP_HEADER);
-
-    tp-&gt;snd_nxt = tp-&gt;write_seq;
-    /* 设置skb相关参数 */
-    tcp_init_nondata_skb(buff, tp-&gt;write_seq++, TCPCB_FLAG_SYN);
-    /* 设置ECN */
-    TCP_ECN_send_syn(sk, buff);
-
-    /* Send it off. */
-    /* 保存该数据包的发送时间*/
-    TCP_SKB_CB(buff)-&gt;when = tcp_time_stamp;
-    tp-&gt;retrans_stamp = TCP_SKB_CB(buff)-&gt;when;
-    skb_header_release(buff);
-    /* 加入发送队列，待确认后在丢弃*/
-    __tcp_add_write_queue_tail(sk, buff);
-    sk-&gt;sk_wmem_queued += buff-&gt;truesize;
-    sk_mem_charge(sk, buff-&gt;truesize);
-    tp-&gt;packets_out += tcp_skb_pcount(buff);
-    tcp_transmit_skb(sk, buff, 1, GFP_KERNEL);
-
-    /* We change tp-&gt;snd_nxt after the tcp_transmit_skb() call
-     * in order to make this packet get counted in tcpOutSegs.
-     */
-    tp-&gt;snd_nxt = tp-&gt;write_seq;
-    tp-&gt;pushed_seq = tp-&gt;write_seq;
-    TCP_INC_STATS(sock_net(sk), TCP_MIB_ACTIVEOPENS);
-
-    /* Timer for repeating the SYN until an answer. */
-    inet_csk_reset_xmit_timer(sk, ICSK_TIME_RETRANS,
-                  inet_csk(sk)-&gt;icsk_rto, TCP_RTO_MAX);
-    return 0;
-}
-</code></pre>
-
-<pre><code></code></pre>
-
-<pre><code>/*
- * Do all connect socket setups that can be done AF independent.
- */
-static void tcp_connect_init(struct sock *sk)
-{
-    struct dst_entry *dst = __sk_dst_get(sk);
-    struct tcp_sock *tp = tcp_sk(sk);
-    __u8 rcv_wscale;
-
-    /* We'll fix this up when we get a response from the other end.
-     * See tcp_input.c:tcp_rcv_state_process case TCP_SYN_SENT.
-     */
-    tp-&gt;tcp_header_len = sizeof(struct tcphdr) +
-        (sysctl_tcp_timestamps ? TCPOLEN_TSTAMP_ALIGNED : 0);
-
-#ifdef CONFIG_TCP_MD5SIG
-    if (tp-&gt;af_specific-&gt;md5_lookup(sk, sk) != NULL)
-        tp-&gt;tcp_header_len += TCPOLEN_MD5SIG_ALIGNED;
-#endif
-
-    /* If user gave his TCP_MAXSEG, record it to clamp */
-    if (tp-&gt;rx_opt.user_mss)
-        tp-&gt;rx_opt.mss_clamp = tp-&gt;rx_opt.user_mss;
-    tp-&gt;max_window = 0;
-    /* 初始化MTU probe*/
-    tcp_mtup_init(sk);
-    /* 设置mss */
-    tcp_sync_mss(sk, dst_mtu(dst));
-
-    if (!tp-&gt;window_clamp)
-        tp-&gt;window_clamp = dst_metric(dst, RTAX_WINDOW);
-    tp-&gt;advmss = dst_metric(dst, RTAX_ADVMSS);
-    if (tp-&gt;rx_opt.user_mss &amp;&amp; tp-&gt;rx_opt.user_mss &lt; tp-&gt;advmss)
-        tp-&gt;advmss = tp-&gt;rx_opt.user_mss;
-
-    tcp_initialize_rcv_mss(sk);
-    /* 根据接收空间大小初始化一个通告窗口 */
-    tcp_select_initial_window(tcp_full_space(sk),
-                  tp-&gt;advmss - (tp-&gt;rx_opt.ts_recent_stamp ? tp-&gt;tcp_header_len - sizeof(struct tcphdr) : 0),
-                  &amp;tp-&gt;rcv_wnd,
-                  &amp;tp-&gt;window_clamp,
-                  sysctl_tcp_window_scaling,
-                  &amp;rcv_wscale);
-
-    tp-&gt;rx_opt.rcv_wscale = rcv_wscale;
-    tp-&gt;rcv_ssthresh = tp-&gt;rcv_wnd;
-
-    sk-&gt;sk_err = 0;
-    sock_reset_flag(sk, SOCK_DONE);
-    tp-&gt;snd_wnd = 0;
-    /* 更新一些滑动窗口的成员*/
-    tcp_init_wl(tp, tp-&gt;write_seq, 0);
-    tp-&gt;snd_una = tp-&gt;write_seq;
-    tp-&gt;snd_sml = tp-&gt;write_seq;
-    tp-&gt;snd_up = tp-&gt;write_seq;
-    tp-&gt;rcv_nxt = 0;
-    tp-&gt;rcv_wup = 0;
-    tp-&gt;copied_seq = 0;
-
-    inet_csk(sk)-&gt;icsk_rto = TCP_TIMEOUT_INIT;
-    inet_csk(sk)-&gt;icsk_retransmits = 0;
-    tcp_clear_retrans(tp);
-}
-</code></pre>
-
-<pre><code>
-skb发送后，connect并没有返回，因为此时连接还没有建立，tcp进入等待状态，此时回到前面的inet_stream_connect函数
-
-在发送syn后进入等待状态
-</code></pre>
-
-<pre><code>static long inet_wait_for_connect(struct sock *sk, long timeo)
-{
-    DEFINE_WAIT(wait);
-    /* sk_sleep 保存此INET SOCKET的等待队列 */
-    prepare_to_wait(sk-&gt;sk_sleep, &amp;wait, TASK_INTERRUPTIBLE);
-
-    /* Basic assumption: if someone sets sk-&gt;sk_err, he _must_
-     * change state of the socket from TCP_SYN_*.
-     * Connect() does not allow to get error notifications
-     * without closing the socket.
-     */
-    /* 定时等待知道状态变化 */
-    while ((1 &lt;&lt; sk-&gt;sk_state) &amp; (TCPF_SYN_SENT | TCPF_SYN_RECV)) {
-        release_sock(sk);
-        timeo = schedule_timeout(timeo);
-        lock_sock(sk);
-        if (signal_pending(current) || !timeo)
-            break;
-        prepare_to_wait(sk-&gt;sk_sleep, &amp;wait, TASK_INTERRUPTIBLE);
-    }
-    finish_wait(sk-&gt;sk_sleep, &amp;wait);
-    return timeo;
-}
-</code></pre>
-
-<p>```</p>
 ]]></content>
   </entry>
   
