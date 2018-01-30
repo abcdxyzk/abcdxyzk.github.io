@@ -17,7 +17,37 @@ http://blog.csdn.net/u011130578/article/details/44515165
 
 http://blog.sina.com.cn/s/blog_583f42f101011veh.html
 
+```
+	#define TFO_CLIENT_ENABLE       1
+	#define TFO_SERVER_ENABLE       2
+	#define TFO_CLIENT_NO_COOKIE    4       /* Data in SYN w/o cookie option */
+
+	/* Process SYN data but skip cookie validation */
+	#define TFO_SERVER_COOKIE_NOT_CHKED     0x100	// 收到cookie也不检查
+	/* Accept SYN data w/o any cookie option */
+	#define TFO_SERVER_COOKIE_NOT_REQD      0x200	// 不需要cookie需要data就能创建fastopen child，默认情况下syn的data会被忽略
+
+	/* Force enable TFO on all listeners, i.e., not requiring the
+	 * TCP_FASTOPEN socket option. SOCKOPT1/2 determine how to set max_qlen.
+	 */
+	#define TFO_SERVER_WO_SOCKOPT1  0x400		// 调listen后不需要再调setsockopt就开启fastopen
+	#define TFO_SERVER_WO_SOCKOPT2  0x800		// 调listen后不需要再调setsockopt就开启fastopen，backlog=TFO_SERVER_WO_SOCKOPT2>>16
+	/* Always create TFO child sockets on a TFO listener even when
+	 * cookie/data not present. (For testing purpose!)
+	 */
+	#define TFO_SERVER_ALWAYS       0x1000		// 不需要cookie也不需要data就创建fastopen child, 容易被攻击，不开启
+```
+
 ### 测试
+
+#### 开启
+```
+	echo 3 > /proc/sys/net/ipv4/tcp_fastopen   # 1 开启客户端，2 开启服务端，3 都开启
+
+	tc qdisc add dev lo root netem delay 300ms # 设置延迟才能看出效果
+	ifconfig lo mtu 1500
+```
+
 #### client
 ```
 	#include <stdio.h>
@@ -152,15 +182,6 @@ http://blog.sina.com.cn/s/blog_583f42f101011veh.html
 		return 0;
 	}
 ```
-
-#### 开启
-```
-	echo 3 > /proc/sys/net/ipv4/tcp_fastopen   # 1 开启客户端，2 开启服务端，3 都开启
-
-	tc qdisc add dev lo root netem delay 300ms # 设置延迟才能看出效果
-	ifconfig lo mtu 1500
-```
-
 
 ### 原理
 
