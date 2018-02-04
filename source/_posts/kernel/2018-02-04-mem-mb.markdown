@@ -1,0 +1,135 @@
+---
+layout: post
+title: "内存屏障"
+date: 2018-02-04 00:10:00 +0800
+comments: false
+categories:
+- 2018
+- 2018~02
+- kernel
+- kernel~mm
+tags:
+---
+
+https://www.cnblogs.com/icanth/archive/2012/06/10/2544300.html
+
+
+### 内存屏障(Memory Barriers)
+
+一方面，CPU由于采用指令流水线和超流水线技术，可能导致CPU虽然顺序取指令、但有可能会出现“乱序”执行的情况，当然，对于” a++；b = f(a)；c = f”等存在依赖关系的指令，CPU则会在“b= f(a)”执行阶段之前被阻塞；另一方面，编译器也有可能将依赖关系很近“人为地”拉开距离以防止阻塞情况的发生，从而导致编译器乱序，如“a++ ；c = f；b = f(a)”。
+
+一个CPU对指令顺序提供如下保证：
+
+(1) On any given CPU, dependent memory accesses will be issued in order, with respect to itself.如Q = P; D = *Q;将保证其顺序执行
+
+(2) Overlapping loads and stores within a particular CPU will appear to be ordered within that CPU.重叠的Load和Store操作将保证顺序执行（目标地址相同的Load、Store），如：a = *X; *X = b;
+
+(3) It _must_not_ be assumed that independent loads and stores will be issued in the order given.
+
+(4) It _must_ be assumed that overlapping memory accesses may be merged or discarded.如*A = X; Y = *A; => STORE *A = X; Y = LOAD *A; / or STORE *A = Y = X;
+
+
+由此可见，无关的内存操作会被按随机顺序有效的得到执行,但是在CPU与CPU交互时或CPU与IO设备交互时, 这可能会成为问题. 我们需要一些手段来干预编译器和CPU, 使其限制指令顺序。内存屏障就是这样的干预手段. 他们能保证处于内存屏障两边的内存操作满足部分有序.(译注: 这里"部分有序"的意思是, 内存屏障之前的操作都会先于屏障之后的操作, 但是如果几个操作出现在屏障的同一边, 则不保证它们的顺序.)
+
+(1) 写(STORE)内存屏障。在写屏障之前的STORE操作将先于所有在写屏障之后的STORE操作。
+
+(2) 数据依赖屏障。两条Load指令，第二条Load指令依赖于第一条Load指令的结果，则数据依赖屏障保障第二条指令的目标地址将被更新。
+
+(3) 读(LOAD)内存屏障。读屏障包含数据依赖屏障的功能, 并且保证所有出现在屏障之前的LOAD操作都将先于所有出现在屏障之后的LOAD操作被系统中的其他组件所感知.
+
+(4) 通用内存屏障. 通用内存屏障保证所有出现在屏障之前的LOAD和STORE操作都将先于所有出现在屏障之后的LOAD和STORE操作被系统中的其他组件所感知.
+
+(5) LOCK操作.它的作用相当于一个单向渗透屏障.它保证所有出现在LOCK之后的内存操作都将在LOCK操作被系统中的其他组件所感知之后才能发生. 出现在LOCK之前的内存操作可能在LOCK完成之后才发生.LOCK操作总是跟UNLOCK操作配对出现.
+
+(6) UNLOCK操作。它保证所有出现在UNLOCK之前的内存操作都将在UNLOCK操作被系统中的其他组件所感知之前发生.
+
+
+LINUX对于x86而言，在为UP体系统架构下，调用barrier()进行通用内存屏障。在SMP体系架构下，若为64位CPU或支持mfence、lfence、sfence指令的32位CPU，则smp_mb()、smp_rmb()、smp_smb()对应通用内存屏障、写屏障和读屏障；而不支持mfence、lfence、sfence指令的32位CPU则smp_mb()、smp_rmb()、smp_smb()对应LOCK操作。源码请参见《内存屏障源码分析》一节。
+
+
+#### 内存屏障源码分析
+
+/include/asm-generic/system.h：
+```
+	053 #ifdef CONFIG_SMP
+	054 #define smp_mb()        mb()
+	055 #define smp_rmb()       rmb()
+	056 #define smp_wmb()       wmb()
+	057 #else
+	058 #define smp_mb()        barrier()
+	059 #define smp_rmb()       barrier()
+	060 #define smp_wmb()       barrier()
+	061 #endif
+```
+
+在x86 UP体系架构中，smp_mb、smp_rmb、smp_wmb被翻译成barrier：
+
+```
+	012 #define barrier() __asm__ __volatile__("": : :"memory")
+```
+`__volatile`告诉编译器此条语句不进行任何优化，"": : :"memory" 内存单元已被修改、需要重新读入。
+
+
+
+在x86 SMP体系架构中，smp_mb、smp_rmb、smp_wmb如下定义：
+
+/arch/x86/include/asm/system.h：
+
+```
+	352 /*
+	353  * Force strict CPU ordering.
+	354  * And yes, this is required on UP too when we're talking
+	355  * to devices.
+	356  */
+	357 #ifdef CONFIG_X86_32
+	358 /*
+	359  * Some non-Intel clones support out of order store. wmb() ceases to be a
+	360  * nop for these.
+	361  */
+	362 #define mb() alternative("lock; addl $0,0(%%esp)", "mfence", X86_FEATURE_XMM2)
+	363 #define rmb() alternative("lock; addl $0,0(%%esp)", "lfence", X86_FEATURE_XMM2)
+	364 #define wmb() alternative("lock; addl $0,0(%%esp)", "sfence", X86_FEATURE_XMM)
+	365 #else
+	366 #define mb()    asm volatile("mfence":::"memory")
+	367 #define rmb()   asm volatile("lfence":::"memory")
+	368 #define wmb()   asm volatile("sfence" ::: "memory")
+	369 #endif
+```
+
+362~364行针对x86的32位CPU，366~368行针对x86的64位CPU。
+
+
+在x86的64位CPU中，mb()宏实际为：
+
+```
+	asm volatile("sfence" ::: "memory")。
+```
+
+volatile告诉编译器严禁在此处汇编语句与其它语句重组优化，memory强制编译器假设RAM所有内存单元均被汇编指令修改，"sfence" ::: 表示在此插入一条串行化汇编指令sfence。
+
+mfence：串行化发生在mfence指令之前的读写操作
+
+lfence：串行化发生在mfence指令之前的读操作、但不影响写操作
+
+sfence：串行化发生在mfence指令之前的写操作、但不影响读操作
+
+
+
+#### 在x86的32位CPU中，mb()宏实际为：
+
+```
+	mb() alternative("lock; addl $0,0(%%esp)", "mfence", X86_FEATURE_XMM2)
+```
+
+由于x86的32位CPU有可能不提供mfence、lfence、sfence三条汇编指令的支持，故在不支持mfence的指令中使用："lock; addl $0,0(%%esp)", "mfence"。lock表示将“addl $0,0(%%esp)”语句作为内存屏障。
+
+关于lock的实现：cpu上有一根pin #HLOCK连到北桥,lock前缀会在执行这条指令前先去拉这根pin，持续到这个指令结束时放开#HLOCK pin，在这期间，北桥会屏蔽掉一切外设以及AGP的内存操作。也就保证了这条指令的atomic。
+
+
+
+#### 参考资料
+
+《memroy-barries.txt》，/Documentation/memory-barriers.txt
+
+《LINUX内核内存屏障》，http://blog.csdn.net/ljl1603/article/details/6793982
+
