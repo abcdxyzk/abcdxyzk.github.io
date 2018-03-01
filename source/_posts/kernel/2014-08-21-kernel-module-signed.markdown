@@ -7,7 +7,7 @@ categories:
 - 2014
 - 2014~08
 - kernel
-- kernel~base
+- kernel~signature
 tags:
 ---
 #### linux内核模块签名 Documentation/module_signing.txt
