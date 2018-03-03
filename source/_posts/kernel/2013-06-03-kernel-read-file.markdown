@@ -7,7 +7,7 @@ categories:
 - 2013
 - 2013~06
 - kernel
-- kernel~base
+- kernel~fs
 tags:
 ---
 ```
@@ -117,4 +117,7 @@ offset是偏移量。
 若origin是SEEK_SET(0)，则将该文件的位移量设置为距文件开始处offset 个字节。  
 若origin是SEEK_CUR(1)，则将该文件的位移量设置为其当前值加offset, offset可为正或负。  
 若origin是SEEK_END(2)，则将该文件的位移量设置为文件长度加offset, offset可为正或负。  
+
+
+http://blog.csdn.net/yf210yf/article/details/8997007
 
