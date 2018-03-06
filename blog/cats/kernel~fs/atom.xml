@@ -4,7 +4,7 @@
   <title><![CDATA[Category: kernel~fs | kk Blog —— 通用基础]]></title>
   <link href="http://abcdxyzk.github.io/blog/cats/kernel~fs/atom.xml" rel="self"/>
   <link href="http://abcdxyzk.github.io/"/>
-  <updated>2018-03-02T02:31:34+08:00</updated>
+  <updated>2018-03-07T02:03:37+08:00</updated>
   <id>http://abcdxyzk.github.io/</id>
   <author>
     <name><![CDATA[kk]]></name>
@@ -131,6 +131,124 @@
 
 
 <p>第3点使得软件更新变得简单，可以在不关闭软件的情况下进行更新，不需要重启。因为系统通过inode号码，识别运行中的文件，不通过文件名。更新的时候，新版文件以同样的文件名，生成一个新的inode，不会影响到运行中的文件。等到下一次运行这个软件的时候，文件名就自动指向新版文件，旧版文件的inode则被回收。</p>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[linux内核文件读取]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2013/06/03/kernel-read-file/"/>
+    <updated>2013-06-03T11:32:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2013/06/03/kernel-read-file</id>
+    <content type="html"><![CDATA[<pre><code>    // test_file.c
+
+    #include &lt;linux/module.h&gt;
+    #include &lt;linux/kernel.h&gt;
+    #include &lt;linux/init.h&gt;
+
+    #include &lt;linux/types.h&gt;
+
+    #include &lt;linux/fs.h&gt;
+    #include &lt;linux/string.h&gt;
+    #include &lt;asm/uaccess.h&gt; /* get_fs(),set_fs(),get_ds() */
+
+
+    static int __init file_test_init(void)
+    {
+        char *FILE_DIR = "/root/test.txt";
+        char *buff = "module read/write test";
+        char tmp[100];
+        struct file *filp = NULL;
+        mm_segment_t old_fs;
+        ssize_t ret;
+
+        filp = filp_open(FILE_DIR, O_RDWR | O_CREAT, 0644);
+
+        if(IS_ERR(filp)) {
+            printk("open error...\n");
+            return -2;
+        }
+
+        old_fs = get_fs();
+        set_fs(get_ds());
+
+        filp-&gt;f_op-&gt;write(filp, buff, strlen(buff), &amp;filp-&gt;f_pos);
+        filp-&gt;f_op-&gt;llseek(filp, 0, 0);
+        ret = filp-&gt;f_op-&gt;read(filp, tmp, strlen(buff), &amp;filp-&gt;f_pos);
+
+        set_fs(old_fs);
+
+        if(ret &gt; 0)
+            printk("%s\n", tmp);
+        else if(ret == 0)
+            printk("read nothing.............\n");
+        else {
+            printk("read error\n");
+            return -1;
+        }
+
+        filp_close(filp, NULL);
+        return 0;
+    }
+
+    static void __exit file_test_exit(void)
+    {
+        printk("file test exit\n");
+    }
+
+    module_init(file_test_init);
+    module_exit(file_test_exit);
+
+    MODULE_LICENSE("GPL");
+</code></pre>
+
+<pre><code>// Makefile
+
+obj-m := test_file.o
+
+KDIR := /lib/modules/$(uname -r)/build/
+PWD := $(shellpwd)
+
+all:
+        make -C $(KDIR) M=$(PWD) modules
+clean:
+        make -C $(KDIR) M=$(PWD) clean
+</code></pre>
+
+<h4>注意：</h4>
+
+<p>在调用filp->f_op->read和filp->f_op->write等对文件的操作之前，应该先设置FS。<br/>
+默认情况下，filp->f_op->read或者filp->f_op->write会对传进来的参数buff进行指针检查。如果不是在用户空间会拒绝访问。因为是在内核模块中，所以buff肯定不在用户空间，所以要增大其寻址范围。</p>
+
+<p>拿filp->f_op->write为例来说明：<br/>
+filp->f_op->write最终会调用access_ok ==> range_ok.<br/>
+而range_ok会判断访问的地址是否在0 ～ addr_limit之间。如果在，则ok，继续。如果不在，则禁止访问。而内核空间传过来的buff肯定大于addr_limit。所以要set_fs(get_ds())。<br/>
+这些函数在asm/uaccess.h中定义。以下是这个头文件中的部分内容：<br/>
+```
+    #define MAKE_MM_SEG(s)  ((mm_segment_t) { (s) })</p>
+
+<pre><code>#define KERNEL_DS   MAKE_MM_SEG(-1UL)
+#define USER_DS     MAKE_MM_SEG(PAGE_OFFSET)
+
+#define get_ds()    (KERNEL_DS)
+#define get_fs()    (current_thread_info()-&gt;addr_limit)
+#define set_fs(x)   (current_thread_info()-&gt;addr_limit = (x))
+
+#define segment_eq(a, b)    ((a).seg == (b).seg)
+</code></pre>
+
+<p>```</p>
+
+<p>可以看到set_fs(get_ds())改变了addr_limit的值。这样就使得从模块中传递进去的参数也可以正常使用了。</p>
+
+<p>在写测试模块的时候，要实现的功能是写进去什么，然后读出来放在tmp数组中。但写完了以后filp->f_ops已经在末尾了，这个时候读是什么也 读不到的，如果想要读到数据，则应该改变filp->f-ops的值，这就要用到filp->f_op->llseek函数了。其中的参数需要记下笔记：<br/>
+系统调用：<br/>
+off_t sys_lseek(unsigned int fd, off_t offset, unsigned int origin)<br/>
+offset是偏移量。<br/>
+若origin是SEEK_SET(0)，则将该文件的位移量设置为距文件开始处offset 个字节。<br/>
+若origin是SEEK_CUR(1)，则将该文件的位移量设置为其当前值加offset, offset可为正或负。<br/>
+若origin是SEEK_END(2)，则将该文件的位移量设置为文件长度加offset, offset可为正或负。</p>
+
+<p><a href="http://blog.csdn.net/yf210yf/article/details/8997007">http://blog.csdn.net/yf210yf/article/details/8997007</a></p>
 ]]></content>
   </entry>
   
