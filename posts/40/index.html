@@ -62,6 +62,590 @@ if (query != null) {
       
   <header>
     
+      <h2 class="entry-title"><a href="/blog/2015/04/18/kernel-mm-reclaim/">Linux内存管理--内存回收</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-04-18T23:01:00+08:00'><span class='date'>2015-04-18</span> <span class='time'>23:01:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p>os.51cto.com/art/201310/412758_all.htm</p>
+
+<p>  内存的回收在Linux内存管理中占据非常重要的地位，系统的内存毕竟是有限的，跑的进程成百上千，系统内存越来越小，我们必须选择一些内存进行回收，以满足别的任务的需求。在内存回收过程中，有哪些内存可以回收，什么时候进行回收，回收内存时如何尽可能的减少对系统性能的影响，回收内存的策略，这些是我们着重要关注的问题，也是本文主要阐述的重点。</p>
+
+<h4>1.1 内存回收的目标</h4>
+
+<p>不是所有的物理内存都可以参与回收的，比如要是把内核代码段的内存给回收了，系统就无法正常运行了，一般内核代码段，数据段，内核kmalloc()出来的内存，内核线程占用的内存等都是不可以回收的，除此之外的内存都是我们要回收的目标。</p>
+
+<p>回收的内存主要是由用户态进程占用的内存和内核自己在运行时所使用的一些内存组成。用户态进程占用的内存主要是我们常见的进程代码段，数据段，堆栈等，内核运行使用的内存主要是磁盘高速缓存(如索引节点，目录项高速缓存），页面高速缓存(访问文件时系统生成的页面cache)，mmap()文件时所用的有名映射所使用的物理内存。后面的这些内才能虽然也是内核管理使用的内存，但对其进行回收的时候，顶多影响内核的性能，而不会导致系统无法运行。</p>
+
+<h4>1.2 内存回收的时机</h4>
+
+<p>1、内存紧缺回收：grow_buffers()无法获取缓冲区页，alloc_page_buffers()无法获取页临时缓冲区首部，__alloc_pages()无法再给定的内存区分配一组连续页框。</p>
+
+<p>2、周期回收：必要时，激活相应内核线程执行内存回收算法：kswapd()内核线程，检查某个内存管理区的空闲页框数是否已低于pages_high值的标高。events内核线程，一个工作者线程，回收位于高速内存缓存中的所有空闲的slab。</p>
+
+<h4>1.3 内存回收的策略</h4>
+
+<h5>1.3.1 内存回收的分类</h5>
+
+<p>内存回收主要是要回收两类内存：最近最少使用的内存以及高速内存缓存中空闲的slab。前者主要包括用户态进程的代码段，数据段，堆栈，文件映射内存，页高速内存，后者主要包括磁盘高速缓存及一些其他的空闲内存高速缓存。</p>
+
+<p>最近最少使用内存存放在一个lru链表上，每个内存管理区zone都有一个lru结构，里面含有active和inactive两个链表头，active链表上记录当前的活跃的报文，inactive用来记录当前不活跃的报文。一般我们回首lru上的inactive链表上的内存页。同时，在内存回收的过程中，会从active链表向inactive链表上补充对应的最近最少使用内存页。每个内存页的内核数据结构page上有一个标记位PG_referenced,该标记位使得一个页从"不活动“状态转为”活动“状态的时间加倍，反之亦然。比如:一个页面可能1个小时内没人反应，不能因为偶然的一次访问就认为它是活跃的，得两次才认为它是一个活跃的页面。下面是页面在inactive和active链表上转移的变化图。</p>
+
+<p>Slab内存高速缓存中经常会有一些完全空闲的slab，这些是我们回收的另一个目标。</p>
+
+<h5>1.3.2 反向映射</h5>
+
+<p>对于可以通过用户态线性地址空间可以直接访问到的物理页来说，可以分为匿名页和文件映射页两类，匿名页指的是不与具体文件对应映射的物理页，比如代码段，堆栈等使用的物理页，映射页指的是映射到文件某一部分的物理页，通常使用mmap()来进行相关的映射。</p>
+
+<p>对于匿名映射和文件映射来说，可能一段物理内存会在多个进程的页表中使用，比如对于匿名映射，fork()一个进程，一开始会共用父进程的物理内存，对于文件映射，多个进程可能同时映射到一个文件的同一部分文件。所以在页面回收时，需要将该页面在所有的页表引用中给去除掉。这种手段称为反向映射。想要找到使用这些物理页的页表项的话，需要先找到引用他们的页表，而页表的地址记录在每个进程的内存描述符里面，同时用来描述进程用户态地址空间的每个vm_area_struct都记录了一个指针，指向所属的内存描述符。因此只要通过物理页找到引用他们的vm_area_struct,就能找到内存描述符，从而找到页表，找到对应的页表项。</p>
+
+<p>匿名页的反向映射：</p>
+
+<p>对于匿名页来说，每个页面的mapping字段指向一个anon_vma描述符，anon_vma描述符中存在一个链表头，所有引用该页面的vm_area_struct都存放在里面。page,anon_vma,vm_area_struct这些数据结构的关系如下图所示：</p>
+
+<p>对于匿名页来说，其被别的地址空间引用，基本上都是因为fork（）进程时，子进程复制父进程的地址空间，从而被引用的。各个vm_area_struct加入anon_vma的链表的过程如下：</p>
+
+<p>假设当前一个进程p，后来fork出一个子进程c。</p>
+
+<p>1、当进程P为某个vm_area_struct加入第一个物理页时，比如说发生了缺页异常，动态分配一个anon_vma的数据结构，将vm_area_struct加入该anon_vma所管理的链表，vm_area_struct结构中的anon_vma字段指向该anon_vma,同时把该页面中的mapping字段赋值为该anon_vma.对于后续为该vm_area_struct申请的物理页面，其mapping字段都赋值为该anon_vma。</p>
+
+<p>2、当该进程p执行fork()时，在fork的处理过程中，会调用dup_mmap()来复制进程p的线性地址空间，在dup_mmap()会复制进程p的每一个vm_area_struct，加入到自己的地址空间中，并将vm_area_struct加入到anon_vma所管理的链表中，参看anon_vma_link()。此时为进程p申请的页面被进程c共享，通过页面的mapping字段可以找到anon_vma，从anon_vma可以遍历进程p,c。</p>
+
+<p>3、考虑一个问题，在进程c中才触发缺页异常被申请的内存页，其mmapping被赋值为所属vm_area_struct的vma_anon，但进程p并没有使用到该页，所以一个物理页mapping字段指向的vma_anon所下挂的vm_area_struct可能并不包含该物理页。</p>
+
+<p>文件映射页的反向映射：</p>
+
+<p>对于每个文件映射页，其page mapping字段指向的是对应文件的address_space数据结构，address_space中有个 struct prio_tree_root i_mmap 字段，指向一个优先树，优先树里面会把所有映射该文件内容的vm_area_struct 给组织起来。在该树中，其树的节点基地址和堆地址分别是映射的文件内容的起始地址和结束地址，要是多个进程同时映射该地址段，会用链表在该节点上将vm_area_struct串起来。</p>
+
+<h5>1.3.3 内存回收流程介绍</h5>
+
+<p>睡眠回收我们不关注，主要介绍内存紧缺回收及周期回收：</p>
+
+<p>1、内存紧缺回收主要函数是try_to_free_pages()，该函数会执行一个循环，按照优先级从12到0，依次调用shrink_caches()，shrink_slab()来回收页面，直到回收至少32个内存页面。</p>
+
+<p>依次调用以下辅助函数：</p>
+
+<p>shrink_caches()：调用shrink_zone()对传入的zone链表中的每个zone，进行lru上面的页面回收。</p>
+
+<p>shrink_slab()：对磁盘索引节点cache和目录项索引节点等磁盘高速缓存进行回收，由于磁盘索引节点和目录项索引节点都是从slab高速缓存中分配的，这样就会导致空闲slab的产生，空闲slab后续会在周期性回收的cache_reap工作队列中被回收。估计也就是因为最终会清零空闲slab，才会起这么一个函数名。^_^</p>
+
+<p>shrink_zone()：对内存管理区上的lru链表中的非活跃页面进行回收，在非活跃页面不足的时候，调用refill_inactive_zone()对lru上的inactive链表补充非活跃页面,同时shrink_zone()调用shrink_cache()来进行页面的回收，该函数的具体解析可以参照下面的源码浅析。</p>
+
+<p>shrink_list()：该辅助函数在shrink_cache()中被调用，该函数对在shrink_cache（）中传入的非活跃page列表进行遍历，对每个页面进行回收工作，该函数的具体解析可以参考下面的源码解析。</p>
+
+<p>refill_inactie_zone()：该辅助函数根据一定的规则将处于lru active链表上的活跃页面移动到inactive链表上，以补充可以回收的页面，在lru链表里有两类页，一类是属于用户态空间的页，比如用户态进程的代码段，数据段，一类是在页高速缓存中的页，系统为了降低对应用程序的影响，将要优先将页高速缓存页进行回收，同时为了系统整体性能也会适当回收用户态进程页。按照如下经验公式进行选择：</p>
+
+<p>交换倾向值=映射比率/2+负荷值+交换值</p>
+
+<p>2、kswapd进程一般会在系统中睡眠，但当__alloc_page()发现各个管理区的剩余页面都低于警告值(由内存管理描述符的pages_low字段和protection字段推算出来)时，会激活kswapd进程进行页面回收，直到回收的页面使得管理区的剩余页面高于zone->pages_high时才停止回收，本质上也是调用了shrink_zone（）和shrink_slab()。</p>
+
+<p>3、cache_reap工作队列定期运行来回收slab高速缓存中空闲的slab占用的页。</p>
+
+<h4>1.4 相关源代码的浅析</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+<span class='line-number'>82</span>
+<span class='line-number'>83</span>
+<span class='line-number'>84</span>
+<span class='line-number'>85</span>
+<span class='line-number'>86</span>
+<span class='line-number'>87</span>
+<span class='line-number'>88</span>
+<span class='line-number'>89</span>
+<span class='line-number'>90</span>
+<span class='line-number'>91</span>
+<span class='line-number'>92</span>
+<span class='line-number'>93</span>
+<span class='line-number'>94</span>
+<span class='line-number'>95</span>
+<span class='line-number'>96</span>
+<span class='line-number'>97</span>
+<span class='line-number'>98</span>
+<span class='line-number'>99</span>
+<span class='line-number'>100</span>
+<span class='line-number'>101</span>
+<span class='line-number'>102</span>
+<span class='line-number'>103</span>
+<span class='line-number'>104</span>
+<span class='line-number'>105</span>
+<span class='line-number'>106</span>
+<span class='line-number'>107</span>
+<span class='line-number'>108</span>
+<span class='line-number'>109</span>
+<span class='line-number'>110</span>
+<span class='line-number'>111</span>
+<span class='line-number'>112</span>
+<span class='line-number'>113</span>
+<span class='line-number'>114</span>
+<span class='line-number'>115</span>
+<span class='line-number'>116</span>
+<span class='line-number'>117</span>
+<span class='line-number'>118</span>
+<span class='line-number'>119</span>
+<span class='line-number'>120</span>
+<span class='line-number'>121</span>
+<span class='line-number'>122</span>
+<span class='line-number'>123</span>
+<span class='line-number'>124</span>
+<span class='line-number'>125</span>
+<span class='line-number'>126</span>
+<span class='line-number'>127</span>
+<span class='line-number'>128</span>
+<span class='line-number'>129</span>
+<span class='line-number'>130</span>
+<span class='line-number'>131</span>
+<span class='line-number'>132</span>
+<span class='line-number'>133</span>
+<span class='line-number'>134</span>
+<span class='line-number'>135</span>
+<span class='line-number'>136</span>
+<span class='line-number'>137</span>
+<span class='line-number'>138</span>
+<span class='line-number'>139</span>
+<span class='line-number'>140</span>
+<span class='line-number'>141</span>
+<span class='line-number'>142</span>
+<span class='line-number'>143</span>
+<span class='line-number'>144</span>
+<span class='line-number'>145</span>
+<span class='line-number'>146</span>
+<span class='line-number'>147</span>
+<span class='line-number'>148</span>
+<span class='line-number'>149</span>
+<span class='line-number'>150</span>
+<span class='line-number'>151</span>
+<span class='line-number'>152</span>
+<span class='line-number'>153</span>
+<span class='line-number'>154</span>
+<span class='line-number'>155</span>
+<span class='line-number'>156</span>
+<span class='line-number'>157</span>
+<span class='line-number'>158</span>
+<span class='line-number'>159</span>
+<span class='line-number'>160</span>
+<span class='line-number'>161</span>
+<span class='line-number'>162</span>
+<span class='line-number'>163</span>
+<span class='line-number'>164</span>
+<span class='line-number'>165</span>
+<span class='line-number'>166</span>
+<span class='line-number'>167</span>
+<span class='line-number'>168</span>
+<span class='line-number'>169</span>
+<span class='line-number'>170</span>
+<span class='line-number'>171</span>
+<span class='line-number'>172</span>
+<span class='line-number'>173</span>
+<span class='line-number'>174</span>
+<span class='line-number'>175</span>
+<span class='line-number'>176</span>
+<span class='line-number'>177</span>
+<span class='line-number'>178</span>
+<span class='line-number'>179</span>
+<span class='line-number'>180</span>
+<span class='line-number'>181</span>
+<span class='line-number'>182</span>
+<span class='line-number'>183</span>
+<span class='line-number'>184</span>
+<span class='line-number'>185</span>
+<span class='line-number'>186</span>
+<span class='line-number'>187</span>
+<span class='line-number'>188</span>
+<span class='line-number'>189</span>
+<span class='line-number'>190</span>
+<span class='line-number'>191</span>
+<span class='line-number'>192</span>
+<span class='line-number'>193</span>
+<span class='line-number'>194</span>
+<span class='line-number'>195</span>
+<span class='line-number'>196</span>
+<span class='line-number'>197</span>
+<span class='line-number'>198</span>
+<span class='line-number'>199</span>
+<span class='line-number'>200</span>
+<span class='line-number'>201</span>
+<span class='line-number'>202</span>
+<span class='line-number'>203</span>
+<span class='line-number'>204</span>
+<span class='line-number'>205</span>
+<span class='line-number'>206</span>
+<span class='line-number'>207</span>
+<span class='line-number'>208</span>
+<span class='line-number'>209</span>
+<span class='line-number'>210</span>
+<span class='line-number'>211</span>
+<span class='line-number'>212</span>
+<span class='line-number'>213</span>
+<span class='line-number'>214</span>
+<span class='line-number'>215</span>
+<span class='line-number'>216</span>
+<span class='line-number'>217</span>
+<span class='line-number'>218</span>
+<span class='line-number'>219</span>
+<span class='line-number'>220</span>
+<span class='line-number'>221</span>
+<span class='line-number'>222</span>
+<span class='line-number'>223</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void 
+</span><span class='line'>shrink_zone(struct zone *zone, struct scan_control *sc) 
+</span><span class='line'>{ 
+</span><span class='line'>&#9;unsigned long nr_active; 
+</span><span class='line'>&#9;unsigned long nr_inactive; 
+</span><span class='line'>
+</span><span class='line'>&#9;//根据优先级，得到可以扫描的页面数，优先级越高， 
+</span><span class='line'>&#9;//代表越不急迫，可以扫描的页面数也最少 
+</span><span class='line'>&#9;zone-&gt;nr_scan_active += (zone-&gt;nr_active &gt;&gt; sc-&gt;priority) + 1; 
+</span><span class='line'>&#9;nr_active = zone-&gt;nr_scan_active; 
+</span><span class='line'>&#9;if (nr_active &gt;= SWAP_CLUSTER_MAX) 
+</span><span class='line'>&#9;&#9;zone-&gt;nr_scan_active = 0; 
+</span><span class='line'>&#9;else 
+</span><span class='line'>&#9;&#9;nr_active = 0; 
+</span><span class='line'>
+</span><span class='line'>&#9;zone-&gt;nr_scan_inactive += (zone-&gt;nr_inactive &gt;&gt; sc-&gt;priority) + 1; 
+</span><span class='line'>&#9;nr_inactive = zone-&gt;nr_scan_inactive; 
+</span><span class='line'>&#9;//非活动页比较少的话，可以先忽略过去，将跳过的页面记录到nr_scan_inactive中 
+</span><span class='line'>&#9;//留待下一次再处理 
+</span><span class='line'>&#9;if (nr_inactive &gt;= SWAP_CLUSTER_MAX) 
+</span><span class='line'>&#9;&#9;zone-&gt;nr_scan_inactive = 0; 
+</span><span class='line'>&#9;else 
+</span><span class='line'>&#9;&#9;nr_inactive = 0; 
+</span><span class='line'>
+</span><span class='line'>&#9;//设置需要回收的页面数为32个 
+</span><span class='line'>&#9;sc-&gt;nr_to_reclaim = SWAP_CLUSTER_MAX; 
+</span><span class='line'>
+</span><span class='line'>&#9;//开始回收页面，每次扫描32个页面，多了不干噢!!! 
+</span><span class='line'>&#9;while (nr_active || nr_inactive) { 
+</span><span class='line'>&#9;&#9;if (nr_active) { 
+</span><span class='line'>&#9;&#9;&#9;//设置每次要扫描的非活动页面数，需要将其放 
+</span><span class='line'>&#9;&#9;&#9;//入到inactive list里面 
+</span><span class='line'>&#9;&#9;&#9;sc-&gt;nr_to_scan = min(nr_active, 
+</span><span class='line'>&#9;&#9;&#9;(unsigned long)SWAP_CLUSTER_MAX); 
+</span><span class='line'>&#9;&#9;&#9;nr_active -= sc-&gt;nr_to_scan; 
+</span><span class='line'>&#9;&#9;&#9;//补充inactive list中的页面 
+</span><span class='line'>&#9;&#9;&#9;refill_inactive_zone(zone, sc); 
+</span><span class='line'>&#9;&#9;} 
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (nr_inactive) { 
+</span><span class='line'>&#9;&#9;&#9;//设置每次将要扫描的页面，最多也就32个页面 
+</span><span class='line'>&#9;&#9;&#9;sc-&gt;nr_to_scan = min(nr_inactive, 
+</span><span class='line'>&#9;&#9;&#9;(unsigned long)SWAP_CLUSTER_MAX); 
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;nr_inactive -= sc-&gt;nr_to_scan; 
+</span><span class='line'>&#9;&#9;&#9;//开始正式回收inactive list中的页面 
+</span><span class='line'>&#9;&#9;&#9;shrink_cache(zone, sc); 
+</span><span class='line'>&#9;&#9;&#9;//32个页面被回收完毕，大功告成了!!! 
+</span><span class='line'>&#9;&#9;&#9;if (sc-&gt;nr_to_reclaim &lt;= 0) 
+</span><span class='line'>&#9;&#9;&#9;&#9;break; 
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;} 
+</span><span class='line'>} 
+</span><span class='line'>
+</span><span class='line'>static int shrink_list(struct list_head *page_list, struct scan_control *sc) 
+</span><span class='line'>{ 
+</span><span class='line'>&#9;LIST_HEAD(ret_pages);
+</span><span class='line'>&#9;struct pagevec freed_pvec;
+</span><span class='line'>&#9;int pgactivate = 0;
+</span><span class='line'>&#9;int reclaimed = 0;
+</span><span class='line'>&#9;//有进程需要调度，先进行调度 
+</span><span class='line'>&#9;cond_resched();
+</span><span class='line'>
+</span><span class='line'>&#9;pagevec_init(&freed_pvec, 1); 
+</span><span class='line'>&#9;//对于page_list 链表上的每一个页面试图进行回收 
+</span><span class='line'>&#9;while (!list_empty(page_list)) { 
+</span><span class='line'>&#9;&#9;struct address_space *mapping; 
+</span><span class='line'>&#9;&#9;struct page *page; 
+</span><span class='line'>&#9;&#9;int may_enter_fs; 
+</span><span class='line'>&#9;&#9;int referenced; 
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;//获取一个页面 
+</span><span class='line'>&#9;&#9;page = lru_to_page(page_list); 
+</span><span class='line'>&#9;&#9;//从lru上摘除 
+</span><span class='line'>&#9;&#9;list_del(&page-&gt;lru); 
+</span><span class='line'>&#9;&#9;//page被锁定，不能回收 
+</span><span class='line'>&#9;&#9;if (TestSetPageLocked(page))//page is locked? 
+</span><span class='line'>&#9;&#9;&#9;goto keep; 
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;BUG_ON(PageActive(page)); 
+</span><span class='line'>&#9;&#9;//page正在被writeback，不能回收 
+</span><span class='line'>&#9;&#9;if (PageWriteback(page))//page is writeback? 
+</span><span class='line'>&#9;&#9;&#9;goto keep_locked; 
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;sc-&gt;nr_scanned++; 
+</span><span class='line'>&#9;&#9;/* Double the slab pressure for mapped and swapcache pages */ 
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (page_mapped(page) || PageSwapCache(page)) 
+</span><span class='line'>&#9;&#9;&#9;sc-&gt;nr_scanned++; 
+</span><span class='line'>&#9;&#9;//查看最近该页面有无被访问过 
+</span><span class='line'>&#9;&#9;referenced = page_referenced(page, 1, sc-&gt;priority &lt;= 0); 
+</span><span class='line'>&#9;&#9;/* In active use or really unfreeable?  Activate it. */ 
+</span><span class='line'>&#9;&#9;//1页面被访问过，2页面在用户态空间，页面是文件映射页面， 
+</span><span class='line'>&#9;&#9;//页面在交换高速缓存中，同时满足这两个条件的话，页面不被回收 
+</span><span class='line'>&#9;&#9;if (referenced && page_mapping_inuse(page)) 
+</span><span class='line'>&#9;&#9;&#9;goto activate_locked; 
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;#ifdef CONFIG_SWAP
+</span><span class='line'>&#9;&#9;//page is anon and page has not been add to swapcache 
+</span><span class='line'>&#9;&#9;//该页面是匿名映射的页面，且该页面不在swapcache中 
+</span><span class='line'>&#9;&#9;if (PageAnon(page) && !PageSwapCache(page)) { 
+</span><span class='line'>&#9;&#9;&#9;//将页面加入到swap cache中 
+</span><span class='line'>&#9;&#9;&#9;if (!add_to_swap(page)) 
+</span><span class='line'>&#9;&#9;&#9;&#9;goto activate_locked; 
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;#endif /* CONFIG_SWAP */ 
+</span><span class='line'>&#9;&#9;//得到对应的address_space，有可能是对应文件的address_space,或者是 
+</span><span class='line'>&#9;&#9;//swap cache的address_space 
+</span><span class='line'>&#9;&#9;mapping = page_mapping(page); 
+</span><span class='line'>&#9;&#9;may_enter_fs = (sc-&gt;gfp_mask & __GFP_FS) || 
+</span><span class='line'>&#9;&#9;&#9;&#9;(PageSwapCache(page) && (sc-&gt;gfp_mask & __GFP_IO)); 
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;//该页面被映射到某个用户页表中 
+</span><span class='line'>&#9;&#9;if (page_mapped(page) && mapping) { 
+</span><span class='line'>&#9;&#9;&#9;//将该页面在用户页表中的页表项通通清除 
+</span><span class='line'>&#9;&#9;&#9;switch (try_to_unmap(page)) { 
+</span><span class='line'>&#9;&#9;&#9;&#9;case SWAP_FAIL: 
+</span><span class='line'>&#9;&#9;&#9;&#9;goto activate_locked; 
+</span><span class='line'>&#9;&#9;&#9;&#9;case SWAP_AGAIN: 
+</span><span class='line'>&#9;&#9;&#9;&#9;goto keep_locked; 
+</span><span class='line'>&#9;&#9;&#9;&#9;case SWAP_SUCCESS: 
+</span><span class='line'>&#9;&#9;&#9;&#9;; /* try to free the page below */ 
+</span><span class='line'>&#9;&#9;&#9;} 
+</span><span class='line'>&#9;&#9;} 
+</span><span class='line'>&#9;&#9;//页面是脏的，哈哈，准备往文件或swapcache里面写硬盘吧 
+</span><span class='line'>&#9;&#9;if (PageDirty(page)) { 
+</span><span class='line'>&#9;&#9;&#9;if (referenced) 
+</span><span class='line'>&#9;&#9;&#9;&#9;goto keep_locked; 
+</span><span class='line'>&#9;&#9;&#9;if (!may_enter_fs) 
+</span><span class='line'>&#9;&#9;&#9;&#9;goto keep_locked; 
+</span><span class='line'>&#9;&#9;&#9;if (laptop_mode && !sc-&gt;may_writepage) 
+</span><span class='line'>&#9;&#9;&#9;&#9;goto keep_locked; 
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;/* Page is dirty, try to write it out here */ 
+</span><span class='line'>&#9;&#9;&#9;//往磁盘上写页面 
+</span><span class='line'>&#9;&#9;&#9;switch(pageout(page, mapping)) { 
+</span><span class='line'>&#9;&#9;&#9;&#9;case PAGE_KEEP: 
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;goto keep_locked; 
+</span><span class='line'>&#9;&#9;&#9;&#9;case PAGE_ACTIVATE: 
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;goto activate_locked; 
+</span><span class='line'>&#9;&#9;&#9;&#9;case PAGE_SUCCESS: 
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;if (PageWriteback(page) || PageDirty(page)) 
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;goto keep; 
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;if (TestSetPageLocked(page)) 
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;goto keep; 
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;if (PageDirty(page) || PageWriteback(page)) 
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;goto keep_locked; 
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;mapping = page_mapping(page); 
+</span><span class='line'>&#9;&#9;&#9;&#9;case PAGE_CLEAN: 
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;; /* try to free the page below */ 
+</span><span class='line'>&#9;&#9;&#9;} 
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;//若页面是缓冲区页面，将对应的buffer_head给释放掉 
+</span><span class='line'>&#9;&#9;if (PagePrivate(page)) { 
+</span><span class='line'>&#9;&#9;&#9;if (!try_to_release_page(page, sc-&gt;gfp_mask)) 
+</span><span class='line'>&#9;&#9;&#9;&#9;goto activate_locked; 
+</span><span class='line'>&#9;&#9;&#9;if (!mapping && page_count(page) == 1) 
+</span><span class='line'>&#9;&#9;&#9;&#9;goto free_it; 
+</span><span class='line'>&#9;&#9;} 
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (!mapping) 
+</span><span class='line'>&#9;&#9;&#9;goto keep_locked; 
+</span><span class='line'>&#9;&#9;/* truncate got there first */ 
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;spin_lock_irq(&mapping-&gt;tree_lock); 
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;//页面为脏页面或者page的引用计数为2，都是不可以回收的  
+</span><span class='line'>&#9;&#9;if (page_count(page) != 2 || PageDirty(page)) { 
+</span><span class='line'>&#9;&#9;&#9;spin_unlock_irq(&mapping-&gt;tree_lock); 
+</span><span class='line'>&#9;&#9;&#9;goto keep_locked; 
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;#ifdef CONFIG_SWAP 
+</span><span class='line'>&#9;&#9;&#9;//到达这里，说明该page只被swap cache或者页高速缓存及 
+</span><span class='line'>&#9;&#9;&#9;//fpra所共有，需要将其从swap cache上或者页高速缓存上删除。 
+</span><span class='line'>&#9;&#9;if (PageSwapCache(page)) { 
+</span><span class='line'>&#9;&#9;&#9;swp_entry_t swap = { .val = page-&gt;private }; 
+</span><span class='line'>&#9;&#9;&#9;//从swap cache上进行删除 
+</span><span class='line'>&#9;&#9;&#9;__delete_from_swap_cache(page); 
+</span><span class='line'>&#9;&#9;&#9;spin_unlock_irq(&mapping-&gt;tree_lock); 
+</span><span class='line'>&#9;&#9;&#9;swap_free(swap); 
+</span><span class='line'>&#9;&#9;&#9;__put_page(page); 
+</span><span class='line'>&#9;&#9;&#9;/* The pagecache ref */ 
+</span><span class='line'>&#9;&#9;&#9;goto free_it; 
+</span><span class='line'>&#9;&#9;} 
+</span><span class='line'>&#9;&#9;#endif /* CONFIG_SWAP */ 
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;//从页面高速缓存中将该页面删除 
+</span><span class='line'>&#9;&#9;__remove_from_page_cache(page); 
+</span><span class='line'>&#9;&#9;spin_unlock_irq(&mapping-&gt;tree_lock); 
+</span><span class='line'>&#9;&#9;__put_page(page); 
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;free_it: 
+</span><span class='line'>&#9;&#9;&#9;unlock_page(page); 
+</span><span class='line'>&#9;&#9;&#9;reclaimed++; 
+</span><span class='line'>&#9;&#9;&#9;if (!pagevec_add(&freed_pvec, page)) 
+</span><span class='line'>&#9;&#9;&#9;&#9;__pagevec_release_nonlru(&freed_pvec); 
+</span><span class='line'>&#9;&#9;&#9;continue; 
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;activate_locked: 
+</span><span class='line'>&#9;&#9;&#9;//将页面设为active页面，等回去将其放入lru的active链表 
+</span><span class='line'>&#9;&#9;&#9;SetPageActive(page); 
+</span><span class='line'>&#9;&#9;&#9;pgactivate++; 
+</span><span class='line'>&#9;&#9;keep_locked: 
+</span><span class='line'>&#9;&#9;&#9;//保持页面的状态不变，放入对应的lru active或inactive链表中 
+</span><span class='line'>&#9;&#9;&#9;unlock_page(page); 
+</span><span class='line'>&#9;&#9;keep: 
+</span><span class='line'>&#9;&#9;&#9;//将该无法回收的页面，放入到ret_pages链表中 
+</span><span class='line'>&#9;&#9;&#9;list_add(&page-&gt;lru, &ret_pages); 
+</span><span class='line'>&#9;&#9;&#9;BUG_ON(PageLRU(page)); 
+</span><span class='line'>&#9;} 
+</span><span class='line'>&#9;//此处将无法回收的页面放入page_list中，在函数返回后，去其进行处理 
+</span><span class='line'>&#9;list_splice(&ret_pages, page_list); 
+</span><span class='line'>&#9;//此处将可以释放的页面通通给释放掉，回收了^_^ 
+</span><span class='line'>
+</span><span class='line'>&#9;if (pagevec_count(&freed_pvec)) 
+</span><span class='line'>&#9;&#9;__pagevec_release_nonlru(&freed_pvec); 
+</span><span class='line'>&#9;mod_page_state(pgactivate, pgactivate); 
+</span><span class='line'>&#9;sc-&gt;nr_reclaimed += reclaimed; 
+</span><span class='line'>&#9;return reclaimed; 
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2015/04/18/kernel-mm-alloc/">Linux物理内存页面分配</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-04-18T22:38:00+08:00'><span class='date'>2015-04-18</span> <span class='time'>22:38:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="/download/kernel/Linux_Physical_Memory_Page_Allocation.pdf">Linux_Physical_Memory_Page_Allocation.pdf</a></p>
+
+<p>转自 <a href="http://www.jtben.com/document/1266382">http://www.jtben.com/document/1266382</a></p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
       <h2 class="entry-title"><a href="/blog/2015/04/18/kernel-mm-descript/">Linux物理内存描述</a></h2>
     
     
@@ -1226,1345 +1810,6 @@ frag0的作用是: 有些包的包头会存在skb->frag[0]里面，gro合并时�
 
     </article>
   
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/04/15/debug-mark-cong/">拥塞控制模块注意</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-04-15T14:24:00+08:00'><span class='date'>2015-04-15</span> <span class='time'>14:24:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><h4>应用改变sock的拥塞控制算法</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#define SOL_TCP 6
-</span><span class='line'>#define TCP_CONGESTION  13
-</span><span class='line'>
-</span><span class='line'>strcpy(name, "cubic");
-</span><span class='line'>setsockopt (connfd, SOL_TCP, TCP_CONGESTION, name, strlen(name));</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>net/socket.c</h5>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>SYSCALL_DEFINE5(setsockopt, int, fd, int, level, int, optname,
-</span><span class='line'>&#9;&#9;char __user *, optval, int, optlen)
-</span><span class='line'>{
-</span><span class='line'>&#9;...
-</span><span class='line'>&#9;&#9;&#9;err =
-</span><span class='line'>&#9;&#9;&#9;&#9;sock-&gt;ops-&gt;setsockopt(sock, level, optname, optval,
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;  optlen);
-</span><span class='line'>&#9;...
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>对于ipv4的tcp，sock->ops指向 net/ipv4/af_inet.c 中的 inet_stream_ops，所以setsockopt等于sock_common_setsockopt。</p>
-
-<h5>net/core/sock.c</h5>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>int sock_common_setsockopt(struct socket *sock, int level, int optname,
-</span><span class='line'>&#9;&#9;&#9;   char __user *optval, unsigned int optlen)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct sock *sk = sock-&gt;sk;
-</span><span class='line'>
-</span><span class='line'>&#9;return sk-&gt;sk_prot-&gt;setsockopt(sk, level, optname, optval, optlen);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>sk_prot 指向 net/ipv4/tcp_ipv4.c 中的 tcp_prot，所以setsockopt等于tcp_setsockopt</p>
-
-<h5>net/ipv4/tcp.c</h5>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>int tcp_setsockopt(struct sock *sk, int level, int optname, char __user *optval,
-</span><span class='line'>&#9;&#9;   unsigned int optlen)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct inet_connection_sock *icsk = inet_csk(sk);
-</span><span class='line'>
-</span><span class='line'>&#9;if (level != SOL_TCP)
-</span><span class='line'>&#9;&#9;return icsk-&gt;icsk_af_ops-&gt;setsockopt(sk, level, optname,
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9; optval, optlen);
-</span><span class='line'>&#9;return do_tcp_setsockopt(sk, level, optname, optval, optlen);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>因为level = SOL_TCP, optname = TCP_CONGESTION, 所以直接到do_tcp_setsockopt的第一个if里。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static int do_tcp_setsockopt(struct sock *sk, int level,
-</span><span class='line'>&#9;&#9;int optname, char __user *optval, unsigned int optlen)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
-</span><span class='line'>&#9;struct inet_connection_sock *icsk = inet_csk(sk); 
-</span><span class='line'>&#9;int val;    
-</span><span class='line'>&#9;int err = 0;
-</span><span class='line'>
-</span><span class='line'>&#9;/* This is a string value all the others are int's */
-</span><span class='line'>&#9;if (optname == TCP_CONGESTION) {    
-</span><span class='line'>&#9;&#9;char name[TCP_CA_NAME_MAX]; 
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;if (optlen &lt; 1)
-</span><span class='line'>&#9;&#9;&#9;return -EINVAL;
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;val = strncpy_from_user(name, optval,
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;min_t(long, TCP_CA_NAME_MAX-1, optlen));
-</span><span class='line'>&#9;&#9;if (val &lt; 0)
-</span><span class='line'>&#9;&#9;&#9;return -EFAULT;
-</span><span class='line'>&#9;&#9;name[val] = 0;
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;lock_sock(sk);
-</span><span class='line'>&#9;&#9;err = tcp_set_congestion_control(sk, name);
-</span><span class='line'>&#9;&#9;release_sock(sk);
-</span><span class='line'>&#9;&#9;return err;
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>...
-</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>net/ipv4/tcp_cong.c</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/* Change congestion control for socket */
-</span><span class='line'>int tcp_set_congestion_control(struct sock *sk, const char *name)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct inet_connection_sock *icsk = inet_csk(sk);
-</span><span class='line'>&#9;struct tcp_congestion_ops *ca;
-</span><span class='line'>&#9;int err = 0;
-</span><span class='line'>
-</span><span class='line'>&#9;rcu_read_lock();
-</span><span class='line'>&#9;ca = tcp_ca_find(name);
-</span><span class='line'>
-</span><span class='line'>&#9;/* no change asking for existing value */
-</span><span class='line'>&#9;if (ca == icsk-&gt;icsk_ca_ops)
-</span><span class='line'>&#9;&#9;goto out;
-</span><span class='line'>
-</span><span class='line'>#ifdef CONFIG_MODULES
-</span><span class='line'>&#9;/* not found attempt to autoload module */
-</span><span class='line'>&#9;if (!ca && capable(CAP_NET_ADMIN)) {
-</span><span class='line'>&#9;&#9;rcu_read_unlock();
-</span><span class='line'>&#9;&#9;request_module("tcp_%s", name);
-</span><span class='line'>&#9;&#9;rcu_read_lock();
-</span><span class='line'>&#9;&#9;ca = tcp_ca_find(name);
-</span><span class='line'>&#9;}
-</span><span class='line'>#endif
-</span><span class='line'>&#9;if (!ca)
-</span><span class='line'>&#9;&#9;err = -ENOENT;
-</span><span class='line'>
-</span><span class='line'>&#9;else if (!((ca-&gt;flags & TCP_CONG_NON_RESTRICTED) || capable(CAP_NET_ADMIN)))
-</span><span class='line'>&#9;&#9;err = -EPERM;
-</span><span class='line'>
-</span><span class='line'>&#9;else if (!try_module_get(ca-&gt;owner))
-</span><span class='line'>&#9;&#9;err = -EBUSY;
-</span><span class='line'>
-</span><span class='line'>&#9;else {
-</span><span class='line'>&#9;&#9;tcp_cleanup_congestion_control(sk);
-</span><span class='line'>&#9;&#9;icsk-&gt;icsk_ca_ops = ca;
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;if (sk-&gt;sk_state != TCP_CLOSE && icsk-&gt;icsk_ca_ops-&gt;init) // 如果sk-&gt;sk_state = TCP_CLOSE, 那么不会调用拥塞控制模块的初始化
-</span><span class='line'>&#9;&#9;&#9;icsk-&gt;icsk_ca_ops-&gt;init(sk);
-</span><span class='line'>&#9;}
-</span><span class='line'> out:
-</span><span class='line'>&#9;rcu_read_unlock();
-</span><span class='line'>&#9;return err;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>可以看到，如果sk->sk_state = TCP_CLOSE, 那么不会调用拥塞控制模块的初始化。</p>
-
-<hr />
-
-<h4>那么什么时候sk->sk_state == TCP_CLOSE，并且还能调用setsockopt呢？</h4>
-
-<h5>举一种情况：当收到RST包的时候，tcp_rcv_established()->tcp_validate_incoming()->tcp_reset()->tcp_done()将sk置为TCP_CLOSE。</h5>
-
-<h5>如果拥塞控制模块中init有申请内存，release中释放内存。那么在上述情况下将会出现没有申请而直接释放的情况，导致panic。</h5>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>BUG: unable to handle kernel paging request at ffffeba4000002a0
-</span><span class='line'>
-</span><span class='line'>[&lt;ffffffff8115b17e&gt;] kfree+0x6e/0x240
-</span><span class='line'>[&lt;ffffffffa0068055&gt;] cong_release+0x35/0x50 [cong]
-</span><span class='line'>[&lt;ffffffff81467953&gt;] tcp_cleanup_congestion_control+0x23/0x40
-</span><span class='line'>[&lt;ffffffff81465bb9&gt;] tcp_v4_destroy_sock+0x29/0x2d0
-</span><span class='line'>[&lt;ffffffff8144e9e3&gt;] inet_csk_destroy_sock+0x53/0x140
-</span><span class='line'>[&lt;ffffffff814504c0&gt;] tcp_close+0x340/0x4a0
-</span><span class='line'>[&lt;ffffffff814748de&gt;] inet_release+0x5e/0x90
-</span><span class='line'>[&lt;ffffffff813f4359&gt;] sock_release+0x29/0x90
-</span><span class='line'>[&lt;ffffffff813f43d7&gt;] sock_close+0x17/0x40
-</span><span class='line'>[&lt;ffffffff81173ed3&gt;] __fput+0xf3/0x220
-</span><span class='line'>[&lt;ffffffff8117401c&gt;] fput+0x1c/0x30
-</span><span class='line'>[&lt;ffffffff8116df2d&gt;] filp_close+0x5d/0x90
-</span><span class='line'>[&lt;ffffffff8117090c&gt;] sys_close+0xac/0x110
-</span><span class='line'>[&lt;ffffffff8100af72&gt;] system_call_fastpath+0x16/0x1b</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>测试代码</h4>
-
-<p><a href="/download/debug/congestion_mod_panic.tar.gz">congestion_mod_panic</a></p>
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/04/15/kernel-net-sum/">TCP校验和的原理和实现</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-04-15T14:07:00+08:00'><span class='date'>2015-04-15</span> <span class='time'>14:07:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://blog.csdn.net/zhangskd/article/details/11770647">http://blog.csdn.net/zhangskd/article/details/11770647</a></p>
-
-<h4>概述</h4>
-
-<p>TCP校验和是一个端到端的校验和，由发送端计算，然后由接收端验证。其目的是为了发现TCP首部和数据在发送端到接收端之间发生的任何改动。如果接收方检测到校验和有差错，则TCP段会被直接丢弃。</p>
-
-<p>TCP校验和覆盖TCP首部和TCP数据，而IP首部中的校验和只覆盖IP的首部，不覆盖IP数据报中的任何数据。</p>
-
-<p>TCP的校验和是必需的，而UDP的校验和是可选的。</p>
-
-<p>TCP和UDP计算校验和时，都要加上一个12字节的伪首部。</p>
-
-<h4>伪首部</h4>
-
-<p><img src="/images/kernel/2015-04-15-1.jpeg" alt="" /></p>
-
-<p>伪首部共有12字节，包含如下信息：源IP地址、目的IP地址、保留字节(置0)、传输层协议号(TCP是6)、TCP报文长度(报头+数据)。</p>
-
-<p>伪首部是为了增加TCP校验和的检错能力：如检查TCP报文是否收错了(目的IP地址)、传输层协议是否选对了(传输层协议号)等。</p>
-
-<h4>定义</h4>
-
-<h5>(1) RFC 793的TCP校验和定义</h5>
-
-<p>The checksum field is the 16 bit one&rsquo;s complement of the one&rsquo;s complement sum of all 16-bit words in the header and text. If a segment contains an odd number of header and text octets to be checksummed, the last octet is padded on the right with zeros to form a 16-bit word for checksum purposes. The pad is not transmitted as part of the segment. While computing the checksum, the checksum field itself is replaced with zeros.</p>
-
-<p>上述的定义说得很明确：<br/>
-首先，把伪首部、TCP报头、TCP数据分为16位的字，如果总长度为奇数个字节，则在最后增添一个位都为0的字节。把TCP报头中的校验和字段置为0（否则就陷入鸡生蛋还是蛋生鸡的问题）。</p>
-
-<p>其次，用反码相加法累加所有的16位字（进位也要累加）。</p>
-
-<p>最后，对计算结果取反，作为TCP的校验和。</p>
-
-<h5>(2) RFC 1071的IP校验和定义</h5>
-
-<p>1.Adjacent octets to be checksummed are paired to form 16-bit integers, and the 1&rsquo;s complement sum of these 16-bit integers is formed.</p>
-
-<p>2.To generate a checksum, the checksum field itself is cleared, the 16-bit 1&rsquo;s complement sum is computed over the octets concerned, and the 1&rsquo;s complement of this sum is placed in the checksum field.</p>
-
-<p>3.To check a checksum, the 1&rsquo;s complement sum is computed over the same set of octets, including the checksum field. If the result is all 1 bits (-0 in 1&rsquo;s complement arithmetic), the check succeeds.</p>
-
-<p>可以看到，TCP校验和、IP校验和的计算方法是基本一致的，除了计算的范围不同。</p>
-
-<h4>实现</h4>
-
-<p>基于2.6.18、x86_64。</p>
-
-<p>csum_tcpudp_nofold()按4字节累加伪首部到sum中。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static inline unsigned long csum_tcpudp_nofold (unsigned long saddr, unsigned long daddr,  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;unsigned short len, unsigned short proto,  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;unsigned int sum)  
-</span><span class='line'>{  
-</span><span class='line'>&#9;asm("addl %1, %0\n"    /* 累加daddr */  
-</span><span class='line'>&#9;&#9;"adcl %2, %0\n"    /* 累加saddr */  
-</span><span class='line'>&#9;&#9;"adcl %3, %0\n"    /* 累加len(2字节), proto, 0*/  
-</span><span class='line'>&#9;&#9;"adcl $0, %0\n"    /*加上进位 */  
-</span><span class='line'>&#9;&#9;: "=r" (sum)  
-</span><span class='line'>&#9;&#9;: "g" (daddr), "g" (saddr), "g" ((ntohs(len) &lt;&lt; 16) + proto*256), "0" (sum));  
-</span><span class='line'>&#9;return sum;  
-</span><span class='line'>}   </span></code></pre></td></tr></table></div></figure>
-
-
-<p>csum_tcpudp_magic()产生最终的校验和。</p>
-
-<p>首先，按4字节累加伪首部到sum中。</p>
-
-<p>其次，累加sum的低16位、sum的高16位，并且对累加的结果取反。</p>
-
-<p>最后，截取sum的高16位，作为校验和。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static inline unsigned short int csum_tcpudp_magic(unsigned long saddr, unsigned long daddr,  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9;unsigned short len, unsigned short proto,  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9;unsigned int sum)  
-</span><span class='line'>{  
-</span><span class='line'>&#9;return csum_fold(csum_tcpudp_nofold(saddr, daddr, len, proto, sum));  
-</span><span class='line'>}  
-</span><span class='line'>  
-</span><span class='line'>static inline unsigned int csum_fold(unsigned int sum)  
-</span><span class='line'>{  
-</span><span class='line'>&#9;__asm__(  
-</span><span class='line'>&#9;&#9;"addl %1, %0\n"  
-</span><span class='line'>&#9;&#9;"adcl 0xffff, %0"  
-</span><span class='line'>&#9;&#9;: "=r" (sum)  
-</span><span class='line'>&#9;&#9;: "r" (sum &lt;&lt; 16), "0" (sum & 0xffff0000)   
-</span><span class='line'>  
-</span><span class='line'>&#9;&#9;/* 将sum的低16位，作为寄存器1的高16位，寄存器1的低16位补0。 
-</span><span class='line'>&#9;&#9;  * 将sum的高16位，作为寄存器0的高16位，寄存器0的低16位补0。 
-</span><span class='line'>&#9;&#9;  * 这样，addl %1, %0就累加了sum的高16位和低16位。 
-</span><span class='line'>&#9;&#9;  * 
-</span><span class='line'>&#9;&#9; * 还要考虑进位。如果有进位，adcl 0xfff, %0为：0x1 + 0xffff + %0，寄存器0的高16位加1。 
-</span><span class='line'>&#9;&#9;  * 如果没有进位，adcl 0xffff, %0为：0xffff + %0，对寄存器0的高16位无影响。 
-</span><span class='line'>&#9;&#9;  */  
-</span><span class='line'>  
-</span><span class='line'>&#9;);  
-</span><span class='line'>  
-</span><span class='line'>&#9;return (~sum) &gt;&gt; 16; /* 对sum取反，返回它的高16位，作为最终的校验和 */  
-</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
-
-
-<h4>发送校验</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#define CHECKSUM_NONE 0 /* 不使用校验和，UDP可选 */  
-</span><span class='line'>#define CHECKSUM_HW 1 /* 由硬件计算报头和首部的校验和 */  
-</span><span class='line'>#define CHECKSUM_UNNECESSARY 2 /* 表示不需要校验，或者已经成功校验了 */  
-</span><span class='line'>#define CHECKSUM_PARTIAL CHECKSUM_HW  
-</span><span class='line'>#define CHECKSUM_COMPLETE CHECKSUM_HW  </span></code></pre></td></tr></table></div></figure>
-
-
-<h5>@tcp_transmit_skb()</h5>
-
-<pre><code>icsk-&gt;icsk_af_ops-&gt;send_check(sk, skb-&gt;len, skb); /* 计算校验和 */
-</code></pre>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>void tcp_v4_send_check(struct sock *sk, int len, struct sk_buff *skb)  
-</span><span class='line'>{  
-</span><span class='line'>&#9;struct inet_sock *inet = inet_sk(sk);  
-</span><span class='line'>&#9;struct tcphdr *th = skb-&gt;h.th;  
-</span><span class='line'>   
-</span><span class='line'>&#9;if (skb-&gt;ip_summed == CHECKSUM_HW) {  
-</span><span class='line'>&#9;&#9;/* 只计算伪首部，TCP报头和TCP数据的累加由硬件完成 */  
-</span><span class='line'>&#9;&#9;th-&gt;check = ~tcp_v4_check(th, len, inet-&gt;saddr, inet-&gt;daddr, 0);  
-</span><span class='line'>&#9;&#9;skb-&gt;csum = offsetof(struct tcphdr, check); /* 校验和值在TCP首部的偏移 */  
-</span><span class='line'>  
-</span><span class='line'>&#9;} else {  
-</span><span class='line'>&#9;&#9;/* tcp_v4_check累加伪首部，获取最终的校验和。 
-</span><span class='line'>&#9;&#9; * csum_partial累加TCP报头。 
-</span><span class='line'>&#9;&#9; * 那么skb-&gt;csum应该是TCP数据部分的累加，这是在从用户空间复制时顺便累加的。 
-</span><span class='line'>&#9;&#9; */  
-</span><span class='line'>&#9;&#9;th-&gt;check = tcp_v4_check(th, len, inet-&gt;saddr, inet-&gt;daddr,  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;csum_partial((char *)th, th-&gt;doff &lt;&lt; 2, skb-&gt;csum));  
-</span><span class='line'>&#9;}  
-</span><span class='line'>}  
-</span></code></pre></td></tr></table></div></figure>
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>unsigned csum_partial(const unsigned char *buff, unsigned len, unsigned sum)  
-</span><span class='line'>{  
-</span><span class='line'>&#9;return add32_with_carry(do_csum(buff, len), sum);  
-</span><span class='line'>}  
-</span><span class='line'>  
-</span><span class='line'>static inline unsigned add32_with_carry(unsigned a, unsigned b)  
-</span><span class='line'>{  
-</span><span class='line'>&#9;asm("addl %2, %0\n\t"  
-</span><span class='line'>&#9;&#9; "adcl $0, %0"  
-</span><span class='line'>&#9;&#9; : "=r" (a)  
-</span><span class='line'>&#9;&#9; : "0" (a), "r" (b));  
-</span><span class='line'>&#9;return a;  
-</span><span class='line'>}   </span></code></pre></td></tr></table></div></figure>
-
-
-<p>do_csum()用于计算一段内存的校验和，这里用于累加TCP报头。</p>
-
-<p>具体计算时用到一些技巧：<br/>
-1.反码累加时，按16位、32位、64位来累加的效果是一样的。<br/>
-2.使用内存对齐，减少内存操作的次数。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-<span class='line-number'>58</span>
-<span class='line-number'>59</span>
-<span class='line-number'>60</span>
-<span class='line-number'>61</span>
-<span class='line-number'>62</span>
-<span class='line-number'>63</span>
-<span class='line-number'>64</span>
-<span class='line-number'>65</span>
-<span class='line-number'>66</span>
-<span class='line-number'>67</span>
-<span class='line-number'>68</span>
-<span class='line-number'>69</span>
-<span class='line-number'>70</span>
-<span class='line-number'>71</span>
-<span class='line-number'>72</span>
-<span class='line-number'>73</span>
-<span class='line-number'>74</span>
-<span class='line-number'>75</span>
-<span class='line-number'>76</span>
-<span class='line-number'>77</span>
-<span class='line-number'>78</span>
-<span class='line-number'>79</span>
-<span class='line-number'>80</span>
-<span class='line-number'>81</span>
-<span class='line-number'>82</span>
-<span class='line-number'>83</span>
-<span class='line-number'>84</span>
-<span class='line-number'>85</span>
-<span class='line-number'>86</span>
-<span class='line-number'>87</span>
-<span class='line-number'>88</span>
-<span class='line-number'>89</span>
-<span class='line-number'>90</span>
-<span class='line-number'>91</span>
-<span class='line-number'>92</span>
-<span class='line-number'>93</span>
-<span class='line-number'>94</span>
-<span class='line-number'>95</span>
-<span class='line-number'>96</span>
-<span class='line-number'>97</span>
-<span class='line-number'>98</span>
-<span class='line-number'>99</span>
-<span class='line-number'>100</span>
-<span class='line-number'>101</span>
-<span class='line-number'>102</span>
-<span class='line-number'>103</span>
-<span class='line-number'>104</span>
-<span class='line-number'>105</span>
-<span class='line-number'>106</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static __force_inline unsigned do_csum(const unsigned char *buff, unsigned len)  
-</span><span class='line'>{  
-</span><span class='line'>&#9;unsigned odd, count;  
-</span><span class='line'>&#9;unsigned long result = 0;  
-</span><span class='line'>  
-</span><span class='line'>&#9;if (unlikely(len == 0))  
-</span><span class='line'>&#9;&#9;return result;  
-</span><span class='line'>  
-</span><span class='line'>&#9;/* 使起始地址为XXX0，接下来可按2字节对齐 */  
-</span><span class='line'>&#9;odd = 1 & (unsigned long) buff;  
-</span><span class='line'>&#9;if (unlikely(odd)) {  
-</span><span class='line'>&#9;&#9;result = *buff &lt;&lt; 8; /* 因为机器是小端的 */  
-</span><span class='line'>&#9;&#9;len--;  
-</span><span class='line'>&#9;&#9;buff++;  
-</span><span class='line'>&#9;}  
-</span><span class='line'>&#9;count = len &gt;&gt; 1; /* nr of 16-bit words，这里可能余下1字节未算，最后会处理*/  
-</span><span class='line'>  
-</span><span class='line'>&#9;if (count) {  
-</span><span class='line'>&#9;&#9;/* 使起始地址为XX00，接下来可按4字节对齐 */  
-</span><span class='line'>&#9;&#9;if (2 & (unsigned long) buff) {  
-</span><span class='line'>&#9;&#9;&#9;result += *(unsigned short *)buff;  
-</span><span class='line'>&#9;&#9;&#9;count--;  
-</span><span class='line'>&#9;&#9;&#9;len -= 2;  
-</span><span class='line'>&#9;&#9;&#9;buff += 2;  
-</span><span class='line'>&#9;&#9;}  
-</span><span class='line'>&#9;&#9;count &gt;&gt;= 1; /* nr of 32-bit words，这里可能余下2字节未算，最后会处理 */  
-</span><span class='line'>  
-</span><span class='line'>&#9;&#9;if (count) {  
-</span><span class='line'>&#9;&#9;&#9;unsigned long zero;  
-</span><span class='line'>&#9;&#9;&#9;unsigned count64;  
-</span><span class='line'>&#9;&#9;&#9;/* 使起始地址为X000，接下来可按8字节对齐 */  
-</span><span class='line'>&#9;&#9;&#9;if (4 & (unsigned long)buff) {  
-</span><span class='line'>&#9;&#9;&#9;&#9;result += *(unsigned int *)buff;  
-</span><span class='line'>&#9;&#9;&#9;&#9;count--;  
-</span><span class='line'>&#9;&#9;&#9;&#9;len -= 4;  
-</span><span class='line'>&#9;&#9;&#9;&#9;buff += 4;  
-</span><span class='line'>&#9;&#9;&#9;}  
-</span><span class='line'>&#9;&#9;&#9;count &gt;&gt;= 1; /* nr of 64-bit words，这里可能余下4字节未算，最后会处理*/  
-</span><span class='line'>  
-</span><span class='line'>&#9;&#9;&#9;/* main loop using 64byte blocks */  
-</span><span class='line'>&#9;&#9;&#9;zero = 0;  
-</span><span class='line'>&#9;&#9;&#9;count64 = count &gt;&gt; 3; /* 64字节的块数，这里可能余下56字节未算，最后会处理 */  
-</span><span class='line'>&#9;&#9;&#9;while (count64) { /* 反码累加所有的64字节块 */  
-</span><span class='line'>&#9;&#9;&#9;&#9;asm ("addq 0*8(%[src]), %[res]\n\t"    /* b、w、l、q分别对应8、16、32、64位操作 */  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;"addq 1*8(%[src]), %[res]\n\t"    /* [src]为指定寄存器的别名，效果应该等同于0、1等 */  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;"adcq 2*8(%[src]), %[res]\n\t"  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;"adcq 3*8(%[src]), %[res]\n\t"  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;"adcq 4*8(%[src]), %[res]\n\t"  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;"adcq 5*8(%[src]), %[res]\n\t"  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;"adcq 6*8(%[src]), %[res]\n\t"  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;"adcq 7*8(%[src]), %[res]\n\t"  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;"adcq %[zero], %[res]"  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;: [res] "=r" (result)  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;: [src] "r" (buff), [zero] "r" (zero), "[res]" (result));  
-</span><span class='line'>&#9;&#9;&#9;&#9;buff += 64;  
-</span><span class='line'>&#9;&#9;&#9;&#9;count64--;  
-</span><span class='line'>&#9;&#9;&#9;}  
-</span><span class='line'>  
-</span><span class='line'>&#9;&#9;&#9;/* 从这里开始，反序处理之前可能漏算的字节 */  
-</span><span class='line'>  
-</span><span class='line'>&#9;&#9;&#9;/* last upto 7 8byte blocks，前面按8个8字节做计算单位，所以最多可能剩下7个8字节 */  
-</span><span class='line'>&#9;&#9;&#9;count %= 8;  
-</span><span class='line'>&#9;&#9;&#9;while (count) {  
-</span><span class='line'>&#9;&#9;&#9;&#9;asm ("addq %1, %0\n\t"  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9; "adcq %2, %0\n"  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9; : "=r" (result)  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9; : "m" (*(unsigned long *)buff), "r" (zero), "0" (result));  
-</span><span class='line'>&#9;&#9;&#9;&#9;--count;  
-</span><span class='line'>&#9;&#9;&#9;&#9;buff += 8;  
-</span><span class='line'>&#9;&#9;&#9;}  
-</span><span class='line'>  
-</span><span class='line'>&#9;&#9;&#9;/* 带进位累加result的高32位和低32位 */  
-</span><span class='line'>&#9;&#9;&#9;result = add32_with_carry(result&gt;&gt;32, result&0xffffffff);  
-</span><span class='line'>  
-</span><span class='line'>&#9;&#9;&#9;/* 之前始按8字节对齐，可能有4字节剩下 */  
-</span><span class='line'>&#9;&#9;&#9;if (len & 4) {  
-</span><span class='line'>&#9;&#9;&#9;&#9;result += *(unsigned int *) buff;  
-</span><span class='line'>&#9;&#9;&#9;&#9;buff += 4;  
-</span><span class='line'>&#9;&#9;&#9;}  
-</span><span class='line'>&#9;&#9;}  
-</span><span class='line'>  
-</span><span class='line'>&#9;   /* 更早前按4字节对齐，可能有2字节剩下 */  
-</span><span class='line'>&#9;&#9;if (len & 2) {  
-</span><span class='line'>&#9;&#9;&#9;result += *(unsigned short *) buff;  
-</span><span class='line'>&#9;&#9;&#9;buff += 2;  
-</span><span class='line'>&#9;&#9;}  
-</span><span class='line'>&#9;}  
-</span><span class='line'>  
-</span><span class='line'>&#9;/* 最早之前按2字节对齐，可能有1字节剩下 */  
-</span><span class='line'>&#9;if (len & 1)  
-</span><span class='line'>&#9;&#9;result += *buff;  
-</span><span class='line'>  
-</span><span class='line'>&#9;/* 再次带进位累加result的高32位和低32位 */  
-</span><span class='line'>&#9;result = add32_with_carry(result&gt;&gt;32, result & 0xffffffff);   
-</span><span class='line'>  
-</span><span class='line'>&#9;/* 这里涉及到一个技巧，用于处理初始地址为奇数的情况 */  
-</span><span class='line'>&#9;if (unlikely(odd)) {  
-</span><span class='line'>&#9;&#9;result = from32to16(result); /* 累加到result的低16位 */  
-</span><span class='line'>&#9;&#9;/* result为：0 0 a b 
-</span><span class='line'>&#9;&#9; * 然后交换a和b，result变为：0 0 b a 
-</span><span class='line'>&#9;&#9; */  
-</span><span class='line'>&#9;&#9;result = ((result &gt;&gt; 8) & 0xff) | ((result & oxff) &lt;&lt; 8);  
-</span><span class='line'>&#9;}  
-</span><span class='line'>  
-</span><span class='line'>&#9;return result; /* 返回result的低32位 */  
-</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static inline unsigned short from32to16(unsigned a)  
-</span><span class='line'>{  
-</span><span class='line'>&#9;unsigned short b = a &gt;&gt; 16;  
-</span><span class='line'>&#9;asm ("addw %w2, %w0\n\t"  
-</span><span class='line'>&#9;&#9;&#9;  "adcw $0, %w0\n"  
-</span><span class='line'>&#9;&#9;&#9;  : "=r" (b)  
-</span><span class='line'>&#9;&#9;&#9;  : "0" (b), "r" (a));  
-</span><span class='line'>&#9;return b;  
-</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
-
-
-<p>csum_partial_copy_from_user()用于拷贝用户空间数据到内核空间，同时计算用户数据的校验和，结果保存到skb->csum中（X86_64）。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/** 
-</span><span class='line'> * csum_partial_copy_from_user - Copy and checksum from user space. 
-</span><span class='line'> * @src: source address (user space) 
-</span><span class='line'> * @dst: destination address 
-</span><span class='line'> * @len: number of bytes to be copied. 
-</span><span class='line'> * @isum: initial sum that is added into the result (32bit unfolded) 
-</span><span class='line'> * @errp: set to -EFAULT for an bad source address. 
-</span><span class='line'> * 
-</span><span class='line'> * Returns an 32bit unfolded checksum of the buffer. 
-</span><span class='line'> * src and dst are best aligned to 64bits. 
-</span><span class='line'> */  
-</span><span class='line'>  
-</span><span class='line'>unsigned int csum_partial_copy_from_user(const unsigned char __user *src,  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;unsigned char *dst, int len, unsigned int isum, int *errp)  
-</span><span class='line'>{  
-</span><span class='line'>&#9;might_sleep();  
-</span><span class='line'>&#9;*errp = 0;  
-</span><span class='line'>  
-</span><span class='line'>&#9;if (likely(access_ok(VERIFY_READ, src, len))) {  
-</span><span class='line'>  
-</span><span class='line'>&#9;&#9;/* Why 6, not 7? To handle odd addresses aligned we would need to do considerable 
-</span><span class='line'>&#9;&#9; * complications to fix the checksum which is defined as an 16bit accumulator. The fix 
-</span><span class='line'>&#9;&#9; * alignment code is primarily for performance compatibility with 32bit and that will handle 
-</span><span class='line'>&#9;&#9; * odd addresses slowly too. 
-</span><span class='line'>&#9;&#9; * 处理X010、X100、X110的起始地址。不处理X001，因为这会使复杂度大增加。 
-</span><span class='line'>&#9;&#9; */  
-</span><span class='line'>&#9;&#9;if (unlikely((unsigned long)src & 6)) {  
-</span><span class='line'>&#9;&#9;&#9;while (((unsigned long)src & 6) && len &gt;= 2) {  
-</span><span class='line'>&#9;&#9;&#9;&#9;__u16 val16;  
-</span><span class='line'>&#9;&#9;&#9;&#9;*errp = __get_user(val16, (__u16 __user *)src);  
-</span><span class='line'>&#9;&#9;&#9;&#9;if (*errp)  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;return isum;  
-</span><span class='line'>&#9;&#9;&#9;&#9;*(__u16 *)dst = val16;  
-</span><span class='line'>&#9;&#9;&#9;&#9;isum = add32_with_carry(isum, val16);  
-</span><span class='line'>&#9;&#9;&#9;&#9;src += 2;  
-</span><span class='line'>&#9;&#9;&#9;&#9;dst += 2;  
-</span><span class='line'>&#9;&#9;&#9;&#9;len -= 2;  
-</span><span class='line'>&#9;&#9;&#9;}  
-</span><span class='line'>&#9;&#9;}  
-</span><span class='line'>  
-</span><span class='line'>&#9;&#9;/* 计算函数是用纯汇编实现的，应该是因为效率吧 */  
-</span><span class='line'>&#9;&#9;isum = csum_parial_copy_generic((__force void *)src, dst, len, isum, errp, NULL);  
-</span><span class='line'>  
-</span><span class='line'>&#9;&#9;if (likely(*errp == 0))  
-</span><span class='line'>&#9;&#9;&#9;return isum; /* 成功 */  
-</span><span class='line'>&#9;}  
-</span><span class='line'>  
-</span><span class='line'>&#9;*errp = -EFAULT;  
-</span><span class='line'>&#9;memset(dst, 0, len);  
-</span><span class='line'>&#9;return isum;  
-</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
-
-
-<p>上述的实现比较复杂，来看下最简单的csum_partial_copy_from_user()实现（um）。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>unsigned int csum_partial_copy_from_user(const unsigned char *src,  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;unsigned char *dst, int len, int sum,  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;int *err_ptr)  
-</span><span class='line'>{  
-</span><span class='line'>&#9;if (copy_from_user(dst, src, len)) { /* 拷贝用户空间数据到内核空间 */  
-</span><span class='line'>&#9;&#9;*err_ptr = -EFAULT; /* bad address */  
-</span><span class='line'>&#9;&#9;return (-1);  
-</span><span class='line'>&#9;}  
-</span><span class='line'>  
-</span><span class='line'>&#9;return csum_partial(dst, len, sum); /* 计算用户数据的校验和，会存到skb-&gt;csum中 */  
-</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
-
-
-<h4>接收校验</h4>
-
-<h5>@tcp_v4_rcv</h5>
-
-<pre><code>/* 检查校验和 */
-if (skb-&gt;ip_summed != CHECKSUM_UNNECESSARY &amp;&amp; tcp_v4_checksum_init(skb))  
-    goto bad_packet;   
-</code></pre>
-
-<p>接收校验的第一部分，主要是计算伪首部。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static int tcp_v4_checksum_init(struct sk_buff *skb)  
-</span><span class='line'>{  
-</span><span class='line'>&#9;/* 如果TCP报头、TCP数据的反码累加已经由硬件完成 */  
-</span><span class='line'>&#9;if (skb-&gt;ip_summed == CHECKSUM_HW) {  
-</span><span class='line'>  
-</span><span class='line'>&#9;&#9;/* 现在只需要再累加上伪首部，取反获取最终的校验和。 
-</span><span class='line'>&#9;&#9; * 校验和为0时，表示TCP数据报正确。 
-</span><span class='line'>&#9;&#9; */  
-</span><span class='line'>&#9;&#9;if (! tcp_v4_check(skb-&gt;h.th, skb-&gt;len, skb-&gt;nh.iph-&gt;saddr, skb-&gt;nh.iph-&gt;daddr, skb-&gt;csum)) {  
-</span><span class='line'>&#9;&#9;&#9;skb-&gt;ip_summed = CHECKSUM_UNNECESSARY;  
-</span><span class='line'>&#9;&#9;&#9;return 0; /* 校验成功 */  
-</span><span class='line'>  
-</span><span class='line'>&#9;&#9;} /* 没有else失败退出吗？*/  
-</span><span class='line'>&#9;}  
-</span><span class='line'>  
-</span><span class='line'>&#9;/* 对伪首部进行反码累加，主要用于软件方法 */  
-</span><span class='line'>&#9;skb-&gt;csum = csum_tcpudp_nofold(skb-&gt;nh.iph-&gt;saddr, skb-&gt;nh.iph-&gt;daddr, skb-&gt;len, IPPROTO_TCP, 0);  
-</span><span class='line'>   
-</span><span class='line'>  
-</span><span class='line'>&#9;/* 对于长度小于76字节的小包，接着累加TCP报头和报文，完成校验；否则，以后再完成检验。*/  
-</span><span class='line'>&#9;if (skb-&gt;len &lt;= 76) {  
-</span><span class='line'>&#9;&#9;return __skb_checksum_complete(skb);  
-</span><span class='line'>&#9;}  
-</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
-
-
-<p>接收校验的第二部分，计算报头和报文。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>tcp_v4_rcv、tcp_v4_do_rcv()
-</span><span class='line'>
-</span><span class='line'>  | --&gt; tcp_checksum_complete()
-</span><span class='line'>
-</span><span class='line'>      | --&gt; __tcp_checksum_complete()
-</span><span class='line'>
-</span><span class='line'>          | --&gt; __skb_checksum_complete()
-</span><span class='line'>
-</span><span class='line'>
-</span><span class='line'>tcp_rcv_established()
-</span><span class='line'>
-</span><span class='line'>  | --&gt; tcp_checksum_complete_user()
-</span><span class='line'>
-</span><span class='line'>      | --&gt; __tcp_checksum_complete_user()
-</span><span class='line'>
-</span><span class='line'>          | --&gt; __tcp_checksum_complete()
-</span><span class='line'>
-</span><span class='line'>              | --&gt; __skb_checksum_complete()</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>unsigned int __skb_checksum_complete(struct sk_buff *skb)  
-</span><span class='line'>{  
-</span><span class='line'>&#9;unsigned int sum;  
-</span><span class='line'>  
-</span><span class='line'>&#9;sum = (u16) csum_fold(skb_checksum(skb, 0, skb-&gt;len, skb-&gt;csum));  
-</span><span class='line'>  
-</span><span class='line'>&#9;if (likely(!sum)) { /* sum为0表示成功了 */  
-</span><span class='line'>&#9;&#9;/* 硬件检测失败，软件检测成功了，说明硬件检测有误 */  
-</span><span class='line'>&#9;&#9;if (unlikely(skb-&gt;ip_summed == CHECKSUM_HW))  
-</span><span class='line'>&#9;&#9;&#9;netdev_rx_csum_fault(skb-&gt;dev);  
-</span><span class='line'>&#9;&#9;skb-&gt;ip_summed = CHECKSUM_UNNECESSARY;  
-</span><span class='line'>&#9;}  
-</span><span class='line'>&#9;return sum;  
-</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
-
-
-<p>计算skb包的校验和时，可以指定相对于skb->data的偏移量offset。由于skb包可能由分页和分段，所以需要考虑skb->data + offset是位于此skb段的线性区中、还是此skb的分页中，或者位于其它分段中。这个函数逻辑比较复杂。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-<span class='line-number'>58</span>
-<span class='line-number'>59</span>
-<span class='line-number'>60</span>
-<span class='line-number'>61</span>
-<span class='line-number'>62</span>
-<span class='line-number'>63</span>
-<span class='line-number'>64</span>
-<span class='line-number'>65</span>
-<span class='line-number'>66</span>
-<span class='line-number'>67</span>
-<span class='line-number'>68</span>
-<span class='line-number'>69</span>
-<span class='line-number'>70</span>
-<span class='line-number'>71</span>
-<span class='line-number'>72</span>
-<span class='line-number'>73</span>
-<span class='line-number'>74</span>
-<span class='line-number'>75</span>
-<span class='line-number'>76</span>
-<span class='line-number'>77</span>
-<span class='line-number'>78</span>
-<span class='line-number'>79</span>
-<span class='line-number'>80</span>
-<span class='line-number'>81</span>
-<span class='line-number'>82</span>
-<span class='line-number'>83</span>
-<span class='line-number'>84</span>
-<span class='line-number'>85</span>
-<span class='line-number'>86</span>
-<span class='line-number'>87</span>
-<span class='line-number'>88</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/* Checksum skb data. */  
-</span><span class='line'>unsigned int skb_checksum(const struct sk_buff *skb, int offset, int len, unsigned int csum)  
-</span><span class='line'>{  
-</span><span class='line'>&#9;int start = skb_headlen(skb); /* 线性区域长度 */  
-</span><span class='line'>&#9;/* copy &gt; 0，说明offset在线性区域中。 
-</span><span class='line'>&#9; * copy &lt; 0，说明offset在此skb的分页数据中，或者在其它分段skb中。 
-</span><span class='line'>&#9; */  
-</span><span class='line'>&#9;int i, copy = start - offset;  
-</span><span class='line'>&#9;int pos = 0; /* 表示校验了多少数据 */  
-</span><span class='line'>  
-</span><span class='line'>&#9;/* Checksum header. */  
-</span><span class='line'>&#9;if (copy &gt; 0) { /* 说明offset在本skb的线性区域中 */  
-</span><span class='line'>&#9;&#9;if (copy &gt; len)  
-</span><span class='line'>&#9;&#9;&#9;copy = len; /* 不能超过指定的校验长度 */  
-</span><span class='line'>  
-</span><span class='line'>&#9;&#9;/* 累加copy长度的线性区校验 */  
-</span><span class='line'>&#9;&#9;csum = csum_partial(skb-&gt;data + offset, copy, csum);  
-</span><span class='line'>  
-</span><span class='line'>&#9;&#9;if ((len -= copy) == 0)  
-</span><span class='line'>&#9;&#9;&#9;return csum;  
-</span><span class='line'>  
-</span><span class='line'>&#9;&#9;offset += copy; /* 接下来从这里继续处理 */  
-</span><span class='line'>&#9;&#9;pos = copy; /* 已处理数据长 */  
-</span><span class='line'>&#9;}  
-</span><span class='line'>  
-</span><span class='line'>&#9;/* 累加本skb分页数据的校验和 */  
-</span><span class='line'>&#9;for (i = 0; i &lt; skb_shinfo(skb)-&gt;nr_frags; i++) {  
-</span><span class='line'>&#9;&#9;int end;  
-</span><span class='line'>&#9;&#9;BUG_TRAP(start &lt;= offset + len);  
-</span><span class='line'>&#9;  
-</span><span class='line'>&#9;&#9;end = start + skb_shinfo(skb)-&gt;frags[i].size;  
-</span><span class='line'>  
-</span><span class='line'>&#9;&#9;if ((copy = end - offset) &gt; 0) { /* 如果offset位于本页中，或者线性区中 */  
-</span><span class='line'>&#9;&#9;&#9;unsigned int csum2;  
-</span><span class='line'>&#9;&#9;&#9;u8 *vaddr; /* 8位够吗？*/  
-</span><span class='line'>&#9;&#9;&#9;skb_frag_t *frag = &skb_shinfo(skb)-&gt;frags[i];  
-</span><span class='line'>   
-</span><span class='line'>&#9;&#9;&#9;if (copy &gt; len)  
-</span><span class='line'>&#9;&#9;&#9;&#9;copy = len;  
-</span><span class='line'>  
-</span><span class='line'>&#9;&#9;&#9;vaddr = kmap_skb_frag(frag); /* 把物理页映射到内核空间 */  
-</span><span class='line'>&#9;&#9;&#9;csum2 = csum_partial(vaddr + frag-&gt;page_offset + offset - start, copy, 0);  
-</span><span class='line'>&#9;&#9;&#9;kunmap_skb_frag(vaddr); /* 解除映射 */  
-</span><span class='line'>  
-</span><span class='line'>&#9;&#9;&#9;/* 如果pos为奇数，需要对csum2进行处理。 
-</span><span class='line'>&#9;&#9;&#9; * csum2：a, b, c, d =&gt; b, a, d, c 
-</span><span class='line'>&#9;&#9;&#9; */  
-</span><span class='line'>&#9;&#9;&#9;csum = csum_block_add(csum, csum2, pos);  
-</span><span class='line'>  
-</span><span class='line'>&#9;&#9;&#9;if (! (len -= copy))  
-</span><span class='line'>&#9;&#9;&#9;&#9;return csum;  
-</span><span class='line'>  
-</span><span class='line'>&#9;&#9;&#9;offset += copy;  
-</span><span class='line'>&#9;&#9;&#9;pos += copy;  
-</span><span class='line'>&#9;&#9;}  
-</span><span class='line'>&#9;&#9;start = end; /* 接下来从这里处理 */  
-</span><span class='line'>&#9;}  
-</span><span class='line'>   
-</span><span class='line'>&#9;/* 如果此skb是个大包，还有其它分段 */  
-</span><span class='line'>&#9;if (skb_shinfo(skb)-&gt;frag_list) {  
-</span><span class='line'>&#9;&#9;struct sk_buff *list = skb_shinfo(skb)-&gt;frag_list;  
-</span><span class='line'>  
-</span><span class='line'>&#9;&#9;for (; list; list = list-&gt;next) {  
-</span><span class='line'>&#9;&#9;&#9;int end;  
-</span><span class='line'>&#9;&#9;&#9;BUG_TRAP(start &lt;= offset + len);  
-</span><span class='line'>   
-</span><span class='line'>&#9;&#9;&#9;end = start + list-&gt;len;  
-</span><span class='line'>  
-</span><span class='line'>&#9;&#9;&#9;if ((copy = end - offset) &gt; 0) { /* 如果offset位于此skb分段中，或者分页，或者线性区 */  
-</span><span class='line'>&#9;&#9;&#9;&#9;unsigned int csum2;  
-</span><span class='line'>&#9;&#9;&#9;&#9;if (copy &gt; len)  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;copy = len;  
-</span><span class='line'>  
-</span><span class='line'>&#9;&#9;&#9;&#9;csum2 = skb_checksum(list, offset - start, copy, 0); /* 递归调用 */  
-</span><span class='line'>&#9;&#9;&#9;&#9;csum = csum_block_add(csum, csum2, pos);  
-</span><span class='line'>&#9;&#9;&#9;&#9;if ((len -= copy) == 0)  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;return csum;  
-</span><span class='line'>  
-</span><span class='line'>&#9;&#9;&#9;&#9;offset += copy;  
-</span><span class='line'>&#9;&#9;&#9;&#9;pos += copy;  
-</span><span class='line'>&#9;&#9;&#9;}  
-</span><span class='line'>&#9;&#9;&#9;start = end;  
-</span><span class='line'>&#9;&#9;}  
-</span><span class='line'>&#9;}  
-</span><span class='line'>  
-</span><span class='line'>&#9;BUG_ON(len);  
-</span><span class='line'>&#9;return csum;  
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>重算skb的checksum</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;linux/version.h&gt;
-</span><span class='line'>#include &lt;linux/net.h&gt;
-</span><span class='line'>#include &lt;linux/ip.h&gt;
-</span><span class='line'>#include &lt;linux/tcp.h&gt;
-</span><span class='line'>#include &lt;net/tcp.h&gt;
-</span><span class='line'>
-</span><span class='line'>void skbcsum(struct sk_buff *skb)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct tcphdr *tcph;
-</span><span class='line'>&#9;struct iphdr *iph;
-</span><span class='line'>&#9;int iphl;
-</span><span class='line'>&#9;int tcphl;
-</span><span class='line'>&#9;int tcplen;
-</span><span class='line'>
-</span><span class='line'>&#9;iph = (struct iphdr *)skb-&gt;data;
-</span><span class='line'>&#9;iphl = iph-&gt;ihl &lt;&lt; 2;
-</span><span class='line'>&#9;tcph = (struct tcphdr *)(skb-&gt;data + iphl);
-</span><span class='line'>&#9;tcphl = tcph-&gt;doff &lt;&lt; 2;
-</span><span class='line'>
-</span><span class='line'>&#9;iph-&gt;check = 0;
-</span><span class='line'>&#9;iph-&gt;check = ip_fast_csum((unsigned char *)iph, iph-&gt;ihl);
-</span><span class='line'>
-</span><span class='line'>&#9;tcph-&gt;check    = 0;
-</span><span class='line'>&#9;tcplen        = skb-&gt;len - (iph-&gt;ihl &lt;&lt; 2);
-</span><span class='line'>&#9;if (skb-&gt;ip_summed == CHECKSUM_PARTIAL) {
-</span><span class='line'>&#9;&#9;tcph-&gt;check = ~csum_tcpudp_magic(iph-&gt;saddr, iph-&gt;daddr,
-</span><span class='line'>&#9;&#9;&#9;&#9;tcplen, IPPROTO_TCP, 0);
-</span><span class='line'>#if LINUX_VERSION_CODE &lt; KERNEL_VERSION(2, 6, 32)
-</span><span class='line'>&#9;&#9;skb-&gt;csum = offsetof(struct tcphdr, check);
-</span><span class='line'>#else
-</span><span class='line'>&#9;&#9;skb-&gt;csum_start    = skb_transport_header(skb) - skb-&gt;head;
-</span><span class='line'>&#9;&#9;skb-&gt;csum_offset = offsetof(struct tcphdr, check);
-</span><span class='line'>#endif
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;else {
-</span><span class='line'>&#9;&#9;skb-&gt;csum = 0;
-</span><span class='line'>&#9;&#9;skb-&gt;csum = skb_checksum(skb, iph-&gt;ihl &lt;&lt; 2, tcplen, 0);
-</span><span class='line'>&#9;&#9;tcph-&gt;check = csum_tcpudp_magic(iph-&gt;saddr, iph-&gt;daddr,
-</span><span class='line'>&#9;&#9;&#9;&#9;tcplen, IPPROTO_TCP, skb-&gt;csum);
-</span><span class='line'>
-</span><span class='line'>&#9;}
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-
-</div>
-  
-  
-
-
-    </article>
-  
   <div class="pagination">
     
       <a class="prev" href="/posts/41">&larr; Older</a>
@@ -2622,7 +1867,7 @@ if (!document.getElementById('assembly~arm')) document.getElementById('aexp_asse
 if (!document.getElementById('assembly')) document.getElementById('aexp_assembly').style.visibility = 'hidden';
 if (!document.getElementById('assembly~base')) document.getElementById('aexp_assembly~base').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(57)</span></li>
+<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(58)</span></li>
 <div id='tools' class='catsub'><li><a href='/blog/cats/tools~base/?opendiv=tools'>base</a><a href='##' onmousedown=showDiv('tools~base') id='aexp_tools~base'><span class='exp_style' id='exp_tools~base'>[+]</span></a><span class='right_span'>14</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~base')) document.getElementById('aexp_tools~base').style.visibility = 'hidden';
@@ -2646,6 +1891,10 @@ if (!document.getElementById('tools~graphviz、codeviz')) document.getElementByI
 <li><a href='/blog/cats/tools~haproxy/?opendiv=tools'>haproxy</a><a href='##' onmousedown=showDiv('tools~haproxy') id='aexp_tools~haproxy'><span class='exp_style' id='exp_tools~haproxy'>[+]</span></a><span class='right_span'>9</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~haproxy')) document.getElementById('aexp_tools~haproxy').style.visibility = 'hidden';
+</script>
+<li><a href='/blog/cats/tools~isal/?opendiv=tools'>isal</a><a href='##' onmousedown=showDiv('tools~isal') id='aexp_tools~isal'><span class='exp_style' id='exp_tools~isal'>[+]</span></a><span class='right_span'>1</span></li>
+<script language='javascript' type='text/javascript'>
+if (!document.getElementById('tools~isal')) document.getElementById('aexp_tools~isal').style.visibility = 'hidden';
 </script>
 <li><a href='/blog/cats/tools~mysql/?opendiv=tools'>mysql</a><a href='##' onmousedown=showDiv('tools~mysql') id='aexp_tools~mysql'><span class='exp_style' id='exp_tools~mysql'>[+]</span></a><span class='right_span'>6</span></li>
 <script language='javascript' type='text/javascript'>
@@ -2732,10 +1981,14 @@ if (!document.getElementById('kernel~signature')) document.getElementById('aexp_
 if (!document.getElementById('kernel')) document.getElementById('aexp_kernel').style.visibility = 'hidden';
 if (!document.getElementById('kernel~sound')) document.getElementById('aexp_kernel~sound').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/android/'>android</a><a href='##' onmousedown=showDiv('android') id='aexp_android'><span class='exp_style' id='exp_android'>[+]</span></a><span class='right_span'>(22)</span></li>
+<li class='catclass'><a href='/blog/cats/android/'>android</a><a href='##' onmousedown=showDiv('android') id='aexp_android'><span class='exp_style' id='exp_android'>[+]</span></a><span class='right_span'>(23)</span></li>
 <div id='android' class='catsub'><li><a href='/blog/cats/android~base/?opendiv=android'>base</a><a href='##' onmousedown=showDiv('android~base') id='aexp_android~base'><span class='exp_style' id='exp_android~base'>[+]</span></a><span class='right_span'>13</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('android~base')) document.getElementById('aexp_android~base').style.visibility = 'hidden';
+</script>
+<li><a href='/blog/cats/android~g9300/?opendiv=android'>g9300</a><a href='##' onmousedown=showDiv('android~g9300') id='aexp_android~g9300'><span class='exp_style' id='exp_android~g9300'>[+]</span></a><span class='right_span'>1</span></li>
+<script language='javascript' type='text/javascript'>
+if (!document.getElementById('android~g9300')) document.getElementById('aexp_android~g9300').style.visibility = 'hidden';
 </script>
 <li><a href='/blog/cats/android~i9507v/?opendiv=android'>i9507v</a><a href='##' onmousedown=showDiv('android~i9507v') id='aexp_android~i9507v'><span class='exp_style' id='exp_android~i9507v'>[+]</span></a><span class='right_span'>1</span></li>
 <script language='javascript' type='text/javascript'>
@@ -2855,8 +2108,9 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2018/'>2018</a><a href='##' onmousedown=showDiv('2018')><span class='exp_style' id='exp_2018'>[+]</span></a><span class='right_span'>(23)</span></li>
-<div id='2018' class='catsub'><li><a href='/blog/cats/2018~03/?opendiv=2018'>2018-03</a><span class='right_span'>9</span></li>
+<li class='catclass'><a href='/blog/cats/2018/'>2018</a><a href='##' onmousedown=showDiv('2018')><span class='exp_style' id='exp_2018'>[+]</span></a><span class='right_span'>(25)</span></li>
+<div id='2018' class='catsub'><li><a href='/blog/cats/2018~04/?opendiv=2018'>2018-04</a><span class='right_span'>1</span></li>
+<li><a href='/blog/cats/2018~03/?opendiv=2018'>2018-03</a><span class='right_span'>10</span></li>
 <li><a href='/blog/cats/2018~02/?opendiv=2018'>2018-02</a><span class='right_span'>6</span></li>
 <li><a href='/blog/cats/2018~01/?opendiv=2018'>2018-01</a><span class='right_span'>8</span></li>
 </div><li class='catclass'><a href='/blog/cats/2017/'>2017</a><a href='##' onmousedown=showDiv('2017')><span class='exp_style' id='exp_2017'>[+]</span></a><span class='right_span'>(10)</span></li>
@@ -2958,6 +2212,14 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
   <ul id="recent_posts">
     
       <li class="post">
+        <a href="/blog/2018/04/12/isal-erase-1/">高性能纠删码编码</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2018/03/23/android-G9300-crom/">G9300 CROM锁</a>
+      </li>
+    
+      <li class="post">
         <a href="/blog/2018/03/23/alg-mdev/">遍历数组一次求方差</a>
       </li>
     
@@ -2967,14 +2229,6 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
     
       <li class="post">
         <a href="/blog/2018/03/12/kernel-crypto-tcp_md5/">TCP MD5选项</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2018/03/12/kernel-crypto-sample/">Linux内核的加密函数</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2018/03/03/kernel-alsa-4/">截获alsa-pcm音频</a>
       </li>
     
   </ul>
