@@ -12,36 +12,32 @@ tags:
 ---
 [Problem 1896 神奇的魔法数](http://acm.fzu.edu.cn/problem.php?pid=1896)
 ```
-Accept: 98    Submit: 307
-Time Limit: 1000 mSec    Memory Limit : 32768 KB
+	Accept: 98    Submit: 307
+	Time Limit: 1000 mSec    Memory Limit : 32768 KB
 
+	Problem Description
 
-Problem Description
+	John定义了一种“神奇的魔法数”。 不含前导零且相邻两个数字之差至少为m的正整数被称为“神奇的魔法数”。特别的，对于任意的m，数字1..9都是“神奇的魔法数”。
+	John想知道，对于给定的m，在正整数a和b之间，包括a和b，总共有多少个“神奇的魔法数”？
 
+	Input
 
-John定义了一种“神奇的魔法数”。 不含前导零且相邻两个数字之差至少为m的正整数被称为“神奇的魔法数”。特别的，对于任意的m，数字1..9都是“神奇的魔法数”。
-John想知道，对于给定的m，在正整数a和b之间，包括a和b，总共有多少个“神奇的魔法数”？
+	第一行一个数字T（1<=T<=100），表示测试数据组数。
+	接下来T行，每行代表一组测试数据，包括三个整数a,b,m。（1<=a<=b<=2,000,000,000, 0<=m<=9）
 
-Input
+	Output
 
+	对于每组测试数据，输出一行表示“神奇的魔法数”的个数。
 
-第一行一个数字T（1<=T<=100），表示测试数据组数。
-接下来T行，每行代表一组测试数据，包括三个整数a,b,m。（1<=a<=b<=2,000,000,000, 0<=m<=9）
+	Sample Input
 
-Output
+	7 1 10 2 1 20 3 1 100 0 10 20 4 20 30 5 1 10 9 11 100 9
 
+	Sample Output
 
-对于每组测试数据，输出一行表示“神奇的魔法数”的个数。
+	9 15 100 5 3 9 1
 
-Sample Input
-
-7 1 10 2 1 20 3 1 100 0 10 20 4 20 30 5 1 10 9 11 100 9
-
-Sample Output
-
-9 15 100 5 3 9 1
-
-Source福州大学第七届程序设计竞赛
+	Source福州大学第七届程序设计竞赛
 ```
 
 ```
@@ -114,42 +110,42 @@ Source福州大学第七届程序设计竞赛
 
 #### [How many 0's?](http://poj.org/problem?id=3286)
 ```
-Time Limit: 1000MS
-Memory Limit: 65536KTotal Submissions: 2997
-Accepted: 1603
+	Time Limit: 1000MS
+	Memory Limit: 65536KTotal Submissions: 2997
+	Accepted: 1603
 
-Description
+	Description
 
-A Benedict monk No.16 writes down the decimal representations of all natural numbers between and including m and n, m ≤ n. How many 0's will he write down?
+	A Benedict monk No.16 writes down the decimal representations of all natural numbers between and including m and n, m ≤ n. How many 0's will he write down?
 
-Input
+	Input
 
-Input consists of a sequence of lines. Each line contains two unsigned 32-bit integers m and n, m ≤ n. The last line of input has the value of m negative and this line should not be processed.
+	Input consists of a sequence of lines. Each line contains two unsigned 32-bit integers m and n, m ≤ n. The last line of input has the value of m negative and this line should not be processed.
 
-Output
+	Output
 
-For each line of input print one line of output with one integer number giving the number of 0's written down by the monk.
+	For each line of input print one line of output with one integer number giving the number of 0's written down by the monk.
 
-Sample Input
+	Sample Input
 
-10 11
-100 200
-0 500
-1234567890 2345678901
-0 4294967295
--1 -1
+	10 11
+	100 200
+	0 500
+	1234567890 2345678901
+	0 4294967295
+	-1 -1
 
-Sample Output
+	Sample Output
 
-1
-22
-92
-987654304
-3825876150
+	1
+	22
+	92
+	987654304
+	3825876150
 
-Source
+	Source
 
-Waterloo Local Contest, 2006.5.27
+	Waterloo Local Contest, 2006.5.27
 ```
 
 ```
