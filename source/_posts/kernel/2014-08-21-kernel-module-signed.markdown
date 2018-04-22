@@ -10,6 +10,25 @@ categories:
 - kernel~signature
 tags:
 ---
+
+##### make binrpm-pkg 模块签名和debuginfo同时开启会出错
+模块签名是在mod_install的时候，但后续在find-debuginfo.sh中debugedit又会修改文件，导致前面的签名无效。
+
+可行改动方法为：
+
+1. 在Makefile中将 `mod_sign_cmd = perl $(srctree)/scripts/sign-file $(CONFIG_MODULE_SIG_HASH) $(MODSECKEY) $(MODPUBKEY)` 改为 `mod_sign_cmd=true`，
+
+2. 在find-debuginfo_kk.sh中的debugedit后几行位置加上下面三行
+```
+  if [[ $f =~ .ko$ ]]; then
+    $BUILDDIR/scripts/sign-file "sha256" "$BUILDDIR/signing_key.priv" "$BUILDDIR/signing_key.x509" "$f"
+  fi
+```
+
+vault.centos.org/7.3.1611/os/Source/SPackages/rpm-4.11.3-21.el7.src.rpm
+
+---------------------------
+
 #### linux内核模块签名 Documentation/module_signing.txt
 内核在模块模块加载时使用加密签名验证，校验签名是否与已编译的内核公钥匹配。目前只支持RSA X.509验证。  
 签名验证在通过CONFIG_MODULE_SIG使能。打开签名同时还会强制做模块ELF元数据检查，然后再做签名验证。  
