@@ -19,6 +19,10 @@ https://stackoverflow.com/questions/5140425/openssl-command-line-to-verify-the-s
 
 -------------
 
+查看网站证书
+```
+	openssl s_client -showcerts -connect www.baidu.com:443
+```
 
 ### 证书
 
@@ -69,6 +73,7 @@ https://stackoverflow.com/questions/5140425/openssl-command-line-to-verify-the-s
   下面是一个证书的例子：
 
 ```
+# openssl x509 -text -in test.crt
 Certificate:
    Data:
        Version: 3 (0x2)
