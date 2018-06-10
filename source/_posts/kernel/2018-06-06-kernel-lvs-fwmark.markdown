@@ -7,7 +7,7 @@ categories:
 - 2018
 - 2018~06
 - kernel
-- kernel~base
+- kernel~net
 tags:
 ---
 
