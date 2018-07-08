@@ -1,0 +1,497 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+
+  <title><![CDATA[Category: 2018~07 | kk Blog —— 通用基础]]></title>
+  <link href="http://abcdxyzk.github.io/blog/cats/2018~07/atom.xml" rel="self"/>
+  <link href="http://abcdxyzk.github.io/"/>
+  <updated>2018-07-09T01:33:49+08:00</updated>
+  <id>http://abcdxyzk.github.io/</id>
+  <author>
+    <name><![CDATA[kk]]></name>
+    
+  </author>
+  <generator uri="http://octopress.org/">Octopress</generator>
+
+  
+  <entry>
+    <title type="html"><![CDATA[参数ip_early_demux]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2018/07/09/kernel-ip_early_demux/"/>
+    <updated>2018-07-09T01:12:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2018/07/09/kernel-ip_early_demux</id>
+    <content type="html"><![CDATA[<p>ip_early_demux 内核中默认是1（开启），
+所以在ip_rcv_finish 到 tcp_v4_rcv 中 skb->destructor = sock_edemux;</p>
+
+<p>且很大概率 skb->_skb_refdst = (unsigned long)dst | SKB_DST_NOREF; // #define SKB_DST_NOREF   1UL</p>
+
+<p>对于NOREF的dst，如果要缓存(tcp_prequeue()或sk_add_backlog()), 则要调skb_dst_force(skb);
+<code>
+    static inline void skb_dst_force(struct sk_buff *skb)
+    {
+        if (skb_dst_is_noref(skb)) {
+            WARN_ON(!rcu_read_lock_held());
+            skb-&gt;_skb_refdst &amp;= ~SKB_DST_NOREF;
+            dst_clone(skb_dst(skb));
+        }   
+    }
+</code></p>
+
+<hr />
+
+<p><a href="http://blog.chinaunix.net/uid-20662820-id-4935075.html">http://blog.chinaunix.net/uid-20662820-id-4935075.html</a></p>
+
+<p>The routing cache has been suppressed in Linux 3.6 after a 2 years effort by David and the other Linux kernel developers.
+The global cache has been suppressed and some stored information have been moved to more separate resources like socket.</p>
+
+<p>Metrics were stored in the routing cache entry which has disappeared. So it has been necessary to introduce a separate TCP metrics cache.
+A netlink interface is available to update/delete/add entry to the cache.</p>
+
+<p>总结起来说就是Linux内核从3.6开始将全局的route cache全部剔除，取而代之的是各个子系统（tcp协议栈）内部的cache，由各个子系统维护。</p>
+
+<p>当内核接收到一个TCP数据包来说，首先需要查找skb对应的路由，然后查找skb对应的socket。David Miller 发现这样做是一种浪费，对于属于同一个socket(只考虑ESTABLISHED情况）的路由是相同的，那么如果能将skb的路由缓存到socket（skb->sk)中，就可以只查找查找一次skb所属的socket，就可以顺便把路由找到了，于是David Miller提交了一个patch ipv4: Early TCP socket demux</p>
+
+<pre><code>    (commit 41063e9dd11956f2d285e12e4342e1d232ba0ea2)
+    ipv4: Early TCP socket demux.
+
+        Input packet processing for local sockets involves two major demuxes.
+        One for the route and one for the socket.
+
+        But we can optimize this down to one demux for certain kinds of local
+        sockets.
+
+        Currently we only do this for established TCP sockets, but it could
+        at least in theory be expanded to other kinds of connections.
+
+        If a TCP socket is established then it's identity is fully specified.
+
+        This means that whatever input route was used during the three-way
+        handshake must work equally well for the rest of the connection since
+        the keys will not change.
+
+        Once we move to established state, we cache the receive packet's input
+        route to use later.
+
+        Like the existing cached route in sk-&gt;sk_dst_cache used for output
+        packets, we have to check for route invalidations using dst-&gt;obsolete
+        and dst-&gt;ops-&gt;check().
+
+        Early demux occurs outside of a socket locked section, so when a route
+        invalidation occurs we defer the fixup of sk-&gt;sk_rx_dst until we are
+        actually inside of established state packet processing and thus have
+        the socket locked.
+</code></pre>
+
+<p>然而Davem添加的这个patch是有局限的，因为这个处理对于转发的数据包，增加了一个在查找路由之前查找socket的逻辑，可能导致转发效率的降低。
+Alexander Duyck提出增加一个ip_early_demux参数来控制是否启动这个特性。</p>
+
+<pre><code>    This change is meant to add a control for disabling early socket demux.
+    The main motivation behind this patch is to provide an option to disable
+    the feature as it adds an additional cost to routing that reduces overall
+    throughput by up to 5%. For example one of my systems went from 12.1Mpps
+    to 11.6 after the early socket demux was added. It looks like the reason
+    for the regression is that we are now having to perform two lookups, first
+    the one for an established socket, and then the one for the routing table.
+
+    By adding this patch and toggling the value for ip_early_demux to 0 I am
+    able to get back to the 12.1Mpps I was previously seeing.
+</code></pre>
+
+<pre><code>    static int ip_rcv_finish(struct sk_buff *skb)
+    {
+        const struct iphdr *iph = ip_hdr(skb);
+        struct rtable *rt;
+
+        if (sysctl_ip_early_demux &amp;&amp; !skb_dst(skb) &amp;&amp; skb-&gt;sk == NULL) {
+            const struct net_protocol *ipprot;
+            int protocol = iph-&gt;protocol;
+
+            ipprot = rcu_dereference(inet_protos[protocol]);
+            if (ipprot &amp;&amp; ipprot-&gt;early_demux) {
+                ipprot-&gt;early_demux(skb);
+                /* must reload iph, skb-&gt;head might have changed */
+                iph = ip_hdr(skb);
+            }
+        }
+
+        /*
+         * Initialise the virtual path cache for the packet. It describes
+         * how the packet travels inside Linux networking.
+         */
+        if (!skb_dst(skb)) {
+            int err = ip_route_input_noref(skb, iph-&gt;daddr, iph-&gt;saddr,
+                               iph-&gt;tos, skb-&gt;dev);
+            if (unlikely(err)) {
+                if (err == -EXDEV)
+                    NET_INC_STATS_BH(dev_net(skb-&gt;dev),
+                         LINUX_MIB_IPRPFILTER);
+                goto drop;
+            }
+        }
+        ......
+</code></pre>
+
+<p>ip_early_demux就这样诞生了，目前内核中默认是1（开启），但是如果你的数据流量中60%以上都是转发的，那么请关闭这个特性。</p>
+
+<pre><code>    void tcp_v4_early_demux(struct sk_buff *skb)
+    {
+        const struct iphdr *iph;
+        const struct tcphdr *th;
+        struct sock *sk;
+
+        if (skb-&gt;pkt_type != PACKET_HOST)
+            return;
+
+        if (!pskb_may_pull(skb, skb_transport_offset(skb) + sizeof(struct tcphdr)))
+            return;
+
+        iph = ip_hdr(skb);
+        th = tcp_hdr(skb);
+
+        if (th-&gt;doff &lt; sizeof(struct tcphdr) / 4)
+            return;
+
+        sk = __inet_lookup_established(dev_net(skb-&gt;dev), &amp;tcp_hashinfo,
+                           iph-&gt;saddr, th-&gt;source,
+                           iph-&gt;daddr, ntohs(th-&gt;dest),
+                           skb-&gt;skb_iif);
+        if (sk) {
+            skb-&gt;sk = sk;
+            skb-&gt;destructor = sock_edemux;
+            if (sk-&gt;sk_state != TCP_TIME_WAIT) {
+                struct dst_entry *dst = sk-&gt;sk_rx_dst;
+
+                if (dst)
+                    dst = dst_check(dst, 0);
+                if (dst &amp;&amp;
+                    inet_sk(sk)-&gt;rx_dst_ifindex == skb-&gt;skb_iif)
+                    skb_dst_set_noref(skb, dst);
+            }
+        }
+    }
+</code></pre>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[tcp选项TCP_DEFER_ACCEPT]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2018/07/09/kernel-tcp_defer_accept/"/>
+    <updated>2018-07-09T00:24:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2018/07/09/kernel-tcp_defer_accept</id>
+    <content type="html"><![CDATA[<p><a href="http://www.pagefault.info/?p=346">http://www.pagefault.info/?p=346</a></p>
+
+<p>TCP_DEFER_ACCEPT这个选项可能大家都知道，不过我这里会从源码和数据包来详细的分析这个选项。要注意，这里我所使用的内核版本是3.0.</p>
+
+<p>首先看man手册中的介绍(man 7 tcp):
+<code>
+    TCP_DEFER_ACCEPT (since Linux 2.4)
+    Allow a listener to be awakened only when data arrives on the socket. Takes an integer value (seconds), this can bound the maximum number of attempts TCP will make to complete the connection. This option should not be used in code intended to be portable.
+</code></p>
+
+<p>  我先来简单介绍下，这个选项主要是针对server端的服务器，一般来说我们三次握手，当客户端发送syn，然后server端接收到，然后发送syn + ack,然后client接收到syn+ack之后，再次发送ack(client进入establish状态),最终server端收到最后一个ack，进入establish状态。</p>
+
+<p>  而当正确的设置了TCP_DEFER_ACCEPT选项之后，server端会在接收到最后一个ack之后，并不进入establish状态，而只是将这个socket标记为acked，然后丢掉这个ack。此时server端这个socket还是处于syn_recved，然后接下来就是等待client发送数据， 而由于这个socket还是处于syn_recved,因此此时就会被syn_ack定时器所控制，对syn ack进行重传,而重传次数是由我们设置TCP_DEFER_ACCEPT传进去的值以及TCP_SYNCNT选项，proc文件系统的tcp_synack_retries一起来决定的(后面分析源码会看到如何来计算这个值).而我们知道我们传递给TCP_DEFER_ACCEPT的是秒，而在内核里面会将这个东西转换为重传次数.</p>
+
+<p>这里要注意，当重传次数超过限制之后，并且当最后一个ack到达时，下一次导致超时的synack定时器还没启动，那么这个defer的连接将会被加入到establish队列，然后通知上层用户。这个也是符合man里面所说的(Takes an integer value (seconds), this can bound the maximum number of attempts TCP will make to complete the connection.) 也就是最终会完成这个连接.</p>
+
+<p>我们来看抓包，这里server端设置deffer accept，然后客户端connect并不发送数据，我们来看会发生什么:</p>
+
+<pre><code>    //客户端发送syn
+    19:38:20.631611 IP T-diaoliang.60277 &gt; T-diaoliang.sunproxyadmin: Flags [S], seq 2500439144, win 32792, options [mss 16396,sackOK,TS val 9008384 ecr 0,nop,wscale 4], length 0
+    //server回了syn+ack
+    19:38:20.631622 IP T-diaoliang.sunproxyadmin &gt; T-diaoliang.60277: Flags [S.], seq 1342179593, ack 2500439145, win 32768, options [mss 16396,sackOK,TS val 9008384 ecr 9008384,nop,wscale 4], length 0
+
+    //client发送最后一个ack
+    19:38:20.631629 IP T-diaoliang.60277 &gt; T-diaoliang.sunproxyadmin: Flags [.], ack 1, win 2050, options [nop,nop,TS val 9008384 ecr 9008384], length 0
+
+    //这里注意时间，可以看到过了大概1分半之后，server重新发送了syn+ack
+    19:39:55.035893 IP T-diaoliang.sunproxyadmin &gt; T-diaoliang.60277: Flags [S.], seq 1342179593, ack 2500439145, win 32768, options [mss 16396,sackOK,TS val 9036706 ecr 9008384,nop,wscale 4], length 0
+    19:39:55.035899 IP T-diaoliang.60277 &gt; T-diaoliang.sunproxyadmin: Flags [.], ack 1, win 2050, options [nop,nop,TS val 9036706 ecr 9036706,nop,nop,sack 1 {0:1}], length 0
+
+    //再过了1分钟，server close掉这条连接。
+    19:40:55.063435 IP T-diaoliang.sunproxyadmin &gt; T-diaoliang.60277: Flags [F.], seq 1, ack 1, win 2048, options [nop,nop,TS val 9054714 ecr 9036706], length 0
+
+    19:40:55.063692 IP T-diaoliang.60277 &gt; T-diaoliang.sunproxyadmin: Flags [F.], seq 1, ack 2, win 2050, options [nop,nop,TS val 9054714 ecr 9054714], length 0
+
+    19:40:55.063701 IP T-diaoliang.sunproxyadmin &gt; T-diaoliang.60277: Flags [.], ack 2, win 2048, options [nop,nop,TS val 9054714 ecr 9054714], length 0
+</code></pre>
+
+<p>这里要注意，close的原因是当synack超时之后，nginx接收到了这条连接，然后读事件超时，最终导致close这条连接。</p>
+
+<p>接下来就来看内核的代码。</p>
+
+<p>先从设置TCP_DEFER_ACCEPT开始，设置TCP_DEFER_ACCEPT是通过setsockopt来做的，而传递给内核的值是秒，下面就是内核中对应的do_tcp_setsockopt函数，它用来设置tcp相关的option，下面我们能看到主要就是将传递进去的val转换为将要重传的次数。</p>
+
+<pre><code>    case TCP_DEFER_ACCEPT:
+        /* Translate value in seconds to number of retransmits */
+        //注意参数
+        icsk-&gt;icsk_accept_queue.rskq_defer_accept =
+        secs_to_retrans(val, TCP_TIMEOUT_INIT / HZ, TCP_RTO_MAX / HZ);
+        break;
+</code></pre>
+
+<p>这里可以看到通过调用secs_to_retrans来将秒转换为重传次数。接下来就来看这个函数，它有三个参数，第一个是将要转换的秒，第二个是RTO的初始值，第三个是RTO的最大值。 可以看到这里都是依据RTO来计算的，这是因为这个重传次数是syn_ack的重传次数。</p>
+
+<p>这个函数实现很简单，就是一个定时器退避的计算过程(定时器退避可以看我前面的blog的介绍)，每次乘2，然后来计算重传次数。</p>
+
+<pre><code>    static u8 secs_to_retrans(int seconds, int timeout, int rto_max)
+    {
+        u8 res = 0;
+
+        if (seconds &gt; 0) {
+            int period = timeout;
+            //重传次数
+            res = 1;
+            //开始遍历
+            while (seconds &gt; period &amp;&amp; res &lt; 255) {
+                res++;
+                //定时器退避
+                timeout &lt;&lt;= 1;
+                if (timeout &gt; rto_max)
+                    timeout = rto_max;
+                //定时器的秒数
+                period += timeout;
+            }
+        }
+        return res;
+    }
+</code></pre>
+
+<p>然后来看当server端接收到最后一个ack的处理，这里只关注defer_accept的部分,这个函数是tcp_check_req，它主要用来检测SYN_RECV状态接收到包的校验。</p>
+
+<p>req->retrans表示已经重传的次数。</p>
+
+<p>acked标记主要是为了syn_ack定时器来使用的。</p>
+
+<pre><code>    //两个条件，一个是重传次数小于defer_accept，一个是序列号，这两个都必须满足。
+    if (req-&gt;retrans &lt; inet_csk(sk)-&gt;icsk_accept_queue.rskq_defer_accept &amp;&amp;
+        TCP_SKB_CB(skb)-&gt;end_seq == tcp_rsk(req)-&gt;rcv_isn + 1) {
+        //此时设置acked。
+        inet_rsk(req)-&gt;acked = 1;
+        NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_TCPDEFERACCEPTDROP);
+        return NULL;
+    }
+</code></pre>
+
+<p>而当tcp_check_req返回之后，在tcp_v4_do_rcv中会丢掉这个包，让socket继续保存在半连接队列中。</p>
+
+<p>然后来看syn ack定时器，这个定时器我以前有分析过（<a href="http://simohayha.iteye.com/admin/blogs/481989">http://simohayha.iteye.com/admin/blogs/481989</a>)
+，因此我这里只是简要的再次分析下。如果需要更详细的分析，可以看我上面的链接,这个定时器会调用inet_csk_reqsk_queue_prune函数，在这个函数中做相关的处理。</p>
+
+<p>这里我们就主要关注重试次数。其中icsk_syn_retries是TCP_SYNCNT这个option设置的。这个值会比sysctl_tcp_synack_retries优先.然后是rskq_defer_accept，它又比icsk_syn_retries优先.</p>
+
+<pre><code>    void inet_csk_reqsk_queue_prune(struct sock *parent,
+                    const unsigned long interval,
+                    const unsigned long timeout,
+                    const unsigned long max_rto)
+    {
+        ........................
+        //最大的重试次数
+        int max_retries = icsk-&gt;icsk_syn_retries ? : sysctl_tcp_synack_retries;
+        int thresh = max_retries;
+        unsigned long now = jiffies;
+        struct request_sock **reqp, *req;
+        int i, budget;
+
+        ....................................
+        //更新设置最大的重试次数。
+        if (queue-&gt;rskq_defer_accept)
+            max_retries = queue-&gt;rskq_defer_accept;
+
+        budget = 2 * (lopt-&gt;nr_table_entries / (timeout / interval));
+        i = lopt-&gt;clock_hand;
+
+        do {
+            reqp=&amp;lopt-&gt;syn_table[i];
+            while ((req = *reqp) != NULL) {
+                if (time_after_eq(now, req-&gt;expires)) {
+                    int expire = 0, resend = 0;
+                    //这个函数主要是判断超时和是否重新发送syn ack，然后保存在expire和resend这个变量中。
+                    syn_ack_recalc(req, thresh, max_retries,
+                               queue-&gt;rskq_defer_accept,
+                               &amp;expire, &amp;resend);
+                    ....................................................
+                    if (!expire &amp;&amp;
+                        (!resend ||
+                         !req-&gt;rsk_ops-&gt;rtx_syn_ack(parent, req, NULL) ||
+                         inet_rsk(req)-&gt;acked)) {
+                        unsigned long timeo;
+                        //更新重传次数。
+                        if (req-&gt;retrans++ == 0)
+                            lopt-&gt;qlen_young--;
+                        timeo = min((timeout &lt;&lt; req-&gt;retrans), max_rto);
+                        req-&gt;expires = now + timeo;
+                        reqp = &amp;req-&gt;dl_next;
+                        continue;
+                    }
+                    //如果超时，则丢掉这个请求，并对应的关闭连接.
+                    /* Drop this request */
+                    inet_csk_reqsk_queue_unlink(parent, req, reqp);
+                    reqsk_queue_removed(queue, req);
+                    reqsk_free(req);
+                    continue;
+                }
+                reqp = &amp;req-&gt;dl_next;
+            }
+
+            i = (i + 1) &amp; (lopt-&gt;nr_table_entries - 1);
+
+        } while (--budget &gt; 0);
+        ...............................................
+    }
+</code></pre>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[TCP_CORK以及TCP_NODELAY]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2018/07/08/kernel-nodelay_cork/"/>
+    <updated>2018-07-08T23:53:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2018/07/08/kernel-nodelay_cork</id>
+    <content type="html"><![CDATA[<p>默认情况下 tp->nodelay = 0; 也就是delay=1</p>
+
+<hr />
+
+<p><a href="https://blog.csdn.net/dog250/article/details/5941637">https://blog.csdn.net/dog250/article/details/5941637</a></p>
+
+<p>  所谓的cork就是塞子的意思，形象地理解就是用cork将连接塞住，使得数据先不发出去，等到拔去塞子后再发出去，而nodelay事实上是为了禁用Nagle算法，Nagle算法为了增加了网络的吞吐量而牺牲了响应时间体验，这在有些应用中是不合适的，比如交互式应用(终端登录或者远程X应用 etc.)，因此有必要提供一个选项将它禁用掉，Nagle算法在RFC1122中有提及，它的实现实际上很简单，利用了tcp本身的一些特性，在算法描述中，关键的一点是“什么时候真实的发送数据”，这个问题的解答也是很简单，原则上只要发出的包都被对端ack了就可以发送了，这实际上也是一种权衡，Nagle算法最初的目的在于解决大量小包存在于网络从而造成网络拥塞的问题(一个小包可能只有几个字节，比如ls，cat等等，然而为每个小包封装几个协议头，其大小就不可忽视了，大量此类小包存在于网络势必会使得网络带宽的利用率大大下降)，如果包被ack了，说明包已经离开了网络进入了对端主机，这样就可以发送数据了，此时无需再等，有多少数据发送多少(当然要考虑窗口大小和MTU)，如果很极端地等待更多的数据，那么响应度会更低，换句话简单的说Nagle算法只允许一个未被ack的包存在于网络，它并不管包的大小。</p>
+
+<p>  可以看出，Nagle算法完全由tcp协议的ack机制决定，这会带来一些问题，比如如果对端ack回复很快的话，Nagle事实上不会拼接太多的数据包，虽然避免了网络拥塞，网络总体的利用率依然很低，Nagle真的做到了“只做好一件事”的原则，然而有没有另外一种算法，可以提高整体网络利用率呢？也就是说尽量以不能再多的数据发送，这里之所以说是尽量还是权衡导致的，某时可以发送数据的时候将会发送数据，即使当前数据再小也不再等待后续的可能拼接成更大包的数据的到来。</p>
+
+<p>  实际上，这样的需求可以用TCP_CORK来实现，但是实现得可能并不像你想象的那么完美，cork并不会将连接完全塞住。内核其实并不知道应用层到底什么时候会发送第二批数据用于和第一批数据拼接以达到MTU的大小，因此内核会给出一个时间限制，在该时间内没有拼接成一个大包(努力接近MTU)的话，内核就会无条件发送，这里给出的只是一个大致的思想，真实的情况还要受到窗口大小以及拥塞情况的影响，因此tcp“何时发送数据”这个问题非常复杂。</p>
+
+<p>  Nagle算法主要避免网络因为太多的小包(协议头的比例非常之大)而拥塞，而CORK算法则是为了提高网络的利用率，使得总体上协议头占用的比例尽可能的小。如此看来这二者在避免发送小包上是一致的，在用户控制的层面上，Nagle算法完全不受用户socket的控制，你只能简单的设置TCP_NODELAY而禁用它，CORK算法同样也是通过设置或者清除TCP_cork使能或者禁用之，然而Nagle算法关心的是网络拥塞问题，只要所有的ack回来则发包，而CORK算法却可以关心内容，在前后数据包发送间隔很短的前提下(很重要，否则内核会帮你将分散的包发出)，即使你是分散发送多个小数据包，你也可以通过使能CORK算法将这些内容拼接在一个包内，如果此时用Nagle算法的话，则可能做不到这一点。</p>
+
+<p>  接下来看一下内核代码，然后给出一个测试程序来感性感受这些选项。tcp的发送函数是tcp_sendmsg，这个函数中存在一个大循环，用于将用户数据置入skb中，它的形式如下：</p>
+
+<pre><code>    int tcp_sendmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
+            size_t size)
+    {
+
+        while (--iovlen &gt;= 0) {
+            0.更新数据结构元数据；
+            while (seglen &gt; 0) {
+                int copy;
+                skb = sk-&gt;sk_write_queue.prev;
+                1.如果既有skb的长度过大或者根本还没有一个skb则分配一个skb；
+                2.将数据拷贝到既有的skb或者新的skb中；
+                3.更新skb和用户数据的元数据；
+                //如果数据还没有达到mss，则继续，换句话就是如果数据已经达到mss了就接着往下走来权衡是否马上发送。
+                if (skb-&gt;len != mss_now || (flags &amp; MSG_OOB))
+                    continue;
+                4.权衡发送与否
+                continue;
+            }
+        }
+    out:
+        //如果循环完成，所有数据都进入了skb，调用tcp_push来权衡是否发送
+        tcp_push(sk, tp, flags, mss_now, tp-&gt;nonagle);
+    }
+
+    tcp_push很短但是很复杂，
+    static inline void tcp_push(struct sock *sk, struct tcp_opt *tp, int flags,
+                    int mss_now, int nonagle)
+    {
+        if (sk-&gt;sk_send_head) {
+            struct sk_buff *skb = sk-&gt;sk_write_queue.prev;
+            ...
+            //如果有MSG_MORE，则当作cork来处理
+            __tcp_push_pending_frames(sk, tp, mss_now,
+                          (flags &amp; MSG_MORE) ? TCP_NAGLE_CORK : nonagle);
+        }
+    }
+
+    static __inline__ void __tcp_push_pending_frames(struct sock *sk,
+                             struct tcp_opt *tp,
+                             unsigned cur_mss,
+                             int nonagle)
+    {
+        struct sk_buff *skb = sk-&gt;sk_send_head;
+        if (skb) {
+            if (!tcp_skb_is_last(sk, skb)) //如果已经有了很多的skb，则尽量马上发送
+                nonagle = TCP_NAGLE_PUSH;
+            //只有tcp_snd_test返回1才会发送数据，该函数很复杂
+            if (!tcp_snd_test(tp, skb, cur_mss, nonagle) ||
+                tcp_write_xmit(sk, nonagle))
+                tcp_check_probe_timer(sk, tp);
+        }
+        tcp_cwnd_validate(sk, tp);
+    }
+
+    static __inline__ int tcp_snd_test(struct tcp_opt *tp, struct sk_buff *skb,
+                       unsigned cur_mss, int nonagle)
+    {
+        //如果有TCP_NAGLE_PUSH标志(或者tcp_nagle_check同意发送)且未ack的数据够少且...则可以发送
+        return (((nonagle&amp;TCP_NAGLE_PUSH) || tp-&gt;urg_mode
+             || !tcp_nagle_check(tp, skb, cur_mss, nonagle)) &amp;&amp;
+            ((tcp_packets_in_flight(tp) &lt; tp-&gt;snd_cwnd) ||
+             (TCP_SKB_CB(skb)-&gt;flags &amp; TCPCB_FLAG_FIN)) &amp;&amp;
+            !after(TCP_SKB_CB(skb)-&gt;end_seq, tp-&gt;snd_una + tp-&gt;snd_wnd));
+    }
+</code></pre>
+
+<p>tcp_nagle_check函数是一个很重要的函数，它基本决定了数据是否可以发送的80%，内核源码中对该函数有一条注释：<br/>
+-3. Or TCP_NODELAY was set.<br/>
+-4. Or TCP_CORK is not set, and all sent packets are ACKed.</p>
+
+<p>就是说如果TCP_NODELAY值为1就可以直接发送，或者cork被禁用的情况下所有发出的包都被ack了也可以发送数据，这里体现的就是Nagle算法和CORK算法的区别了，Nagle算法只要求所有的出发包都ack就可以发送，而不管当前包是否足够大(虽然它通过tcp_minshall_check保证了包不太小)，而如果启用cork的话，可能仅仅数据被ack就不够了，这就是为何在代码注释中说cork要比Nagle更stronger的原因，同时这段代码也说明了为何TCP_CORK和TCP_NODELAY不能一起使用的原因，它们有共同的东西，却在做着不同的事情。看看tcp_nagle_check：
+<code>
+    static __inline__ int
+    tcp_nagle_check(struct tcp_opt *tp, struct sk_buff *skb, unsigned mss_now, int nonagle)
+    {
+        return (skb-&gt;len &lt; mss_now &amp;&amp;
+            !(TCP_SKB_CB(skb)-&gt;flags &amp; TCPCB_FLAG_FIN) &amp;&amp;
+            ((nonagle &amp; TCP_NAGLE_CORK) ||
+                (!nonagle &amp;&amp; tp-&gt;packets_out &amp;&amp; tcp_minshall_check(tp))));
+    }
+</code></p>
+
+<p>看看<code>__tcp_push_pending_frames</code>的最后，有一个tcp_check_probe_timer调用，就是说在没有数据被发送的时候会调用这个函数。这个函数有两个作用，第一个是防止0窗口导致的死锁，另一个作用就是定时发送由于使能了CORK算法或者Nagle算法一直等待新数据拼接而没有机会发送的数据包。这个timer内置在重传timer之中，其时间间隔和rtt有关，一旦触发则会发送数据包或者窗口探测包。反过来可以理解，如果没有这个timer的话，启用cork的连接将几乎(可能根据实现的不同还会受别的因素影响，太复杂了)每次都发送mtu大小的数据包。该timer调用tcp_probe_timer函数：
+<code>
+    static void tcp_probe_timer(struct sock *sk)
+    {
+        struct tcp_opt *tp = tcp_sk(sk);
+        int max_probes;
+        //1.如果有数据在网络上，则期望马上回来ack，ack中会通告对端窗口
+        //2.如果没有数据要发送，则无需关注对端窗口，即使为0也无所谓
+        if (tp-&gt;packets_out || !sk-&gt;sk_send_head) {
+            tp-&gt;probes_out = 0;
+            return;
+        }
+        //这个sysctl_tcp_retries2是可以调整的
+        max_probes = sysctl_tcp_retries2;
+        if (tp-&gt;probes_out &gt; max_probes) {
+            tcp_write_err(sk);
+        } else {
+            tcp_send_probe0(sk);
+        }
+    }
+</code></p>
+
+<p>tcp_send_probe0会调用tcp_write_wakeup函数，该函数会要么发送可以发送的数据，如果由于发送队列越过了发送窗口导致不能发送，则发送一个窗口探测包：
+<code>
+    int tcp_write_wakeup(struct sock *sk)
+    {
+        if (sk-&gt;sk_state != TCP_CLOSE) {
+            struct tcp_opt *tp = tcp_sk(sk);
+            struct sk_buff *skb;
+            if ((skb = sk-&gt;sk_send_head) != NULL &amp;&amp;
+                before(TCP_SKB_CB(skb)-&gt;seq, tp-&gt;snd_una+tp-&gt;snd_wnd)) {
+                ...//在sk_send_head队列上取出一个发送出去，其ack会带回对端通告窗口的大小
+                err = tcp_transmit_skb(sk, skb_clone(skb, GFP_ATOMIC));
+                ...
+                return err;
+            } else {
+                ...
+                return tcp_xmit_probe_skb(sk, 0);
+            }
+        }
+        return -1;
+    }
+</code></p>
+
+<p>  这个probe timer虽然一定程度阻碍了cork的满载发送，然而它却是必要的，这是由于tcp并不为纯的ack包(不带数据的ack包)提供确认，因此一旦这种ack包丢失，那么就有可能死锁，发送端的窗口无法更新，接收端由于已经发送了ack而等待接收数据，两端就这样僵持起来，因此需要一个timer，定期发送一个探测包，一个ack丢失，不能所有的ack都丢失吧，在timer到期时，如果本来发送队列上有数据要发送，则直接发送这些数据而不再发送探测包，因为发送了这些数据，所以它“破坏”了cork的承诺，不过也因此增强了响应度。</p>
+
+<p>  udp没有连接，没有确认，因此也就不需要什么timer之类的复杂机制，也因此，它是真正承诺的cork，除非你在应用层手工拔掉塞子，否则数据将不会发出。</p>
+]]></content>
+  </entry>
+  
+</feed>
