@@ -62,6 +62,1182 @@ if (query != null) {
       
   <header>
     
+      <h2 class="entry-title"><a href="/blog/2013/05/24/debug-kretprobe/">Linux内核kretprobe机制</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2013-05-24T10:22:00+08:00'><span class='date'>2013-05-24</span> <span class='time'>10:22:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://www.ibm.com/developerworks/cn/linux/l-cn-systemtap1/index.html">http://www.ibm.com/developerworks/cn/linux/l-cn-systemtap1/index.html</a></p>
+
+<p>  kretprobe也使用了kprobes来实现，当用户调用register_kretprobe()时，kprobe在被探测函数的入口建立 了一个探测点，当执行到探测点时，kprobe保存了被探测函数的返回地址并取代返回地址为一个trampoline的地址，kprobe在初始化时定义 了该trampoline并且为该trampoline注册了一个kprobe,当被探测函数执行它的返回指令时，控制传递到该trampoline，因 此kprobe已经注册的对应于trampoline的处理函数将被执行，而该处理函数会调用用户关联到该kretprobe上的处理函数，处理完毕后， 设置指令寄存器指向已经备份的函数返回地址，因而原来的函数返回被正常执行。</p>
+
+<p>  被探测函数的返回地址保存在类型为 kretprobe_instance的变量中，结构kretprobe的maxactive字段指定了被探测函数可以被同时探测的实例数，函数 register_kretprobe()将预分配指定数量的kretprobe_instance。如果被探测函数是非递归的并且调用时已经保持了自旋 锁（spinlock），那么maxactive为1就足够了；  如果被探测函数是非递归的且运行时是抢占失效的，那么maxactive为NR_CPUS就可以了；如果maxactive被设置为小于等于0,  它被设置到缺省值（如果抢占使能， 即配置了  CONFIG_PREEMPT，缺省值为10和2*NR_CPUS中的最大值，否则缺省值为NR_CPUS）。</p>
+
+<p>  如果 maxactive被设置的太小了，一些探测点的执行可能被丢失，但是不影响系统的正常运行，在结构kretprobe中nmissed字段将记录被丢失 的探测点执行数，它在返回探测点被注册时设置为0，每次当执行探测函数而没有kretprobe_instance可用时，它就加1。</p>
+
+<p><a href="http://hi.baidu.com/lixiang1988/item/8884bc286c9920ceddf69acd">http://hi.baidu.com/lixiang1988/item/8884bc286c9920ceddf69acd</a></p>
+
+<h4>kretprobe的实现</h4>
+
+<p>相关数据结构与函数分析</p>
+
+<h5>1)　struct kretprobe结构</h5>
+
+<p>  该结构是kretprobe实现的基础数据结构，以下是该结构的成员：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct kprobe kp; //该成员是kretprobe内嵌的struct kprobe结构。
+</span><span class='line'>kretprobe_handler_t handler;//该成员是调试者定义的回调函数。
+</span><span class='line'>int maxactive;//该成员是最多支持的返回地址实例数。
+</span><span class='line'>int nmissed;//该成员记录有多少次该函数返回没有被回调函数处理。
+</span><span class='line'>struct hlist_head free_instances;
+</span><span class='line'>用于链接未使用的返回地址实例，在注册时初始化。
+</span><span class='line'>struct hlist_head used_instances;//该成员是正在被使用的返回地址实例链表。</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>2)　struct kretprobe_instance结构</h5>
+
+<p>  该结构表示一个返回地址实例。因为函数每次被调用的地方不同，这造成了返回地址不同，因此需要为每一次发生的调用记录在这样一个结构里面。以下是该结构的成员：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct hlist_node uflist;
+</span><span class='line'>该成员被链接入kretprobe的used_instances或是free_instances链表。
+</span><span class='line'>struct kretprobe *rp;//该成员指向所属的kretprobe结构。
+</span><span class='line'>kprobe_opcode_t *ret_addr;//该成员用于记录被探测函数正真的返回地址。
+</span><span class='line'>struct task_struct *task;//该成员记录当时运行的进程。</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>3)　pre_handler_kretprobe()函数</h5>
+
+<p>  该函数在kretprobe探测点被执行到后，用于修改被探测函数的返回地址。</p>
+
+<h5>4)　trampoline_handler()函数</h5>
+
+<p>  该函数用于执行调试者定义的回调函数以及把被探测函数的返回地址修改回原来的返回地址。</p>
+
+<h4>kretprobe处理流程分析</h4>
+
+<p>  kretprobe探测方式是基于kprobe实现的又一种内核探测方式，该探测方式主要用于在函数返回时进行探测，获得内核函数的返回值，还可以用于计算函数执行时间等方面。</p>
+
+<h5>1)　kretprobe的注册过程</h5>
+
+<p>  调试者要进行kretprobe调试首先要注册处理，这需要在调试模块中调用register_kretprobe()，下文中称该函数为 kretprobe  注册器。kretprobe注册器对传入的kretprobe结构的中kprobe.pre_handler赋值为 pre_handler_kretprobe()函数，用于在探测点被触发时被调用。接着，kretprobe注册器还会初始化kretprobe的一些 成员，比如分配返回地址实例的空间等操作。最后，kretprobe注册器会利用  kretprobe内嵌的structkprobe结构进行kropbe的注册。自此，kretprobe注册过程就完成了。</p>
+
+<h5>2)　kretprobe探测点的触发过程</h5>
+
+<p>  kretprobe触发是在刚进入被探测函数的第一条汇编指令时发生的，因为 kretprobe注册时把该地址修改位int3指令。<br/>
+  此时发生了一次CPU异常处理，这与kprobe探测点被触发相同。但与kprobe处理不同的是，这里并不是运行用户定义的pre_handler函 数，而是执行pre_handler_kretprobe()函数，该函数又会调用arch_prepare_kretprobe()函数。 arch_prepare_kretprobe()函数的主要功能是把被探测函数的返回地址变换为&amp;kretprobe_trampoline所 在的地址，这是一个汇编地址标签。这个标签的地址在kretprobe_trampoline_holder()中用汇编伪指令定义。替换函数返回地址是 kretprobe实现的关键。当被探测函数返回时，返回到&amp;kretprobe_trampoline地址处开始运行。</p>
+
+<p>  接着，在 一些保护现场的处理后，又去调用trampoline_handler()函数。该函数的主要有两个作用，一是根据当前的实例去运行用户定义的调试函数， 也就是kretprobe结构中的handler所指向的函数，二是把返回值设成被探测函数正真的返回地址。最后，在进行一些堆栈的处理后，被探测函数又 返回到了正常执行流程中去。</p>
+
+<p>  以上讨论的就是kretprobe的执行过程，可以看出，该调试方式的关键点在于修改被探测函数的返回地址到kprobes的控制流程中，之后再把返回地址修改到原来的返回地址并使得该函数继续正常执行。</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2013/05/24/debug-kprobe-base/">Linux内核kprobe机制</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2013-05-24T10:22:00+08:00'><span class='date'>2013-05-24</span> <span class='time'>10:22:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><ul>
+<li>探测点处理函数在运行时是失效抢占的，依赖于特定的架构，探测点处理函数运行时也可能是中断失效的。</li>
+<li><p>因此，对于任何探测点处理函数，不要使用导致睡眠或进程调度的任何内核函数（如尝试获得semaphore)。</p>
+
+<p>Kprobe机制是内核提供的一种调试机制，它提供了一种方法，能够在不修改现有代码的基础上，灵活的跟踪内核函数的执行。它的基本工作原理是：用户指定一个探测点，并把一个用户定义的处理函数关联到该探测点，当内核执行到该探测点时，相应的关联函数被执行，然后继续执行正常的代码路径。</p>
+
+<p>Kprobe提供了三种形式的探测点，一种是最基本的kprobe，能够在指定代码执行前、执行后进行探测，但此时不能访问被探测函数内的相关变量信 息；一种是jprobe，用于探测某一函数的入口，并且能够访问对应的函数参数；一种是kretprobe，用于完成指定函数返回值的探测功能。其中最基 本的就是kprobe机制，jprobe以及kretprobe的实现都依赖于kprobe，但其代码的实现都很巧妙，强烈建议每一个内核爱好者阅读。</p></li>
+</ul>
+
+
+<h4>代码：</h4>
+
+<h5>首先是struct kprobe结构，每一个探测点的基本结构。</h5>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>structkprobe {
+</span><span class='line'>&#9;/*用于保存kprobe的全局hash表，以被探测的addr为key*/
+</span><span class='line'>&#9;structhlist_node hlist;
+</span><span class='line'>
+</span><span class='line'>&#9;/* list of kprobes for multi-handler support */
+</span><span class='line'>&#9;/*当对同一个探测点存在多个探测函数时，所有的函数挂在这条链上*/
+</span><span class='line'>&#9;structlist_head list;
+</span><span class='line'>
+</span><span class='line'>&#9;/*count the number of times this probe was temporarily disarmed */
+</span><span class='line'>&#9;unsigned longnmissed;
+</span><span class='line'>
+</span><span class='line'>&#9;/* location of the probe point */
+</span><span class='line'>&#9;/*被探测的目标地址*/
+</span><span class='line'>&#9;kprobe_opcode_t *addr;
+</span><span class='line'>
+</span><span class='line'>&#9;/* Allow user to indicate symbol name of the probe point */
+</span><span class='line'>&#9;/*symblo_name的存在，允许用户指定函数名而非确定的地址*/
+</span><span class='line'>&#9;constchar*symbol_name;
+</span><span class='line'>
+</span><span class='line'>&#9;/* Offset into the symbol */
+</span><span class='line'>&#9;/*如果被探测点为函数内部某个指令，需要使用addr + offset的方式*/
+</span><span class='line'>&#9;unsigned intoffset;
+</span><span class='line'>
+</span><span class='line'>&#9;/* Called before addr is executed. */
+</span><span class='line'>&#9;/*探测函数，在目标探测点执行之前调用*/
+</span><span class='line'>&#9;kprobe_pre_handler_t pre_handler;
+</span><span class='line'>
+</span><span class='line'>&#9;/* Called after addr is executed, unless... */
+</span><span class='line'>&#9;/*探测函数，在目标探测点执行之后调用*/
+</span><span class='line'>&#9;kprobe_post_handler_t post_handler;
+</span><span class='line'>
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * ... called if executing addr causes a fault (eg. page fault).
+</span><span class='line'>&#9; * Return 1 if it handled fault, otherwise kernel will see it.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;kprobe_fault_handler_t fault_handler;
+</span><span class='line'>
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * ... called if breakpoint trap occurs in probe handler.
+</span><span class='line'>&#9; * Return 1 if it handled break, otherwise kernel will see it.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;kprobe_break_handler_t break_handler;
+</span><span class='line'>
+</span><span class='line'>&#9;/*opcode 以及 ainsn 用于保存被替换的指令码*/
+</span><span class='line'>
+</span><span class='line'>&#9;/* Saved opcode (which has been replaced with breakpoint) */
+</span><span class='line'>&#9;kprobe_opcode_t opcode;
+</span><span class='line'>
+</span><span class='line'>&#9;/* copy of the original instruction */
+</span><span class='line'>&#9;structarch_specific_insn ainsn;
+</span><span class='line'>
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * Indicates various status flags.
+</span><span class='line'>&#9; * Protected by kprobe_mutex after this kprobe is registered.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;u32 flags;
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  对于kprobe功能的实现主要利用了内核中的两个功能特性：异常（尤其是int 3），单步执行（EFLAGS中的TF标志）。</p>
+
+<h5>大概的流程：</h5>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'> 1）在注册探测点的时候，对被探测函数的指令码进行替换，替换为int 3的指令码；
+</span><span class='line'> 2）在执行int 3的异常执行中，通过通知链的方式调用kprobe的异常处理函数；
+</span><span class='line'> 3）在kprobe的异常出来函数中，判断是否存在pre_handler钩子，存在则执行；
+</span><span class='line'> 4）执行完后，准备进入单步调试，通过设置EFLAGS中的TF标志位，并且把异常返回的地址修改为保存的原指令码；
+</span><span class='line'> 5）代码返回，执行原有指令，执行结束后触发单步异常；
+</span><span class='line'> 6）在单步异常的处理中，清除单步标志，执行post_handler流程，并最终返回；</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  下面又进入代码时间，首先看一下kprobe模块的初始化代码，初始化代码主要做了两件事：标记出哪些代码是不能被探测的，这些代码属于kprobe实现的关键代码；注册通知链到die_notifier，用于接收异常通知。</p>
+
+<h5>初始化代码位于kernel/kprobes.c中</h5>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>staticint__init init_kprobes(void)
+</span><span class='line'>{
+</span><span class='line'>&#9;inti,err =0;
+</span><span class='line'>&#9;&#9;....
+</span><span class='line'>
+</span><span class='line'>&#9; /*kprobe_blacklist中保存的是kprobe实现的关键代码路径，这些函数不应该被kprobe探测*/
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * Lookup and populate the kprobe_blacklist.
+</span><span class='line'>&#9; *
+</span><span class='line'>&#9; * Unlike the kretprobe blacklist, we'll need to determine
+</span><span class='line'>&#9; * the range of addresses that belong to the said functions,
+</span><span class='line'>&#9; * since a kprobe need not necessarily be at the beginning
+</span><span class='line'>&#9; * of a function.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;for(kb =kprobe_blacklist;kb-&gt;name!=NULL;kb++){
+</span><span class='line'>&#9;&#9;kprobe_lookup_name(kb-&gt;name,addr);
+</span><span class='line'>&#9;&#9;if(!addr)
+</span><span class='line'>&#9;&#9;&#9;continue;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;kb-&gt;start_addr =(unsigned long)addr;
+</span><span class='line'>&#9;&#9;symbol_name =kallsyms_lookup(kb-&gt;start_addr,
+</span><span class='line'>&#9;&#9;&#9;&#9;&size,&offset,&modname,namebuf);
+</span><span class='line'>&#9;&#9;if(!symbol_name)
+</span><span class='line'>&#9;&#9;&#9;kb-&gt;range =0;
+</span><span class='line'>&#9;&#9;else
+</span><span class='line'>&#9;&#9;&#9;kb-&gt;range =size;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;&#9;....
+</span><span class='line'>&#9;if(!err)
+</span><span class='line'>&#9;&#9;/*注册通知链到die_notifier，用于接收int 3的异常信息*/
+</span><span class='line'>&#9;&#9;err =register_die_notifier(&kprobe_exceptions_nb);
+</span><span class='line'>&#9;&#9; ....
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>其中的通知链：</h5>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>staticstructnotifier_block kprobe_exceptions_nb ={
+</span><span class='line'>&#9;.notifier_call =kprobe_exceptions_notify,
+</span><span class='line'>&#9;/*优先级最高，保证最先执行*/
+</span><span class='line'>&#9;.priority =0x7fffffff /* we need to be notified first */
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<h6>kprobe的注册流程register_kprobe。</h6>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+<span class='line-number'>82</span>
+<span class='line-number'>83</span>
+<span class='line-number'>84</span>
+<span class='line-number'>85</span>
+<span class='line-number'>86</span>
+<span class='line-number'>87</span>
+<span class='line-number'>88</span>
+<span class='line-number'>89</span>
+<span class='line-number'>90</span>
+<span class='line-number'>91</span>
+<span class='line-number'>92</span>
+<span class='line-number'>93</span>
+<span class='line-number'>94</span>
+<span class='line-number'>95</span>
+<span class='line-number'>96</span>
+<span class='line-number'>97</span>
+<span class='line-number'>98</span>
+<span class='line-number'>99</span>
+<span class='line-number'>100</span>
+<span class='line-number'>101</span>
+<span class='line-number'>102</span>
+<span class='line-number'>103</span>
+<span class='line-number'>104</span>
+<span class='line-number'>105</span>
+<span class='line-number'>106</span>
+<span class='line-number'>107</span>
+<span class='line-number'>108</span>
+<span class='line-number'>109</span>
+<span class='line-number'>110</span>
+<span class='line-number'>111</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int__kprobes register_kprobe(structkprobe *p)
+</span><span class='line'>{
+</span><span class='line'>&#9;intret =0;
+</span><span class='line'>&#9;structkprobe *old_p;
+</span><span class='line'>&#9;structmodule *probed_mod;
+</span><span class='line'>&#9;kprobe_opcode_t *addr;
+</span><span class='line'>
+</span><span class='line'>&#9;/*获取被探测点的地址，指定了symbol_name，则从kallsyms中获取；指定了offset，则返回addr + offset*/
+</span><span class='line'>&#9;addr =kprobe_addr(p);
+</span><span class='line'>&#9;if(!addr)
+</span><span class='line'>&#9;&#9;return-EINVAL;
+</span><span class='line'>&#9;p-&gt;addr =addr;
+</span><span class='line'>
+</span><span class='line'>&#9;/*判断同一个kprobe是否被重复注册*/
+</span><span class='line'>&#9;ret =check_kprobe_rereg(p);
+</span><span class='line'>&#9;if(ret)
+</span><span class='line'>&#9;&#9;returnret;
+</span><span class='line'>
+</span><span class='line'>&#9;jump_label_lock();
+</span><span class='line'>&#9;preempt_disable();
+</span><span class='line'>&#9;/*判断被注册的函数是否位于内核的代码段内，或位于不能探测的kprobe实现路径中*/
+</span><span class='line'>&#9;if(!kernel_text_address((unsigned long)p-&gt;addr)||
+</span><span class='line'>&#9;&#9;in_kprobes_functions((unsigned long)p-&gt;addr)||
+</span><span class='line'>&#9;&#9;ftrace_text_reserved(p-&gt;addr,p-&gt;addr)||
+</span><span class='line'>&#9;&#9;jump_label_text_reserved(p-&gt;addr,p-&gt;addr))
+</span><span class='line'>&#9;&#9;gotofail_with_jump_label;
+</span><span class='line'>
+</span><span class='line'>&#9;/* User can pass only KPROBE_FLAG_DISABLED to register_kprobe */
+</span><span class='line'>&#9;p-&gt;flags&=KPROBE_FLAG_DISABLED;
+</span><span class='line'>
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * Check if are we probing a module.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;/*判断被探测的地址是否属于某一个模块，并且位于模块的text section内*/
+</span><span class='line'>&#9;probed_mod =__module_text_address((unsigned long)p-&gt;addr);
+</span><span class='line'>&#9;if(probed_mod){
+</span><span class='line'>&#9;&#9;/*如果被探测的为模块地址，首先要增加模块的引用计数*/
+</span><span class='line'>&#9;&#9;/*
+</span><span class='line'>&#9;&#9; * We must hold a refcount of the probed module while updating
+</span><span class='line'>&#9;&#9; * its code to prohibit unexpected unloading.
+</span><span class='line'>&#9;&#9; */
+</span><span class='line'>&#9;&#9;if(unlikely(!try_module_get(probed_mod)))
+</span><span class='line'>&#9;&#9;&#9;gotofail_with_jump_label;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;/*
+</span><span class='line'>&#9;&#9; * If the module freed .init.text, we couldn't insert
+</span><span class='line'>&#9;&#9; * kprobes in there.
+</span><span class='line'>&#9;&#9; */
+</span><span class='line'>&#9;&#9;/*如果被探测的地址位于模块的init地址段内，但该段代码区间已被释放，则直接退出*/
+</span><span class='line'>&#9;&#9;if(within_module_init((unsigned long)p-&gt;addr,probed_mod)&&
+</span><span class='line'>&#9;&#9;&#9;probed_mod-&gt;state!=MODULE_STATE_COMING){
+</span><span class='line'>&#9;&#9;&#9;module_put(probed_mod);
+</span><span class='line'>&#9;&#9;&#9;gotofail_with_jump_label;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;preempt_enable();
+</span><span class='line'>&#9;jump_label_unlock();
+</span><span class='line'>
+</span><span class='line'>&#9;p-&gt;nmissed =0;
+</span><span class='line'>&#9;INIT_LIST_HEAD(&p-&gt;list);
+</span><span class='line'>&#9;mutex_lock(&kprobe_mutex);
+</span><span class='line'>
+</span><span class='line'>&#9;jump_label_lock();/* needed to call jump_label_text_reserved() */
+</span><span class='line'>
+</span><span class='line'>&#9;get_online_cpus();    /* For avoiding text_mutex deadlock. */
+</span><span class='line'>&#9;mutex_lock(&text_mutex);
+</span><span class='line'>
+</span><span class='line'>&#9;/*判断在同一个探测点是否已经注册了其他的探测函数*/
+</span><span class='line'>&#9;old_p =get_kprobe(p-&gt;addr);
+</span><span class='line'>&#9;if(old_p){
+</span><span class='line'>&#9;&#9;/* Since this may unoptimize old_p, locking text_mutex. */
+</span><span class='line'>&#9;&#9;/*如果已经存在注册过的kprobe，则将探测点的函数修改为aggr_pre_handler，并将所有的handler挂载到其链表上，由其负责所有handler函数的执行*/
+</span><span class='line'>&#9;&#9;ret =register_aggr_kprobe(old_p,p);
+</span><span class='line'>&#9;&#9;gotoout;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;/* 分配特定的内存地址用于保存原有的指令
+</span><span class='line'>&#9; * 按照内核注释，被分配的地址必须must be on special executable page on x86.
+</span><span class='line'>&#9; * 该地址被保存在kprobe-&gt;ainsn.insn
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;ret =arch_prepare_kprobe(p);
+</span><span class='line'>&#9;if(ret)
+</span><span class='line'>&#9;&#9;gotoout;
+</span><span class='line'>
+</span><span class='line'>&#9;/*将kprobe加入到相应的hash表内*/
+</span><span class='line'>&#9;INIT_HLIST_NODE(&p-&gt;hlist);
+</span><span class='line'>&#9;hlist_add_head_rcu(&p-&gt;hlist,
+</span><span class='line'>&#9;&#9;&#9;   &kprobe_table[hash_ptr(p-&gt;addr,KPROBE_HASH_BITS)]);
+</span><span class='line'>
+</span><span class='line'>&#9;if(!kprobes_all_disarmed &&!kprobe_disabled(p))
+</span><span class='line'>/*将探测点的指令码修改为int 3指令*/
+</span><span class='line'>&#9;&#9;__arm_kprobe(p);
+</span><span class='line'>
+</span><span class='line'>&#9;/* Try to optimize kprobe */
+</span><span class='line'>&#9;try_to_optimize_kprobe(p);
+</span><span class='line'>
+</span><span class='line'>out:
+</span><span class='line'>&#9;mutex_unlock(&text_mutex);
+</span><span class='line'>&#9;put_online_cpus();
+</span><span class='line'>&#9;jump_label_unlock();
+</span><span class='line'>&#9;mutex_unlock(&kprobe_mutex);
+</span><span class='line'>
+</span><span class='line'>&#9;if(probed_mod)
+</span><span class='line'>&#9;&#9;module_put(probed_mod);
+</span><span class='line'>
+</span><span class='line'>&#9;returnret;
+</span><span class='line'>
+</span><span class='line'>fail_with_jump_label:
+</span><span class='line'>&#9;preempt_enable();
+</span><span class='line'>&#9;jump_label_unlock();
+</span><span class='line'>&#9;return-EINVAL;</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>注册完毕，就开始kprobe的执行流程了。对于该探测点，由于其起始指令已经被修改为int3，因此在执行到该地址时，必然会触发3号中断向量的处理流程do_int3.</h5>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* May run on IST stack. */
+</span><span class='line'>dotraplinkage void__kprobes do_int3(structpt_regs *regs,longerror_code)
+</span><span class='line'>{
+</span><span class='line'>#ifdef CONFIG_KGDB_LOW_LEVEL_TRAP
+</span><span class='line'>&#9;if(kgdb_ll_trap(DIE_INT3,"int3",regs,error_code,3,SIGTRAP)
+</span><span class='line'>&#9;&#9;&#9;==NOTIFY_STOP)
+</span><span class='line'>&#9;&#9;return;
+</span><span class='line'>#endif /* CONFIG_KGDB_LOW_LEVEL_TRAP */
+</span><span class='line'>#ifdef CONFIG_KPROBES
+</span><span class='line'>&#9;/*在这里以DIE_INT3，通知kprobe注册的通知链*/
+</span><span class='line'>&#9;if(notify_die(DIE_INT3,"int3",regs,error_code,3,SIGTRAP)
+</span><span class='line'>&#9;&#9;&#9;==NOTIFY_STOP)
+</span><span class='line'>&#9;&#9;return;
+</span><span class='line'>#else
+</span><span class='line'>&#9;if(notify_die(DIE_TRAP,"int3",regs,error_code,3,SIGTRAP)
+</span><span class='line'>&#9;&#9;&#9;==NOTIFY_STOP)
+</span><span class='line'>&#9;&#9;return;
+</span><span class='line'>#endif
+</span><span class='line'>
+</span><span class='line'>&#9;preempt_conditional_sti(regs);
+</span><span class='line'>&#9;do_trap(3,SIGTRAP,"int3",regs,error_code,NULL);
+</span><span class='line'>&#9;preempt_conditional_cli(regs);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>在do_int3中触发kprobe注册的通知链函数，kprobe_exceptions_notify。由于kprobe以及jprobe等机制的处 理核心都在此函数内，这里只针对kprobe的流程进行分析：进入函数的原因是DIE_INT3,并且是第一次进入该函数。</h5>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+<span class='line-number'>82</span>
+<span class='line-number'>83</span>
+<span class='line-number'>84</span>
+<span class='line-number'>85</span>
+<span class='line-number'>86</span>
+<span class='line-number'>87</span>
+<span class='line-number'>88</span>
+<span class='line-number'>89</span>
+<span class='line-number'>90</span>
+<span class='line-number'>91</span>
+<span class='line-number'>92</span>
+<span class='line-number'>93</span>
+<span class='line-number'>94</span>
+<span class='line-number'>95</span>
+<span class='line-number'>96</span>
+<span class='line-number'>97</span>
+<span class='line-number'>98</span>
+<span class='line-number'>99</span>
+<span class='line-number'>100</span>
+<span class='line-number'>101</span>
+<span class='line-number'>102</span>
+<span class='line-number'>103</span>
+<span class='line-number'>104</span>
+<span class='line-number'>105</span>
+<span class='line-number'>106</span>
+<span class='line-number'>107</span>
+<span class='line-number'>108</span>
+<span class='line-number'>109</span>
+<span class='line-number'>110</span>
+<span class='line-number'>111</span>
+<span class='line-number'>112</span>
+<span class='line-number'>113</span>
+<span class='line-number'>114</span>
+<span class='line-number'>115</span>
+<span class='line-number'>116</span>
+<span class='line-number'>117</span>
+<span class='line-number'>118</span>
+<span class='line-number'>119</span>
+<span class='line-number'>120</span>
+<span class='line-number'>121</span>
+<span class='line-number'>122</span>
+<span class='line-number'>123</span>
+<span class='line-number'>124</span>
+<span class='line-number'>125</span>
+<span class='line-number'>126</span>
+<span class='line-number'>127</span>
+<span class='line-number'>128</span>
+<span class='line-number'>129</span>
+<span class='line-number'>130</span>
+<span class='line-number'>131</span>
+<span class='line-number'>132</span>
+<span class='line-number'>133</span>
+<span class='line-number'>134</span>
+<span class='line-number'>135</span>
+<span class='line-number'>136</span>
+<span class='line-number'>137</span>
+<span class='line-number'>138</span>
+<span class='line-number'>139</span>
+<span class='line-number'>140</span>
+<span class='line-number'>141</span>
+<span class='line-number'>142</span>
+<span class='line-number'>143</span>
+<span class='line-number'>144</span>
+<span class='line-number'>145</span>
+<span class='line-number'>146</span>
+<span class='line-number'>147</span>
+<span class='line-number'>148</span>
+<span class='line-number'>149</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int__kprobes kprobe_exceptions_notify(structnotifier_block *self,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;   unsigned longval,void*data)
+</span><span class='line'>{
+</span><span class='line'>&#9;structdie_args *args =data;
+</span><span class='line'>&#9;intret =NOTIFY_DONE;
+</span><span class='line'>
+</span><span class='line'>&#9;if(args-&gt;regs &&user_mode_vm(args-&gt;regs))
+</span><span class='line'>&#9;&#9;returnret;
+</span><span class='line'>
+</span><span class='line'>&#9;switch(val){
+</span><span class='line'>&#9;caseDIE_INT3:
+</span><span class='line'>/*对于kprobe，进入kprobe_handle*/
+</span><span class='line'>&#9;&#9;if(kprobe_handler(args-&gt;regs))
+</span><span class='line'>&#9;&#9;&#9;ret =NOTIFY_STOP;
+</span><span class='line'>&#9;&#9;break;
+</span><span class='line'>&#9;caseDIE_DEBUG:
+</span><span class='line'>&#9;&#9;if(post_kprobe_handler(args-&gt;regs)){
+</span><span class='line'>&#9;&#9;&#9;/*
+</span><span class='line'>&#9;&#9;&#9; * Reset the BS bit in dr6 (pointed by args-&gt;err) to
+</span><span class='line'>&#9;&#9;&#9; * denote completion of processing
+</span><span class='line'>&#9;&#9;&#9; */
+</span><span class='line'>&#9;&#9;&#9;(*(unsigned long*)ERR_PTR(args-&gt;err))&=~DR_STEP;
+</span><span class='line'>&#9;&#9;&#9;ret =NOTIFY_STOP;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;break;
+</span><span class='line'>&#9;caseDIE_GPF:
+</span><span class='line'>&#9;&#9;/*
+</span><span class='line'>&#9;&#9; * To be potentially processing a kprobe fault and to
+</span><span class='line'>&#9;&#9; * trust the result from kprobe_running(), we have
+</span><span class='line'>&#9;&#9; * be non-preemptible.
+</span><span class='line'>&#9;&#9; */
+</span><span class='line'>&#9;&#9;if(!preemptible()&&kprobe_running()&&
+</span><span class='line'>&#9;&#9;&#9;kprobe_fault_handler(args-&gt;regs,args-&gt;trapnr))
+</span><span class='line'>&#9;&#9;&#9;ret =NOTIFY_STOP;
+</span><span class='line'>&#9;&#9;break;
+</span><span class='line'>&#9;default:
+</span><span class='line'>&#9;&#9;break;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;returnret;
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>staticint__kprobes kprobe_handler(structpt_regs *regs)
+</span><span class='line'>{
+</span><span class='line'>&#9;kprobe_opcode_t *addr;
+</span><span class='line'>&#9;structkprobe *p;
+</span><span class='line'>&#9;structkprobe_ctlblk *kcb;
+</span><span class='line'>
+</span><span class='line'>&#9;/*对于int 3中断，其被Intel定义为Trap，那么异常发生时EIP寄存器内指向的为异常指令的后一条指令*/
+</span><span class='line'>&#9;addr =(kprobe_opcode_t *)(regs-&gt;ip -sizeof(kprobe_opcode_t));
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * We don't want to be preempted for the entire
+</span><span class='line'>&#9; * duration of kprobe processing. We conditionally
+</span><span class='line'>&#9; * re-enable preemption at the end of this function,
+</span><span class='line'>&#9; * and also in reenter_kprobe() and setup_singlestep().
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;preempt_disable();
+</span><span class='line'>
+</span><span class='line'>&#9;kcb =get_kprobe_ctlblk();
+</span><span class='line'>&#9;/*获取addr对应的kprobe*/
+</span><span class='line'>&#9;p =get_kprobe(addr);
+</span><span class='line'>
+</span><span class='line'>&#9;if(p){
+</span><span class='line'>/*如果异常的进入是由kprobe导致，则进入reenter_kprobe(jprobe需要，到时候分析)*/
+</span><span class='line'>&#9;&#9;if(kprobe_running()){
+</span><span class='line'>&#9;&#9;&#9;if(reenter_kprobe(p,regs,kcb))
+</span><span class='line'>&#9;&#9;&#9;&#9;return1;
+</span><span class='line'>&#9;&#9;}else{
+</span><span class='line'>&#9;&#9;&#9;set_current_kprobe(p,regs,kcb);
+</span><span class='line'>&#9;&#9;&#9;kcb-&gt;kprobe_status =KPROBE_HIT_ACTIVE;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;/*
+</span><span class='line'>&#9;&#9;&#9; * If we have no pre-handler or it returned 0, we
+</span><span class='line'>&#9;&#9;&#9; * continue with normal processing.  If we have a
+</span><span class='line'>&#9;&#9;&#9; * pre-handler and it returned non-zero, it prepped
+</span><span class='line'>&#9;&#9;&#9; * for calling the break_handler below on re-entry
+</span><span class='line'>&#9;&#9;&#9; * for jprobe processing, so get out doing nothing
+</span><span class='line'>&#9;&#9;&#9; * more here.
+</span><span class='line'>&#9;&#9;&#9; */
+</span><span class='line'>&#9;/*执行在此地址上挂载的pre_handle函数*/
+</span><span class='line'>&#9;&#9;&#9;if(!p-&gt;pre_handler ||!p-&gt;pre_handler(p,regs))
+</span><span class='line'>/*设置单步调试模式，为post_handle函数的执行做准备*/
+</span><span class='line'>&#9;&#9;&#9;&#9;setup_singlestep(p,regs,kcb,0);
+</span><span class='line'>&#9;&#9;&#9;return1;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;}elseif(*addr !=BREAKPOINT_INSTRUCTION){
+</span><span class='line'>&#9;&#9;/*
+</span><span class='line'>&#9;&#9; * The breakpoint instruction was removed right
+</span><span class='line'>&#9;&#9; * after we hit it.  Another cpu has removed
+</span><span class='line'>&#9;&#9; * either a probepoint or a debugger breakpoint
+</span><span class='line'>&#9;&#9; * at this address.  In either case, no further
+</span><span class='line'>&#9;&#9; * handling of this interrupt is appropriate.
+</span><span class='line'>&#9;&#9; * Back up over the (now missing) int3 and run
+</span><span class='line'>&#9;&#9; * the original instruction.
+</span><span class='line'>&#9;&#9; */
+</span><span class='line'>&#9;&#9;regs-&gt;ip =(unsigned long)addr;
+</span><span class='line'>&#9;&#9;preempt_enable_no_resched();
+</span><span class='line'>&#9;&#9;return1;
+</span><span class='line'>&#9;}elseif(kprobe_running()){
+</span><span class='line'>&#9;&#9;p =__this_cpu_read(current_kprobe);
+</span><span class='line'>&#9;&#9;if(p-&gt;break_handler &&p-&gt;break_handler(p,regs)){
+</span><span class='line'>&#9;&#9;&#9;setup_singlestep(p,regs,kcb,0);
+</span><span class='line'>&#9;&#9;&#9;return1;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;}/* else: not a kprobe fault; let the kernel handle it */
+</span><span class='line'>
+</span><span class='line'>&#9;preempt_enable_no_resched();
+</span><span class='line'>&#9;return0;
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>staticvoid__kprobes setup_singlestep(structkprobe *p,structpt_regs *regs,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;   structkprobe_ctlblk *kcb,intreenter)
+</span><span class='line'>{
+</span><span class='line'>&#9;if(setup_detour_execution(p,regs,reenter))
+</span><span class='line'>&#9;&#9;return;
+</span><span class='line'>
+</span><span class='line'>#if!defined(CONFIG_PREEMPT)
+</span><span class='line'>&#9;if(p-&gt;ainsn.boostable ==1 &&!p-&gt;post_handler){
+</span><span class='line'>&#9;&#9;/* Boost up -- we can execute copied instructions directly */
+</span><span class='line'>&#9;&#9;if(!reenter)
+</span><span class='line'>&#9;&#9;&#9;reset_current_kprobe();
+</span><span class='line'>&#9;&#9;/*
+</span><span class='line'>&#9;&#9; * Reentering boosted probe doesn't reset current_kprobe,
+</span><span class='line'>&#9;&#9; * nor set current_kprobe, because it doesn't use single
+</span><span class='line'>&#9;&#9; * stepping.
+</span><span class='line'>&#9;&#9; */
+</span><span class='line'>&#9;&#9;regs-&gt;ip =(unsigned long)p-&gt;ainsn.insn;
+</span><span class='line'>&#9;&#9;preempt_enable_no_resched();
+</span><span class='line'>&#9;&#9;return;
+</span><span class='line'>&#9;}
+</span><span class='line'>#endif
+</span><span class='line'>&#9;/*jprobe*/
+</span><span class='line'>&#9;if(reenter){
+</span><span class='line'>&#9;&#9;save_previous_kprobe(kcb);
+</span><span class='line'>&#9;&#9;set_current_kprobe(p,regs,kcb);
+</span><span class='line'>&#9;&#9;kcb-&gt;kprobe_status =KPROBE_REENTER;
+</span><span class='line'>&#9;}else
+</span><span class='line'>&#9;&#9;kcb-&gt;kprobe_status =KPROBE_HIT_SS;
+</span><span class='line'>&#9;/* Prepare real single stepping */
+</span><span class='line'>&#9;/*准备单步模式，设置EFLAGS的TF标志位，清楚IF标志位(禁止中断)*/
+</span><span class='line'>&#9;clear_btf();
+</span><span class='line'>&#9;regs-&gt;flags|=X86_EFLAGS_TF;
+</span><span class='line'>&#9;regs-&gt;flags&=~X86_EFLAGS_IF;
+</span><span class='line'>&#9;/* single step inline if the instruction is an int3 */
+</span><span class='line'>&#9;if(p-&gt;opcode ==BREAKPOINT_INSTRUCTION)
+</span><span class='line'>&#9;&#9;regs-&gt;ip =(unsigned long)p-&gt;addr;
+</span><span class='line'>&#9;else
+</span><span class='line'>/*设置异常返回的指令为保存的被探测点的指令*/
+</span><span class='line'>&#9;&#9;regs-&gt;ip =(unsigned long)p-&gt;ainsn.insn;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>对应kprobe,pre_handle的执行就结束了，按照代码，程序开始执行保存的被探测点的指令，由于开启了单步调试模式，执行完指令后会继续触发异常，这次的是do_debug异常处理流程。</h5>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>dotraplinkage void__kprobes do_debug(structpt_regs *regs,longerror_code)
+</span><span class='line'>{
+</span><span class='line'>&#9;....
+</span><span class='line'>
+</span><span class='line'>&#9;/*在do_debug中，以DIE_DEBUG再一次触发kprobe的通知链*/
+</span><span class='line'>&#9;if(notify_die(DIE_DEBUG,"debug",regs,PTR_ERR(&dr6),error_code,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9;SIGTRAP)==NOTIFY_STOP)
+</span><span class='line'>&#9;&#9;return;
+</span><span class='line'>   
+</span><span class='line'>&#9;....
+</span><span class='line'>&#9;return;
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>/*对于kprobe_exceptions_notify，其DIE_DEBUG处理流程*/
+</span><span class='line'>caseDIE_DEBUG:
+</span><span class='line'>&#9;&#9;if(post_kprobe_handler(args-&gt;regs)){
+</span><span class='line'>&#9;&#9;&#9;/*
+</span><span class='line'>&#9;&#9;&#9; * Reset the BS bit in dr6 (pointed by args-&gt;err) to
+</span><span class='line'>&#9;&#9;&#9; * denote completion of processing
+</span><span class='line'>&#9;&#9;&#9; */
+</span><span class='line'>&#9;&#9;&#9;(*(unsigned long*)ERR_PTR(args-&gt;err))&=~DR_STEP;
+</span><span class='line'>&#9;&#9;&#9;ret =NOTIFY_STOP;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;break;
+</span><span class='line'>
+</span><span class='line'>staticint__kprobes post_kprobe_handler(structpt_regs *regs)
+</span><span class='line'>{
+</span><span class='line'>&#9;structkprobe *cur =kprobe_running();
+</span><span class='line'>&#9;structkprobe_ctlblk *kcb =get_kprobe_ctlblk();
+</span><span class='line'>
+</span><span class='line'>&#9;if(!cur)
+</span><span class='line'>&#9;&#9;return0;
+</span><span class='line'>
+</span><span class='line'>&#9;/*设置异常返回的EIP为下一条需要执行的指令*/
+</span><span class='line'>&#9;resume_execution(cur,regs,kcb);
+</span><span class='line'>&#9;/*恢复异常执行前的EFLAGS*/
+</span><span class='line'>&#9;regs-&gt;flags|=kcb-&gt;kprobe_saved_flags;
+</span><span class='line'>
+</span><span class='line'>&#9;/*执行post_handler函数*/
+</span><span class='line'>&#9;if((kcb-&gt;kprobe_status !=KPROBE_REENTER)&&cur-&gt;post_handler){
+</span><span class='line'>&#9;&#9;kcb-&gt;kprobe_status =KPROBE_HIT_SSDONE;
+</span><span class='line'>&#9;&#9;cur-&gt;post_handler(cur,regs,0);
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;/* Restore back the original saved kprobes variables and continue. */
+</span><span class='line'>&#9;if(kcb-&gt;kprobe_status ==KPROBE_REENTER){
+</span><span class='line'>&#9;&#9;restore_previous_kprobe(kcb);
+</span><span class='line'>&#9;&#9;gotoout;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;reset_current_kprobe();
+</span><span class='line'>out:
+</span><span class='line'>&#9;preempt_enable_no_resched();
+</span><span class='line'>
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * if somebody else is singlestepping across a probe point, flags
+</span><span class='line'>&#9; * will have TF set, in which case, continue the remaining processing
+</span><span class='line'>&#9; * of do_debug, as if this is not a probe hit.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;if(regs-&gt;flags&X86_EFLAGS_TF)
+</span><span class='line'>&#9;&#9;return0;
+</span><span class='line'>
+</span><span class='line'>&#9;return1;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>至此，一个典型的kprobe的流程已经执行完毕了。</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2013/05/23/command-addr2line/">addr2line命令</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2013-05-23T18:14:00+08:00'><span class='date'>2013-05-23</span> <span class='time'>18:14:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p>这是一个示例程序，func函数返回参数a除以参数b的结果。这里使用0作为除数，结果就是程序因为除以0导致错误，直接中断了。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;stdio.h&gt;
+</span><span class='line'>int func(int a, int b)
+</span><span class='line'>{
+</span><span class='line'>&#9;return a / b;
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>int main()
+</span><span class='line'>{
+</span><span class='line'>&#9;int x = 10;
+</span><span class='line'>&#9;int y = 0;
+</span><span class='line'>&#9;printf("%d / %d = %d\n", x, y, func(x, y));
+</span><span class='line'>&#9;return 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>$ gcc -o test1 -g test1.c  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>编译程序，test1.c是程序文件名。执行程序，结果程序异常中断。查看系统dmesg信息，发现系统日志的错误信息：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>[54106.016179] test1[8352] trap divide error ip:400506 sp:7fff2add87e0 error:0 in test1[400000+1000]</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这条信息里的ip字段后面的数字就是test1程序出错时所程序执行的位置。使用addr2line就可以将400506转换成出错程序的位置：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>$ addr2line -e test1 400506  
+</span><span class='line'>/home/hanfoo/code/test/addr2line/test1.c:5</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这里的test1.c:5指的就是test1.c的第5行</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>return a / b;  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>也正是这里出现的错误。addr2line帮助我们解决了问题。</p>
+
+<p>  addr2line如何找到的这一行呢。在可执行程序中都包含有调试信息， 其中很重要的一份数据就是程序源程序的行号和编译后的机器代码之间的对应关系Line Number Table。DWARF格式的Line  Number Table是一种高度压缩的数据，存储的是表格前后两行的差值，在解析调试信息时，需要按照规则在内存里重建Line Number  Table才能使用。</p>
+
+<p>Line Number Table存储在可执行程序的.debug_line域，使用命令</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>$ readelf -w test1</span></code></pre></td></tr></table></div></figure>
+
+
+<p>可以输出DWARF的调试信息，其中有两行</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>Special opcode 146: advance Address by 10 to 0x4004fe and Line by 1 to 5  
+</span><span class='line'>Special opcode 160: advance Address by 11 to 0x400509 and Line by 1 to 6  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>这里说明机器二进制编码的0x4004fe位置开始，对应于源码中的第5行，0x400509开始就对应与源码的第6行了，所以400506这个地址对应的是源码第5行位置。</p>
+
+<p>addr2line通过分析调试信息中的Line Number Table自动就能把源码中的出错位置找出来.</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
       <h2 class="entry-title"><a href="/blog/2013/05/13/command-tcpdump/">抓包命令tcpdump</a></h2>
     
     
@@ -298,461 +1474,6 @@ UDP十分简单，上面的输出行表明从主机ROUTE的port1端口发出的�
 
     </article>
   
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2013/05/07/lang-c-flush-out/">C语言输出缓冲区函数说明</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2013-05-07T18:15:00+08:00'><span class='date'>2013-05-07</span> <span class='time'>18:15:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;stdio.h&gt;
-</span><span class='line'>#include &lt;unistd.h&gt;
-</span><span class='line'>
-</span><span class='line'>int main(void)
-</span><span class='line'>{
-</span><span class='line'>&#9;int i = 0;
-</span><span class='line'>&#9;while(1) {
-</span><span class='line'>&#9;&#9;printf("sleeping %d", i++); //(1)
-</span><span class='line'>&#9;&#9;fflush(stdout);
-</span><span class='line'>&#9;&#9;sleep(1);
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;return 0;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>1</h4>
-
-<p>printf将"sleeping %d"输出到标准输出文件的缓冲区中(缓冲区在内存上)，fflush(stdout)将缓冲区中的内容强制刷新到，并将其中的内容输出到显示器上(&ldquo;\n"回车换行 == fflush(stdout)+换行)</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>fflush()
-</span><span class='line'>buffer(In memroy) -----------&gt; hard disk/monitor</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>2</h4>
-
-<p>有三个流(stream)是自动打开的， 相应的FILE结构指针为stdin、stdout、stderr，与之对应的文件描述符是：STDIN_FILENO、STDOUT_FILENO、STDERR_FILENO。</p>
-
-<h4>流缓冲的属性：</h4>
-
-<p>缓冲区类型有：全缓冲(大部分缓冲都是这类型)、行缓冲(例如stdio,stdout)、无缓冲(例如stderr)。<br/>
-关于全缓冲，例如普通的文件操作，进行fputs、fprintf操作后，数据并没有立即写入磁盘文件中，当fflush或fclose文件时，数据才真正写入。<br/>
-可以用以下函数设置流的缓冲类型：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>void setvbuf()  
-</span><span class='line'>void setbuf()  
-</span><span class='line'>void setbuffer()  
-</span><span class='line'>void setlinebuf()</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>3</h4>
-
-<p>fflush() 是把 FILE *里的缓冲区(位于用户态进程空间)刷新到内核中<br/>
-fsync() -是把内核中对应的缓冲(是在 vfs 层的缓冲)刷新到硬盘中</p>
-
-<h4>4</h4>
-
-<p>在Linux的标准函数库中，有一套称作“高级I/O”的函数，我们熟知的printf()、fopen()、fread()、fwrite()都在此 列，它们也被称作“缓冲I/O（buffered I/O）”，每次写文件的时候，也仅仅是写入内存中的缓冲区，等满足了一定的条件（达到一定数量，或遇到特定字符，如换行符\n和文件结束符EOF），再 将缓冲区中的内容一次性写入文件，这样就大大增加了文件读写的速度。</p>
-
-<hr />
-
-<p>  The three types of buffering available are unbuffered, block buffered, and line buffered. When an output stream is unbuffered, information appears on the destination file or terminal as soon as written; when it is block buffered many characters are saved up and written as a block; when it is line buffered characters are saved up until a newline is output or input is read from any stream attached to a terminal device (typically stdin). The function fflush(3) may be used to force the block out early. (See fclose(3).) Normally all files are block buffered. When the first I/O operation occurs on a file, malloc(3) is called, and a buffer is obtained. If a stream refers to a terminal (as stdout normally does) it is line buffered. The standard error
-stream stderr is always unbuffered by default.</p>
-
-<p>  一般来说，block buffered的效率高些，将多次的操作合并成一次操作。先在标准库里缓存一部分，直到该缓冲区满了，或者程序显示的调用fflush时，将进行更新操作。而setbuf 则可以设置该缓冲区的大小。</p>
-
-<h5>setbuf()</h5>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;stdio.h&gt;
-</span><span class='line'>void setbuf(FILE *stream, char *buf);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>这个函数应该必须在如何输出被写到该文件之前调用。一般放在main里靠前面的语句！但是setbuf有个经典的错误，man手册上也提到了，c陷阱和缺陷上也提到了
-You must make sure that both buf and the space it points to still exist by the time stream is closed, which also happens at program termination. For example, the following is illegal:</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;stdio.h&gt;
-</span><span class='line'>int main()
-</span><span class='line'>{
-</span><span class='line'>&#9;char buf[BUFSIZ];
-</span><span class='line'>&#9;setbuf(stdin, buf);
-</span><span class='line'>&#9;printf("Hello, world!\n");
-</span><span class='line'>&#9;return 0;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>这个程序是错误的。buf缓冲区最后一次清空应该在main函数结束之后，程序交回控制给操作系统之前C运行库所必须进行的清理工作的一部分，但是此时 buf字符数组已经释放。修改的方法是将buf设置为static，或者全局变量； 或者调用malloc来动态申请内存。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>char * malloc();
-</span><span class='line'>setbuf(stdout,malloc(BUFSIZE));</span></code></pre></td></tr></table></div></figure>
-
-
-<p>这里不需要判断malloc的返回值，如果malloc调用失败，将返回一个null指针，setbuf的第二个参数可以是null,此时不进行缓冲！</p>
-
-<h5>fflush()</h5>
-
-<p>fflush函数则刷新缓冲区，将缓冲区上的内容更新到文件里。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;stdio.h&gt;
-</span><span class='line'>int fflush(FILE *stream);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>  The function fflush forces a write of all user-space buffered data for the given output or update stream via the stream underlying write function. The open status of the stream is unaffected. If the stream argument is NULL, fflush flushes all open output streams.</p>
-
-<p>但是fflush仅仅刷新C库里的缓冲。其他的一些数据的刷新需要调用fsync或者sync!</p>
-
-<p>  Note that fflush() only flushes the user space buffers provided by the C library. To ensure that the data is physically stored on disk the kernel buffers must be flushed too, e.g. with sync(2) or fsync(2).</p>
-
-<h5>fsync()和sync()</h5>
-
-<p>  fsync和sync最终将缓冲的数据更新到文件里。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;unistd.h&gt;
-</span><span class='line'>int fsync(int fd);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>  fsync copies all in-core parts of a file to disk, and waits until the device reports that all parts are on stable storage. It also updates metadata stat information. It does not necessarily ensure that the entry in the directory containing the file has also reached disk. For that an explicit fsync on the file descriptor of the directory is also needed.</p>
-
-<p>  同步命令sync就直接调用了sync函数来更新磁盘上的缓冲！</p>
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2013/05/07/lang-c-call-addr/">通过绝对内存地址进行参数赋值与函数调用</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2013-05-07T18:15:00+08:00'><span class='date'>2013-05-07</span> <span class='time'>18:15:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p>同一个数可以通过不同的方式表达出来，对于函数的访问，变量的赋值除了直接对变量赋值以外，还可以通过绝对内存地址进行参数赋值与函数调用。</p>
-
-<h4>1、通过地址修改变量的值</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>int x;
-</span><span class='line'>int *p;
-</span><span class='line'>printf("%x\n",&x);
-</span><span class='line'>p=(int *)0x0012ff60;
-</span><span class='line'>*p = 3;
-</span><span class='line'>printf("%d\n",x);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>程序的输出结果为：<br/>
-12ff603</p>
-
-<p>程序首先输出变量x所在地址为十六进制的0x12ff60（本来应该为8位的十六进制数，高位为0则省略掉），然后定义一个指针变量，让它指向该地址，通过指针变量的值来修改变量x的值。</p>
-
-<p>示例代码：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>int *ptr=(int*)0xa4000000;
-</span><span class='line'>*ptr=0xaabb;
-</span><span class='line'>printf("%d\n",*ptr);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>以上程序会崩溃，因为这样做会给一个指针分配一个随意的地址，很危险，所以这种做法是不允许的。</p>
-
-<h4>2、通过地址调用函数的执行</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;iostream&gt;using namespace std; 
-</span><span class='line'>typedef void(*FuncPtr)() ;
-</span><span class='line'> 
-</span><span class='line'>void  p()
-</span><span class='line'>{ 
-</span><span class='line'>&#9;printf("MOP\n");
-</span><span class='line'>}   
-</span><span class='line'> 
-</span><span class='line'>int main()
-</span><span class='line'>{
-</span><span class='line'>&#9;void (*ptr)();
-</span><span class='line'>&#9;p();
-</span><span class='line'>&#9;printf("%x\n",p);
-</span><span class='line'>&#9;ptr = (void (*)())0x4110f0;
-</span><span class='line'>&#9;ptr();//函数指针执行
-</span><span class='line'>&#9;((void (*)())0x4110f0)();
-</span><span class='line'>&#9;((FuncPtr)0x4110f0)();
-</span><span class='line'>&#9;return 0;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>程序执行结果如下：<br/>
-MOP4110f0MOP<br/>
-MOP<br/>
-MOP</p>
-
-<p>首先定义一个ptr的函数指针，第一次通过函数名调用函数，输出Mop，打印函数的入口地址，函数的入口地址为4110f0。然后给函数指针ptr赋地址值为p的入口地址，调用ptr，输出Mop。接着的过程是不通过函数指针直接执行，仍然使用p的入口地址调用，输出为MOP。最后是通过typedef调用的直接执行。</p>
-
-<p>函数名称、代码都是放在代码段的，因为是放在代码段，每次会跳到相同的地方，但参数会压栈，所以函数只根据函数名来获取入口地址，与参数和返回值无关。无论参数和返回值如何不同，函数入口地址都是一个地方。</p>
-
-<p>对以下程序进行分析如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;stdio.h&gt; int   p(int a,int b) 
-</span><span class='line'>{ 
-</span><span class='line'>&#9;return 3;
-</span><span class='line'>}   
-</span><span class='line'> 
-</span><span class='line'>int main()
-</span><span class='line'>{
-</span><span class='line'>&#9;printf("%x\n",p);
-</span><span class='line'>&#9;int a = p(2,3);
-</span><span class='line'>&#9;printf("%d\n",p);
-</span><span class='line'>&#9;int b = p(4,5);
-</span><span class='line'>&#9;printf("%x\n",p);
-</span><span class='line'>&#9;return 0;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>程序输出结果如下：<br/>
-4111594264281411159<br/>
-十六进制的411159转换成十进制的值为4264281。程序中打印的p的入口地址，无论p是否调用函数，入口地址都没有改变。
-分析如下代码：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;stdio.h&gt; int  p(int a,int b) 
-</span><span class='line'>{ 
-</span><span class='line'>&#9;return ((a&gt;b)?a:b);
-</span><span class='line'>}  
-</span><span class='line'>int main()
-</span><span class='line'>{
-</span><span class='line'>&#9;int (*ptr)(int ,int);
-</span><span class='line'>&#9;ptr = (int (*)(int,int))0x411159;
-</span><span class='line'>&#9;int c = ptr(5,6);
-</span><span class='line'>&#9;printf("%d\n",c);
-</span><span class='line'>&#9;return 0;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>程序输出为:<br/>
-6
-通过函数指针调用有返回值和参数的函数，不适用函数名，而是用函数入口地址调用。<br/>
-函数存放在内存的代码区域内，也有地址，一个函数在编译时被分配一个入口地址，将这个入口地址称为函数的指针，函数的地址就是函数的名字。
-函数指针不能指向不同类型或是带不同形参的函数。</p>
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2013/03/26/ubuntu-use-nvidia/">ubuntu(>=12.04) N卡双显卡 切换</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2013-03-26T22:21:00+08:00'><span class='date'>2013-03-26</span> <span class='time'>22:21:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://blog.sina.com.cn/s/blog_6dee445401013sss.html">http://blog.sina.com.cn/s/blog_6dee445401013sss.html</a><br/>
-<a href="http://www.cnblogs.com/congbo/archive/2012/09/12/2682105.html">http://www.cnblogs.com/congbo/archive/2012/09/12/2682105.html</a><br/>
-<a href="http://wenku.baidu.com/view/e69d3019650e52ea551898e0.html">http://wenku.baidu.com/view/e69d3019650e52ea551898e0.html</a></p>
-
-<p>  NVIDIA的Optimus技术可让笔记本根据性能需要在英特尔集成显卡和NVIDIA独显之间自动切换，节省电力。
-但这项技术不支持Linux。现在，NVIDIA工程师透露他们正致力于实现Linux支持。
-NVIDIA的Aaron Plattner在邮件列表上说，他已经在新的Linux版驱动上概念验证了Optimus，未来Linux笔记本用户有望获得Optimus支持。</p>
-
-<p>  当你美滋滋的装好了ubuntu之后，习惯性的用自带的驱动检测工具给装上显卡驱动，以为大功告成的时候，肯跌的事情来了，当你重启你会发现，黑 屏！！！！！！！！！！！木有错，你进不去X桌面了，这就是双显卡的悲剧，咋办捏？就这样放弃么，肿么可能，用linux就必修经得起折腾，于是上网狂找 资料，发现一个第三方的玩意貌似可以解决，叫Bumblebee(大黄蜂) ，Nvidia的双显卡切换叫Optimus（擎天柱），还有一个双显卡切换的软件ironhide（铁皮）。大黄蜂是唯一完美解决的</p>
-
-<h4>第一步：安装我们的主角Bumblebee(大黄蜂)</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>sudo add-apt-repository ppa:bumblebee/stable
-</span><span class='line'>sudo apt-get update
-</span><span class='line'>sudo apt-get install bumblebee bumblebee-nvidia
-</span><span class='line'>// 12.04.2 安装时出现需要：nvidia-current  但依赖：XXX 的情况不要安装nvidia-current，
-</span><span class='line'>// 而是添加源：sudo add-apt-repository ppa:ubuntu-x-swat/x-updates，然后再执行 sudo apt-get install bumblebee bumblebee-nvidia
-</span><span class='line'>sudo reboot</span></code></pre></td></tr></table></div></figure>
-
-
-<p>ps: Bumblebee3 已经非常完善，把所有的东西都配置好了</p>
-
-<h4>第二步：查看显卡工作状态</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>lspci |grep VGA
-</span><span class='line'>结果如下：
-</span><span class='line'>00:02.0 VGA compatible controller: Intel Corporation 2nd Generation Core Processor Family Integrated Graphics Controller (rev 09)
-</span><span class='line'>01:00.0 VGA compatible controller: NVIDIA Corporation GF108 [GeForce GT 540M] (rev ff)</span></code></pre></td></tr></table></div></figure>
-
-
-<p>独显的状态为rev ff 即为关闭状态，OK 大功告成！</p>
-
-<hr />
-
-<h4>下面非必需，也许要装拓展才能运行下面的命令</h4>
-
-<p>打开N卡设置<br/>
-optirun nvidia-settings -c :8</p>
-
-<p>下边两个命令可以对比开独显跟不开独显的性能差距<br/>
-glxgears            // 直接运行</p>
-
-<p>optirun glxgears    //使用独显运行<br/>
-Ps：optirun XXX 就是调用独显的关键了，这个就是指明用独立显卡打开指定的xxx程序</p>
-
-<ul>
-<li>可以自己先装高版本nvidia，再装bumblebee，这样似乎性能更好？</li>
-</ul>
-
-
-<hr />
-
-<ol>
-<li><p>bumblebee并不是单纯为了省电，是为了能初步使用双显卡所特有的optimus功能（说白了就是平时显示任务重的时候用独显渲染，普通显示用集显渲染），而鉴于nvidia官方驱动目前无法支持linux下双显卡模式，只能用bumblebee替代。（最新版本nvidia官方驱动初步支持双显卡模式，但是支持的很差，而且需要xrandr1.4+版本，强烈不建议使用）</p></li>
-<li><p>Nvidia的双显卡电脑是无法禁用集显而单独工作的，因为就算使用独显渲染，也必须依靠集显来显示输出。（可以简单理解为独显是通过集显间接连接在主板上）。</p></li>
-<li><p>默认安装的系统是不带nvidia独显驱动的，所以默认驱动并正常工作的是集成intel显卡，而不是独显。在这种情况下，独显通电，发热，但是完全不起作用。但是你再装上nvidia的独显，由于目前linux下官方驱动并不支持双显卡的工作模式，所以结果一定是黑屏。。。</p></li>
-<li><p>基于以上三点，bumblebee腾空出世。它本身并不是驱动，你可以看做是一个显卡驱动管理程序。安装好bumblebee之后，再安装bumblebee-nvidia来安装上官方驱动（你也可以自己下载安装nvidia官方驱动，或者nouveau开源驱动，但是不推荐，新手很容易出问题），这时候，你电脑上就有了intel的集显驱动和nvidia独显的官方驱动。bumblebee依赖与bbswitch（不用管他，会自动装上），会在系统运行时候，默认关闭掉独显，只使用集显（减少耗电和发热）。它并不会像windows下nvidia官方驱动那样提供智能的optimus功能，根据系统运行程序显示负担来判断是否需要独显工作。所以，如果你明确某个程序需要nvidia独显来渲染图形的时候，需要在terminal中手动输入optirun xxx来启动该程序。比如，你想用独显来显示网页，或者flash，可以用optirun firefox 命令来启动firefox， 而普通的firefox命令只会使用集显显示。</p></li>
-<li><p>如果你想用独显玩dota2, 那么你需要用optirun steam来启动steam客户端，然后再启动游戏，这样游戏就是通过独显来渲染的。你也可以用普通的steam命令来启动steam，然后在dota2游戏的属性中，加入启动方式optirun %command。 这样只有在启动游戏之后独显才会工作。</p></li>
-<li><p>如果安装完成bumblebee或者nvidia驱动之后，系统启动出现黑屏，解决方法很简单，ctl+alt+ 1或2或。。。。6,都可以，进入模拟终端，输入用户名和密码，删除掉/etc/X11/xorg.conf文件，再重启一定能启动图形界面。</p></li>
-</ol>
-
-
-<hr />
-
-<p><a href="https://wiki.archlinux.org/index.php/Bumblebee_%28%E7%AE%80%E4%BD%93%E4%B8%AD%E6%96%87%29">今天下完了13.04，惯例安装显卡驱动，报错</a></p>
-</div>
-  
-  
-
-
-    </article>
-  
   <div class="pagination">
     
       <a class="prev" href="/posts/89">&larr; Older</a>
@@ -878,7 +1599,7 @@ if (!document.getElementById('system~namespace')) document.getElementById('aexp_
 if (!document.getElementById('system')) document.getElementById('aexp_system').style.visibility = 'hidden';
 if (!document.getElementById('system~ubuntu')) document.getElementById('aexp_system~ubuntu').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/kernel/'>kernel</a><a href='##' onmousedown=showDiv('kernel') id='aexp_kernel'><span class='exp_style' id='exp_kernel'>[+]</span></a><span class='right_span'>(198)</span></li>
+<li class='catclass'><a href='/blog/cats/kernel/'>kernel</a><a href='##' onmousedown=showDiv('kernel') id='aexp_kernel'><span class='exp_style' id='exp_kernel'>[+]</span></a><span class='right_span'>(201)</span></li>
 <div id='kernel' class='catsub'><li><a href='/blog/cats/kernel~base/?opendiv=kernel'>base</a><a href='##' onmousedown=showDiv('kernel~base') id='aexp_kernel~base'><span class='exp_style' id='exp_kernel~base'>[+]</span></a><span class='right_span'>18</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('kernel~base')) document.getElementById('aexp_kernel~base').style.visibility = 'hidden';
@@ -911,7 +1632,7 @@ if (!document.getElementById('kernel~kexec')) document.getElementById('aexp_kern
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('kernel~mm')) document.getElementById('aexp_kernel~mm').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/kernel~net/?opendiv=kernel'>net</a><a href='##' onmousedown=showDiv('kernel~net') id='aexp_kernel~net'><span class='exp_style' id='exp_kernel~net'>[+]</span></a><span class='right_span'>89</span></li>
+<li><a href='/blog/cats/kernel~net/?opendiv=kernel'>net</a><a href='##' onmousedown=showDiv('kernel~net') id='aexp_kernel~net'><span class='exp_style' id='exp_kernel~net'>[+]</span></a><span class='right_span'>92</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('kernel~net')) document.getElementById('aexp_kernel~net').style.visibility = 'hidden';
 </script>
@@ -1055,8 +1776,8 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2018/'>2018</a><a href='##' onmousedown=showDiv('2018')><span class='exp_style' id='exp_2018'>[+]</span></a><span class='right_span'>(38)</span></li>
-<div id='2018' class='catsub'><li><a href='/blog/cats/2018~07/?opendiv=2018'>2018-07</a><span class='right_span'>3</span></li>
+<li class='catclass'><a href='/blog/cats/2018/'>2018</a><a href='##' onmousedown=showDiv('2018')><span class='exp_style' id='exp_2018'>[+]</span></a><span class='right_span'>(41)</span></li>
+<div id='2018' class='catsub'><li><a href='/blog/cats/2018~07/?opendiv=2018'>2018-07</a><span class='right_span'>6</span></li>
 <li><a href='/blog/cats/2018~06/?opendiv=2018'>2018-06</a><span class='right_span'>5</span></li>
 <li><a href='/blog/cats/2018~04/?opendiv=2018'>2018-04</a><span class='right_span'>6</span></li>
 <li><a href='/blog/cats/2018~03/?opendiv=2018'>2018-03</a><span class='right_span'>10</span></li>
@@ -1161,23 +1882,23 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
   <ul id="recent_posts">
     
       <li class="post">
+        <a href="/blog/2018/07/23/kernel-ip_tunnel/">IPIP实现IP隧道</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2018/07/23/kernel-ip_rule/">linux策略路由</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2018/07/23/kernel-rpf/">反向路径过滤 -- reverse path filt</a>
+      </li>
+    
+      <li class="post">
         <a href="/blog/2018/07/09/kernel-ip_early_demux/">参数ip_early_demux</a>
       </li>
     
       <li class="post">
         <a href="/blog/2018/07/09/kernel-tcp_defer_accept/">tcp选项TCP_DEFER_ACCEPT</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2018/07/08/kernel-nodelay_cork/">TCP_CORK以及TCP_NODELAY</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2018/06/12/kernel-nf_socket/">nf_socket</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2018/06/11/command-editcap/">editcap: pcap文件的合并和分隔</a>
       </li>
     
   </ul>
