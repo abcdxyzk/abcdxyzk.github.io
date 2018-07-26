@@ -10,6 +10,15 @@ categories:
 - system~cgroup
 tags:
 ---
+
+#### docker bridge 设置
+```
+	docker network create --subnet=192.168.3.0/24 --gateway=192.168.3.1 nett
+	docker run -i -t --net nett --ip 192.168.3.2 49f7960eb7e4 /bin/bash
+```
+
+------------------
+
 http://www.linuxidc.com/Linux/2014-01/95513.htm
 
 #### 一、禁用selinux
