@@ -52,18 +52,21 @@ Cisco 的网络操作系统 (Cisco IOS) 从11.0开始就采用新的策略性路
 #### 3.1 接口地址的配置 IP Addr
 
 对于接口的配置可以用下面的命令进行：
-
-Usage: ip addr [ add | del ] IFADDR dev STRING
+```
+	Usage: ip addr [ add | del ] IFADDR dev STRING
+```
 
 例如：
 ```
 	router># ip addr add 192.168.0.1/24 broadcast 192.168.0.255 label eth0 dev eth0
 ```
+
 上面表示，给接口eth0赋予地址192.168.0.1 掩码是255.255.255.0(24代表掩码中1的个数)，广播地址是192.168.0.255
 
 #### 3.2 路由的配置 IP Route
 
 Linux最多可以支持255张路由表，其中有3张表是内置的：
+
 ```
 　　表255 本地路由表（Local table）本地接口地址，广播地址，已及NAT地址都放在这个表。该路由表由系统自动维护，管理员不能直接修改。
 
@@ -78,18 +81,23 @@ Linux最多可以支持255张路由表，其中有3张表是内置的：
 
 ##### Usage: ip route list SELECTOR
 
-ip route { change | del | add | append | replace | monitor } ROUTE
+```
+	ip route { change | del | add | append | replace | monitor } ROUTE
+```
 
 如果想查看路由表的内容，可以通过命令：
+
 ```
 	ip route list table table_number
 ```
+
 对于路由的操作包括change、del、add 、append 、replace 、 monitor这些。例如添加路由可以用：
 
 ```
 	router># ip route add 0/0 via 192.168.0.4 table main
 	router># ip route add 192.168.3.0/24 via 192.168.0.3 table 1
 ```
+
 第一条命令是向主路由表（main table）即表254添加一条路由，路由的内容是设置192.168.0.4成为网关。
 
 第二条命令代表向路由表1添加一条路由，子网192.168.3.0（子网掩码是255.255.255.0）的网关是192.168.0.3。
@@ -136,6 +144,7 @@ ip route { change | del | add | append | replace | monitor } ROUTE
 	router># ip rule add [from 0/0] table 1 pref 32800
 	router >#ip rule add from 192.168.3.112/32 [tos 0x10] table ２ pref 1500prohibit
 ```
+
 第一条命令将向规则链增加一条规则，规则匹配的对象是所有的数据包，动作是选用路由表1的路由，这条规则的优先级是32800。
 
 第二条命令将向规则链增加一条规则，规则匹配的对象是IP为192.168.3.112，tos等于0x10的包，使用路由表2，这条规则的优先级是1500，动作是。添加以后，我们可以看看系统规则的变化。
@@ -148,6 +157,7 @@ ip route { change | del | add | append | replace | monitor } ROUTE
 	32767: from all lookup default
 	32800: from all lookup 1
 ```
+
 上面的规则是以源地址为关键字，作为是否匹配的依据的。除了源地址外，还可以用以下的信息：
 
 From -- 源地址
@@ -286,7 +296,7 @@ inet_check_attr 335
 
 proc
 
-在/proc/net/route里显示路由信息。
+在 /proc/net/route 里显示路由信息。
 
 fib_get_procinfo
 
@@ -344,6 +354,7 @@ u 主规则main_rule
 ```
 
 u 默认规则default rule
+
 ```
 	static struct fib_rule default_rule = {
 		r_clntref: ATOMIC_INIT(2),
@@ -352,6 +363,7 @@ u 默认规则default rule
 		r_action: RTN_UNICAST,/*动作是返回路由*/
 	};
 ```
+
 规则链的链头指向本地规则。
 
 #### RPDB的中心函数fib_lookup
