@@ -3,7 +3,6 @@ layout: post
 title: "crash执行shell脚本"
 date: 2018-08-05 23:39:00 +0800
 comments: false
-published: false
 categories:
 - 2018
 - 2018~08
