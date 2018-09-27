@@ -62,6 +62,247 @@ if (query != null) {
       
   <header>
     
+      <h2 class="entry-title"><a href="/blog/2015/01/14/kernel-sched-idle/">Idle进程的切换过程</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-01-14T23:39:00+08:00'><span class='date'>2015-01-14</span> <span class='time'>23:39:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://blog.chinaunix.net/uid-27767798-id-3577069.html">http://blog.chinaunix.net/uid-27767798-id-3577069.html</a></p>
+
+<p>  每个cpu都有自己的运行队列，如果当前cpu上运行的任务都已经dequeue出运行队列，而且idle_balance也没有移动到当前运行队列的任务，那么schedule函数中，按照rt ，cfs，idle这三种调度方式顺序，寻找各自的运行任务，那么如果rt和cfs都未找到运行任务，那么最后会调用idle schedule的idle进程，作为schedule函数调度的下一个任务。</p>
+
+<p>kernel/sched.c 中的schedule()函数中的片段</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (prev-&gt;state && !(preempt_count() & PREEMPT_ACTIVE)) {   
+</span><span class='line'>&#9;//state大于0代表prev也就是当前运行的任务不是running状态，并且没有标记 PREEMPT_ACTIVE，就表示当前的运行的任务没有必要停留在运行队列中了
+</span><span class='line'>&#9;if (unlikely(signal_pending_state(prev-&gt;state, prev)))  //如果当前进程标记了状态是TASK_INTERRUPTIBLE，并且还有信号未处理，那么没有必要从运行队列中移除这个进程
+</span><span class='line'>&#9;&#9;prev-&gt;state = TASK_RUNNING;
+</span><span class='line'>&#9;else
+</span><span class='line'>&#9;&#9;deactivate_task(rq, prev, DEQUEUE_SLEEP);        //从运行队列中移除这个进程
+</span><span class='line'>&#9;switch_count = &prev-&gt;nvcsw;
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>pre_schedule(rq, prev);
+</span><span class='line'>
+</span><span class='line'>if (unlikely(!rq-&gt;nr_running)) //如果当前运行队列没有进程可以运行了，就balance其他运行队列的任务到当前运行队列，这里balance的具体过程暂时不说
+</span><span class='line'>&#9;idle_balance(cpu, rq);
+</span><span class='line'>
+</span><span class='line'>put_prev_task(rq, prev);
+</span><span class='line'>next = pick_next_task(rq);     //按照rt，cfs，idle优先级的顺序挑选进程，如果在rt和cfs中都没有找到能够运行的任务，那么当前cpu会切换到idle进程。</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  这里 PREEMPT_ACTIVE是个标志位，由于进程由于系统调用或者中断异常返回到用户态之前，都要判断是否可以被抢占，会首先判断preempt_count,等于0的时候表示没有禁止抢占，然后再去判断是否标记了need_resched,如果标记了，在去调用schedule函数，如果在某些时候禁止了抢占，禁止了一次就要preempt_count加1。可以肯定的一点是进程的state和是否在运行队列的因果关系并不是十分同步的，修改了进程的状态后，可能还需要做一些其他的工作才去调用schedule函数。引用一下其他人的例子。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>for (;;) {
+</span><span class='line'>   prepare_to_wait(&wq, &__wait,TASK_UNINTERRUPTIBLE);
+</span><span class='line'>   if (condition)
+</span><span class='line'>&#9; break;
+</span><span class='line'>   schedule();
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  可以看出在修改了进程的state之后，并不会立刻调用schedule函数，即使立刻调用了schedule函数，也不能保证在schedule函数之前的禁止抢占开启之前有其他的抢占动作。毕竟修改进程的state和从运行队列中移除任务不是一行代码（机器码）就能搞定的事情。所以如果在修改了进程的状态之后和schedule函数禁止抢占之前有抢占动作（可能是中断异常返回），如果这个时候进程被其他进程抢占，这个时候把当前进程移除运行队列，那么这个进程将永远没有机会运行后面的代码。所以这个时候在抢占的过程之前将preempt_count标记PREEMPT_ACTIVE，这样抢占中调用schedule函数将不会从当前运行队列中移除当前进程，这样才有前面分析schedule函数代码，有判断进程state同时判断preempt_count未标记PREEMPT_ACTIVE的情况。</p>
+
+<p>  在当前进程被移除出运行队列之前还需要判断是否有挂起的信号需要处理，如果当前进程的状态是TASK_INTERRUPTIBLE或者TASK_WAKEKILL的时候，如果还有信号未处理，那么当前进程就不需要被移除运行队列，并且将state置为running。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static inline int signal_pending_state(long state, struct task_struct *p)
+</span><span class='line'>{
+</span><span class='line'>&#9;if (!(state & (TASK_INTERRUPTIBLE | TASK_WAKEKILL))) //首先判断状态不是这两个可以处理信号的状态就直接返回0，后面的逻辑不考虑了
+</span><span class='line'>&#9;&#9;return 0;
+</span><span class='line'>&#9;if (!signal_pending(p))             //如果没有信号挂起就不继续了
+</span><span class='line'>&#9;&#9;return 0;
+</span><span class='line'>
+</span><span class='line'>&#9;return (state & TASK_INTERRUPTIBLE) || __fatal_signal_pending(p); //如果有信号
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<pre><code>说下 put_prev_task的逻辑，按照道理说应该是rt，cfs，idle的顺序寻找待运行态的任务。
+</code></pre>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>pick_next_task(struct rq *rq)
+</span><span class='line'>{
+</span><span class='line'>&#9;const struct sched_class *class;
+</span><span class='line'>&#9;struct task_struct *p;
+</span><span class='line'>
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * Optimization: we know that if all tasks are in
+</span><span class='line'>&#9; * the fair class we can call that function directly:
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;//这里注释的意思都能看懂，如果rq中的cfs队列的运行个数和rq中的运行个数相同，直接调用cfs中 的pick函数，因为默认的调度策略是cfs。
+</span><span class='line'>&#9;if (likely(rq-&gt;nr_running == rq-&gt;cfs.nr_running)) {
+</span><span class='line'>&#9;&#9;p = fair_sched_class.pick_next_task(rq);
+</span><span class='line'>&#9;&#9;if (likely(p))
+</span><span class='line'>&#9;&#9;return p;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;//这里 sched_class_highest就是rt_sched_class，所以前面没有选择出任务，那么从rt开始挑选任务，直到idle
+</span><span class='line'>&#9;class = sched_class_highest;
+</span><span class='line'>      for ( ; ; ) {
+</span><span class='line'>&#9;&#9;p = class-&gt;pick_next_task(rq);
+</span><span class='line'>&#9;&#9;if (p)
+</span><span class='line'>&#9;&#9;&#9;return p;
+</span><span class='line'>&#9;&#9;/*
+</span><span class='line'>&#9;&#9; * Will never be NULL as the idle class always
+</span><span class='line'>&#9;&#9; * returns a non-NULL p:
+</span><span class='line'>&#9;&#9; */
+</span><span class='line'>&#9;&#9;class = class-&gt;next;
+</span><span class='line'>&#9;}
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  从每个调度类的代码的最后可以看出这个next关系</p>
+
+<p>sched_rt.c中：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static const struct sched_class rt_sched_class = {
+</span><span class='line'>.next = &fair_sched_class,</span></code></pre></td></tr></table></div></figure>
+
+
+<p>sched_fair.c中：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static const struct sched_class fair_sched_class = {
+</span><span class='line'>.next = &idle_sched_class,</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  那么可以试想如果rt和cfs都没有可以运行的任务，那么最后就是调用idle的pick_next_task函数</p>
+
+<p>sched_idletask.c:</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static struct task_struct *pick_next_task_idle(struct rq *rq)
+</span><span class='line'>{
+</span><span class='line'>&#9;schedstat_inc(rq, sched_goidle);
+</span><span class='line'>&#9;calc_load_account_idle(rq);
+</span><span class='line'>&#9;return rq-&gt;idle;    //可以看到就是返回rq中idle进程。
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  这idle进程在启动start_kernel函数的时候调用init_idle函数的时候，把当前进程（0号进程）置为每个rq的idle上。</p>
+
+<p>kernel/sched.c:5415</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>rq-&gt;curr = rq-&gt;idle = idle;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  这里idle就是调用start_kernel函数的进程，就是0号进程。</p>
+
+<p>  0号进程在fork完init进程等之后，进入cpu_idle函数，大概的逻辑是for循环调用hlt指令，每次hlt返回后，调用schedule函数，具体的流程现在还没太看懂，可以看到的是在具体的逻辑在default_idle函数中，调用了safe_halt函数</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static inline void native_safe_halt(void)
+</span><span class='line'>{
+</span><span class='line'>&#9;asm volatile("sti; hlt": : :"memory");
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  关于hlt指令的作用是：引用wiki百科</p>
+
+<blockquote><p>  In the x86 computer architecture, HLT (halt) is an assembly language instruction which halts the CPU until the next external interrupt is fired.[1] Interrupts are signals sent by hardware devices to the CPU alerting it that an event occurred to which it should react. For example, hardware timers send interrupts to the CPU at regular intervals.</p>
+
+<p>  The HLT instruction is executed by the operating system when there is no immediate work to be done, and the system enters its idle state. In Windows NT, for example, this instruction is run in the &ldquo;System Idle Process&rdquo;.</p></blockquote>
+
+<p>  可以看到注释的意思是，hlt指令使得cpu挂起，直到有中断产生这个时候cpu重新开始运行。所以时钟中断会唤醒正在hlt中的cpu，让它调用schedule函数，检测是否有新的任务在rq中，如果有的话切换到新的任务，否则继续执行hlt，cpu继续挂起。</p>
+
+<p>参考文章<br/>
+1.<a href="http://blog.csdn.net/dog250/article/details/5303547">http://blog.csdn.net/dog250/article/details/5303547</a></p>
+
+<p>2.<a href="http://en.wikipedia.org/wiki/HLT">http://en.wikipedia.org/wiki/HLT</a></p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
       <h2 class="entry-title"><a href="/blog/2015/01/14/kernel-nmi-irq/">NMI 看门狗</a></h2>
     
     
@@ -1168,418 +1409,6 @@ int n - 触发软中断n。相应的中断处理函数的地址为：中断向�
 
     </article>
   
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/01/03/android-I9507V-kernel/">编译I9507V内核</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-01-03T14:52:00+08:00'><span class='date'>2015-01-03</span> <span class='time'>14:52:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p>源码地址 <a href="http://opensource.samsung.com/reception/receptionSub.do?method=sub&amp;sub=F&amp;searchValue=9507">http://opensource.samsung.com/reception/receptionSub.do?method=sub&amp;sub=F&amp;searchValue=9507</a></p>
-
-<p>好像三星android4.3版本后的bootloader会检测是否三星自编译内核，不是的会开机提示一下，不影响正常使用。</p>
-
-<p>按照README_Kernel.txt的做。</p>
-
-<p>内核中说明是用4.7编译器，但是4.7编译出来的装上去会挂，不知道为什么。<br/>
-但是换成4.6编译器就没问题。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>make VARIANT_DEFCONFIG=jftdd_eur_defconfig jf_defconfig SELINUX_DEFCONFIG=selinux_defconfig</span></code></pre></td></tr></table></div></figure>
-
-
-<p>最后作成boot.img</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>mkbootimg --kernel zImage --ramdisk boot.img-ramdisk.cpio.gz --base 80200000 --ramdisk_offset 1FF8000 --pagesize 2048 --cmdline "console=null androidboot.hardware=qcom user_debug=31 msm_rtb.filter=0x3F ehci-hcd.park=3 maxcpus=4" -o boot.img
-</span><span class='line'>
-</span><span class='line'>tar cf boot.img.tar boot.img
-</span><span class='line'>用odin3.10，选择AP项刷入</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>修改</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-<span class='line-number'>58</span>
-<span class='line-number'>59</span>
-<span class='line-number'>60</span>
-<span class='line-number'>61</span>
-<span class='line-number'>62</span>
-<span class='line-number'>63</span>
-<span class='line-number'>64</span>
-<span class='line-number'>65</span>
-<span class='line-number'>66</span>
-<span class='line-number'>67</span>
-<span class='line-number'>68</span>
-<span class='line-number'>69</span>
-<span class='line-number'>70</span>
-<span class='line-number'>71</span>
-<span class='line-number'>72</span>
-<span class='line-number'>73</span>
-<span class='line-number'>74</span>
-<span class='line-number'>75</span>
-<span class='line-number'>76</span>
-<span class='line-number'>77</span>
-<span class='line-number'>78</span>
-<span class='line-number'>79</span>
-<span class='line-number'>80</span>
-<span class='line-number'>81</span>
-<span class='line-number'>82</span>
-<span class='line-number'>83</span>
-<span class='line-number'>84</span>
-<span class='line-number'>85</span>
-<span class='line-number'>86</span>
-<span class='line-number'>87</span>
-<span class='line-number'>88</span>
-<span class='line-number'>89</span>
-<span class='line-number'>90</span>
-<span class='line-number'>91</span>
-<span class='line-number'>92</span>
-<span class='line-number'>93</span>
-<span class='line-number'>94</span>
-<span class='line-number'>95</span>
-<span class='line-number'>96</span>
-<span class='line-number'>97</span>
-<span class='line-number'>98</span>
-<span class='line-number'>99</span>
-<span class='line-number'>100</span>
-<span class='line-number'>101</span>
-<span class='line-number'>102</span>
-<span class='line-number'>103</span>
-<span class='line-number'>104</span>
-<span class='line-number'>105</span>
-<span class='line-number'>106</span>
-<span class='line-number'>107</span>
-<span class='line-number'>108</span>
-<span class='line-number'>109</span>
-<span class='line-number'>110</span>
-<span class='line-number'>111</span>
-<span class='line-number'>112</span>
-<span class='line-number'>113</span>
-<span class='line-number'>114</span>
-<span class='line-number'>115</span>
-<span class='line-number'>116</span>
-<span class='line-number'>117</span>
-<span class='line-number'>118</span>
-<span class='line-number'>119</span>
-<span class='line-number'>120</span>
-<span class='line-number'>121</span>
-<span class='line-number'>122</span>
-<span class='line-number'>123</span>
-<span class='line-number'>124</span>
-<span class='line-number'>125</span>
-<span class='line-number'>126</span>
-<span class='line-number'>127</span>
-<span class='line-number'>128</span>
-<span class='line-number'>129</span>
-<span class='line-number'>130</span>
-<span class='line-number'>131</span>
-<span class='line-number'>132</span>
-<span class='line-number'>133</span>
-<span class='line-number'>134</span>
-<span class='line-number'>135</span>
-<span class='line-number'>136</span>
-<span class='line-number'>137</span>
-<span class='line-number'>138</span>
-<span class='line-number'>139</span>
-<span class='line-number'>140</span>
-<span class='line-number'>141</span>
-<span class='line-number'>142</span>
-<span class='line-number'>143</span>
-<span class='line-number'>144</span>
-<span class='line-number'>145</span>
-<span class='line-number'>146</span>
-<span class='line-number'>147</span>
-<span class='line-number'>148</span>
-<span class='line-number'>149</span>
-<span class='line-number'>150</span>
-<span class='line-number'>151</span>
-<span class='line-number'>152</span>
-<span class='line-number'>153</span>
-<span class='line-number'>154</span>
-<span class='line-number'>155</span>
-<span class='line-number'>156</span>
-<span class='line-number'>157</span>
-<span class='line-number'>158</span>
-<span class='line-number'>159</span>
-<span class='line-number'>160</span>
-<span class='line-number'>161</span>
-<span class='line-number'>162</span>
-<span class='line-number'>163</span>
-<span class='line-number'>164</span>
-<span class='line-number'>165</span>
-<span class='line-number'>166</span>
-<span class='line-number'>167</span>
-<span class='line-number'>168</span>
-<span class='line-number'>169</span>
-<span class='line-number'>170</span>
-<span class='line-number'>171</span>
-<span class='line-number'>172</span>
-<span class='line-number'>173</span>
-<span class='line-number'>174</span>
-<span class='line-number'>175</span>
-<span class='line-number'>176</span>
-<span class='line-number'>177</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>diff --git a/Makefile b/Makefile
-</span><span class='line'>index 16603ac..6d2b29f 100755
-</span><span class='line'>--- a/Makefile
-</span><span class='line'>+++ b/Makefile
-</span><span class='line'>@@ -193,7 +193,7 @@ SUBARCH := $(shell uname -m | sed -e s/i.86/i386/ -e s/sun4u/sparc64/ \
-</span><span class='line'> # Note: Some architectures assign CROSS_COMPILE in their arch/*/Makefile
-</span><span class='line'> export KBUILD_BUILDHOST := $(SUBARCH)
-</span><span class='line'> ARCH     ?=arm
-</span><span class='line'>-CROSS_COMPILE    ?=/opt/toolchains/arm-eabi-4.7/bin/arm-eabi-
-</span><span class='line'>+CROSS_COMPILE    ?=/home/kk/android/gcc-arm-none-eabi-4_6-2012q4/bin/arm-none-eabi-
-</span><span class='line'> 
-</span><span class='line'> # Architecture as present in compile.h
-</span><span class='line'> UTS_MACHINE  := $(ARCH)
-</span><span class='line'>diff --git a/arch/arm/configs/jftdd_eur_defconfig b/arch/arm/configs/jftdd_eur_defconfig
-</span><span class='line'>index 389a204..2c53b92 100755
-</span><span class='line'>--- a/arch/arm/configs/jftdd_eur_defconfig
-</span><span class='line'>+++ b/arch/arm/configs/jftdd_eur_defconfig
-</span><span class='line'>@@ -2,3 +2,5 @@ CONFIG_MACH_JF_EUR=y
-</span><span class='line'> CONFIG_MACH_JFTDD_EUR=y
-</span><span class='line'> CONFIG_EXTRA_FIRMWARE="audience-es325-fw-eur.bin"
-</span><span class='line'> CONFIG_EXTRA_FIRMWARE_DIR="firmware"
-</span><span class='line'>+CONFIG_LOCALVERSION="-chn-kk"
-</span><span class='line'>+CONFIG_LOCALVERSION_AUTO=n
-</span><span class='line'>diff --git a/include/linux/printk.h b/include/linux/printk.h
-</span><span class='line'>index 0525927..4dbc5cf 100755
-</span><span class='line'>--- a/include/linux/printk.h
-</span><span class='line'>+++ b/include/linux/printk.h
-</span><span class='line'>@@ -98,7 +98,13 @@ extern void printk_tick(void);
-</span><span class='line'> asmlinkage __printf(1, 0)
-</span><span class='line'> int vprintk(const char *fmt, va_list args);
-</span><span class='line'> asmlinkage __printf(1, 2) __cold
-</span><span class='line'>-int printk(const char *fmt, ...);
-</span><span class='line'>+
-</span><span class='line'>+static __always_inline int printk(const char *fmt, ...)
-</span><span class='line'>+{
-</span><span class='line'>+ return 0;
-</span><span class='line'>+}
-</span><span class='line'>+
-</span><span class='line'>+int orig_printk(const char *s, ...);
-</span><span class='line'> 
-</span><span class='line'> /*
-</span><span class='line'>  * Special printk facility for scheduler use only, _DO_NOT_USE_ !
-</span><span class='line'>diff --git a/include/net/tcp.h b/include/net/tcp.h
-</span><span class='line'>index a70c0e4..0d13553 100755
-</span><span class='line'>--- a/include/net/tcp.h
-</span><span class='line'>+++ b/include/net/tcp.h
-</span><span class='line'>@@ -140,9 +140,9 @@ extern void tcp_time_wait(struct sock *sk, int state, int timeo);
-</span><span class='line'>                                   * for local resources.
-</span><span class='line'>                                   */
-</span><span class='line'> 
-</span><span class='line'>-#define TCP_KEEPALIVE_TIME   (120*60*HZ) /* two hours */
-</span><span class='line'>-#define TCP_KEEPALIVE_PROBES 9       /* Max of 9 keepalive probes    */
-</span><span class='line'>-#define TCP_KEEPALIVE_INTVL  (75*HZ)
-</span><span class='line'>+#define TCP_KEEPALIVE_TIME   (10*60*HZ)  /* 10 mins */
-</span><span class='line'>+#define TCP_KEEPALIVE_PROBES 7       /* Max of 7 keepalive probes    */
-</span><span class='line'>+#define TCP_KEEPALIVE_INTVL  (60*HZ)
-</span><span class='line'> 
-</span><span class='line'> #define MAX_TCP_KEEPIDLE 32767
-</span><span class='line'> #define MAX_TCP_KEEPINTVL    32767
-</span><span class='line'>diff --git a/kernel/printk.c b/kernel/printk.c
-</span><span class='line'>index f7c85aa..80d2cd0 100755
-</span><span class='line'>--- a/kernel/printk.c
-</span><span class='line'>+++ b/kernel/printk.c
-</span><span class='line'>@@ -995,7 +995,7 @@ static int have_callable_console(void)
-</span><span class='line'>  * See the vsnprintf() documentation for format string extensions over C99.
-</span><span class='line'>  */
-</span><span class='line'> 
-</span><span class='line'>-asmlinkage int printk(const char *fmt, ...)
-</span><span class='line'>+asmlinkage int orig_printk(const char *fmt, ...)
-</span><span class='line'> {
-</span><span class='line'>  va_list args;
-</span><span class='line'>  int r;
-</span><span class='line'>diff --git a/kernel/sched/core.c b/kernel/sched/core.c
-</span><span class='line'>index 5f5959c..03ba861 100755
-</span><span class='line'>--- a/kernel/sched/core.c
-</span><span class='line'>+++ b/kernel/sched/core.c
-</span><span class='line'>@@ -6912,7 +6912,7 @@ void __init sched_init_smp(void)
-</span><span class='line'> }
-</span><span class='line'> #endif /* CONFIG_SMP */
-</span><span class='line'> 
-</span><span class='line'>-const_debug unsigned int sysctl_timer_migration = 1;
-</span><span class='line'>+const_debug unsigned int sysctl_timer_migration = 0;
-</span><span class='line'> 
-</span><span class='line'> int in_sched_functions(unsigned long addr)
-</span><span class='line'> {
-</span><span class='line'>diff --git a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
-</span><span class='line'>index 10def3a..a68e108 100755
-</span><span class='line'>--- a/net/ipv4/tcp_input.c
-</span><span class='line'>+++ b/net/ipv4/tcp_input.c
-</span><span class='line'>@@ -75,7 +75,7 @@
-</span><span class='line'> #include &lt;asm/unaligned.h&gt;
-</span><span class='line'> #include &lt;net/netdma.h&gt;
-</span><span class='line'> 
-</span><span class='line'>-int sysctl_tcp_timestamps __read_mostly = 1;
-</span><span class='line'>+int sysctl_tcp_timestamps __read_mostly = 0;
-</span><span class='line'> int sysctl_tcp_window_scaling __read_mostly = 1;
-</span><span class='line'> int sysctl_tcp_sack __read_mostly = 1;
-</span><span class='line'> int sysctl_tcp_fack __read_mostly = 1;
-</span><span class='line'>@@ -1300,7 +1300,7 @@ static int tcp_match_skb_to_sack(struct sock *sk, struct sk_buff *skb,
-</span><span class='line'>          unsigned int new_len = (pkt_len / mss) * mss;
-</span><span class='line'>          if (!in_sack && new_len &lt; pkt_len) {
-</span><span class='line'>              new_len += mss;
-</span><span class='line'>-             if (new_len &gt; skb-&gt;len)
-</span><span class='line'>+             if (new_len &gt;= skb-&gt;len)
-</span><span class='line'>                  return 0;
-</span><span class='line'>          }
-</span><span class='line'>          pkt_len = new_len;
-</span><span class='line'>@@ -4782,7 +4782,7 @@ restart:
-</span><span class='line'>      int copy = SKB_MAX_ORDER(header, 0);
-</span><span class='line'> 
-</span><span class='line'>      /* Too big header? This can happen with IPv6. */
-</span><span class='line'>-     if (copy &lt; 0)
-</span><span class='line'>+     if (copy &lt;= 0)
-</span><span class='line'>          return;
-</span><span class='line'>      if (end - start &lt; copy)
-</span><span class='line'>          copy = end - start;
-</span><span class='line'>diff --git a/net/ipv4/tcp_minisocks.c b/net/ipv4/tcp_minisocks.c
-</span><span class='line'>index 3cabafb..6b36c25 100755
-</span><span class='line'>--- a/net/ipv4/tcp_minisocks.c
-</span><span class='line'>+++ b/net/ipv4/tcp_minisocks.c
-</span><span class='line'>@@ -27,7 +27,7 @@
-</span><span class='line'> #include &lt;net/inet_common.h&gt;
-</span><span class='line'> #include &lt;net/xfrm.h&gt;
-</span><span class='line'> 
-</span><span class='line'>-int sysctl_tcp_syncookies __read_mostly = 1;
-</span><span class='line'>+int sysctl_tcp_syncookies __read_mostly = 0;
-</span><span class='line'> EXPORT_SYMBOL(sysctl_tcp_syncookies);
-</span><span class='line'> 
-</span><span class='line'> int sysctl_tcp_abort_on_overflow __read_mostly;
-</span><span class='line'>diff --git a/net/netfilter/nf_conntrack_proto_sctp.c b/net/netfilter/nf_conntrack_proto_sctp.c
-</span><span class='line'>index 72b5088..7c54171 100755
-</span><span class='line'>--- a/net/netfilter/nf_conntrack_proto_sctp.c
-</span><span class='line'>+++ b/net/netfilter/nf_conntrack_proto_sctp.c
-</span><span class='line'>@@ -50,7 +50,7 @@ static unsigned int sctp_timeouts[SCTP_CONNTRACK_MAX] __read_mostly = {
-</span><span class='line'>  [SCTP_CONNTRACK_CLOSED]         = 10 SECS,
-</span><span class='line'>  [SCTP_CONNTRACK_COOKIE_WAIT]        = 3 SECS,
-</span><span class='line'>  [SCTP_CONNTRACK_COOKIE_ECHOED]      = 3 SECS,
-</span><span class='line'>- [SCTP_CONNTRACK_ESTABLISHED]        = 5 DAYS,
-</span><span class='line'>+ [SCTP_CONNTRACK_ESTABLISHED]        = 20 MINS,
-</span><span class='line'>  [SCTP_CONNTRACK_SHUTDOWN_SENT]      = 300 SECS / 1000,
-</span><span class='line'>  [SCTP_CONNTRACK_SHUTDOWN_RECD]      = 300 SECS / 1000,
-</span><span class='line'>  [SCTP_CONNTRACK_SHUTDOWN_ACK_SENT]  = 3 SECS,
-</span><span class='line'>diff --git a/net/netfilter/nf_conntrack_proto_tcp.c b/net/netfilter/nf_conntrack_proto_tcp.c
-</span><span class='line'>index 0d07a1d..84d55e4 100755
-</span><span class='line'>--- a/net/netfilter/nf_conntrack_proto_tcp.c
-</span><span class='line'>+++ b/net/netfilter/nf_conntrack_proto_tcp.c
-</span><span class='line'>@@ -32,7 +32,7 @@
-</span><span class='line'> /* "Be conservative in what you do,
-</span><span class='line'>     be liberal in what you accept from others."
-</span><span class='line'>     If it's non-zero, we mark only out of window RST segments as INVALID. */
-</span><span class='line'>-static int nf_ct_tcp_be_liberal __read_mostly = 0;
-</span><span class='line'>+static int nf_ct_tcp_be_liberal __read_mostly = 1;
-</span><span class='line'> 
-</span><span class='line'> /* If it is set to zero, we disable picking up already established
-</span><span class='line'>    connections. */
-</span><span class='line'>@@ -67,7 +67,7 @@ static const char *const tcp_conntrack_names[] = {
-</span><span class='line'> static unsigned int tcp_timeouts[TCP_CONNTRACK_TIMEOUT_MAX] __read_mostly = {
-</span><span class='line'>  [TCP_CONNTRACK_SYN_SENT]    = 2 MINS,
-</span><span class='line'>  [TCP_CONNTRACK_SYN_RECV]    = 60 SECS,
-</span><span class='line'>- [TCP_CONNTRACK_ESTABLISHED] = 5 DAYS,
-</span><span class='line'>+ [TCP_CONNTRACK_ESTABLISHED] = 20 MINS,
-</span><span class='line'>  [TCP_CONNTRACK_FIN_WAIT]    = 2 MINS,
-</span><span class='line'>  [TCP_CONNTRACK_CLOSE_WAIT]  = 60 SECS,
-</span><span class='line'>  [TCP_CONNTRACK_LAST_ACK]    = 30 SECS,
-</span><span class='line'>diff --git a/scripts/setlocalversion b/scripts/setlocalversion
-</span><span class='line'>index 857ea4f..742fe12 100755
-</span><span class='line'>--- a/scripts/setlocalversion
-</span><span class='line'>+++ b/scripts/setlocalversion
-</span><span class='line'>@@ -184,7 +184,7 @@ else
-</span><span class='line'>  # LOCALVERSION= is not specified
-</span><span class='line'>  if test "${LOCALVERSION+set}" != "set"; then
-</span><span class='line'>      scm=$(scm_version --short)
-</span><span class='line'>-     res="$res${scm:++}"
-</span><span class='line'>+     res="$res${scm:+}"
-</span><span class='line'>  fi
-</span><span class='line'> fi
-</span><span class='line'> </span></code></pre></td></tr></table></div></figure>
-
-
-
-</div>
-  
-  
-
-
-    </article>
-  
   <div class="pagination">
     
       <a class="prev" href="/posts/57">&larr; Older</a>
@@ -1705,7 +1534,7 @@ if (!document.getElementById('system~namespace')) document.getElementById('aexp_
 if (!document.getElementById('system')) document.getElementById('aexp_system').style.visibility = 'hidden';
 if (!document.getElementById('system~ubuntu')) document.getElementById('aexp_system~ubuntu').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/kernel/'>kernel</a><a href='##' onmousedown=showDiv('kernel') id='aexp_kernel'><span class='exp_style' id='exp_kernel'>[+]</span></a><span class='right_span'>(202)</span></li>
+<li class='catclass'><a href='/blog/cats/kernel/'>kernel</a><a href='##' onmousedown=showDiv('kernel') id='aexp_kernel'><span class='exp_style' id='exp_kernel'>[+]</span></a><span class='right_span'>(203)</span></li>
 <div id='kernel' class='catsub'><li><a href='/blog/cats/kernel~base/?opendiv=kernel'>base</a><a href='##' onmousedown=showDiv('kernel~base') id='aexp_kernel~base'><span class='exp_style' id='exp_kernel~base'>[+]</span></a><span class='right_span'>18</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('kernel~base')) document.getElementById('aexp_kernel~base').style.visibility = 'hidden';
@@ -1738,7 +1567,7 @@ if (!document.getElementById('kernel~kexec')) document.getElementById('aexp_kern
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('kernel~mm')) document.getElementById('aexp_kernel~mm').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/kernel~net/?opendiv=kernel'>net</a><a href='##' onmousedown=showDiv('kernel~net') id='aexp_kernel~net'><span class='exp_style' id='exp_kernel~net'>[+]</span></a><span class='right_span'>93</span></li>
+<li><a href='/blog/cats/kernel~net/?opendiv=kernel'>net</a><a href='##' onmousedown=showDiv('kernel~net') id='aexp_kernel~net'><span class='exp_style' id='exp_kernel~net'>[+]</span></a><span class='right_span'>94</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('kernel~net')) document.getElementById('aexp_kernel~net').style.visibility = 'hidden';
 </script>
@@ -1882,8 +1711,9 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2018/'>2018</a><a href='##' onmousedown=showDiv('2018')><span class='exp_style' id='exp_2018'>[+]</span></a><span class='right_span'>(43)</span></li>
-<div id='2018' class='catsub'><li><a href='/blog/cats/2018~08/?opendiv=2018'>2018-08</a><span class='right_span'>1</span></li>
+<li class='catclass'><a href='/blog/cats/2018/'>2018</a><a href='##' onmousedown=showDiv('2018')><span class='exp_style' id='exp_2018'>[+]</span></a><span class='right_span'>(44)</span></li>
+<div id='2018' class='catsub'><li><a href='/blog/cats/2018~09/?opendiv=2018'>2018-09</a><span class='right_span'>1</span></li>
+<li><a href='/blog/cats/2018~08/?opendiv=2018'>2018-08</a><span class='right_span'>1</span></li>
 <li><a href='/blog/cats/2018~07/?opendiv=2018'>2018-07</a><span class='right_span'>7</span></li>
 <li><a href='/blog/cats/2018~06/?opendiv=2018'>2018-06</a><span class='right_span'>5</span></li>
 <li><a href='/blog/cats/2018~04/?opendiv=2018'>2018-04</a><span class='right_span'>6</span></li>
@@ -1989,6 +1819,10 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
   <ul id="recent_posts">
     
       <li class="post">
+        <a href="/blog/2018/09/28/kernel-sk_lookup/">nulls_hlist原理 和 tcp连接查找</a>
+      </li>
+    
+      <li class="post">
         <a href="/blog/2018/08/05/debug-crash_shell/">crash执行shell脚本</a>
       </li>
     
@@ -2002,10 +1836,6 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
     
       <li class="post">
         <a href="/blog/2018/07/23/kernel-ip_rule/">linux策略路由</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2018/07/23/kernel-rpf/">反向路径过滤 -- reverse path filt</a>
       </li>
     
   </ul>

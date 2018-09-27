@@ -62,6 +62,1177 @@ if (query != null) {
       
   <header>
     
+      <h2 class="entry-title"><a href="/blog/2013/09/27/kernel-net-tcp-timer/">内核tcp的定时器管理</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2013-09-27T16:11:00+08:00'><span class='date'>2013-09-27</span> <span class='time'>16:11:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><h5>在内核中tcp协议栈有6种类型的定时器：</h5>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>1 重传定时器。
+</span><span class='line'>2 delayed ack定时器
+</span><span class='line'>3 零窗口探测定时器
+</span><span class='line'>上面三种定时器都是作为tcp状态机的一部分来实现的。
+</span><span class='line'>4 keep-alive 定时器 主要是管理established状态的连接。
+</span><span class='line'>5 time_wait定时器 主要是用来客户端关闭时的time_wait状态用到。
+</span><span class='line'>6 syn-ack定时器(主要是用在listening socket) 管理新的连接请求时所用到。</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>而在内核中，tcp协议栈管理定时器主要有下面4个函数：</h5>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>inet_csk_reset_xmit_timer    这个函数是用来重启定时器
+</span><span class='line'>inet_csk_clear_xmit_timer 这个函数用来删除定时器。
+</span><span class='line'>上面两个函数都是针对状态机里面的定时器。
+</span><span class='line'>tcp_set_keepalive 这个函数是用来管理keepalive 定时器的接口。
+</span><span class='line'>tcp_synack_timer  这个函数是用来管理syn_ack定时器的接口。</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>先来看定时器的初始化。</h5>
+
+<p>首先是在tcp_v4_init_sock中对定时器的初始化，它会调用tcp_init_xmit_timers，我们就先来看这个函数：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void tcp_init_xmit_timers(struct sock *sk)
+</span><span class='line'>{
+</span><span class='line'>&#9;inet_csk_init_xmit_timers(sk, &tcp_write_timer, &tcp_delack_timer, &tcp_keepalive_timer);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>可以看到这个函数很简单，就是调用inet_csk_init_xmit_timers,然后把3个定时器的回掉函数传递进去，下面我们来看inet_csk_init_xmit_timers。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void inet_csk_init_xmit_timers(struct sock *sk,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;void (*retransmit_handler)(unsigned long),
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;void (*delack_handler)(unsigned long),
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;void (*keepalive_handler)(unsigned long))
+</span><span class='line'>{
+</span><span class='line'>&#9;struct inet_connection_sock *icsk = inet_csk(sk);
+</span><span class='line'>
+</span><span class='line'>&#9;//安装定时器，设置定时器的回掉函数。
+</span><span class='line'>&#9;setup_timer(&icsk-&gt;icsk_retransmit_timer, retransmit_handler, (unsigned long)sk);
+</span><span class='line'>&#9;setup_timer(&icsk-&gt;icsk_delack_timer, delack_handler, (unsigned long)sk);
+</span><span class='line'>&#9;setup_timer(&sk-&gt;sk_timer, keepalive_handler, (unsigned long)sk);
+</span><span class='line'>&#9;icsk-&gt;icsk_pending = icsk-&gt;icsk_ack.pending = 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>我 们可以看到icsk->icsk_retransmit_timer定时器，也就是重传定时器的回调函数是tcp_write_timer,而 icsk->icsk_delack_timer定时器也就是delayed-ack 定时器的回调函数是tcp_delack_timer,最后sk->sk_timer也就是keepalive定时器的回掉函数是 tcp_keepalive_timer.<br/>
+这里还有一个要注意的，tcp_write_timer还会处理0窗口定时器。<br/>
+这里有关内核定时器的一些基础的东西我就不介绍了，想了解的可以去看下ldd第三版。<br/>
+接下来我们就来一个个的分析这6个定时器，首先是重传定时器。<br/>
+我们知道4层最终调用tcp_xmit_write来讲数据发送到3层，并且tcp是字节流的，因此每次他总是发送一段数据到3层，而每次当它发送完毕(返回正确),则它就会启动重传定时器，我们来看代码：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
+</span><span class='line'>&#9;&#9;&#9;  int push_one, gfp_t gfp)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>&#9;struct sk_buff *skb;
+</span><span class='line'>&#9;unsigned int tso_segs, sent_pkts;
+</span><span class='line'>&#9;int cwnd_quota;
+</span><span class='line'>&#9;int result;
+</span><span class='line'>
+</span><span class='line'>.............................................
+</span><span class='line'>
+</span><span class='line'>&#9;while ((skb = tcp_send_head(sk))) {
+</span><span class='line'>..................................................
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;//可以看到只有当传输成功，我们才会走到下面的函数。
+</span><span class='line'>&#9;&#9;if (unlikely(tcp_transmit_skb(sk, skb, 1, gfp)))
+</span><span class='line'>&#9;&#9;&#9;break;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;/* Advance the send_head.  This one is sent out.
+</span><span class='line'>&#9;&#9; * This call will increment packets_out.
+</span><span class='line'>&#9;&#9; */
+</span><span class='line'>&#9;&#9;//最终在这个函数中启动重传定时器。
+</span><span class='line'>&#9;&#9;tcp_event_new_data_sent(sk, skb);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;tcp_minshall_update(tp, mss_now, skb);
+</span><span class='line'>&#9;&#9;sent_pkts++;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (push_one)
+</span><span class='line'>&#9;&#9;&#9;break;
+</span><span class='line'>&#9;}
+</span><span class='line'>...........................
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>现在我们来看tcp_event_new_data_sent,如何启动定时器的.</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void tcp_event_new_data_sent(struct sock *sk, struct sk_buff *skb)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>&#9;unsigned int prior_packets = tp-&gt;packets_out;
+</span><span class='line'>
+</span><span class='line'>&#9;tcp_advance_send_head(sk, skb);
+</span><span class='line'>&#9;tp-&gt;snd_nxt = TCP_SKB_CB(skb)-&gt;end_seq;
+</span><span class='line'>
+</span><span class='line'>&#9;/* Don't override Nagle indefinately with F-RTO */
+</span><span class='line'>&#9;if (tp-&gt;frto_counter == 2)
+</span><span class='line'>&#9;&#9;tp-&gt;frto_counter = 3;
+</span><span class='line'>&#9;//关键在这里.
+</span><span class='line'>&#9;tp-&gt;packets_out += tcp_skb_pcount(skb);
+</span><span class='line'>&#9;if (!prior_packets)
+</span><span class='line'>&#9;&#9;inet_csk_reset_xmit_timer(sk, ICSK_TIME_RETRANS, inet_csk(sk)-&gt;icsk_rto, TCP_RTO_MAX);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>可以看到只有当prior_packets为0时才会重启定时器,而prior_packets则是发送未确认的段的个数,也就是说如果发送了很多段,如果前面的段没有确认,那么后面发送的时候不会重启这个定时器.<br/>
+我们要知道，定时器的间隔是通过rtt来得到的，具体的算法，可以看下tcp/ip详解。<br/>
+当 启动了重传定时器，我们就会等待ack的到来，如果超时还没到来，那么就调用重传定时器的回调函数，否则最终会调用tcp_rearm_rto来删除或者 重启定时器，这个函数是在tcp_ack()->tcp_clean_rtx_queue()中被调用的。tcp_ack是专门用来处理ack。<br/>
+这个函数很简单，就是通过判断packets_out，这个值表示当前还未确认的段的个数。然后来进行相关操作。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void tcp_rearm_rto(struct sock *sk)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>
+</span><span class='line'>&#9;//为0说明所有的传输的段都已经acked。此时remove定时器。否则重启定时器。
+</span><span class='line'>&#9;if (!tp-&gt;packets_out) {
+</span><span class='line'>&#9;&#9;inet_csk_clear_xmit_timer(sk, ICSK_TIME_RETRANS);
+</span><span class='line'>&#9;} else {
+</span><span class='line'>&#9;&#9;inet_csk_reset_xmit_timer(sk, ICSK_TIME_RETRANS,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;  inet_csk(sk)-&gt;icsk_rto, TCP_RTO_MAX);
+</span><span class='line'>&#9;}
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  接下来来看tcp_write_timer的实现。这个函数主要是通过icsk->icsk_pending来判断是那个定时器导致超时，这里只有两 种，一种是ICSK_TIME_RETRANS，也就是重传定时器，另一种是ICSK_TIME_PROBE0也就是0窗口定时器。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define ICSK_TIME_RETRANS   1   /* Retransmit timer */
+</span><span class='line'>#define ICSK_TIME_PROBE0    3   /* Zero window probe timer */
+</span><span class='line'>static void tcp_write_timer(unsigned long data)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct sock *sk = (struct sock *)data;
+</span><span class='line'>&#9;struct inet_connection_sock *icsk = inet_csk(sk);
+</span><span class='line'>&#9;int event;
+</span><span class='line'>
+</span><span class='line'>&#9;//首先加锁。
+</span><span class='line'>&#9;bh_lock_sock(sk);
+</span><span class='line'>&#9;//如果是进程空间则什么也不做。
+</span><span class='line'>&#9;if (sock_owned_by_user(sk)) {
+</span><span class='line'>&#9;&#9;/* Try again later */
+</span><span class='line'>&#9;&#9;sk_reset_timer(sk, &icsk-&gt;icsk_retransmit_timer, jiffies + (HZ / 20));
+</span><span class='line'>&#9;&#9;goto out_unlock;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;//如果状态为close或者icsk_pending为空，则什么也不做。
+</span><span class='line'>&#9;if (sk-&gt;sk_state == TCP_CLOSE || !icsk-&gt;icsk_pending)
+</span><span class='line'>&#9;&#9;goto out;
+</span><span class='line'>&#9;//如果超时时间已经过了，则重启定时器。
+</span><span class='line'>
+</span><span class='line'>&#9;if (time_after(icsk-&gt;icsk_timeout, jiffies)) {
+</span><span class='line'>&#9;&#9;sk_reset_timer(sk, &icsk-&gt;icsk_retransmit_timer, icsk-&gt;icsk_timeout);
+</span><span class='line'>&#9;&#9;goto out;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;//取出定时器类型。
+</span><span class='line'>&#9;event = icsk-&gt;icsk_pending;
+</span><span class='line'>&#9;icsk-&gt;icsk_pending = 0;
+</span><span class='line'>
+</span><span class='line'>&#9;//通过判断event来确定进入那个函数进行处理。
+</span><span class='line'>&#9;switch (event) {
+</span><span class='line'>&#9;case ICSK_TIME_RETRANS:
+</span><span class='line'>&#9;&#9;tcp_retransmit_timer(sk);
+</span><span class='line'>&#9;&#9;break;
+</span><span class='line'>&#9;case ICSK_TIME_PROBE0:
+</span><span class='line'>&#9;&#9;tcp_probe_timer(sk);
+</span><span class='line'>&#9;&#9;break;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;TCP_CHECK_TIMER(sk);
+</span><span class='line'>
+</span><span class='line'>out:
+</span><span class='line'>&#9;sk_mem_reclaim(sk);
+</span><span class='line'>out_unlock:
+</span><span class='line'>&#9;bh_unlock_sock(sk);
+</span><span class='line'>&#9;sock_put(sk);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>我们这里只看重传定时器，0窗口定时器后面紧接着会介绍。<br/>
+tcp_retransmit_timer,这个函数用来处理数据段的重传。<br/>
+这里要注意，重传的时候为了防止确认二义性，使用karn算法，也就是定时器退避策略。下面的代码最后部分会修改定时器的值，这里是增加一倍。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+<span class='line-number'>82</span>
+<span class='line-number'>83</span>
+<span class='line-number'>84</span>
+<span class='line-number'>85</span>
+<span class='line-number'>86</span>
+<span class='line-number'>87</span>
+<span class='line-number'>88</span>
+<span class='line-number'>89</span>
+<span class='line-number'>90</span>
+<span class='line-number'>91</span>
+<span class='line-number'>92</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void tcp_retransmit_timer(struct sock *sk)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>&#9;struct inet_connection_sock *icsk = inet_csk(sk);
+</span><span class='line'>
+</span><span class='line'>&#9;//如果没有需要确认的段，则什么也不做。
+</span><span class='line'>&#9;if (!tp-&gt;packets_out)
+</span><span class='line'>&#9;&#9;goto out;
+</span><span class='line'>
+</span><span class='line'>&#9;WARN_ON(tcp_write_queue_empty(sk));
+</span><span class='line'>
+</span><span class='line'>&#9;/**首先进行一些合法性判断，其中:
+</span><span class='line'>&#9; * snd_wnd为窗口大小。
+</span><span class='line'>&#9; * sock_flag用来判断sock的状态。
+</span><span class='line'>&#9; * 最后一个判断是当前的连接状态不能处于syn_sent和syn_recv状态,也就是连接还未建
+</span><span class='line'>&#9; * 立状态.
+</span><span class='line'>&#9;if (!tp-&gt;snd_wnd && !sock_flag(sk, SOCK_DEAD) &&
+</span><span class='line'>&#9;&#9;!((1 &lt;&lt; sk-&gt;sk_state) & (TCPF_SYN_SENT | TCPF_SYN_RECV))) {
+</span><span class='line'>&#9;&#9;//tcp_time_stamp也就是jifes，而rcv_tstamp表示最后一个ack接收的时间，也就是最后一次对端确认的时间。因此这两个时间之差不能大于tcp_rto_max,因为tcp_rto_max为我们重传定时器的间隔时间的最大值。
+</span><span class='line'>&#9;&#9;if (tcp_time_stamp - tp-&gt;rcv_tstamp &gt; TCP_RTO_MAX) {
+</span><span class='line'>&#9;&#9;&#9;tcp_write_err(sk);
+</span><span class='line'>&#9;&#9;&#9;goto out;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;//这个函数用来进入loss状态，也就是进行一些拥塞以及流量的控制。
+</span><span class='line'>&#9;&#9;tcp_enter_loss(sk, 0);
+</span><span class='line'>&#9;&#9;//现在开始重传skb。
+</span><span class='line'>&#9;&#9;tcp_retransmit_skb(sk, tcp_write_queue_head(sk));
+</span><span class='line'>&#9;&#9;__sk_dst_reset(sk);
+</span><span class='line'>&#9;&#9;//然后重启定时器，继续等待ack的到来。
+</span><span class='line'>&#9;&#9;goto out_reset_timer;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;//程序到达这里说明上面的校验失败，因此下面这个函数用来判断我们重传需要的次数。如果超过了重传次数，直接跳转到out。
+</span><span class='line'>&#9;if (tcp_write_timeout(sk))
+</span><span class='line'>&#9;&#9;goto out;
+</span><span class='line'>
+</span><span class='line'>&#9;//到达这里说明我们重传的次数还没到。icsk-&gt;icsk_retransmits表示重传的次数。
+</span><span class='line'>&#9;if (icsk-&gt;icsk_retransmits == 0) {
+</span><span class='line'>&#9;&#9;//这里其实也就是收集一些统计信息。
+</span><span class='line'>&#9;&#9;int mib_idx;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (icsk-&gt;icsk_ca_state == TCP_CA_Disorder) {
+</span><span class='line'>&#9;&#9;&#9;if (tcp_is_sack(tp))
+</span><span class='line'>&#9;&#9;&#9;&#9;mib_idx = LINUX_MIB_TCPSACKFAILURES;
+</span><span class='line'>&#9;&#9;&#9;else
+</span><span class='line'>&#9;&#9;&#9;&#9;mib_idx = LINUX_MIB_TCPRENOFAILURES;
+</span><span class='line'>&#9;&#9;} else if (icsk-&gt;icsk_ca_state == TCP_CA_Recovery) {
+</span><span class='line'>&#9;&#9;&#9;if (tcp_is_sack(tp))
+</span><span class='line'>&#9;&#9;&#9;&#9;mib_idx = LINUX_MIB_TCPSACKRECOVERYFAIL;
+</span><span class='line'>&#9;&#9;&#9;else
+</span><span class='line'>&#9;&#9;&#9;&#9;mib_idx = LINUX_MIB_TCPRENORECOVERYFAIL;
+</span><span class='line'>&#9;&#9;} else if (icsk-&gt;icsk_ca_state == TCP_CA_Loss) {
+</span><span class='line'>&#9;&#9;&#9;mib_idx = LINUX_MIB_TCPLOSSFAILURES;
+</span><span class='line'>&#9;&#9;} else {
+</span><span class='line'>&#9;&#9;&#9;mib_idx = LINUX_MIB_TCPTIMEOUTS;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;NET_INC_STATS_BH(sock_net(sk), mib_idx);
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;//是否使用f-rto算法。
+</span><span class='line'>&#9;if (tcp_use_frto(sk)) {
+</span><span class='line'>&#9;&#9;tcp_enter_frto(sk);
+</span><span class='line'>&#9;} else {
+</span><span class='line'>&#9;&#9;//否则处理sack.
+</span><span class='line'>&#9;&#9;tcp_enter_loss(sk, 0);
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;// 再次尝试重传队列的第一个段。
+</span><span class='line'>&#9;if (tcp_retransmit_skb(sk, tcp_write_queue_head(sk)) &gt; 0) {
+</span><span class='line'>&#9;&#9;//重传失败。
+</span><span class='line'>&#9;&#9;if (!icsk-&gt;icsk_retransmits)
+</span><span class='line'>&#9;&#9;&#9;icsk-&gt;icsk_retransmits = 1;
+</span><span class='line'>&#9;&#9;inet_csk_reset_xmit_timer(sk, ICSK_TIME_RETRANS,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;  min(icsk-&gt;icsk_rto, TCP_RESOURCE_PROBE_INTERVAL),
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;  TCP_RTO_MAX);
+</span><span class='line'>&#9;&#9;goto out;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;//icsk-&gt;icsk_backoff主要用在零窗口定时器。
+</span><span class='line'>&#9;icsk-&gt;icsk_backoff++;
+</span><span class='line'>&#9;//icsk_retransmits也就是重试次数。
+</span><span class='line'>&#9;icsk-&gt;icsk_retransmits++;
+</span><span class='line'>
+</span><span class='line'>out_reset_timer:
+</span><span class='line'>&#9;//计算rto，并重启定时器，这里使用karn算法，也就是下次超时时间增加一倍/
+</span><span class='line'>&#9;icsk-&gt;icsk_rto = min(icsk-&gt;icsk_rto &lt;&lt; 1, TCP_RTO_MAX);
+</span><span class='line'>&#9;//重启定时器，可以看到超时时间就是我们上面的icsk_rto.
+</span><span class='line'>&#9;inet_csk_reset_xmit_timer(sk, ICSK_TIME_RETRANS, icsk-&gt;icsk_rto, TCP_RTO_MAX);
+</span><span class='line'>&#9;if (icsk-&gt;icsk_retransmits &gt; sysctl_tcp_retries1)
+</span><span class='line'>&#9;&#9;__sk_dst_reset(sk);
+</span><span class='line'>
+</span><span class='line'>out:;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>下面我们来看tcp_write_timeout，它用来判断重传次数是否已经到了。这里主要分为两个分支，一个是状态为syn_sent或者syn_recv状态，一个是另外的状态。而这里系统设置的重传次数一共有4种。<br/>
+1 sysctl_tcp_syn_retries，它表示syn分节的重传次数。<br/>
+2 sysctl_tcp_retries1 它表示的是最大的重试次数，当超过了这个值，我们就需要检测路由表了。<br/>
+3 sysctl_tcp_retries2 这个值也是表示重试最大次数，只不过这个值一般要比上面的值大。和上面那个不同的是，当重试次数超过这个值，我们就必须放弃重试了。<br/>
+4 sysctl_tcp_orphan_retries 主要是针对孤立的socket(也就是已经从进程上下文中删除了，可是还有一些清理工作没有完成).对于这种socket，我们重试的最大的次数就是它。<br/>
+下面来看代码：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int tcp_write_timeout(struct sock *sk)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct inet_connection_sock *icsk = inet_csk(sk);
+</span><span class='line'>&#9;//retry_untry表示我们需要重传的最大次数。
+</span><span class='line'>&#9;int retry_until;
+</span><span class='line'>
+</span><span class='line'>&#9;//判断socket状态。
+</span><span class='line'>&#9;if ((1 &lt;&lt; sk-&gt;sk_state) & (TCPF_SYN_SENT | TCPF_SYN_RECV)) {
+</span><span class='line'>&#9;&#9;if (icsk-&gt;icsk_retransmits)
+</span><span class='line'>&#9;&#9;&#9;dst_negative_advice(&sk-&gt;sk_dst_cache);
+</span><span class='line'>&#9;&#9;//设置重传最大值
+</span><span class='line'>&#9;&#9;retry_until = icsk-&gt;icsk_syn_retries ? : sysctl_tcp_syn_retries;
+</span><span class='line'>&#9;} else {
+</span><span class='line'>&#9;&#9;//是否需要检测路由表。
+</span><span class='line'>&#9;&#9;if (icsk-&gt;icsk_retransmits &gt;= sysctl_tcp_retries1) {
+</span><span class='line'>&#9;&#9;&#9;/* Black hole detection */
+</span><span class='line'>&#9;&#9;&#9;tcp_mtu_probing(icsk, sk);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;dst_negative_advice(&sk-&gt;sk_dst_cache);
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;//设置重传最大次数为sysctl_tcp_retries2
+</span><span class='line'>&#9;&#9;retry_until = sysctl_tcp_retries2;
+</span><span class='line'>&#9;&#9;if (sock_flag(sk, SOCK_DEAD)) {
+</span><span class='line'>&#9;&#9;&#9;//表示是一个孤立的socket。
+</span><span class='line'>&#9;&#9;&#9;const int alive = (icsk-&gt;icsk_rto &lt; TCP_RTO_MAX);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;//从tcp_orphan_retries(这个函数中会通过sysctl_tcp_orphan_retries来进行计算)中取得重传最大次数。
+</span><span class='line'>&#9;&#9;&#9;retry_until = tcp_orphan_retries(sk, alive);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;if (tcp_out_of_resources(sk, alive || icsk-&gt;icsk_retransmits &lt; retry_until))
+</span><span class='line'>&#9;&#9;&#9;&#9;return 1;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;//最终进行判断，如果重传次数已到则返回1,否则为0.
+</span><span class='line'>&#9;if (icsk-&gt;icsk_retransmits &gt;= retry_until) {
+</span><span class='line'>&#9;&#9;/* Has it gone just too far? */
+</span><span class='line'>&#9;&#9;tcp_write_err(sk);
+</span><span class='line'>&#9;&#9;return 1;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;return 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>下面来介绍下tcp_enter_loss，这个函数主要用来标记丢失的段(也就是没有acked的段),然后通过执行slow start来降低传输速率.<br/>
+有关slow start以及Congestion avoidance算法描述可以看rfc2001:<br/>
+<a href="http://www.faqs.org/rfcs/rfc2001.html">http://www.faqs.org/rfcs/rfc2001.html</a></p>
+
+<p>下面4个算法主要是用来对拥塞进行控制的，这四个算法其实都是彼此相连的。slow start和Congestion avoidance使用了相同的机制，他们都涉及到了拥塞窗口的定义。其中拥塞窗口限制着传输的长度，它的大小根据拥塞程度上升或者下降。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>Slow start
+</span><span class='line'>Congestion avoidance
+</span><span class='line'>Fast re-transmit
+</span><span class='line'>Fast recovery</span></code></pre></td></tr></table></div></figure>
+
+
+<p>然后下面主要是介绍了slow start和Congestion avoidance的一些实现细节。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>CWND - Sender side limit
+</span><span class='line'>RWND - Receiver side limit
+</span><span class='line'>Slow start threshold ( SSTHRESH ) - Used to determine whether slow start is used or congestion avoidance
+</span><span class='line'>When starting, probe slowly - IW &lt;= 2 * SMSS
+</span><span class='line'>Initial size of SSTHRESH can be arbitrarily high, as high as the RWND
+</span><span class='line'>Use slow start when SSTHRESH &gt; CWND. Else, use Congestion avoidance
+</span><span class='line'>Slow start - CWND is increased by an amount less than or equal to the SMSS for every ACK
+</span><span class='line'>Congestion avoidance - CWND += SMSS*SMSS/CWND
+</span><span class='line'>When loss is detected - SSTHRESH = max( FlightSize/2, 2*SMSS )</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这里要注意在slow start中，窗口的大小是指数级的增长的。并且当cwnd(拥塞窗口)小于等于ssthresh，就是slow start模式，否则就执行Congestion avoidance。</p>
+
+<h5>现在我们来看tcp_enter_loss的实现。</h5>
+
+<p>首先来介绍下下面要用到的几个关键域的含义。<br/>
+1 icsk->icsk_ca_state 这个域表示拥塞控制的状态。<br/>
+2 tp->snd_una 这个域表示tcp滑动窗口中的发送未确认的第一个字节的序列号。<br/>
+3 tp->prior_ssthresh 这个域表示前一个snd_ssthresh得大小，也就是说每次改变snd_ssthresh前都要保存老的snd_ssthresh到这个域。<br/>
+4 tp->snd_ssthresh  slow start开始时的threshold大小<br/>
+5 tp->snd_cwnd_cnt 这个域表示拥塞窗口的大小。<br/>
+6 TCP_SKB_CB(skb)->sacked tcp数据中的sack标记。<br/>
+7 tp->high_seq 拥塞开始时，snd_nxt的大小。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void tcp_enter_loss(struct sock *sk, int how)
+</span><span class='line'>{
+</span><span class='line'>&#9;const struct inet_connection_sock *icsk = inet_csk(sk);
+</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>&#9;struct sk_buff *skb;
+</span><span class='line'>
+</span><span class='line'>
+</span><span class='line'>&#9;/* 1 拥塞控制状态小于TCP_CA_Disorder
+</span><span class='line'>&#9; * 2 发送未确认的序列号等于拥塞开始时的下一个将要发送的序列号
+</span><span class='line'>&#9; * 3 状态为TCP_CA_Loss，并且还未重新传输过。
+</span><span class='line'>&#9; * 如果有一个满足说明有数据丢失,因此降低threshold。
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;if (icsk-&gt;icsk_ca_state &lt;= TCP_CA_Disorder || tp-&gt;snd_una == tp-&gt;high_seq ||
+</span><span class='line'>&#9;&#9;(icsk-&gt;icsk_ca_state == TCP_CA_Loss && !icsk-&gt;icsk_retransmits)) {
+</span><span class='line'>&#9;&#9;//保存老的snd_ssthresh。
+</span><span class='line'>&#9;&#9;tp-&gt;prior_ssthresh = tcp_current_ssthresh(sk);
+</span><span class='line'>&#9;&#9;//减小snd_ssthresh
+</span><span class='line'>&#9;&#9;tp-&gt;snd_ssthresh = icsk-&gt;icsk_ca_ops-&gt;ssthresh(sk);
+</span><span class='line'>&#9;&#9;//设置拥塞状态。
+</span><span class='line'>&#9;&#9;tcp_ca_event(sk, CA_EVENT_LOSS);
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;//设置拥塞窗口大小
+</span><span class='line'>&#9;tp-&gt;snd_cwnd    = 1;
+</span><span class='line'>&#9;tp-&gt;snd_cwnd_cnt   = 0;
+</span><span class='line'>&#9;//设置时间
+</span><span class='line'>&#9;tp-&gt;snd_cwnd_stamp = tcp_time_stamp;
+</span><span class='line'>
+</span><span class='line'>&#9;tp-&gt;bytes_acked = 0;
+</span><span class='line'>&#9;//清空所有相关的计数器。
+</span><span class='line'>&#9;tcp_clear_retrans_partial(tp);
+</span><span class='line'>
+</span><span class='line'>&#9;if (tcp_is_reno(tp))
+</span><span class='line'>&#9;&#9;tcp_reset_reno_sack(tp);
+</span><span class='line'>
+</span><span class='line'>&#9;if (!how) {
+</span><span class='line'>&#9;&#9;/* Push undo marker, if it was plain RTO and nothing
+</span><span class='line'>&#9;&#9; * was retransmitted. */
+</span><span class='line'>&#9;&#9;tp-&gt;undo_marker = tp-&gt;snd_una;
+</span><span class='line'>&#9;} else {
+</span><span class='line'>&#9;&#9;tp-&gt;sacked_out = 0;
+</span><span class='line'>&#9;&#9;tp-&gt;fackets_out = 0;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;tcp_clear_all_retrans_hints(tp);
+</span><span class='line'>
+</span><span class='line'>&#9;//遍历sock的write队列。
+</span><span class='line'>&#9;tcp_for_write_queue(skb, sk) {
+</span><span class='line'>&#9;&#9;if (skb == tcp_send_head(sk))
+</span><span class='line'>&#9;&#9;&#9;break;
+</span><span class='line'>&#9;&#9;//判断sack段。
+</span><span class='line'>&#9;&#9;if (TCP_SKB_CB(skb)-&gt;sacked & TCPCB_RETRANS)
+</span><span class='line'>&#9;&#9;&#9;tp-&gt;undo_marker = 0;
+</span><span class='line'>&#9;&#9;TCP_SKB_CB(skb)-&gt;sacked &= (~TCPCB_TAGBITS)|TCPCB_SACKED_ACKED;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;//如果how为1,则说明不管sack段，此时标记所有的段为丢失(sack的意思去看tcp/ip详解).
+</span><span class='line'>&#9;&#9;if (!(TCP_SKB_CB(skb)-&gt;sacked&TCPCB_SACKED_ACKED) || how) {
+</span><span class='line'>&#9;&#9;&#9;//设置sack段。
+</span><span class='line'>&#9;&#9;&#9;TCP_SKB_CB(skb)-&gt;sacked &= ~TCPCB_SACKED_ACKED;
+</span><span class='line'>&#9;&#9;&#9;TCP_SKB_CB(skb)-&gt;sacked |= TCPCB_LOST;
+</span><span class='line'>&#9;&#9;&#9;//update 相关的域。
+</span><span class='line'>&#9;&#9;&#9;tp-&gt;lost_out += tcp_skb_pcount(skb);
+</span><span class='line'>&#9;&#9;&#9;tp-&gt;retransmit_high = TCP_SKB_CB(skb)-&gt;end_seq;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;tcp_verify_left_out(tp);
+</span><span class='line'>&#9;//设置当前的reordering的长度
+</span><span class='line'>&#9;tp-&gt;reordering = min_t(unsigned int, tp-&gt;reordering,
+</span><span class='line'>&#9;&#9;&#9;&#9;   sysctl_tcp_reordering);
+</span><span class='line'>&#9;//设置拥塞状态。
+</span><span class='line'>&#9;tcp_set_ca_state(sk, TCP_CA_Loss);
+</span><span class='line'>&#9;tp-&gt;high_seq = tp-&gt;snd_nxt;
+</span><span class='line'>&#9;//由于我们修改了拥塞窗口，因此设置ecn状态。
+</span><span class='line'>&#9;TCP_ECN_queue_cwr(tp);
+</span><span class='line'>&#9;/* Abort F-RTO algorithm if one is in progress */
+</span><span class='line'>&#9;tp-&gt;frto_counter = 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>接 下来来看零窗口探测定时器。至于为什么会出现零窗口，这里就不阐述了，详细的可以去看tcp/ip详解。我们知道当0窗口之后,客户机会等待服务器端的窗 口打开报文，可是由于ip是不可靠的，有可能这个报文会丢失，因此就需要客户机发送一个探测段，用来提醒服务器及时汇报当前的窗口大小。这里我们知道当对 端接收窗口关闭后，我们这边的发送窗口也会关闭，此时不能发送任何一般的数据，除了探测段。<br/>
+在内核中是通过tcp_ack_probe来控制零窗口的定时器的。也就是说接收到对端的窗口报告数据后，会进入这个函数。我们来看实现：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void tcp_ack_probe(struct sock *sk)
+</span><span class='line'>{
+</span><span class='line'>&#9;const struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>&#9;struct inet_connection_sock *icsk = inet_csk(sk);
+</span><span class='line'>
+</span><span class='line'>
+</span><span class='line'>&#9;//首先判断是否对端的接收窗口是否已经有空间。
+</span><span class='line'>&#9;if (!after(TCP_SKB_CB(tcp_send_head(sk))-&gt;end_seq, tcp_wnd_end(tp))) {
+</span><span class='line'>&#9;&#9;//如果有空间则删除零窗口探测定时器。
+</span><span class='line'>&#9;&#9;icsk-&gt;icsk_backoff = 0;
+</span><span class='line'>&#9;&#9;inet_csk_clear_xmit_timer(sk, ICSK_TIME_PROBE0);
+</span><span class='line'>&#9;&#9;/* Socket must be waked up by subsequent tcp_data_snd_check().
+</span><span class='line'>&#9;&#9; * This function is not for random using!
+</span><span class='line'>&#9;&#9; */
+</span><span class='line'>&#9;} else {
+</span><span class='line'>&#9;&#9;//否则启动定时器。
+</span><span class='line'>&#9;&#9;inet_csk_reset_xmit_timer(sk, ICSK_TIME_PROBE0,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;  min(icsk-&gt;icsk_rto &lt;&lt; icsk-&gt;icsk_backoff, TCP_RTO_MAX),
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;  TCP_RTO_MAX);
+</span><span class='line'>&#9;}
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>我们知道零窗口定时器和重传的定时器是一个定时器，只不过在回调函数中，进行event判断，从而进入不同的处理。而它调用的是tcp_probe_timer函数。<br/>
+这个函数主要就是用来发送探测包，我们来看它的实现：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void tcp_probe_timer(struct sock *sk)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct inet_connection_sock *icsk = inet_csk(sk);
+</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>&#9;int max_probes;
+</span><span class='line'>&#9;/* 1 tp-&gt;packets_out不为0说明，当定时器被安装之后，对端的接收窗口已经被打开。这* 时就不需要传输探测包。
+</span><span class='line'>&#9; * 2 tcp_send_head用来检测是否有新的段被传输。
+</span><span class='line'>&#9; * 如果上面有一个满足，则不需要发送探测包，并直接返回。
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;if (tp-&gt;packets_out || !tcp_send_head(sk)) {
+</span><span class='line'>&#9;&#9;icsk-&gt;icsk_probes_out = 0;
+</span><span class='line'>&#9;&#9;return;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;//设置最大的重试次数。
+</span><span class='line'>&#9;max_probes = sysctl_tcp_retries2;
+</span><span class='line'>
+</span><span class='line'>&#9;//这里的处理和上面的tcp_write_timeout很类似。
+</span><span class='line'>&#9;if (sock_flag(sk, SOCK_DEAD)) {
+</span><span class='line'>&#9;&#9;const int alive = ((icsk-&gt;icsk_rto &lt;&lt; icsk-&gt;icsk_backoff) &lt; TCP_RTO_MAX);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;max_probes = tcp_orphan_retries(sk, alive);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (tcp_out_of_resources(sk, alive || icsk-&gt;icsk_probes_out &lt;= max_probes))
+</span><span class='line'>&#9;&#9;&#9;return;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;//如果重试次数大于最大的重试次数，则报错。
+</span><span class='line'>&#9;if (icsk-&gt;icsk_probes_out &gt; max_probes) {
+</span><span class='line'>&#9;&#9;tcp_write_err(sk);
+</span><span class='line'>&#9;} else {
+</span><span class='line'>&#9;&#9;/* Only send another probe if we didn't close things up. */
+</span><span class='line'>&#9;//否则发送探测包。这个函数里面会发送探测包，并重启定时器。
+</span><span class='line'>&#9;&#9;tcp_send_probe0(sk);
+</span><span class='line'>&#9;}
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>然 后来看delay ack定时器。所谓的delay ack也就是ack不会马上发送，而是等待一段时间和数据一起发送，这样就减少了一个数据包的发送。这里一般是将ack包含在tcp option中发送的。这里的定时器就是用来控制这段时间，如果定时器到期，都没有数据要发送给对端，此时单独发送这个ack。如果在定时器时间内，有数 据要发送，此时这个ack和数据一起发送给对端。<br/>
+前面我们知道delay ack定时器的回调函数是tcp_delack_timer。在分析这个函数之前，我们先来看下这个定时器是什么时候被启动的。<br/>
+首先我们知道内核接收数据都是在tcp_rcv_eastablished实现的，当我们接收完数据后，此时进入是否进行delay ack.<br/>
+在tcp_rcv_eastablished最终会调用__tcp_ack_snd_check进行判断。<br/>
+可以看到这个函数很简单，就是判断是否需要发送delay ack，如果是则tcp_send_delayed_ack，否则直接发送ack恢复给对端。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void __tcp_ack_snd_check(struct sock *sk, int ofo_possible)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>
+</span><span class='line'>/* 1 第一个判断表示多于一个的段在等待ack，并且我们的receive buf有足够的空间，
+</span><span class='line'> *   这是因为这种情况，表明应用程序读取比较快，而对端的发送速度依赖于ack的到达时间，* 因此我们不希望对端减慢速度。
+</span><span class='line'> * 2 这个sock处在quickack 模式
+</span><span class='line'> * 3 我们有 out-of-order数据,此时必须马上给对端以确认。
+</span><span class='line'> *   当上面的任意一个为真，则立即发送ack。
+</span><span class='line'>**/
+</span><span class='line'>&#9;if (((tp-&gt;rcv_nxt - tp-&gt;rcv_wup) &gt; inet_csk(sk)-&gt;icsk_ack.rcv_mss
+</span><span class='line'>&#9;&#9; /* ... and right edge of window advances far enough.
+</span><span class='line'>&#9;&#9;  * (tcp_recvmsg() will send ACK otherwise). Or...
+</span><span class='line'>&#9;&#9;  */
+</span><span class='line'>&#9;&#9; && __tcp_select_window(sk) &gt;= tp-&gt;rcv_wnd) ||
+</span><span class='line'>&#9;&#9;/* We ACK each frame or... */
+</span><span class='line'>&#9;&#9;tcp_in_quickack_mode(sk) ||
+</span><span class='line'>&#9;&#9;/* We have out of order data. */
+</span><span class='line'>&#9;&#9;(ofo_possible && skb_peek(&tp-&gt;out_of_order_queue))) {
+</span><span class='line'>&#9;&#9;/* Then ack it now */
+</span><span class='line'>&#9;&#9;tcp_send_ack(sk);
+</span><span class='line'>&#9;} else {
+</span><span class='line'>&#9;&#9;/* Else, send delayed ack. */
+</span><span class='line'>&#9;&#9;//在这里启动定时器。
+</span><span class='line'>&#9;&#9;tcp_send_delayed_ack(sk);
+</span><span class='line'>&#9;}
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>上面还有一个tcp_in_quickack_mode，这个函数我们说了，它是用来判断是否处在quickack 模式。<br/>
+来看这个函数：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static inline int tcp_in_quickack_mode(const struct sock *sk)
+</span><span class='line'>{
+</span><span class='line'>&#9;const struct inet_connection_sock *icsk = inet_csk(sk);
+</span><span class='line'>&#9;return icsk-&gt;icsk_ack.quick && !icsk-&gt;icsk_ack.pingpong;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>其中icsk->icsk_ack.pingpong域被设置的情况只有当tcp连接是交互式的，比如telnet等等。icsk->icsk_ack.quick表示能够 quickack的数量。
+然后我们来看tcp_delack_timer的实现。<br/>
+在看之前，我们要知道icsk->icsk_ack.pending表示的是当前的ack的状态。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void tcp_delack_timer(unsigned long data)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct sock *sk = (struct sock *)data;
+</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>&#9;struct inet_connection_sock *icsk = inet_csk(sk);
+</span><span class='line'>
+</span><span class='line'>&#9;bh_lock_sock(sk);
+</span><span class='line'>&#9;//用户进程正在使用，则等会再尝试。
+</span><span class='line'>&#9;if (sock_owned_by_user(sk)) {
+</span><span class='line'>&#9;&#9;/* Try again later. */
+</span><span class='line'>&#9;&#9;icsk-&gt;icsk_ack.blocked = 1;
+</span><span class='line'>&#9;&#9;NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_DELAYEDACKLOCKED);
+</span><span class='line'>&#9;&#9;sk_reset_timer(sk, &icsk-&gt;icsk_delack_timer, jiffies + TCP_DELACK_MIN);
+</span><span class='line'>&#9;&#9;goto out_unlock;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;sk_mem_reclaim_partial(sk);
+</span><span class='line'>
+</span><span class='line'>&#9;//判断sock状态 以及ack的状态。如果是close或者已经处在ICSK_ACK_TIMER，则直接跳出。
+</span><span class='line'>&#9;if (sk-&gt;sk_state == TCP_CLOSE || !(icsk-&gt;icsk_ack.pending & ICSK_ACK_TIMER))
+</span><span class='line'>&#9;&#9;goto out;
+</span><span class='line'>
+</span><span class='line'>&#9;//如果已经超时，则重启定时器，并退出。
+</span><span class='line'>&#9;if (time_after(icsk-&gt;icsk_ack.timeout, jiffies)) {
+</span><span class='line'>&#9;&#9;sk_reset_timer(sk, &icsk-&gt;icsk_delack_timer, icsk-&gt;icsk_ack.timeout);
+</span><span class='line'>&#9;&#9;goto out;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;//清除ack状态。
+</span><span class='line'>&#9;icsk-&gt;icsk_ack.pending &= ~ICSK_ACK_TIMER;
+</span><span class='line'>
+</span><span class='line'>&#9;//开始遍历prequeue。此时主要的目的是为了调用tcp_rcv_eastablished.这里会调用tcp_ack_snd_check来发送ack。
+</span><span class='line'>&#9;if (!skb_queue_empty(&tp-&gt;ucopy.prequeue)) {
+</span><span class='line'>&#9;&#9;struct sk_buff *skb;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_TCPSCHEDULERFAILED);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;//遍历prequeue队列，发送未发送的ack。
+</span><span class='line'>&#9;&#9;while ((skb = __skb_dequeue(&tp-&gt;ucopy.prequeue)) != NULL)
+</span><span class='line'>&#9;&#9;&#9;sk_backlog_rcv(sk, skb);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;tp-&gt;ucopy.memory = 0;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;//检测是否有ack还需要被发送。也就是处于ICSK_ACK_SCHED状态的ack
+</span><span class='line'>&#9;if (inet_csk_ack_scheduled(sk)) {
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (!icsk-&gt;icsk_ack.pingpong) {
+</span><span class='line'>&#9;&#9;&#9;/* Delayed ACK missed: inflate ATO. */
+</span><span class='line'>&#9;&#9;&#9;icsk-&gt;icsk_ack.ato = min(icsk-&gt;icsk_ack.ato &lt;&lt; 1, icsk-&gt;icsk_rto);
+</span><span class='line'>&#9;&#9;} else {
+</span><span class='line'>&#9;&#9;&#9;//到这里说明已经长时间没有通信，并且处于交互模式。这个时候我们需要关闭pingpong模式。
+</span><span class='line'>&#9;&#9;&#9;icsk-&gt;icsk_ack.pingpong = 0;
+</span><span class='line'>&#9;&#9;&#9;icsk-&gt;icsk_ack.ato      = TCP_ATO_MIN;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;//立即发送ack。
+</span><span class='line'>&#9;&#9;tcp_send_ack(sk);
+</span><span class='line'>&#9;&#9;NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_DELAYEDACKS);
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;TCP_CHECK_TIMER(sk);
+</span><span class='line'>
+</span><span class='line'>out:
+</span><span class='line'>&#9;if (tcp_memory_pressure)
+</span><span class='line'>&#9;&#9;sk_mem_reclaim(sk);
+</span><span class='line'>out_unlock:
+</span><span class='line'>&#9;bh_unlock_sock(sk);
+</span><span class='line'>&#9;sock_put(sk);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
       <h2 class="entry-title"><a href="/blog/2013/09/21/ubuntu-dota2/">ubuntu dota2</a></h2>
     
     
@@ -2529,99 +3700,6 @@ slow_path的话，我们就需要判断要不要update窗口的大小了。以�
 
     </article>
   
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2013/08/29/tools-git-svn-base/">git-svn</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2013-08-29T14:37:00+08:00'><span class='date'>2013-08-29</span> <span class='time'>14:37:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><h4>常用</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>1、git-svn clone your_svn_repository
-</span><span class='line'>2、git add/commit
-</span><span class='line'>3、git-svn rebase    获取中心svn repository的更新；
-</span><span class='line'>4、git-svn dcommit   将本地git库的修改同步到中心svn库。</span></code></pre></td></tr></table></div></figure>
-
-
-<hr />
-
-<p>git-svn默认包含在Git的安装包中，不过在Ubuntu中，git-svn是作为一个独立的Package需要额外安装的(sudo apt-get install git-svn)。安装后你就可以使用git svn xxx命令来操作中心SVN代码库了。当然如果你要使用与git svn等价的git-svn命令的话，你还需要将/usr/lib/git-core配置到你的PATH环境变量中，否则Shell会提示你无法找到 git-svn这个命令。</p>
-
-<ul>
-<li><p>检出一个已存在svn repository(类似于svn checkout)<br/>
-我们可以通过git-svn clone命令完成这个操作： git-svn clone your_svn_repository_url</p></li>
-<li><p>从中心服务器的svn repository获取最新更新<br/>
-这个操作可以通过"git-svn rebase"完成。注意这里用的是rebase，而不是update。update命令对于通过git-svn检出的svn repostory的git版本库是不可用的。</p></li>
-<li><p>查看提交历史日志<br/>
-这个简单，使用"git-svn log"，加上-v选项，还可以提供每次commit操作涉及的相关文件的详细信息。</p></li>
-<li><p>将本地代码同步到Svn服务器<br/>
-完成这一操作需要通过"git-svn dcommit"命令。这个命令会将你在本地使用git commit提交到本地代码库的所有更改逐一提交到svn库中。加上-n选项，则该命令不会真正执行commit到svn的操作，而是会显示会有哪些本地 变动将被commit到svn服务器。git-svn dcommit似乎不能单独提交某个本地版本的修改，而是一次批量提交所有与svn中心版本库的差异。</p></li>
-</ul>
-
-
-<h5>下面是一个git-svn的一般使用流程：</h5>
-
-<p>1、git-svn clone your_svn_repository；<br/>
-2、修改本地代码，使用git add/commit将修改提交到本地git库；<br/>
-3、定期使用git-svn rebase获取中心svn repository的更新；<br/>
-4、使用git-svn dcommit命令将本地git库的修改同步到中心svn库。</p>
-
-<h5>冲突</h5>
-
-<p>使用git-svn处理代码冲突的步骤有些繁琐，不过瑕不掩瑜吧。这里用一个小例子来说明一下。</p>
-
-<p>假设某svn中心库上的某个项目foo中只有一个源码文件foo.c：<br/>
-* 我在使用git-svn clone检出版本时，foo.c当时只有一个commit版本信息："svn v1"；<br/>
-* clone出来后，我在本地git库中修改foo.c，并通过git commit提交到本地git库中，版本为"git v1"；<br/>
-* 不过与此同时另外一个同事也在修改foo.c这个文件，并已经将他的修改提交到了svn库中，版本为"svn v2"；<br/>
-* 此时我使用git-svn dcommit尝试提交我的改动，git-svn提示我：<br/>
-  Committing to svn://10.10.1.1:80/foo &hellip;<br/>
-  M foo.c<br/>
-  事务过时: 过期: ”foo/foo.c“在事务“260-1” at /usr/lib/git-core/git-svn line 570<br/>
-* 使用git-svn rebase获取svn服务器上的最新foo.c，导致与foo.c冲突，不过此时svn版本信息已经添加到本地git库中(通过git log可以查看)，git-svn rebase提示你在解决foo.c的冲突后，运行git rebase &ndash;continue完成rebase操作；<br/>
-* 打开foo.c，修改代码，解决冲突；<br/>
-* 执行git rebase &ndash;continue，git提示我：<br/>
-You must edit all merge conflicts and then<br/>
-mark them as resolved using git add<br/>
-* 执行git add foo.c，告知git已完成冲突解决；<br/>
-* 再次执行git rebase &ndash;continue，提示"Applying: git v1"，此时"git v1"版本又一次成功加入本地版本库，你可通过git log查看；<br/>
-* 执行git-svn dcommit将foo.c的改动同步到svn中心库，到此算是完成一次冲突解决。</p>
-
-<ul>
-<li>设置忽略文件<br/>
-要忽略某些文件, 需要首先执行如下命令:<br/>
-git config &ndash;global core.excludesfile ~/.gitignore<br/>
-然后编辑 vi ~/.gitignore.<br/>
-例如: 需要忽略vim的临时文件，就写:<br/>
-.*.swp</li>
-</ul>
-
-</div>
-  
-  
-
-
-    </article>
-  
   <div class="pagination">
     
       <a class="prev" href="/posts/85">&larr; Older</a>
@@ -2747,7 +3825,7 @@ if (!document.getElementById('system~namespace')) document.getElementById('aexp_
 if (!document.getElementById('system')) document.getElementById('aexp_system').style.visibility = 'hidden';
 if (!document.getElementById('system~ubuntu')) document.getElementById('aexp_system~ubuntu').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/kernel/'>kernel</a><a href='##' onmousedown=showDiv('kernel') id='aexp_kernel'><span class='exp_style' id='exp_kernel'>[+]</span></a><span class='right_span'>(202)</span></li>
+<li class='catclass'><a href='/blog/cats/kernel/'>kernel</a><a href='##' onmousedown=showDiv('kernel') id='aexp_kernel'><span class='exp_style' id='exp_kernel'>[+]</span></a><span class='right_span'>(203)</span></li>
 <div id='kernel' class='catsub'><li><a href='/blog/cats/kernel~base/?opendiv=kernel'>base</a><a href='##' onmousedown=showDiv('kernel~base') id='aexp_kernel~base'><span class='exp_style' id='exp_kernel~base'>[+]</span></a><span class='right_span'>18</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('kernel~base')) document.getElementById('aexp_kernel~base').style.visibility = 'hidden';
@@ -2780,7 +3858,7 @@ if (!document.getElementById('kernel~kexec')) document.getElementById('aexp_kern
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('kernel~mm')) document.getElementById('aexp_kernel~mm').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/kernel~net/?opendiv=kernel'>net</a><a href='##' onmousedown=showDiv('kernel~net') id='aexp_kernel~net'><span class='exp_style' id='exp_kernel~net'>[+]</span></a><span class='right_span'>93</span></li>
+<li><a href='/blog/cats/kernel~net/?opendiv=kernel'>net</a><a href='##' onmousedown=showDiv('kernel~net') id='aexp_kernel~net'><span class='exp_style' id='exp_kernel~net'>[+]</span></a><span class='right_span'>94</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('kernel~net')) document.getElementById('aexp_kernel~net').style.visibility = 'hidden';
 </script>
@@ -2924,8 +4002,9 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2018/'>2018</a><a href='##' onmousedown=showDiv('2018')><span class='exp_style' id='exp_2018'>[+]</span></a><span class='right_span'>(43)</span></li>
-<div id='2018' class='catsub'><li><a href='/blog/cats/2018~08/?opendiv=2018'>2018-08</a><span class='right_span'>1</span></li>
+<li class='catclass'><a href='/blog/cats/2018/'>2018</a><a href='##' onmousedown=showDiv('2018')><span class='exp_style' id='exp_2018'>[+]</span></a><span class='right_span'>(44)</span></li>
+<div id='2018' class='catsub'><li><a href='/blog/cats/2018~09/?opendiv=2018'>2018-09</a><span class='right_span'>1</span></li>
+<li><a href='/blog/cats/2018~08/?opendiv=2018'>2018-08</a><span class='right_span'>1</span></li>
 <li><a href='/blog/cats/2018~07/?opendiv=2018'>2018-07</a><span class='right_span'>7</span></li>
 <li><a href='/blog/cats/2018~06/?opendiv=2018'>2018-06</a><span class='right_span'>5</span></li>
 <li><a href='/blog/cats/2018~04/?opendiv=2018'>2018-04</a><span class='right_span'>6</span></li>
@@ -3031,6 +4110,10 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
   <ul id="recent_posts">
     
       <li class="post">
+        <a href="/blog/2018/09/28/kernel-sk_lookup/">nulls_hlist原理 和 tcp连接查找</a>
+      </li>
+    
+      <li class="post">
         <a href="/blog/2018/08/05/debug-crash_shell/">crash执行shell脚本</a>
       </li>
     
@@ -3044,10 +4127,6 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
     
       <li class="post">
         <a href="/blog/2018/07/23/kernel-ip_rule/">linux策略路由</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2018/07/23/kernel-rpf/">反向路径过滤 -- reverse path filt</a>
       </li>
     
   </ul>
