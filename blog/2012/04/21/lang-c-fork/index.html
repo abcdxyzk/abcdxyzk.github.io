@@ -75,11 +75,67 @@ if (query != null) {
   </header>
 
 
-<div class="entry-content"><h4>一 两次fork避免僵死进程</h4>
+<div class="entry-content"><h4>一、两次fork避免僵死进程</h4>
 
 <p>如果在一个进程A中启动了一个子进程B，但是B的执行时间可能很长，也可能很短。因此，既不希望A调用wait或者waitpid来等待B的完成（如果B执行时间太长，A的时间就耗费在等待B的完成了，虽然waitpid有WNOHANG选项，但免不了多次调用waitpid来看B是否完成）；也不希望如果B执行时间太短了，然后A又不用wait或waitpid去获取B的退出状态，那么B就一直处于僵死状态直到A终止（这样造成了资源的浪费）。</p>
 
 <p>此时，可以使用一个小trick。就是调用两次fork，让B的父进程变成init进程（pid=1的那个进程，所有孤儿进程的父进程）。这样，A进程可以想干嘛干嘛去，B进程也可以想执行多久就执行多久了。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;unistd.h&gt;
+</span><span class='line'>#include &lt;sys/wait.h&gt;
+</span><span class='line'>int main()
+</span><span class='line'>{
+</span><span class='line'>&#9;pid_t pid;
+</span><span class='line'>&#9;if ((pid=fork()) &lt; 0) {
+</span><span class='line'>&#9;&#9;printf("fork 1 error\n");
+</span><span class='line'>&#9;&#9;exit(-1);
+</span><span class='line'>&#9;} else if(pid==0）{ //第一个子进程
+</span><span class='line'>&#9;&#9;if ((pid=fork()) &lt; 0) {
+</span><span class='line'>&#9;&#9;&#9;printf("fork 2 error\n");
+</span><span class='line'>&#9;&#9;&#9;exit(-1);
+</span><span class='line'>&#9;&#9;} else if(pid&gt;0) {
+</span><span class='line'>&#9;&#9;&#9;//第二次fork产生的子进程（第二个子进程）的父进程，其实就是第一次fork产生的子进程（第一个子进程）
+</span><span class='line'>&#9;&#9;&#9;exit(0); //第一个子进程结束，那么它的子进程（第二个子进程）将由init进程领养，init进程成为第二个子进程的父进程
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;//第二个子进程（就是我们前面说的B进程）可以做他想做的事情了
+</span><span class='line'>&#9;&#9;................
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;if (waitpid(pid,NULL,0) != pid) //获取第一个子进程的终止状态，不让它变成僵死进程
+</span><span class='line'>&#9;&#9;printf("waitpid error\n");
+</span><span class='line'>&#9;//父进程（就是我们前面说的A进程）也可以做他想做的事情了
+</span><span class='line'>&#9;.........
+</span><span class='line'>&#9;return 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>二、通过信号机制</h4>
+
+<p>子进程退出时向父进程发送SIGCHILD信号，父进程处理SIGCHILD信号。在信号处理函数中调用wait进行处理僵尸进程。测试程序如下所示：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -111,39 +167,51 @@ if (query != null) {
 <span class='line-number'>28</span>
 <span class='line-number'>29</span>
 <span class='line-number'>30</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;unistd.h&gt;
-</span><span class='line'>#include &lt;sys/wait.h&gt;
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;stdio.h&gt;
+</span><span class='line'>#include &lt;unistd.h&gt;
+</span><span class='line'>#include &lt;errno.h&gt;
+</span><span class='line'>#include &lt;stdlib.h&gt;
+</span><span class='line'>#include &lt;signal.h&gt;
+</span><span class='line'>
+</span><span class='line'>static void sig_child(int signo)
+</span><span class='line'>{
+</span><span class='line'>&#9;pid_t pid;
+</span><span class='line'>&#9;int stat;
+</span><span class='line'>&#9;//处理僵尸进程
+</span><span class='line'>&#9;while ((pid = waitpid(-1, &stat, WNOHANG)) &gt;0)
+</span><span class='line'>&#9;&#9;printf("child %d terminated.\n", pid);
+</span><span class='line'>}
+</span><span class='line'>
 </span><span class='line'>int main()
 </span><span class='line'>{
 </span><span class='line'>&#9;pid_t pid;
-</span><span class='line'>&#9;if((pid=fork())&lt;0)
-</span><span class='line'>&#9;{
-</span><span class='line'>&#9;&#9;printf("fork 1 error\n");
-</span><span class='line'>&#9;&#9;exit(-1);
+</span><span class='line'>&#9;//创建捕捉子进程退出信号
+</span><span class='line'>&#9;signal(SIGCHLD, sig_child);
+</span><span class='line'>&#9;pid = fork();
+</span><span class='line'>&#9;if (pid &lt; 0) {
+</span><span class='line'>&#9;&#9;perror("fork error:");
+</span><span class='line'>&#9;&#9;exit(1);
+</span><span class='line'>&#9;} else if (pid == 0) {
+</span><span class='line'>&#9;&#9;printf("I am child process,pid id %d.I am exiting.\n",getpid());
+</span><span class='line'>&#9;&#9;exit(0);
 </span><span class='line'>&#9;}
-</span><span class='line'>&#9;else if(pid==0）//第一个子进程
-</span><span class='line'>&#9;{
-</span><span class='line'>&#9;&#9;if((pid=fork())&lt;0)
-</span><span class='line'>&#9;&#9;{
-</span><span class='line'>&#9;&#9;&#9;printf("fork 2 error\n");
-</span><span class='line'>&#9;&#9;&#9;exit(-1);
-</span><span class='line'>&#9;&#9;}
-</span><span class='line'>&#9;&#9;else if(pid&gt;0)//第二次fork产生的子进程（第二个子进程）的父进程，其实就是第一次fork产生的子进程（第一个子进程）
-</span><span class='line'>&#9;&#9;{
-</span><span class='line'>&#9;&#9;&#9;exit(0);//第一个子进程结束，那么它的子进程（第二个子进程）将由init进程领养，init进程成为第二个子进程的父进程
-</span><span class='line'>&#9;&#9;}
-</span><span class='line'>&#9;&#9;//第二个子进程（就是我们前面说的B进程）可以做他想做的事情了
-</span><span class='line'>&#9;&#9;................
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;if(waitpid(pid,NULL,0)!=pid)//获取第一个子进程的终止状态，不让它变成僵死进程
-</span><span class='line'>&#9;printf("waitpid error\n");
-</span><span class='line'>&#9;//父进程（就是我们前面说的A进程）也可以做他想做的事情了
-</span><span class='line'>&#9;.........
+</span><span class='line'>&#9;printf("I am father process.I will sleep two seconds\n");
+</span><span class='line'>&#9;//等待子进程先退出
+</span><span class='line'>&#9;sleep(2);
+</span><span class='line'>&#9;//输出进程信息
+</span><span class='line'>&#9;system("ps -o pid,ppid,state,tty,command");
+</span><span class='line'>&#9;printf("father process is exiting.\n");
 </span><span class='line'>&#9;return 0;
 </span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
-<h4>二</h4>
+<h4>三</h4>
 
 <p>父进程可以忽略 SIGCLD 软中断而不必要 wait()。可以这样做到(在支持它的系统上,比如Linux):　</p>
 
@@ -155,14 +223,14 @@ if (query != null) {
 <span class='line-number'>6</span>
 <span class='line-number'>7</span>
 <span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>main()　　
-</span><span class='line'>{　　
-</span><span class='line'>&#9;signal(SIGCLD, SIG_IGN); /* now I don't have to wait()! */　　
-</span><span class='line'>&#9;.......　　
-</span><span class='line'>&#9;fork();　　
-</span><span class='line'>&#9;fork();　　
-</span><span class='line'>&#9;fork(); /* Rabbits, rabbits, rabbits! */　　
-</span><span class='line'>｝</span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int main()
+</span><span class='line'>{
+</span><span class='line'>&#9;signal(SIGCLD, SIG_IGN); /* now I don't have to wait()! */
+</span><span class='line'>&#9;.......
+</span><span class='line'>&#9;fork();
+</span><span class='line'>&#9;fork();
+</span><span class='line'>&#9;fork(); /* Rabbits, rabbits, rabbits! */
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
 
