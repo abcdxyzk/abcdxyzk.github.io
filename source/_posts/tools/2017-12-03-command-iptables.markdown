@@ -11,6 +11,21 @@ categories:
 tags:
 ---
 
+#### 一台通过另一台上网
+```
+	find /proc/ -name rp_filter -exec sh -c "echo 0 > {} " \;
+	find /proc/ -name rp_filter -exec cat {} \;
+
+	echo 1 > /proc/sys/net/ipv4/ip_forward
+	cat /proc/sys/net/ipv4/ip_forward
+
+	iptables -t nat -A POSTROUTING -s 12.0.0.10/24 -o wlp7s0 -j MASQUERADE
+	iptables -t nat -L -vn
+```
+
+----------------------------
+
+
 http://blog.csdn.net/l241002209/article/details/43987933
 
 #### 1、添加
