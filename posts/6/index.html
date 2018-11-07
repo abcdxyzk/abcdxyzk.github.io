@@ -62,6 +62,1345 @@ if (query != null) {
       
   <header>
     
+      <h2 class="entry-title"><a href="/blog/2018/03/23/kernel-tsq/">linux Tcp Small Queue(TSQ)实现</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2018-03-23T00:29:00+08:00'><span class='date'>2018-03-23</span> <span class='time'>00:29:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://www.cnhalo.net/2016/09/13/linux-tcp-small-queue/">http://www.cnhalo.net/2016/09/13/linux-tcp-small-queue/</a></p>
+
+<h4>目的</h4>
+
+<p>考虑以下场景</p>
+
+<p>  有两个tcp，其中一个连接的cwnd非常大，应用程序尽可能地发包<br/>
+  或者有个应用程序一直往外无限制地发送udp包</p>
+
+<p>  如果没有一种机制公平地限定各个连接的发送数量，底层的qdisc/网卡队列就会被高发包率的应用占用，同时造成上层tcp计算RTT和cwnd的偏差，以及bufferbloat问题。</p>
+
+<p>  尤其对于默认采用pfifo_fast qdisc算法来说非常常见， 因为基本上只使用一个队列(大多数流的TOS=0)</p>
+
+<h4>解决及未解决</h4>
+
+<p>  因此在qdisc队列长度一定的情况下，让不同的流拥有相等的配额<br/>
+  当达到配额后就不允许该流继续发包， 此时包存在在上层协议的缓存中，不往qdisc上发<br/>
+  如果网卡发包完成后，释放skb的时候，如果发现该流达到配额了，就通过回调机制通知上层可以往qdisc上发了</p>
+
+<p>Tcp Small Queue(TSQ)也由此而来。但是只解决了tcp流之间的公平问题，并没有在udp等其他协议上实现。
+如果udp发满了qdisc，还是会对其他流造成影响。</p>
+
+<p>因此在有很多非tcp业务的机器上，需要配置使用其他qdisc算法结合tc命令配置</p>
+
+<h4>配置</h4>
+
+<h4>qdisc队列长度</h4>
+
+<p>  通过ifconfig eth0查看，其中的txqueuelen就是qdisc的队列长度, 默认1000个skb， 这时候GSO/TSO还没开始，因此如果开启GSO/TSO数据只会更多</p>
+
+<p>  通过ifconfig eth0 txqueuelen 1500可以设置该长度，设置过长会导致bufferbloat问题</p>
+
+<p>因此对于默认qfifo_fast算法，qdisc的长度是以GSO包为单位， 超过该长度在qdisc层就会丢弃该包</p>
+
+<h4>每个流的配额</h4>
+
+<p>在linux 4.9上，默认是4个TSO的大小，256KB</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* Default TSQ limit of four TSO segments */
+</span><span class='line'>net.ipv4.tcp_limit_output_bytes = 262144</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>判断是否超过限制</h4>
+
+<p>在tcp_write_xmit()中，会调用tcp_small_queue_check()来判断该tcp是否达到配额
+tcp_small_queue_check()返回true的话则不发送，让skb继续留在发送队列中.
+并且会在该sock中设置TSQ_THROTTLED标记，表示上层数据在等待qdisc空间</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static bool tcp_small_queue_check(struct sock *sk, const struct sk_buff *skb,
+</span><span class='line'>&#9;&#9;&#9;&#9;  unsigned int factor)
+</span><span class='line'>{
+</span><span class='line'>&#9;unsigned int limit;
+</span><span class='line'>&#9;limit = max(2 * skb-&gt;truesize, sk-&gt;sk_pacing_rate &gt;&gt; 10); //每毫秒的速率，或者两个当前包的大小
+</span><span class='line'>&#9;limit = min_t(u32, limit, sysctl_tcp_limit_output_bytes); //默认最大256K
+</span><span class='line'>&#9;limit &lt;&lt;= factor;   //在重传的话*2
+</span><span class='line'>&#9;if (atomic_read(&sk-&gt;sk_wmem_alloc) &gt; limit) {  //qdisc中的数据超过限制
+</span><span class='line'>&#9;&#9;set_bit(TSQ_THROTTLED, &tcp_sk(sk)-&gt;tsq_flags);    //设置标记，标记当前sock没通过tsq检测
+</span><span class='line'>&#9;&#9;/* It is possible TX completion already happened
+</span><span class='line'>&#9;&#9; * before we set TSQ_THROTTLED, so we must
+</span><span class='line'>&#9;&#9; * test again the condition.
+</span><span class='line'>&#9;&#9; */
+</span><span class='line'>&#9;&#9;smp_mb__after_atomic();
+</span><span class='line'>&#9;&#9;if (atomic_read(&sk-&gt;sk_wmem_alloc) &gt; limit)
+</span><span class='line'>&#9;&#9;&#9;return true;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;return false;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>发送完成释放skb</h4>
+
+<p>在达到qdisc配额前，tcp_transmit_skb会为所有的数据包设置skb->destructor=tcp_wfree,
+在设备发送完数据释放skb的时候，tcp_wfree()被调用，并根据TSQ_THROTTLED来判断，是否有数据正在等待qdisc空间。
+如果有数据包在等待，则把该数据包的sock，加入到percpu的列表中。
+并设置tasklet任务，在下一个软中断中发送该sock中的数据包</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int tcp_transmit_skb(struct sock *sk, struct sk_buff *skb, int clone_it,
+</span><span class='line'>&#9;&#9;&#9;    gfp_t gfp_mask)
+</span><span class='line'>{
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;skb-&gt;destructor = skb_is_tcp_pure_ack(skb) ? __sock_wfree : tcp_wfree;
+</span><span class='line'>&#9;...
+</span><span class='line'>}
+</span><span class='line'>/*
+</span><span class='line'> * Write buffer destructor automatically called from kfree_skb.
+</span><span class='line'> * We can't xmit new skbs from this context, as we might already
+</span><span class='line'> * hold qdisc lock.
+</span><span class='line'> */
+</span><span class='line'>void tcp_wfree(struct sk_buff *skb)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct sock *sk = skb-&gt;sk;
+</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>&#9;int wmem;
+</span><span class='line'>&#9;/* Keep one reference on sk_wmem_alloc.
+</span><span class='line'>&#9; * Will be released by sk_free() from here or tcp_tasklet_func()
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;wmem = atomic_sub_return(skb-&gt;truesize - 1, &sk-&gt;sk_wmem_alloc);
+</span><span class='line'>&#9;/* If this softirq is serviced by ksoftirqd, we are likely under stress.
+</span><span class='line'>&#9; * Wait until our queues (qdisc + devices) are drained.
+</span><span class='line'>&#9; * This gives :
+</span><span class='line'>&#9; * - less callbacks to tcp_write_xmit(), reducing stress (batches)
+</span><span class='line'>&#9; * - chance for incoming ACK (processed by another cpu maybe)
+</span><span class='line'>&#9; *   to migrate this flow (skb-&gt;ooo_okay will be eventually set)
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;if (wmem &gt;= SKB_TRUESIZE(1) && this_cpu_ksoftirqd() == current)
+</span><span class='line'>&#9;&#9;goto out;
+</span><span class='line'>&#9;if (test_and_clear_bit(TSQ_THROTTLED, &tp-&gt;tsq_flags) &&   //判断并清除成功, 避免重复插入队列
+</span><span class='line'>&#9;    !test_and_set_bit(TSQ_QUEUED, &tp-&gt;tsq_flags)) {// 设置TSQ_QUEUED
+</span><span class='line'>&#9;&#9;unsigned long flags;
+</span><span class='line'>&#9;&#9;struct tsq_tasklet *tsq;
+</span><span class='line'>&#9;&#9;/* queue this socket to tasklet queue */
+</span><span class='line'>&#9;&#9;local_irq_save(flags);
+</span><span class='line'>&#9;&#9;tsq = this_cpu_ptr(&tsq_tasklet);
+</span><span class='line'>&#9;&#9;list_add(&tp-&gt;tsq_node, &tsq-&gt;head); //添加sock到percpu列表
+</span><span class='line'>&#9;&#9;tasklet_schedule(&tsq-&gt;tasklet);   //等待在softirq中被调度
+</span><span class='line'>&#9;&#9;local_irq_restore(flags);
+</span><span class='line'>&#9;&#9;return;
+</span><span class='line'>&#9;}
+</span><span class='line'>out:
+</span><span class='line'>&#9;sk_free(sk);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>tasklet</h4>
+
+<p>在系统初始化的时候会初始化percpu的tsq tasklet列表</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* TCP SMALL QUEUES (TSQ)
+</span><span class='line'> *
+</span><span class='line'> * TSQ goal is to keep small amount of skbs per tcp flow in tx queues (qdisc+dev)
+</span><span class='line'> * to reduce RTT and bufferbloat.
+</span><span class='line'> * We do this using a special skb destructor (tcp_wfree).
+</span><span class='line'> *
+</span><span class='line'> * Its important tcp_wfree() can be replaced by sock_wfree() in the event skb
+</span><span class='line'> * needs to be reallocated in a driver.
+</span><span class='line'> * The invariant being skb-&gt;truesize subtracted from sk-&gt;sk_wmem_alloc
+</span><span class='line'> *
+</span><span class='line'> * Since transmit from skb destructor is forbidden, we use a tasklet
+</span><span class='line'> * to process all sockets that eventually need to send more skbs.
+</span><span class='line'> * We use one tasklet per cpu, with its own queue of sockets.
+</span><span class='line'> */
+</span><span class='line'>struct tsq_tasklet {
+</span><span class='line'>&#9;struct tasklet_struct tasklet;
+</span><span class='line'>&#9;struct list_head  head; /* queue of tcp sockets */
+</span><span class='line'>};
+</span><span class='line'>static DEFINE_PER_CPU(struct tsq_tasklet, tsq_tasklet);
+</span><span class='line'>void __init tcp_tasklet_init(void)
+</span><span class='line'>{
+</span><span class='line'>&#9;int i;
+</span><span class='line'>&#9;for_each_possible_cpu(i) {
+</span><span class='line'>&#9;&#9;struct tsq_tasklet *tsq = &per_cpu(tsq_tasklet, i);
+</span><span class='line'>&#9;&#9;INIT_LIST_HEAD(&tsq-&gt;head);
+</span><span class='line'>&#9;&#9;tasklet_init(&tsq-&gt;tasklet,
+</span><span class='line'>&#9;&#9;&#9;     tcp_tasklet_func,
+</span><span class='line'>&#9;&#9;&#9;     (unsigned long)tsq);
+</span><span class='line'>&#9;}
+</span><span class='line'>}
+</span><span class='line'>void __init tcp_init(void)
+</span><span class='line'>{
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;tcp_tasklet_init();
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>tcp_tasklet_func</h4>
+
+<p>tcp_tasklet_func是实际的tasklet在softirq中被执行的函数
+如果应用程序没有持有该sock锁， 则直接调用tcp_tsq_handler来发送等待的skb。
+否则就在应用程序release_sock()的时候调用tcp_release_cb()，再用tcp_tsq_handler()发送skb</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+<span class='line-number'>82</span>
+<span class='line-number'>83</span>
+<span class='line-number'>84</span>
+<span class='line-number'>85</span>
+<span class='line-number'>86</span>
+<span class='line-number'>87</span>
+<span class='line-number'>88</span>
+<span class='line-number'>89</span>
+<span class='line-number'>90</span>
+<span class='line-number'>91</span>
+<span class='line-number'>92</span>
+<span class='line-number'>93</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/*
+</span><span class='line'> * One tasklet per cpu tries to send more skbs.
+</span><span class='line'> * We run in tasklet context but need to disable irqs when
+</span><span class='line'> * transferring tsq-&gt;head because tcp_wfree() might
+</span><span class='line'> * interrupt us (non NAPI drivers)
+</span><span class='line'> */
+</span><span class='line'>static void tcp_tasklet_func(unsigned long data)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct tsq_tasklet *tsq = (struct tsq_tasklet *)data;
+</span><span class='line'>&#9;LIST_HEAD(list);
+</span><span class='line'>&#9;unsigned long flags;
+</span><span class='line'>&#9;struct list_head *q, *n;
+</span><span class='line'>&#9;struct tcp_sock *tp;
+</span><span class='line'>&#9;struct sock *sk;
+</span><span class='line'>&#9;local_irq_save(flags);
+</span><span class='line'>&#9;list_splice_init(&tsq-&gt;head, &list);   //tsq-&gt;head中的所有成员移动到list中
+</span><span class='line'>&#9;local_irq_restore(flags); //调用前关中断，现在恢复
+</span><span class='line'>&#9;list_for_each_safe(q, n, &list) { //遍历所有list成员
+</span><span class='line'>&#9;&#9;tp = list_entry(q, struct tcp_sock, tsq_node);
+</span><span class='line'>&#9;&#9;list_del(&tp-&gt;tsq_node);
+</span><span class='line'>&#9;&#9;sk = (struct sock *)tp;
+</span><span class='line'>&#9;&#9;bh_lock_sock(sk);
+</span><span class='line'>&#9;&#9;if (!sock_owned_by_user(sk)) {
+</span><span class='line'>&#9;&#9;&#9;tcp_tsq_handler(sk);
+</span><span class='line'>&#9;&#9;} else {
+</span><span class='line'>&#9;&#9;&#9;/* defer the work to tcp_release_cb() */
+</span><span class='line'>&#9;&#9;&#9;set_bit(TCP_TSQ_DEFERRED, &tp-&gt;tsq_flags);
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;bh_unlock_sock(sk);
+</span><span class='line'>&#9;&#9;clear_bit(TSQ_QUEUED, &tp-&gt;tsq_flags);
+</span><span class='line'>&#9;&#9;sk_free(sk);
+</span><span class='line'>&#9;}
+</span><span class='line'>}
+</span><span class='line'>static void tcp_tsq_handler(struct sock *sk)
+</span><span class='line'>{
+</span><span class='line'>&#9;if ((1 &lt;&lt; sk-&gt;sk_state) &
+</span><span class='line'>&#9;    (TCPF_ESTABLISHED | TCPF_FIN_WAIT1 | TCPF_CLOSING |
+</span><span class='line'>&#9;     TCPF_CLOSE_WAIT  | TCPF_LAST_ACK)) {
+</span><span class='line'>&#9;&#9;struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>&#9;&#9;if (tp-&gt;lost_out &gt; tp-&gt;retrans_out &&    //有丢的包还没重传
+</span><span class='line'>&#9;&#9;    tp-&gt;snd_cwnd &gt; tcp_packets_in_flight(tp))   //拥塞窗口还有配额
+</span><span class='line'>&#9;&#9;&#9;tcp_xmit_retransmit_queue(sk);    //重传
+</span><span class='line'>&#9;&#9;tcp_write_xmit(sk, tcp_current_mss(sk), tp-&gt;nonagle,   //发送
+</span><span class='line'>&#9;&#9;&#9;       0, GFP_ATOMIC);
+</span><span class='line'>&#9;}
+</span><span class='line'>}
+</span><span class='line'>#define TCP_DEFERRED_ALL ((1UL &lt;&lt; TCP_TSQ_DEFERRED) |       \
+</span><span class='line'>&#9;&#9;&#9;  (1UL &lt;&lt; TCP_WRITE_TIMER_DEFERRED) |   \
+</span><span class='line'>&#9;&#9;&#9;  (1UL &lt;&lt; TCP_DELACK_TIMER_DEFERRED) |  \
+</span><span class='line'>&#9;&#9;&#9;  (1UL &lt;&lt; TCP_MTU_REDUCED_DEFERRED))
+</span><span class='line'>/**
+</span><span class='line'> * tcp_release_cb - tcp release_sock() callback
+</span><span class='line'> * @sk: socket
+</span><span class='line'> *
+</span><span class='line'> * called from release_sock() to perform protocol dependent
+</span><span class='line'> * actions before socket release.
+</span><span class='line'> */
+</span><span class='line'>void tcp_release_cb(struct sock *sk)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>&#9;unsigned long flags, nflags;
+</span><span class='line'>&#9;/* perform an atomic operation only if at least one flag is set */
+</span><span class='line'>&#9;do {
+</span><span class='line'>&#9;&#9;flags = tp-&gt;tsq_flags;
+</span><span class='line'>&#9;&#9;if (!(flags & TCP_DEFERRED_ALL))
+</span><span class='line'>&#9;&#9;&#9;return;
+</span><span class='line'>&#9;&#9;nflags = flags & ~TCP_DEFERRED_ALL;
+</span><span class='line'>&#9;} while (cmpxchg(&tp-&gt;tsq_flags, flags, nflags) != flags);
+</span><span class='line'>&#9;if (flags & (1UL &lt;&lt; TCP_TSQ_DEFERRED))
+</span><span class='line'>&#9;&#9;tcp_tsq_handler(sk);
+</span><span class='line'>&#9;/* Here begins the tricky part :
+</span><span class='line'>&#9; * We are called from release_sock() with :
+</span><span class='line'>&#9; * 1) BH disabled
+</span><span class='line'>&#9; * 2) sk_lock.slock spinlock held
+</span><span class='line'>&#9; * 3) socket owned by us (sk-&gt;sk_lock.owned == 1)
+</span><span class='line'>&#9; *
+</span><span class='line'>&#9; * But following code is meant to be called from BH handlers,
+</span><span class='line'>&#9; * so we should keep BH disabled, but early release socket ownership
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;sock_release_ownership(sk);
+</span><span class='line'>&#9;if (flags & (1UL &lt;&lt; TCP_WRITE_TIMER_DEFERRED)) {
+</span><span class='line'>&#9;&#9;tcp_write_timer_handler(sk);
+</span><span class='line'>&#9;&#9;__sock_put(sk);
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;if (flags & (1UL &lt;&lt; TCP_DELACK_TIMER_DEFERRED)) {
+</span><span class='line'>&#9;&#9;tcp_delack_timer_handler(sk);
+</span><span class='line'>&#9;&#9;__sock_put(sk);
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;if (flags & (1UL &lt;&lt; TCP_MTU_REDUCED_DEFERRED)) {
+</span><span class='line'>&#9;&#9;inet_csk(sk)-&gt;icsk_af_ops-&gt;mtu_reduced(sk);
+</span><span class='line'>&#9;&#9;__sock_put(sk);
+</span><span class='line'>&#9;}
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>tcp_tsq_handler最终还是会调用tcp_write_xmit来发送， 还是需要通过tcp_small_queue_check()检测</p>
+
+<h4>其他</h4>
+
+<p>另外tcp auto cork也使用tsq机制来实现延后发送</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void tcp_push(struct sock *sk, int flags, int mss_now,
+</span><span class='line'>&#9;&#9;     int nonagle, int size_goal)
+</span><span class='line'>{
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;if (tcp_should_autocork(sk, skb, size_goal)) {
+</span><span class='line'>&#9;&#9;//不发了，设置tsq标记后返回
+</span><span class='line'>&#9;&#9;/* avoid atomic op if TSQ_THROTTLED bit is already set */
+</span><span class='line'>&#9;&#9;if (!test_bit(TSQ_THROTTLED, &tp-&gt;tsq_flags)) {
+</span><span class='line'>&#9;&#9;&#9;NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPAUTOCORKING);
+</span><span class='line'>&#9;&#9;&#9;set_bit(TSQ_THROTTLED, &tp-&gt;tsq_flags);
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;/* It is possible TX completion already happened
+</span><span class='line'>&#9;&#9; * before we set TSQ_THROTTLED.
+</span><span class='line'>&#9;&#9; */
+</span><span class='line'>&#9;&#9;if (atomic_read(&sk-&gt;sk_wmem_alloc) &gt; skb-&gt;truesize)
+</span><span class='line'>&#9;&#9;&#9;return;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;if (flags & MSG_MORE) //应用程序标记了很快有新的数据到来，则标记cork，不发送小包
+</span><span class='line'>&#9;&#9;nonagle = TCP_NAGLE_CORK;
+</span><span class='line'>&#9;__tcp_push_pending_frames(sk, mss_now, nonagle);  //最终调用tcp_write_xmit
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2018/03/12/kernel-crypto-tcp_md5/">TCP MD5选项</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2018-03-12T02:58:00+08:00'><span class='date'>2018-03-12</span> <span class='time'>02:58:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://blog.csdn.net/u011130578/article/details/44942679">http://blog.csdn.net/u011130578/article/details/44942679</a></p>
+
+<h4>8.5.1 选项功能</h4>
+
+<p>　　TCP MD5选项用于强化BGP协议的安全性，其基本原理是在TCP报文段的选项中携带MD5摘要。这个摘要的行为类似于这个报文的签名，其中包含这只有通信双方才能理解的信息。如果BGP协议使用TCP作为其传输层协议，使用MD5选项会有效减少安全隐患。</p>
+
+<h4>8.5.2 协议规范</h4>
+
+<p>　　TCP MD5选项的规范由RFC 2385提出。</p>
+
+<p>　　每一个TCP报文段都应该携带MD5选项（包含一个16字节的MD5 digest）。MD5算法的输入数据如下（严格按照顺序）：</p>
+
+<p>（1）TCP伪首部（源IP，目的IP，填充0的协议号，报文长度）</p>
+
+<p>（2）TCP首部，不包含选项，checksum计为0</p>
+
+<p>（3）TCP数据段（如果有）</p>
+
+<p>（4）密钥或口令，这个需要TCP通信双方和连接规范都知晓</p>
+
+<p>　　接收方收到TCP报文时，必须根据报文的信息以及自己的密钥来计算digest，并与报文中的digest进行比较。如果比较失败则必须丢弃报文，并且不能产生任何响应。这样就大大增加了攻击者通过伪造TCP报文实施对BGP协议的攻击的难度。</p>
+
+<h4>8.5.3 开启方法</h4>
+
+<p>　　Linux内核需要开启CONFIG_TCP_MD5SIG编译选项才能支持TCP MD5选项功能。应用进程还需要使用TCP_MD5SIG socket选项导入密钥：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct tcp_md5sig cmd;  
+</span><span class='line'>...  
+</span><span class='line'>setsockopt(sockfd, SOL_TCP, TCP_MD5SIG,  &cmd, sizeof(cmd));  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>　　其中struct tcp_md5sig的定义为：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>191 #define TCP_MD5SIG_MAXKEYLEN    80  
+</span><span class='line'>192   
+</span><span class='line'>193 struct tcp_md5sig {  
+</span><span class='line'>194     struct __kernel_sockaddr_storage tcpm_addr; /* address associated */  
+</span><span class='line'>195     __u16   __tcpm_pad1;                /* zero */  
+</span><span class='line'>196     __u16   tcpm_keylen;                /* key length */  
+</span><span class='line'>197     __u32   __tcpm_pad2;                /* zero */  
+</span><span class='line'>198     __u8    tcpm_key[TCP_MD5SIG_MAXKEYLEN];     /* key (binary) */  
+</span><span class='line'>199 };  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>　　其中tcpm_addr是要通信的服务器的地址（IP地址、端口等），如果sockfd要与N个机器进行通信则需要调用N此setsockopt系统调用来导入相应的地址-密钥对。举个例子，如果A要与B通信，则A需要调用setsockopt来导入B的地址和一个密钥Key，而B也需要调用setsockopt来导入A的地址和与A相同的密钥Key，然后双方才能使用MD5选项进行通信。</p>
+
+<h4>8.5.4 内核实现</h4>
+
+<p>　　TCP_MD5SIG socket选项对应的内核代码为：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>2371 static int do_tcp_setsockopt(struct sock *sk, int level,  
+</span><span class='line'>2372         int optname, char __user *optval, unsigned int optlen)  
+</span><span class='line'>2373 {  
+</span><span class='line'>...  
+</span><span class='line'>2605 #ifdef CONFIG_TCP_MD5SIG  
+</span><span class='line'>2606     case TCP_MD5SIG:  
+</span><span class='line'>2607         /* Read the IP-&gt;Key mappings from userspace */  
+</span><span class='line'>2608         err = tp-&gt;af_specific-&gt;md5_parse(sk, optval, optlen);　//指向tcp_v4_parse_md5_keys函数  
+</span><span class='line'>2609         break;  
+</span><span class='line'>2610 #endif  
+</span><span class='line'>...  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>　　tcp_v4_parse_md5_keys用于导入MD5签名的密钥（key）：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>1083 static int tcp_v4_parse_md5_keys(struct sock *sk, char __user *optval,  
+</span><span class='line'>1084                  int optlen)  
+</span><span class='line'>1085 {    
+</span><span class='line'>1086     struct tcp_md5sig cmd;  
+</span><span class='line'>1087     struct sockaddr_in *sin = (struct sockaddr_in *)&cmd.tcpm_addr;  
+</span><span class='line'>1088      
+</span><span class='line'>1089     if (optlen &lt; sizeof(cmd))  
+</span><span class='line'>1090         return -EINVAL;  
+</span><span class='line'>1091      
+</span><span class='line'>1092     if (copy_from_user(&cmd, optval, sizeof(cmd)))  
+</span><span class='line'>1093         return -EFAULT;  
+</span><span class='line'>1094   
+</span><span class='line'>1095     if (sin-&gt;sin_family != AF_INET)  
+</span><span class='line'>1096         return -EINVAL;  
+</span><span class='line'>1097   
+</span><span class='line'>1098     if (!cmd.tcpm_key || !cmd.tcpm_keylen)  
+</span><span class='line'>1099         return tcp_md5_do_del(sk, (union tcp_md5_addr *)&sin-&gt;sin_addr.s_addr,  
+</span><span class='line'>1100                       AF_INET);　//删除key  
+</span><span class='line'>1101      
+</span><span class='line'>1102     if (cmd.tcpm_keylen &gt; TCP_MD5SIG_MAXKEYLEN)  
+</span><span class='line'>1103         return -EINVAL;  
+</span><span class='line'>1104   
+</span><span class='line'>1105     return tcp_md5_do_add(sk, (union tcp_md5_addr *)&sin-&gt;sin_addr.s_addr,  
+</span><span class='line'>1106                   AF_INET, cmd.tcpm_key, cmd.tcpm_keylen,  
+</span><span class='line'>1107                   GFP_KERNEL);  
+</span><span class='line'>1108 }  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>　　tcp_md5_do_add和tcp_md5_do_del用于添加和删除key：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'> 998 int tcp_md5_do_add(struct sock *sk, const union tcp_md5_addr *addr,  
+</span><span class='line'> 999            int family, const u8 *newkey, u8 newkeylen, gfp_t gfp)  
+</span><span class='line'>1000 {  
+</span><span class='line'>1001     /* Add Key to the list */  
+</span><span class='line'>1002     struct tcp_md5sig_key *key;  
+</span><span class='line'>1003     struct tcp_sock *tp = tcp_sk(sk);  
+</span><span class='line'>1004     struct tcp_md5sig_info *md5sig;  
+</span><span class='line'>1005   
+</span><span class='line'>1006     key = tcp_md5_do_lookup(sk, addr, family);  
+</span><span class='line'>1007     if (key) {　//如果有现成的  
+</span><span class='line'>1008         /* Pre-existing entry - just update that one. */  
+</span><span class='line'>1009         memcpy(key-&gt;key, newkey, newkeylen);　//更新之  
+</span><span class='line'>1010         key-&gt;keylen = newkeylen;  
+</span><span class='line'>1011         return 0;  
+</span><span class='line'>1012     }  
+</span><span class='line'>1013   
+</span><span class='line'>1014     md5sig = rcu_dereference_protected(tp-&gt;md5sig_info,  
+</span><span class='line'>1015                        sock_owned_by_user(sk));  
+</span><span class='line'>1016     if (!md5sig) {  
+</span><span class='line'>1017         md5sig = kmalloc(sizeof(*md5sig), gfp);  
+</span><span class='line'>1018         if (!md5sig)  
+</span><span class='line'>1019             return -ENOMEM;  
+</span><span class='line'>1020   
+</span><span class='line'>1021         sk_nocaps_add(sk, NETIF_F_GSO_MASK);  
+</span><span class='line'>1022         INIT_HLIST_HEAD(&md5sig-&gt;head);  
+</span><span class='line'>1023         rcu_assign_pointer(tp-&gt;md5sig_info, md5sig);  
+</span><span class='line'>1024     }  
+</span><span class='line'>1025   
+</span><span class='line'>1026     key = sock_kmalloc(sk, sizeof(*key), gfp);  
+</span><span class='line'>1027     if (!key)  
+</span><span class='line'>1028         return -ENOMEM;  
+</span><span class='line'>1029     if (hlist_empty(&md5sig-&gt;head) && !tcp_alloc_md5sig_pool(sk)) {  
+</span><span class='line'>1030         sock_kfree_s(sk, key, sizeof(*key));  
+</span><span class='line'>1031         return -ENOMEM;  
+</span><span class='line'>1032     }  
+</span><span class='line'>1033   
+</span><span class='line'>1034     memcpy(key-&gt;key, newkey, newkeylen);　//导入密钥  
+</span><span class='line'>1035     key-&gt;keylen = newkeylen;  
+</span><span class='line'>1036     key-&gt;family = family;  
+</span><span class='line'>1037     memcpy(&key-&gt;addr, addr,  
+</span><span class='line'>1038            (family == AF_INET6) ? sizeof(struct in6_addr) :  
+</span><span class='line'>1039                       sizeof(struct in_addr));　//导入地址信息  
+</span><span class='line'>1040     hlist_add_head_rcu(&key-&gt;node, &md5sig-&gt;head);  
+</span><span class='line'>1041     return 0;  
+</span><span class='line'>1042 }  
+</span><span class='line'>1043 EXPORT_SYMBOL(tcp_md5_do_add);  
+</span><span class='line'>1044   
+</span><span class='line'>1045 int tcp_md5_do_del(struct sock *sk, const union tcp_md5_addr *addr, int family)  
+</span><span class='line'>1046 {  
+</span><span class='line'>1047     struct tcp_sock *tp = tcp_sk(sk);  
+</span><span class='line'>1048     struct tcp_md5sig_key *key;  
+</span><span class='line'>1049     struct tcp_md5sig_info *md5sig;  
+</span><span class='line'>1050   
+</span><span class='line'>1051     key = tcp_md5_do_lookup(sk, addr, family);  
+</span><span class='line'>1052     if (!key)  
+</span><span class='line'>1053         return -ENOENT;  
+</span><span class='line'>1054     hlist_del_rcu(&key-&gt;node);  
+</span><span class='line'>1055     atomic_sub(sizeof(*key), &sk-&gt;sk_omem_alloc);  
+</span><span class='line'>1056     kfree_rcu(key, rcu);  
+</span><span class='line'>1057     md5sig = rcu_dereference_protected(tp-&gt;md5sig_info,  
+</span><span class='line'>1058                        sock_owned_by_user(sk));  
+</span><span class='line'>1059     if (hlist_empty(&md5sig-&gt;head))  
+</span><span class='line'>1060         tcp_free_md5sig_pool();  
+</span><span class='line'>1061     return 0;  
+</span><span class='line'>1062 }  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>　　在TCP发送数据前构建选项信息（tcp_syn_options、tcp_established_options、tcp_synack_options）时都会执行类似下面的代码：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>     #ifdef CONFIG_TCP_MD5SIG  
+</span><span class='line'> 507     *md5 = tp-&gt;af_specific-&gt;md5_lookup(sk, sk);　//指向tcp_v4_md5_lookup  
+</span><span class='line'> 508     if (*md5) {  
+</span><span class='line'> 509         opts-&gt;options |= OPTION_MD5;  
+</span><span class='line'> 510         remaining -= TCPOLEN_MD5SIG_ALIGNED;  
+</span><span class='line'> 511     }  
+</span><span class='line'> 512 #else  
+</span><span class='line'> 513     *md5 = NULL;  
+</span><span class='line'> 514 #endif  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>　　tcp_v4_md5_lookup用于查找MD5签名的key：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>949 struct tcp_md5sig_key *tcp_md5_do_lookup(struct sock *sk,  
+</span><span class='line'>950                      const union tcp_md5_addr *addr,  
+</span><span class='line'>951                      int family)  
+</span><span class='line'>952 {  
+</span><span class='line'>953     struct tcp_sock *tp = tcp_sk(sk);  
+</span><span class='line'>954     struct tcp_md5sig_key *key;  
+</span><span class='line'>955     unsigned int size = sizeof(struct in_addr);  
+</span><span class='line'>956     struct tcp_md5sig_info *md5sig;  
+</span><span class='line'>957   
+</span><span class='line'>958     /* caller either holds rcu_read_lock() or socket lock */  
+</span><span class='line'>959     md5sig = rcu_dereference_check(tp-&gt;md5sig_info,  
+</span><span class='line'>960                        sock_owned_by_user(sk) ||  
+</span><span class='line'>961                        lockdep_is_held(&sk-&gt;sk_lock.slock));  
+</span><span class='line'>962     if (!md5sig)  
+</span><span class='line'>963         return NULL;  
+</span><span class='line'>964 #if IS_ENABLED(CONFIG_IPV6)  
+</span><span class='line'>965     if (family == AF_INET6)  
+</span><span class='line'>966         size = sizeof(struct in6_addr);  
+</span><span class='line'>967 #endif  
+</span><span class='line'>968     hlist_for_each_entry_rcu(key, &md5sig-&gt;head, node) {  
+</span><span class='line'>969         if (key-&gt;family != family)  
+</span><span class='line'>970             continue;     
+</span><span class='line'>971         if (!memcmp(&key-&gt;addr, addr, size))　//地址匹配  
+</span><span class='line'>972             return key;  
+</span><span class='line'>973     }  
+</span><span class='line'>974     return NULL;  
+</span><span class='line'>975 }  
+</span><span class='line'>976 EXPORT_SYMBOL(tcp_md5_do_lookup);  
+</span><span class='line'>977   
+</span><span class='line'>978 struct tcp_md5sig_key *tcp_v4_md5_lookup(struct sock *sk,  
+</span><span class='line'>979                      struct sock *addr_sk)  
+</span><span class='line'>980 {     
+</span><span class='line'>981     union tcp_md5_addr *addr;  
+</span><span class='line'>982       
+</span><span class='line'>983     addr = (union tcp_md5_addr *)&inet_sk(addr_sk)-&gt;inet_daddr;  
+</span><span class='line'>984     return tcp_md5_do_lookup(sk, addr, AF_INET);  
+</span><span class='line'>985 }  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>　　可见如果应用进程导入了key，在构建选项时就会找到。选项信息构建完毕后，tcp_options_write函数会将选项信息写入TCP报头中：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'> 409 static void tcp_options_write(__be32 *ptr, struct tcp_sock *tp,  
+</span><span class='line'> 410                   struct tcp_out_options *opts)  
+</span><span class='line'> 411 {  
+</span><span class='line'> 412     u16 options = opts-&gt;options;    /* mungable copy */  
+</span><span class='line'> 413   
+</span><span class='line'> 414     if (unlikely(OPTION_MD5 & options)) {  
+</span><span class='line'> 415         *ptr++ = htonl((TCPOPT_NOP &lt;&lt; 24) | (TCPOPT_NOP &lt;&lt; 16) |  
+</span><span class='line'> 416                    (TCPOPT_MD5SIG &lt;&lt; 8) | TCPOLEN_MD5SIG);  
+</span><span class='line'> 417         /* overload cookie hash location */  
+</span><span class='line'> 418         opts-&gt;hash_location = (__u8 *)ptr;　//hash_location指向digest所在内存的首地址  
+</span><span class='line'> 419         ptr += 4;　//digest大小为16个字节  
+</span><span class='line'> 420     }  
+</span><span class='line'> ...  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>　　tcp_options_write并没有写入MD5 digest，这个工作在后面完成：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'> 828 static int tcp_transmit_skb(struct sock *sk, struct sk_buff *skb, int clone_it,  
+</span><span class='line'> 829                 gfp_t gfp_mask)  
+</span><span class='line'> 830 {  
+</span><span class='line'>...  
+</span><span class='line'> 870     if (unlikely(tcb-&gt;tcp_flags & TCPHDR_SYN))  
+</span><span class='line'> 871         tcp_options_size = tcp_syn_options(sk, skb, &opts, &md5);  
+</span><span class='line'> 872     else  
+</span><span class='line'> 873         tcp_options_size = tcp_established_options(sk, skb, &opts,  
+</span><span class='line'> 874                                &md5);  
+</span><span class='line'>...  
+</span><span class='line'> 925     tcp_options_write((__be32 *)(th + 1), tp, &opts);  
+</span><span class='line'>...  
+</span><span class='line'> 929 #ifdef CONFIG_TCP_MD5SIG  
+</span><span class='line'> 930     /* Calculate the MD5 hash, as we have all we need now */  
+</span><span class='line'> 931     if (md5) {  
+</span><span class='line'> 932         sk_nocaps_add(sk, NETIF_F_GSO_MASK);  
+</span><span class='line'> 933         tp-&gt;af_specific-&gt;calc_md5_hash(opts.hash_location,  
+</span><span class='line'> 934                            md5, sk, NULL, skb);　//指向tcp_v4_md5_hash_skb  
+</span><span class='line'> 935     }  
+</span><span class='line'> 936 #endif  
+</span><span class='line'>...  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>　　tcp_v4_md5_hash_skb函数计算MD5 digest：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>1165 int tcp_v4_md5_hash_skb(char *md5_hash, struct tcp_md5sig_key *key,  
+</span><span class='line'>1166             const struct sock *sk, const struct request_sock *req,  
+</span><span class='line'>1167             const struct sk_buff *skb)  
+</span><span class='line'>1168 {  
+</span><span class='line'>1169     struct tcp_md5sig_pool *hp;  
+</span><span class='line'>1170     struct hash_desc *desc;  
+</span><span class='line'>1171     const struct tcphdr *th = tcp_hdr(skb);  
+</span><span class='line'>1172     __be32 saddr, daddr;  
+</span><span class='line'>1173   
+</span><span class='line'>1174     if (sk) {  
+</span><span class='line'>1175         saddr = inet_sk(sk)-&gt;inet_saddr;  
+</span><span class='line'>1176         daddr = inet_sk(sk)-&gt;inet_daddr;  
+</span><span class='line'>1177     } else if (req) {  
+</span><span class='line'>1178         saddr = inet_rsk(req)-&gt;loc_addr;  
+</span><span class='line'>1179         daddr = inet_rsk(req)-&gt;rmt_addr;  
+</span><span class='line'>1180     } else {  
+</span><span class='line'>1181         const struct iphdr *iph = ip_hdr(skb);  
+</span><span class='line'>1182         saddr = iph-&gt;saddr;   
+</span><span class='line'>1183         daddr = iph-&gt;daddr;  
+</span><span class='line'>1184     }  
+</span><span class='line'>1185   
+</span><span class='line'>1186     hp = tcp_get_md5sig_pool();  
+</span><span class='line'>1187     if (!hp)  
+</span><span class='line'>1188         goto clear_hash_noput;  
+</span><span class='line'>1189     desc = &hp-&gt;md5_desc;  
+</span><span class='line'>1190   
+</span><span class='line'>1191     if (crypto_hash_init(desc))  
+</span><span class='line'>1192         goto clear_hash;  
+</span><span class='line'>1193   
+</span><span class='line'>1194     if (tcp_v4_md5_hash_pseudoheader(hp, daddr, saddr, skb-&gt;len))　//伪首部  
+</span><span class='line'>1195         goto clear_hash;  
+</span><span class='line'>1196     if (tcp_md5_hash_header(hp, th))　//TCP头  
+</span><span class='line'>1197         goto clear_hash;  
+</span><span class='line'>1198     if (tcp_md5_hash_skb_data(hp, skb, th-&gt;doff &lt;&lt; 2))　//TCP数据  
+</span><span class='line'>1199         goto clear_hash;  
+</span><span class='line'>1200     if (tcp_md5_hash_key(hp, key))　//key  
+</span><span class='line'>1201         goto clear_hash;  
+</span><span class='line'>1202     if (crypto_hash_final(desc, md5_hash))　//将MD5 digest写入  
+</span><span class='line'>1203         goto clear_hash;  
+</span><span class='line'>1204   
+</span><span class='line'>1205     tcp_put_md5sig_pool();  
+</span><span class='line'>1206     return 0;  
+</span><span class='line'>1207   
+</span><span class='line'>1208 clear_hash:  
+</span><span class='line'>1209     tcp_put_md5sig_pool();  
+</span><span class='line'>1210 clear_hash_noput:  
+</span><span class='line'>1211     memset(md5_hash, 0, 16);  
+</span><span class='line'>1212     return 1;  
+</span><span class='line'>1213 }  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>　　TCP在收到报文时会在入口函数检查MD5选项：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>1800 int tcp_v4_do_rcv(struct sock *sk, struct sk_buff *skb)  
+</span><span class='line'>1801 {  
+</span><span class='line'>1802     struct sock *rsk;  
+</span><span class='line'>1803 #ifdef CONFIG_TCP_MD5SIG  
+</span><span class='line'>1804     /* 
+</span><span class='line'>1805      * We really want to reject the packet as early as possible 
+</span><span class='line'>1806      * if: 
+</span><span class='line'>1807      *  o We're expecting an MD5'd packet and this is no MD5 tcp option 
+</span><span class='line'>1808      *  o There is an MD5 option and we're not expecting one 
+</span><span class='line'>1809      */  
+</span><span class='line'>1810     if (tcp_v4_inbound_md5_hash(sk, skb))  
+</span><span class='line'>1811         goto discard;  
+</span><span class='line'>1812 #endif  
+</span><span class='line'>...  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>　　tcp_v4_inbound_md5_hash函数返回false时检查通过：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>1216 static bool tcp_v4_inbound_md5_hash(struct sock *sk, const struct sk_buff *skb)  
+</span><span class='line'>1217 {  
+</span><span class='line'>1218     /* 
+</span><span class='line'>1219      * This gets called for each TCP segment that arrives 
+</span><span class='line'>1220      * so we want to be efficient. 
+</span><span class='line'>1221      * We have 3 drop cases: 
+</span><span class='line'>1222      * o No MD5 hash and one expected. 
+</span><span class='line'>1223      * o MD5 hash and we're not expecting one. 
+</span><span class='line'>1224      * o MD5 hash and its wrong. 
+</span><span class='line'>1225      */  
+</span><span class='line'>1226     const __u8 *hash_location = NULL;  
+</span><span class='line'>1227     struct tcp_md5sig_key *hash_expected;  
+</span><span class='line'>1228     const struct iphdr *iph = ip_hdr(skb);  
+</span><span class='line'>1229     const struct tcphdr *th = tcp_hdr(skb);  
+</span><span class='line'>1230     int genhash;  
+</span><span class='line'>1231     unsigned char newhash[16];  
+</span><span class='line'>1232   
+</span><span class='line'>1233     hash_expected = tcp_md5_do_lookup(sk, (union tcp_md5_addr *)&iph-&gt;saddr,  
+</span><span class='line'>1234                       AF_INET);　//根据源IP地址查找key  
+</span><span class='line'>1235     hash_location = tcp_parse_md5sig_option(th);　//找到MD5 digest在TCP报头中的位置  
+</span><span class='line'>1236   
+</span><span class='line'>1237     /* We've parsed the options - do we have a hash? */  
+</span><span class='line'>1238     if (!hash_expected && !hash_location)　//进程没有导入key信息且没有找到MD5选项  
+</span><span class='line'>1239         return false;　//OK  
+</span><span class='line'>1240   
+</span><span class='line'>1241     if (hash_expected && !hash_location) { //进程导入了key信息且没有找到MD5选项  
+</span><span class='line'>1242         NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_TCPMD5NOTFOUND);  
+</span><span class='line'>1243         return true;　//接收端期望有MD5选项而发送端没有，不行  
+</span><span class='line'>1244     }  
+</span><span class='line'>1245   
+</span><span class='line'>1246     if (!hash_expected && hash_location) {　//进程没有导入key信息但找到了MD5选项  
+</span><span class='line'>1247         NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_TCPMD5UNEXPECTED);  
+</span><span class='line'>1248         return true;　//接收端不期望有MD5选项而发送端有，也不行  
+</span><span class='line'>1249     }  
+</span><span class='line'>1250   
+</span><span class='line'>1251     /* Okay, so this is hash_expected and hash_location - 
+</span><span class='line'>1252      * so we need to calculate the checksum. 
+</span><span class='line'>1253      */  
+</span><span class='line'>1254     genhash = tcp_v4_md5_hash_skb(newhash,  
+</span><span class='line'>1255                       hash_expected,  
+</span><span class='line'>1256                       NULL, NULL, skb);　//使用key计算digest  
+</span><span class='line'>1257   
+</span><span class='line'>1258     if (genhash || memcmp(hash_location, newhash, 16) != 0) {　//生成digest失败或digest不一样则检查不通过，丢弃之  
+</span><span class='line'>1259         net_info_ratelimited("MD5 Hash failed for (%pI4, %d)-&gt;(%pI4, %d)%s\n",  
+</span><span class='line'>1260                      &iph-&gt;saddr, ntohs(th-&gt;source),  
+</span><span class='line'>1261                      &iph-&gt;daddr, ntohs(th-&gt;dest),  
+</span><span class='line'>1262                      genhash ? " tcp_v4_calc_md5_hash failed"  
+</span><span class='line'>1263                      : "");  
+</span><span class='line'>1264         return true;  
+</span><span class='line'>1265     }  
+</span><span class='line'>1266     return false;  
+</span><span class='line'>1267 }  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>　　tcp_parse_md5sig_option用于解析MD5选项：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>3635 #ifdef CONFIG_TCP_MD5SIG  
+</span><span class='line'>3636 /*   
+</span><span class='line'>3637  * Parse MD5 Signature option 
+</span><span class='line'>3638  */           
+</span><span class='line'>3639 const u8 *tcp_parse_md5sig_option(const struct tcphdr *th)  
+</span><span class='line'>3640 {                       
+</span><span class='line'>3641     int length = (th-&gt;doff &lt;&lt; 2) - sizeof(*th);  
+</span><span class='line'>3642     const u8 *ptr = (const u8 *)(th + 1);  
+</span><span class='line'>3643   
+</span><span class='line'>3644     /* If the TCP option is too short, we can short cut */  
+</span><span class='line'>3645     if (length &lt; TCPOLEN_MD5SIG)  
+</span><span class='line'>3646         return NULL;  
+</span><span class='line'>3647       
+</span><span class='line'>3648     while (length &gt; 0) {  
+</span><span class='line'>3649         int opcode = *ptr++;  
+</span><span class='line'>3650         int opsize;  
+</span><span class='line'>3651   
+</span><span class='line'>3652         switch(opcode) {  
+</span><span class='line'>3653         case TCPOPT_EOL:  
+</span><span class='line'>3654             return NULL;  
+</span><span class='line'>3655         case TCPOPT_NOP:  
+</span><span class='line'>3656             length--;  
+</span><span class='line'>3657             continue;  
+</span><span class='line'>3658         default:  
+</span><span class='line'>3659             opsize = *ptr++;  
+</span><span class='line'>3660             if (opsize &lt; 2 || opsize &gt; length)  
+</span><span class='line'>3661                 return NULL;  
+</span><span class='line'>3662             if (opcode == TCPOPT_MD5SIG)  
+</span><span class='line'>3663                 return opsize == TCPOLEN_MD5SIG ? ptr : NULL;  
+</span><span class='line'>3664         }  
+</span><span class='line'>3665         ptr += opsize - 2;  
+</span><span class='line'>3666         length -= opsize;  
+</span><span class='line'>3667     }  
+</span><span class='line'>3668     return NULL;  
+</span><span class='line'>3669 }  
+</span><span class='line'>3670 EXPORT_SYMBOL(tcp_parse_md5sig_option);  
+</span><span class='line'>3671 #endif  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>　　使用TCP MD5选项带来安全性的同时，由于需要计算MD5 digest会带来一些性能损耗，且每包都携带18字节的MD5选项字段也会降低数据发送效率。不过对于类似BGP这样对安全性要求较高的应用来说，这些代码应该是可以承受的。</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
       <h2 class="entry-title"><a href="/blog/2018/03/12/kernel-crypto-sample/">Linux内核的加密函数</a></h2>
     
     
@@ -1143,1975 +2482,6 @@ if (query != null) {
 
     </article>
   
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2018/03/03/kernel-alsa-2/">Linux ALSA 系统架构</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2018-03-03T18:22:00+08:00'><span class='date'>2018-03-03</span> <span class='time'>18:22:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="https://www.linuxidc.com/Linux/2012-07/65903.htm">https://www.linuxidc.com/Linux/2012-07/65903.htm</a></p>
-
-<p>ALSA是Linux声卡驱动的架构，下面基于linux-2.6.32描述下ALSA系统架构。ALSA系统可以分为alsa-lib、alsa-driver，而alsa-driver又分为core层和底层硬件层。作为开发者，我们只需移植底层硬件层，根据自己硬件特性，实现底层的移植。而core层基本属于ALSA标准框架，不需要自己实现。介绍ALSA框架，下面是大体框架图。</p>
-
-<p><img src="/images/kernel/2018-03-03-21.png" alt="" /></p>
-
-<p>如上图所示，alsa驱动最终会被上层应用调用，这是通过alsa-lib实现的，alsa-lib为alsa-driver封装了许多API，通过这些API，上层应用可以调用到驱动层。而alsa-lib中的这些API，我们可暂时把他们当做一个黑盒子，里面具体实现不需要去关注，下面以linux-2.6.32中ALSA调用函数关系说明其架构。先分析ALSA驱动的注册过程。</p>
-
-<h4>一、ALSA驱动的注册</h4>
-
-<p><img src="/images/kernel/2018-03-03-21.png" alt="" /></p>
-
-<p>注册流程查看上图，具体的注册过程不在此赘述。</p>
-
-<p>二、打开流程</p>
-
-<p>在ALSA驱动注册完毕以后，当应用程序开始调用时，会有一个过程：打开设备、映射、设置硬件参数、准备工作、触发数据流。下图为整个流程。</p>
-
-<p><img src="/images/kernel/2018-03-03-22.png" alt="" /></p>
-
-<p>带sep0611的是需要自己实现的底层驱动。</p>
-
-<p>三、写数据流程</p>
-
-<p><img src="/images/kernel/2018-03-03-23.png" alt="" /></p>
-
-<p>图中应用程序通过ALSA-lib的API函数写入数据，ALSA-lib调用等待函数等待底层可写。ALSA-lib通过poll系统调用进入底层驱动并将poll信号加入sleep队列阻塞进程。硬件的中断信号触发底层驱动注册的中断处理函数，中断处理函数进而调用ALSA-driver中的函数判读是否该写。ALSA-driver中的函数再调用底层芯片硬件驱动获取硬件当前数据大小。ALSA-driver再判断空闲数据区的大小，如果满足条件就唤醒sleep队列，poll信号从而被唤醒，进而返回给ALSA-lib，ALSA-lib收到信号后再执行往buffer里写数据。
-ALSA-lib通过mmap机制将硬件申请的内存映射到用户空间，从而应用程序只需调用ALSA-lib往相应位置写数据，硬件就可以直接读取了。如果映射内存里已有数据，通过DMA传输给codec，codec便开始读取数据并进行解码播放声音了。</p>
-
-<p><a href="http://blog.chinaunix.net/uid-20564848-id-74726.html">http://blog.chinaunix.net/uid-20564848-id-74726.html</a></p>
-
-<p><a href="https://my.oschina.net/abcijkxyz/blog/788796">https://my.oschina.net/abcijkxyz/blog/788796</a></p>
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2018/03/03/kernel-alsa-1/">alsa架构分析</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2018-03-03T17:35:00+08:00'><span class='date'>2018-03-03</span> <span class='time'>17:35:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://blog.csdn.net/poltroon/article/details/7978304">http://blog.csdn.net/poltroon/article/details/7978304</a></p>
-
-<p><a href="http://blog.csdn.net/droidphone/article/category/1118446">http://blog.csdn.net/droidphone/article/category/1118446</a></p>
-
-<h2>Linux ALSA声卡驱动之一：ALSA架构简介</h2>
-
-<h4>一.  概述</h4>
-
-<p>  ALSA是Advanced Linux Sound Architecture 的缩写，目前已经成为了linux的主流音频体系结构，想了解更多的关于ALSA的这一开源项目的信息和知识，请查看以下网址：<a href="http://www.alsa-project.org/%E3%80%82">http://www.alsa-project.org/%E3%80%82</a></p>
-
-<p>  在内核设备驱动层，ALSA提供了alsa-driver，同时在应用层，ALSA为我们提供了alsa-lib，应用程序只要调用alsa-lib提供的API，即可以完成对底层音频硬件的控制。</p>
-
-<p><img src="/images/kernel/2018-03-03-2.png" alt="" /><br/>
-                                            图 1.1   alsa的软件体系结构</p>
-
-<p>由图1.1可以看出，用户空间的alsa-lib对应用程序提供统一的API接口，这样可以隐藏了驱动层的实现细节，简化了应用程序的实现难度。内核空间中，alsa-soc其实是对alsa-driver的进一步封装，他针对嵌入式设备提供了一些列增强的功能。本系列博文仅对嵌入式系统中的alsa-driver和alsa-soc进行讨论。</p>
-
-<h4>二.  ALSA设备文件结构</h4>
-
-<p>  我们从alsa在linux中的设备文件结构开始我们的alsa之旅. 看看我的电脑中的alsa驱动的设备文件结构:</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>$ cd /dev/snd
-</span><span class='line'>$ ls -l
-</span><span class='line'>
-</span><span class='line'>crw-rw----+ 1 root audio 116, 8 2011-02-23 21:38 controlC0
-</span><span class='line'>crw-rw----+ 1 root audio 116, 4 2011-02-23 21:38 midiC0D0
-</span><span class='line'>crw-rw----+ 1 root audio 116, 7 2011-02-23 21:39 pcmC0D0c
-</span><span class='line'>crw-rw----+ 1 root audio 116, 6 2011-02-23 21:56 pcmC0D0p
-</span><span class='line'>crw-rw----+ 1 root audio 116, 5 2011-02-23 21:38 pcmC0D1p
-</span><span class='line'>crw-rw----+ 1 root audio 116, 3 2011-02-23 21:38 seq
-</span><span class='line'>crw-rw----+ 1 root audio 116, 2 2011-02-23 21:38 timer</span></code></pre></td></tr></table></div></figure>
-
-
-<p>我们可以看到以下设备文件:</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>controlC0 --&gt;               用于声卡的控制，例如通道选择，混音，麦克风的控制等
-</span><span class='line'>midiC0D0  --&gt;               用于播放midi音频
-</span><span class='line'>pcmC0D0c  --&gt;               用于录音的pcm设备
-</span><span class='line'>pcmC0D0p  --&gt;               用于播放的pcm设备
-</span><span class='line'>seq       --&gt;               音序器
-</span><span class='line'>timer     --&gt;               定时器</span></code></pre></td></tr></table></div></figure>
-
-
-<p>其中，C0D0代表的是声卡0中的设备0，pcmC0D0c最后一个c代表capture，pcmC0D0p最后一个p代表playback，这些都是alsa-driver中的命名规则。从上面的列表可以看出，我的声卡下挂了6个设备，根据声卡的实际能力，驱动实际上可以挂上更多种类的设备，在include/sound/core.h中，定义了以下设备类型：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#define SNDRV_DEV_TOPLEVEL  ((__force snd_device_type_t) 0)
-</span><span class='line'>#define SNDRV_DEV_CONTROL   ((__force snd_device_type_t) 1)
-</span><span class='line'>#define SNDRV_DEV_LOWLEVEL_PRE  ((__force snd_device_type_t) 2)
-</span><span class='line'>#define SNDRV_DEV_LOWLEVEL_NORMAL ((__force snd_device_type_t) 0x1000)
-</span><span class='line'>#define SNDRV_DEV_PCM       ((__force snd_device_type_t) 0x1001)
-</span><span class='line'>#define SNDRV_DEV_RAWMIDI   ((__force snd_device_type_t) 0x1002)
-</span><span class='line'>#define SNDRV_DEV_TIMER     ((__force snd_device_type_t) 0x1003)
-</span><span class='line'>#define SNDRV_DEV_SEQUENCER ((__force snd_device_type_t) 0x1004)
-</span><span class='line'>#define SNDRV_DEV_HWDEP     ((__force snd_device_type_t) 0x1005)
-</span><span class='line'>#define SNDRV_DEV_INFO      ((__force snd_device_type_t) 0x1006)
-</span><span class='line'>#define SNDRV_DEV_BUS       ((__force snd_device_type_t) 0x1007)
-</span><span class='line'>#define SNDRV_DEV_CODEC     ((__force snd_device_type_t) 0x1008)
-</span><span class='line'>#define SNDRV_DEV_JACK          ((__force snd_device_type_t) 0x1009)
-</span><span class='line'>#define SNDRV_DEV_LOWLEVEL  ((__force snd_device_type_t) 0x2000)</span></code></pre></td></tr></table></div></figure>
-
-
-<p> 通常，我们更关心的是pcm和control这两种设备。</p>
-
-<h4>三.  驱动的代码文件结构</h4>
-
-<p>  在Linux2.6代码树中，Alsa的代码文件结构如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>sound
-</span><span class='line'>        /core
-</span><span class='line'>                 /oss
-</span><span class='line'>                /seq
-</span><span class='line'>        /ioctl32
-</span><span class='line'>        /include
-</span><span class='line'>        /drivers
-</span><span class='line'>        /i2c
-</span><span class='line'>        /synth
-</span><span class='line'>                /emux
-</span><span class='line'>        /pci
-</span><span class='line'>                /(cards)
-</span><span class='line'>        /isa
-</span><span class='line'>                /(cards)
-</span><span class='line'>        /arm
-</span><span class='line'>        /ppc
-</span><span class='line'>        /sparc
-</span><span class='line'>        /usb
-</span><span class='line'>        /pcmcia /(cards)
-</span><span class='line'>        /oss
-</span><span class='line'>        /soc
-</span><span class='line'>                /codecs
-</span><span class='line'>
-</span><span class='line'>core            该目录包含了ALSA驱动的中间层，它是整个ALSA驱动的核心部分
-</span><span class='line'>core/oss        包含模拟旧的OSS架构的PCM和Mixer模块
-</span><span class='line'>core/seq        有关音序器相关的代码
-</span><span class='line'>include         ALSA驱动的公共头文件目录，该目录的头文件需要导出给用户空间的应用程序使用，通常，驱动模块私有的头文件不应放置在这里
-</span><span class='line'>drivers         放置一些与CPU、BUS架构无关的公用代码
-</span><span class='line'>i2c             ALSA自己的I2C控制代码
-</span><span class='line'>pci             pci声卡的顶层目录，子目录包含各种pci声卡的代码
-</span><span class='line'>isa             isa声卡的顶层目录，子目录包含各种isa声卡的代码
-</span><span class='line'>soc             针对system-on-chip体系的中间层代码
-</span><span class='line'>soc/codecs      针对soc体系的各种codec的代码，与平台无关</span></code></pre></td></tr></table></div></figure>
-
-
-<h2>Linux ALSA声卡驱动之二：声卡的创建</h2>
-
-<h4>1. struct snd_card</h4>
-
-<h5>1.1. snd_card是什么</h5>
-
-<p>snd_card可以说是整个ALSA音频驱动最顶层的一个结构，整个声卡的软件逻辑结构开始于该结构，几乎所有与声音相关的逻辑设备都是在snd_card的管理之下，声卡驱动的第一个动作通常就是创建一个snd_card结构体。正因为如此，本节中，我们也从 struct cnd_card开始吧。</p>
-
-<h5>1.2. snd_card的定义</h5>
-
-<p>snd_card的定义位于改头文件中：include/sound/core.h</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/* main structure for soundcard */
-</span><span class='line'>
-</span><span class='line'>struct snd_card {
-</span><span class='line'>    int number;         /* number of soundcard (index to
-</span><span class='line'>                                snd_cards) */
-</span><span class='line'>
-</span><span class='line'>    char id[16];            /* id string of this card */
-</span><span class='line'>    char driver[16];        /* driver name */
-</span><span class='line'>    char shortname[32];     /* short name of this soundcard */
-</span><span class='line'>    char longname[80];      /* name of this soundcard */
-</span><span class='line'>    char mixername[80];     /* mixer name */
-</span><span class='line'>    char components[128];       /* card components delimited with
-</span><span class='line'>                                space */
-</span><span class='line'>    struct module *module;      /* top-level module */
-</span><span class='line'>
-</span><span class='line'>    void *private_data;     /* private data for soundcard */
-</span><span class='line'>    void (*private_free) (struct snd_card *card); /* callback for freeing of
-</span><span class='line'>                                private data */
-</span><span class='line'>    struct list_head devices;   /* devices */
-</span><span class='line'>
-</span><span class='line'>    unsigned int last_numid;    /* last used numeric ID */
-</span><span class='line'>    struct rw_semaphore controls_rwsem; /* controls list lock */
-</span><span class='line'>    rwlock_t ctl_files_rwlock;  /* ctl_files list lock */
-</span><span class='line'>    int controls_count;     /* count of all controls */
-</span><span class='line'>    int user_ctl_count;     /* count of all user controls */
-</span><span class='line'>    struct list_head controls;  /* all controls for this card */
-</span><span class='line'>    struct list_head ctl_files; /* active control files */
-</span><span class='line'>
-</span><span class='line'>    struct snd_info_entry *proc_root;   /* root for soundcard specific files */
-</span><span class='line'>    struct snd_info_entry *proc_id; /* the card id */
-</span><span class='line'>    struct proc_dir_entry *proc_root_link;  /* number link to real id */
-</span><span class='line'>
-</span><span class='line'>    struct list_head files_list;    /* all files associated to this card */
-</span><span class='line'>    struct snd_shutdown_f_ops *s_f_ops; /* file operations in the shutdown
-</span><span class='line'>                                state */
-</span><span class='line'>    spinlock_t files_lock;      /* lock the files for this card */
-</span><span class='line'>    int shutdown;           /* this card is going down */
-</span><span class='line'>    int free_on_last_close;     /* free in context of file_release */
-</span><span class='line'>    wait_queue_head_t shutdown_sleep;
-</span><span class='line'>    struct device *dev;     /* device assigned to this card */
-</span><span class='line'>#ifndef CONFIG_SYSFS_DEPRECATED
-</span><span class='line'>    struct device *card_dev;    /* cardX object for sysfs */
-</span><span class='line'>#endif
-</span><span class='line'>#ifdef CONFIG_PM
-</span><span class='line'>    unsigned int power_state;   /* power state */
-</span><span class='line'>    struct mutex power_lock;    /* power lock */
-</span><span class='line'>    wait_queue_head_t power_sleep;
-</span><span class='line'>#endif
-</span><span class='line'>#if defined(CONFIG_SND_MIXER_OSS) || defined(CONFIG_SND_MIXER_OSS_MODULE)
-</span><span class='line'>    struct snd_mixer_oss *mixer_oss;
-</span><span class='line'>    int mixer_oss_change_count;
-</span><span class='line'>#endif
-</span><span class='line'>};
-</span><span class='line'>
-</span><span class='line'>struct list_head devices     记录该声卡下所有逻辑设备的链表
-</span><span class='line'>struct list_head controls    记录该声卡下所有的控制单元的链表
-</span><span class='line'>void *private_data           声卡的私有数据，可以在创建声卡时通过参数指定数据的大小</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>2. 声卡的建立流程</h4>
-
-<h5>2.1.1. 第一步，创建snd_card的一个实例</h5>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>int err;
-</span><span class='line'>....
-</span><span class='line'>err = snd_card_create(index, id, THIS_MODULE, 0, &card);
-</span><span class='line'>
-</span><span class='line'>index           一个整数值，该声卡的编号
-</span><span class='line'>id                字符串，声卡的标识符
-</span><span class='line'>第四个参数    该参数决定在创建snd_card实例时，需要同时额外分配的私有数据的大小，该数据的指针最终会赋值给snd_card的private_data数据成员
-</span><span class='line'>card             返回所创建的snd_card实例的指针</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>2.1.2. 第二步，创建声卡的芯片专用数据</h5>
-
-<p>声卡的专用数据主要用于存放该声卡的一些资源信息，例如中断资源、io资源、dma资源等。可以有两种创建方法：</p>
-
-<p>  通过上一步中snd_card_create()中的第四个参数，让snd_card_create自己创建</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>// struct mychip 用于保存专用数据
-</span><span class='line'>err = snd_card_create(index, id, THIS_MODULE,
-</span><span class='line'>                sizeof(struct mychip), &card);
-</span><span class='line'>// 从private_data中取出
-</span><span class='line'>struct mychip *chip = card-&gt;private_data;</span></code></pre></td></tr></table></div></figure>
-
-
-<p>  自己创建：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct mychip {
-</span><span class='line'>    struct snd_card *card;
-</span><span class='line'>    ....
-</span><span class='line'>};
-</span><span class='line'>struct snd_card *card;
-</span><span class='line'>struct mychip *chip;
-</span><span class='line'>err = snd_card_create(index[dev], id[dev], THIS_MODULE, 0, &card);
-</span><span class='line'>// 专用数据记录snd_card实例
-</span><span class='line'>chip-&gt;card = card;
-</span><span class='line'>.....
-</span><span class='line'>chip = kzalloc(sizeof(*chip), GFP_KERNEL);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>然后，把芯片的专有数据注册为声卡的一个低阶设备：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static int snd_mychip_dev_free(struct snd_device *device)
-</span><span class='line'>{
-</span><span class='line'>    return snd_mychip_free(device-&gt;device_data);
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>static struct snd_device_ops ops = {
-</span><span class='line'>    .dev_free = snd_mychip_dev_free,
-</span><span class='line'>};
-</span><span class='line'>....
-</span><span class='line'>snd_device_new(card, SNDRV_DEV_LOWLEVEL, chip, &ops);</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>2.1.3. 第三步，设置Driver的ID和名字</h5>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>strcpy(card-&gt;driver, "My Chip");
-</span><span class='line'>strcpy(card-&gt;shortname, "My Own Chip 123");
-</span><span class='line'>sprintf(card-&gt;longname, "%s at 0x%lx irq %i",
-</span><span class='line'>            card-&gt;shortname, chip-&gt;ioport, chip-&gt;irq);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>snd_card的driver字段保存着芯片的ID字符串，user空间的alsa-lib会使用到该字符串，所以必须要保证该ID的唯一性。shortname字段更多地用于打印信息，longname字段则会出现在/proc/asound/cards中。</p>
-
-<h5>2.1.4. 第四步，创建声卡的功能部件（逻辑设备），例如PCM，Mixer，MIDI等</h5>
-
-<p>这时候可以创建声卡的各种功能部件了，还记得开头的snd_card结构体的devices字段吗？每一种部件的创建最终会调用snd_device_new()来生成一个snd_device实例，并把该实例链接到snd_card的devices链表中。</p>
-
-<p>通常，alsa-driver的已经提供了一些常用的部件的创建函数，而不必直接调用snd_device_new()，比如：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>PCM     --        snd_pcm_new()
-</span><span class='line'>RAWMIDI --        snd_rawmidi_new()
-</span><span class='line'>CONTROL --        snd_ctl_create()
-</span><span class='line'>TIMER   --        snd_timer_new()
-</span><span class='line'>INFO    --        snd_card_proc_new()
-</span><span class='line'>JACK    --        snd_jack_new()</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>2.1.5. 第五步，注册声卡</h5>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>err = snd_card_register(card);
-</span><span class='line'>if (err &lt; 0) {
-</span><span class='line'>    snd_card_free(card);
-</span><span class='line'>    return err;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>2.2. 一个实际的例子</h4>
-
-<p>我把/sound/arm/pxa2xx-ac97.c的部分代码贴上来：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-<span class='line-number'>58</span>
-<span class='line-number'>59</span>
-<span class='line-number'>60</span>
-<span class='line-number'>61</span>
-<span class='line-number'>62</span>
-<span class='line-number'>63</span>
-<span class='line-number'>64</span>
-<span class='line-number'>65</span>
-<span class='line-number'>66</span>
-<span class='line-number'>67</span>
-<span class='line-number'>68</span>
-<span class='line-number'>69</span>
-<span class='line-number'>70</span>
-<span class='line-number'>71</span>
-<span class='line-number'>72</span>
-<span class='line-number'>73</span>
-<span class='line-number'>74</span>
-<span class='line-number'>75</span>
-<span class='line-number'>76</span>
-<span class='line-number'>77</span>
-<span class='line-number'>78</span>
-<span class='line-number'>79</span>
-<span class='line-number'>80</span>
-<span class='line-number'>81</span>
-<span class='line-number'>82</span>
-<span class='line-number'>83</span>
-<span class='line-number'>84</span>
-<span class='line-number'>85</span>
-<span class='line-number'>86</span>
-<span class='line-number'>87</span>
-<span class='line-number'>88</span>
-<span class='line-number'>89</span>
-<span class='line-number'>90</span>
-<span class='line-number'>91</span>
-<span class='line-number'>92</span>
-<span class='line-number'>93</span>
-<span class='line-number'>94</span>
-<span class='line-number'>95</span>
-<span class='line-number'>96</span>
-<span class='line-number'>97</span>
-<span class='line-number'>98</span>
-<span class='line-number'>99</span>
-<span class='line-number'>100</span>
-<span class='line-number'>101</span>
-<span class='line-number'>102</span>
-<span class='line-number'>103</span>
-<span class='line-number'>104</span>
-<span class='line-number'>105</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static int __devinit pxa2xx_ac97_probe(struct platform_device *dev)
-</span><span class='line'>{
-</span><span class='line'>    struct snd_card *card;
-</span><span class='line'>    struct snd_ac97_bus *ac97_bus;
-</span><span class='line'>    struct snd_ac97_template ac97_template;
-</span><span class='line'>    int ret;
-</span><span class='line'>    pxa2xx_audio_ops_t *pdata = dev-&gt;dev.platform_data;
-</span><span class='line'>
-</span><span class='line'>    if (dev-&gt;id &gt;= 0) {
-</span><span class='line'>        dev_err(&dev-&gt;dev, "PXA2xx has only one AC97 port./n");
-</span><span class='line'>        ret = -ENXIO;
-</span><span class='line'>        goto err_dev;
-</span><span class='line'>    }
-</span><span class='line'>////(1)////
-</span><span class='line'>    ret = snd_card_create(SNDRV_DEFAULT_IDX1, SNDRV_DEFAULT_STR1,
-</span><span class='line'>                  THIS_MODULE, 0, &card);
-</span><span class='line'>    if (ret &lt; 0)
-</span><span class='line'>        goto err;
-</span><span class='line'>
-</span><span class='line'>    card-&gt;dev = &dev-&gt;dev;
-</span><span class='line'>////(3)////
-</span><span class='line'>    strncpy(card-&gt;driver, dev-&gt;dev.driver-&gt;name, sizeof(card-&gt;driver));
-</span><span class='line'>
-</span><span class='line'>////(4)////
-</span><span class='line'>    ret = pxa2xx_pcm_new(card, &pxa2xx_ac97_pcm_client, &pxa2xx_ac97_pcm);
-</span><span class='line'>    if (ret)
-</span><span class='line'>        goto err;
-</span><span class='line'>////(2)////
-</span><span class='line'>    ret = pxa2xx_ac97_hw_probe(dev);
-</span><span class='line'>    if (ret)
-</span><span class='line'>        goto err;
-</span><span class='line'>
-</span><span class='line'>////(4)////
-</span><span class='line'>    ret = snd_ac97_bus(card, 0, &pxa2xx_ac97_ops, NULL, &ac97_bus);
-</span><span class='line'>    if (ret)
-</span><span class='line'>        goto err_remove;
-</span><span class='line'>    memset(&ac97_template, 0, sizeof(ac97_template));
-</span><span class='line'>    ret = snd_ac97_mixer(ac97_bus, &ac97_template, &pxa2xx_ac97_ac97);
-</span><span class='line'>    if (ret)
-</span><span class='line'>        goto err_remove;
-</span><span class='line'>////(3)////
-</span><span class='line'>    snprintf(card-&gt;shortname, sizeof(card-&gt;shortname),
-</span><span class='line'>         "%s", snd_ac97_get_short_name(pxa2xx_ac97_ac97));
-</span><span class='line'>    snprintf(card-&gt;longname, sizeof(card-&gt;longname),
-</span><span class='line'>         "%s (%s)", dev-&gt;dev.driver-&gt;name, card-&gt;mixername);
-</span><span class='line'>
-</span><span class='line'>    if (pdata && pdata-&gt;codec_pdata[0])
-</span><span class='line'>        snd_ac97_dev_add_pdata(ac97_bus-&gt;codec[0], pdata-&gt;codec_pdata[0]);
-</span><span class='line'>    snd_card_set_dev(card, &dev-&gt;dev);
-</span><span class='line'>////(5)////
-</span><span class='line'>    ret = snd_card_register(card);
-</span><span class='line'>    if (ret == 0) {
-</span><span class='line'>        platform_set_drvdata(dev, card);
-</span><span class='line'>        return 0;
-</span><span class='line'>    }
-</span><span class='line'>
-</span><span class='line'>err_remove:
-</span><span class='line'>    pxa2xx_ac97_hw_remove(dev);
-</span><span class='line'>err:
-</span><span class='line'>    if (card)
-</span><span class='line'>        snd_card_free(card);
-</span><span class='line'>err_dev:
-</span><span class='line'>    return ret;
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>static int __devexit pxa2xx_ac97_remove(struct platform_device *dev)
-</span><span class='line'>{
-</span><span class='line'>    struct snd_card *card = platform_get_drvdata(dev);
-</span><span class='line'>
-</span><span class='line'>    if (card) {
-</span><span class='line'>        snd_card_free(card);
-</span><span class='line'>        platform_set_drvdata(dev, NULL);
-</span><span class='line'>        pxa2xx_ac97_hw_remove(dev);
-</span><span class='line'>    }
-</span><span class='line'>
-</span><span class='line'>    return 0;
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>static struct platform_driver pxa2xx_ac97_driver = {
-</span><span class='line'>    .probe      = pxa2xx_ac97_probe,
-</span><span class='line'>    .remove     = __devexit_p(pxa2xx_ac97_remove),
-</span><span class='line'>    .driver     = {
-</span><span class='line'>        .name   = "pxa2xx-ac97",
-</span><span class='line'>        .owner  = THIS_MODULE,
-</span><span class='line'>#ifdef CONFIG_PM
-</span><span class='line'>        .pm = &pxa2xx_ac97_pm_ops,
-</span><span class='line'>#endif
-</span><span class='line'>    },
-</span><span class='line'>};
-</span><span class='line'>
-</span><span class='line'>static int __init pxa2xx_ac97_init(void)
-</span><span class='line'>{
-</span><span class='line'>    return platform_driver_register(&pxa2xx_ac97_driver);
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>static void __exit pxa2xx_ac97_exit(void)
-</span><span class='line'>{
-</span><span class='line'>    platform_driver_unregister(&pxa2xx_ac97_driver);
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>module_init(pxa2xx_ac97_init);
-</span><span class='line'>module_exit(pxa2xx_ac97_exit);
-</span><span class='line'>
-</span><span class='line'>MODULE_AUTHOR("Nicolas Pitre");
-</span><span class='line'>MODULE_DESCRIPTION("AC97 driver for the Intel PXA2xx chip");</span></code></pre></td></tr></table></div></figure>
-
-
-<p>驱动程序通常由probe回调函数开始，对一下2.1中的步骤，是否有相似之处？</p>
-
-<p>经过以上的创建步骤之后，声卡的逻辑结构如下图所示：</p>
-
-<p><img src="/images/kernel/2018-03-03-3.png" alt="" /><br/>
-                                     图 2.2.1  声卡的软件逻辑结构</p>
-
-<p>下面的章节里我们分别讨论一下snd_card_create()和snd_card_register()这两个函数。</p>
-
-<h4>3. snd_card_create()</h4>
-
-<p> snd_card_create()在/sound/core/init.c中定义。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/**
-</span><span class='line'> *  snd_card_create - create and initialize a soundcard structure
-</span><span class='line'> *  @idx: card index (address) [0 ... (SNDRV_CARDS-1)]
-</span><span class='line'> *  @xid: card identification (ASCII string)
-</span><span class='line'> *  @module: top level module for locking
-</span><span class='line'> *  @extra_size: allocate this extra size after the main soundcard structure
-</span><span class='line'> *  @card_ret: the pointer to store the created card instance
-</span><span class='line'> *
-</span><span class='line'> *  Creates and initializes a soundcard structure.
-</span><span class='line'> *
-</span><span class='line'> *  The function allocates snd_card instance via kzalloc with the given
-</span><span class='line'> *  space for the driver to use freely.  The allocated struct is stored
-</span><span class='line'> *  in the given card_ret pointer.
-</span><span class='line'> *
-</span><span class='line'> *  Returns zero if successful or a negative error code.
-</span><span class='line'> */
-</span><span class='line'>int snd_card_create(int idx, const char *xid,
-</span><span class='line'>            struct module *module, int extra_size,
-</span><span class='line'>            struct snd_card **card_ret)</span></code></pre></td></tr></table></div></figure>
-
-
-<p>首先，根据extra_size参数的大小分配内存，该内存区可以作为芯片的专有数据使用（见前面的介绍）：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>card = kzalloc(sizeof(*card) + extra_size, GFP_KERNEL);
-</span><span class='line'>if (!card)
-</span><span class='line'>    return -ENOMEM;</span></code></pre></td></tr></table></div></figure>
-
-
-<p>拷贝声卡的ID字符串：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if (xid)
-</span><span class='line'>    strlcpy(card-&gt;id, xid, sizeof(card-&gt;id));</span></code></pre></td></tr></table></div></figure>
-
-
-<p>如果传入的声卡编号为-1，自动分配一个索引编号：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if (idx &lt; 0) {
-</span><span class='line'>    for (idx2 = 0; idx2 &lt; SNDRV_CARDS; idx2++)
-</span><span class='line'>        /* idx == -1 == 0xffff means: take any free slot */
-</span><span class='line'>        if (~snd_cards_lock & idx & 1&lt;&lt;idx2) {
-</span><span class='line'>            if (module_slot_match(module, idx2)) {
-</span><span class='line'>                idx = idx2;
-</span><span class='line'>                break;
-</span><span class='line'>            }
-</span><span class='line'>        }
-</span><span class='line'>}
-</span><span class='line'>if (idx &lt; 0) {
-</span><span class='line'>    for (idx2 = 0; idx2 &lt; SNDRV_CARDS; idx2++)
-</span><span class='line'>        /* idx == -1 == 0xffff means: take any free slot */
-</span><span class='line'>        if (~snd_cards_lock & idx & 1&lt;&lt;idx2) {
-</span><span class='line'>            if (!slots[idx2] || !*slots[idx2]) {
-</span><span class='line'>                idx = idx2;
-</span><span class='line'>                break;
-</span><span class='line'>            }
-</span><span class='line'>        }
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>初始化snd_card结构中必要的字段：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>    card-&gt;number = idx;
-</span><span class='line'>    card-&gt;module = module;
-</span><span class='line'>    INIT_LIST_HEAD(&card-&gt;devices);
-</span><span class='line'>    init_rwsem(&card-&gt;controls_rwsem);
-</span><span class='line'>    rwlock_init(&card-&gt;ctl_files_rwlock);
-</span><span class='line'>    INIT_LIST_HEAD(&card-&gt;controls);
-</span><span class='line'>    INIT_LIST_HEAD(&card-&gt;ctl_files);
-</span><span class='line'>    spin_lock_init(&card-&gt;files_lock);
-</span><span class='line'>    INIT_LIST_HEAD(&card-&gt;files_list);
-</span><span class='line'>    init_waitqueue_head(&card-&gt;shutdown_sleep);
-</span><span class='line'>#ifdef CONFIG_PM
-</span><span class='line'>    mutex_init(&card-&gt;power_lock);
-</span><span class='line'>    init_waitqueue_head(&card-&gt;power_sleep);
-</span><span class='line'>#endif</span></code></pre></td></tr></table></div></figure>
-
-
-<p>建立逻辑设备：Control</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/* the control interface cannot be accessed from the user space until */
-</span><span class='line'>/* snd_cards_bitmask and snd_cards are set with snd_card_register */
-</span><span class='line'>err = snd_ctl_create(card);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>建立proc文件中的info节点：通常就是/proc/asound/card0</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>err = snd_info_card_create(card);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>把第一步分配的内存指针放入private_data字段中：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if (extra_size &gt; 0)
-</span><span class='line'>    card-&gt;private_data = (char *)card + sizeof(struct snd_card);</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>4. snd_card_register()</h4>
-
-<p>  snd_card_create()在/sound/core/init.c中定义。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/**
-</span><span class='line'> *  snd_card_register - register the soundcard
-</span><span class='line'> *  @card: soundcard structure
-</span><span class='line'> *
-</span><span class='line'> *  This function registers all the devices assigned to the soundcard.
-</span><span class='line'> *  Until calling this, the ALSA control interface is blocked from the
-</span><span class='line'> *  external accesses.  Thus, you should call this function at the end
-</span><span class='line'> *  of the initialization of the card.
-</span><span class='line'> *
-</span><span class='line'> *  Returns zero otherwise a negative error code if the registrain failed.
-</span><span class='line'> */
-</span><span class='line'>int snd_card_register(struct snd_card *card)</span></code></pre></td></tr></table></div></figure>
-
-
-<p>首先，创建sysfs下的设备：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if (!card-&gt;card_dev) {
-</span><span class='line'>    card-&gt;card_dev = device_create(sound_class, card-&gt;dev,
-</span><span class='line'>                       MKDEV(0, 0), card,
-</span><span class='line'>                       "card%i", card-&gt;number);
-</span><span class='line'>    if (IS_ERR(card-&gt;card_dev))
-</span><span class='line'>        card-&gt;card_dev = NULL;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>其中，sound_class是在/sound/sound_core.c中创建的：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static char *sound_devnode(struct device *dev, mode_t *mode)
-</span><span class='line'>{
-</span><span class='line'>    if (MAJOR(dev-&gt;devt) == SOUND_MAJOR)
-</span><span class='line'>        return NULL;
-</span><span class='line'>    return kasprintf(GFP_KERNEL, "snd/%s", dev_name(dev));
-</span><span class='line'>}
-</span><span class='line'>static int __init init_soundcore(void)
-</span><span class='line'>{
-</span><span class='line'>    int rc;
-</span><span class='line'>
-</span><span class='line'>    rc = init_oss_soundcore();
-</span><span class='line'>    if (rc)
-</span><span class='line'>        return rc;
-</span><span class='line'>
-</span><span class='line'>    sound_class = class_create(THIS_MODULE, "sound");
-</span><span class='line'>    if (IS_ERR(sound_class)) {
-</span><span class='line'>        cleanup_oss_soundcore();
-</span><span class='line'>        return PTR_ERR(sound_class);
-</span><span class='line'>    }
-</span><span class='line'>
-</span><span class='line'>    sound_class-&gt;devnode = sound_devnode;
-</span><span class='line'>
-</span><span class='line'>    return 0;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>由此可见，声卡的class将会出现在文件系统的/sys/class/sound/下面，并且，sound_devnode()也决定了相应的设备节点也将会出现在/dev/snd/下面。</p>
-
-<p>接下来的步骤，通过snd_device_register_all()注册所有挂在该声卡下的逻辑设备，snd_device_register_all()实际上是通过snd_card的devices链表，遍历所有的snd_device，并且调用snd_device的ops->dev_register()来实现各自设备的注册的。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if ((err = snd_device_register_all(card)) &lt; 0)
-</span><span class='line'>    return err;</span></code></pre></td></tr></table></div></figure>
-
-
-<p>最后就是建立一些相应的proc和sysfs下的文件或属性节点，代码就不贴了。</p>
-
-<p>至此，整个声卡完成了建立过程</p>
-
-<h2>Linux ALSA声卡驱动之三：PCM设备的创建</h2>
-
-<h4>1. PCM是什么</h4>
-
-<p>PCM是英文Pulse-code modulation的缩写，中文译名是脉冲编码调制。我们知道在现实生活中，人耳听到的声音是模拟信号，PCM就是要把声音从模拟转换成数字信号的一种技术，他的原理简单地说就是利用一个固定的频率对模拟信号进行采样，采样后的信号在波形上看就像一串连续的幅值不一的脉冲，把这些脉冲的幅值按一定的精度进行量化，这些量化后的数值被连续地输出、传输、处理或记录到存储介质中，所有这些组成了数字音频的产生过程。</p>
-
-<p><img src="/images/kernel/2018-03-03-4.png" alt="" /><br/>
-                                    图1.1  模拟音频的采样、量化</p>
-
-<p>PCM信号的两个重要指标是采样频率和量化精度，目前，CD音频的采样频率通常为44100Hz，量化精度是16bit。通常，播放音乐时，应用程序从存储介质中读取音频数据（MP3、WMA、AAC&hellip;&hellip;），经过解码后，最终送到音频驱动程序中的就是PCM数据，反过来，在录音时，音频驱动不停地把采样所得的PCM数据送回给应用程序，由应用程序完成压缩、存储等任务。所以，音频驱动的两大核心任务就是：</p>
-
-<p>  playback    如何把用户空间的应用程序发过来的PCM数据，转化为人耳可以辨别的模拟音频</p>
-
-<p>  capture     把mic拾取到得模拟信号，经过采样、量化，转换为PCM信号送回给用户空间的应用程序</p>
-
-<h4>2. alsa-driver中的PCM中间层</h4>
-
-<p>ALSA已经为我们实现了功能强劲的PCM中间层，自己的驱动中只要实现一些底层的需要访问硬件的函数即可。</p>
-
-<p>要访问PCM的中间层代码，你首先要包含头文件&lt;sound/pcm.h>，另外，如果需要访问一些与 hw_param相关的函数，可能也要包含&lt;sound/pcm_params.h>。</p>
-
-<p>每个声卡最多可以包含4个pcm的实例，每个pcm实例对应一个pcm设备文件。pcm实例数量的这种限制源于linux设备号所占用的位大小，如果以后使用64位的设备号，我们将可以创建更多的pcm实例。不过大多数情况下，在嵌入式设备中，一个pcm实例已经足够了。</p>
-
-<p>一个pcm实例由一个playback stream和一个capture stream组成，这两个stream又分别有一个或多个substreams组成。</p>
-
-<p><img src="/images/kernel/2018-03-03-5.png" alt="" /><br/>
-                                  图2.1  声卡中的pcm结构</p>
-
-<p>在嵌入式系统中，通常不会像图2.1中这么复杂，大多数情况下是一个声卡，一个pcm实例，pcm下面有一个playback和capture stream，playback和capture下面各自有一个substream。</p>
-
-<p> 下面一张图列出了pcm中间层几个重要的结构，他可以让我们从uml的角度看一看这列结构的关系，理清他们之间的关系，对我们理解pcm中间层的实现方式。</p>
-
-<p><img src="/images/kernel/2018-03-03-6.png" alt="" /><br/>
-                                  图2.2  pcm中间层的几个重要的结构体的关系图</p>
-
-<p>  snd_pcm是挂在snd_card下面的一个snd_device</p>
-
-<p>  snd_pcm中的字段：streams[2]，该数组中的两个元素指向两个snd_pcm_str结构，分别代表playback stream和capture stream</p>
-
-<p>  snd_pcm_str中的substream字段，指向snd_pcm_substream结构</p>
-
-<p>  snd_pcm_substream是pcm中间层的核心，绝大部分任务都是在substream中处理，尤其是他的ops（snd_pcm_ops）字段，许多user空间的应用程序通过alsa-lib对驱动程序的请求都是由该结构中的函数处理。它的runtime字段则指向snd_pcm_runtime结构，snd_pcm_runtime记录这substream的一些重要的软件和硬件运行环境和参数。</p>
-
-<h4>3. 新建一个pcm</h4>
-
-<p>alsa-driver的中间层已经为我们提供了新建pcm的api：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>    int snd_pcm_new(struct snd_card *card, const char *id, int device, int playback_count, int capture_count,
-</span><span class='line'>                                 struct snd_pcm ** rpcm);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>参数device 表示目前创建的是该声卡下的第几个pcm，第一个pcm设备从0开始。</p>
-
-<p>参数playback_count 表示该pcm将会有几个playback substream。</p>
-
-<p>参数capture_count 表示该pcm将会有几个capture substream。</p>
-
-<p>另一个用于设置pcm操作函数接口的api：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>    void snd_pcm_set_ops(struct snd_pcm *pcm, int direction, struct snd_pcm_ops *ops);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>新建一个pcm可以用下面一张新建pcm的调用的序列图进行描述：</p>
-
-<p><img src="/images/kernel/2018-03-03-7.png" alt="" /><br/>
-                                      图3.1 新建pcm的序列图</p>
-
-<p>  snd_card_create    pcm是声卡下的一个设备（部件），所以第一步是要创建一个声卡</p>
-
-<p>  snd_pcm_new    调用该api创建一个pcm，才该api中会做以下事情
-   如果有，建立playback stream，相应的substream也同时建立
-   如果有，建立capture stream，相应的substream也同时建立
-   调用snd_device_new()把该pcm挂到声卡中，参数ops中的dev_register字段指向了函数snd_pcm_dev_register，这个回调函数会在声卡的注册阶段被调用。</p>
-
-<p>  snd_pcm_set_ops    设置操作该pcm的控制/操作接口函数，参数中的snd_pcm_ops结构中的函数通常就是我们驱动要实现的函数</p>
-
-<p>  snd_card_register    注册声卡，在这个阶段会遍历声卡下的所有逻辑设备，并且调用各设备的注册回调函数，对于pcm，就是第二步提到的snd_pcm_dev_register函数，该回调函数建立了和用户空间应用程序（alsa-lib）通信所用的设备文件节点:/dev/snd/pcmCxxDxxp和/dev/snd/pcmCxxDxxc</p>
-
-<h4>4. 设备文件节点的建立（dev/snd/pcmCxxDxxp、pcmCxxDxxc） 4.1 struct snd_minor</h4>
-
-<p>每个snd_minor结构体保存了声卡下某个逻辑设备的上下文信息，他在逻辑设备建立阶段被填充，在逻辑设备被使用时就可以从该结构体中得到相应的信息。pcm设备也不例外，也需要使用该结构体。该结构体在include/sound/core.h中定义。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct snd_minor {
-</span><span class='line'>    int type;           /* SNDRV_DEVICE_TYPE_XXX */
-</span><span class='line'>    int card;           /* card number */
-</span><span class='line'>    int device;         /* device number */
-</span><span class='line'>    const struct file_operations *f_ops;    /* file operations */
-</span><span class='line'>    void *private_data;     /* private data for f_ops-&gt;open */
-</span><span class='line'>    struct device *dev;     /* device for sysfs */
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
-
-
-<p>在sound/sound.c中定义了一个snd_minor指针的全局数组：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static struct snd_minor *snd_minors[256];</span></code></pre></td></tr></table></div></figure>
-
-
-<p>前面说过，在声卡的注册阶段（snd_card_register），会调用pcm的回调函数snd_pcm_dev_register()，这个函数里会调用函数snd_register_device_for_dev()：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static int snd_pcm_dev_register(struct snd_device *device)
-</span><span class='line'>{
-</span><span class='line'>    ......
-</span><span class='line'>
-</span><span class='line'>    /* register pcm */
-</span><span class='line'>    err = snd_register_device_for_dev(devtype, pcm-&gt;card,
-</span><span class='line'>                         pcm-&gt;device,
-</span><span class='line'>                    &snd_pcm_f_ops[cidx],
-</span><span class='line'>                    pcm, str, dev);
-</span><span class='line'>    ......
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>我们再进入snd_register_device_for_dev()：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>int snd_register_device_for_dev(int type, struct snd_card *card, int dev,
-</span><span class='line'>                const struct file_operations *f_ops,
-</span><span class='line'>                void *private_data,
-</span><span class='line'>                const char *name, struct device *device)
-</span><span class='line'>{
-</span><span class='line'>    int minor;
-</span><span class='line'>    struct snd_minor *preg;
-</span><span class='line'>
-</span><span class='line'>    if (snd_BUG_ON(!name))
-</span><span class='line'>        return -EINVAL;
-</span><span class='line'>    preg = kmalloc(sizeof *preg, GFP_KERNEL);
-</span><span class='line'>    if (preg == NULL)
-</span><span class='line'>        return -ENOMEM;
-</span><span class='line'>    preg-&gt;type = type;
-</span><span class='line'>    preg-&gt;card = card ? card-&gt;number : -1;
-</span><span class='line'>    preg-&gt;device = dev;
-</span><span class='line'>    preg-&gt;f_ops = f_ops;
-</span><span class='line'>    preg-&gt;private_data = private_data;
-</span><span class='line'>    mutex_lock(&sound_mutex);
-</span><span class='line'>#ifdef CONFIG_SND_DYNAMIC_MINORS
-</span><span class='line'>    minor = snd_find_free_minor();
-</span><span class='line'>#else
-</span><span class='line'>    minor = snd_kernel_minor(type, card, dev);
-</span><span class='line'>    if (minor &gt;= 0 && snd_minors[minor])
-</span><span class='line'>        minor = -EBUSY;
-</span><span class='line'>#endif
-</span><span class='line'>    if (minor &lt; 0) {
-</span><span class='line'>        mutex_unlock(&sound_mutex);
-</span><span class='line'>        kfree(preg);
-</span><span class='line'>        return minor;
-</span><span class='line'>    }
-</span><span class='line'>    snd_minors[minor] = preg;
-</span><span class='line'>    preg-&gt;dev = device_create(sound_class, device, MKDEV(major, minor),
-</span><span class='line'>                  private_data, "%s", name);
-</span><span class='line'>    if (IS_ERR(preg-&gt;dev)) {
-</span><span class='line'>        snd_minors[minor] = NULL;
-</span><span class='line'>        mutex_unlock(&sound_mutex);
-</span><span class='line'>        minor = PTR_ERR(preg-&gt;dev);
-</span><span class='line'>        kfree(preg);
-</span><span class='line'>        return minor;
-</span><span class='line'>    }
-</span><span class='line'>
-</span><span class='line'>    mutex_unlock(&sound_mutex);
-</span><span class='line'>    return 0;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>  首先，分配并初始化一个snd_minor结构中的各字段
-   type：SNDRV_DEVICE_TYPE_PCM_PLAYBACK/SNDRV_DEVICE_TYPE_PCM_CAPTURE
-   card: card的编号
-   device：pcm实例的编号，大多数情况为0
-   f_ops：snd_pcm_f_ops
-   private_data：指向该pcm的实例</p>
-
-<p>  根据type，card和pcm的编号，确定数组的索引值minor，minor也作为pcm设备的此设备号</p>
-
-<p>  把该snd_minor结构的地址放入全局数组snd_minors[minor]中</p>
-
-<p>  最后，调用device_create创建设备节点</p>
-
-<h5>4.2 设备文件的建立</h5>
-
-<p>在4.1节的最后，设备文件已经建立，不过4.1节的重点在于snd_minors数组的赋值过程，在本节中，我们把重点放在设备文件中。</p>
-
-<p>回到pcm的回调函数snd_pcm_dev_register()中：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static int snd_pcm_dev_register(struct snd_device *device)
-</span><span class='line'>{
-</span><span class='line'>    int cidx, err;
-</span><span class='line'>    char str[16];
-</span><span class='line'>    struct snd_pcm *pcm;
-</span><span class='line'>    struct device *dev;
-</span><span class='line'>
-</span><span class='line'>    pcm = device-&gt;device_data;
-</span><span class='line'>         ......
-</span><span class='line'>    for (cidx = 0; cidx &lt; 2; cidx++) {
-</span><span class='line'>                  ......
-</span><span class='line'>        switch (cidx) {
-</span><span class='line'>        case SNDRV_PCM_STREAM_PLAYBACK:
-</span><span class='line'>            sprintf(str, "pcmC%iD%ip", pcm-&gt;card-&gt;number, pcm-&gt;device);
-</span><span class='line'>            devtype = SNDRV_DEVICE_TYPE_PCM_PLAYBACK;
-</span><span class='line'>            break;
-</span><span class='line'>        case SNDRV_PCM_STREAM_CAPTURE:
-</span><span class='line'>            sprintf(str, "pcmC%iD%ic", pcm-&gt;card-&gt;number, pcm-&gt;device);
-</span><span class='line'>            devtype = SNDRV_DEVICE_TYPE_PCM_CAPTURE;
-</span><span class='line'>            break;
-</span><span class='line'>        }
-</span><span class='line'>        /* device pointer to use, pcm-&gt;dev takes precedence if
-</span><span class='line'>         * it is assigned, otherwise fall back to card's device
-</span><span class='line'>         * if possible */
-</span><span class='line'>        dev = pcm-&gt;dev;
-</span><span class='line'>        if (!dev)
-</span><span class='line'>            dev = snd_card_get_device_link(pcm-&gt;card);
-</span><span class='line'>        /* register pcm */
-</span><span class='line'>        err = snd_register_device_for_dev(devtype, pcm-&gt;card,
-</span><span class='line'>                          pcm-&gt;device,
-</span><span class='line'>                          &snd_pcm_f_ops[cidx],
-</span><span class='line'>                          pcm, str, dev);
-</span><span class='line'>                  ......
-</span><span class='line'>    }
-</span><span class='line'>         ......
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>以上代码我们可以看出，对于一个pcm设备，可以生成两个设备文件，一个用于playback，一个用于capture，代码中也确定了他们的命名规则：</p>
-
-<p>  playback  &ndash;  pcmCxDxp，通常系统中只有一各声卡和一个pcm，它就是pcmC0D0p</p>
-
-<p>  capture  &ndash;  pcmCxDxc，通常系统中只有一各声卡和一个pcm，它就是pcmC0D0c</p>
-
-<h5>snd_pcm_f_ops</h5>
-
-<p>snd_pcm_f_ops是一个标准的文件系统file_operations结构数组，它的定义在sound/core/pcm_native.c中：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>const struct file_operations snd_pcm_f_ops[2] = {
-</span><span class='line'>    {
-</span><span class='line'>        .owner =        THIS_MODULE,
-</span><span class='line'>        .write =        snd_pcm_write,
-</span><span class='line'>        .aio_write =        snd_pcm_aio_write,
-</span><span class='line'>        .open =         snd_pcm_playback_open,
-</span><span class='line'>        .release =      snd_pcm_release,
-</span><span class='line'>        .llseek =       no_llseek,
-</span><span class='line'>        .poll =         snd_pcm_playback_poll,
-</span><span class='line'>        .unlocked_ioctl =   snd_pcm_playback_ioctl,
-</span><span class='line'>        .compat_ioctl =     snd_pcm_ioctl_compat,
-</span><span class='line'>        .mmap =         snd_pcm_mmap,
-</span><span class='line'>        .fasync =       snd_pcm_fasync,
-</span><span class='line'>        .get_unmapped_area =    snd_pcm_get_unmapped_area,
-</span><span class='line'>    },
-</span><span class='line'>    {
-</span><span class='line'>        .owner =        THIS_MODULE,
-</span><span class='line'>        .read =         snd_pcm_read,
-</span><span class='line'>        .aio_read =     snd_pcm_aio_read,
-</span><span class='line'>        .open =         snd_pcm_capture_open,
-</span><span class='line'>        .release =      snd_pcm_release,
-</span><span class='line'>        .llseek =       no_llseek,
-</span><span class='line'>        .poll =         snd_pcm_capture_poll,
-</span><span class='line'>        .unlocked_ioctl =   snd_pcm_capture_ioctl,
-</span><span class='line'>        .compat_ioctl =     snd_pcm_ioctl_compat,
-</span><span class='line'>        .mmap =         snd_pcm_mmap,
-</span><span class='line'>        .fasync =       snd_pcm_fasync,
-</span><span class='line'>        .get_unmapped_area =    snd_pcm_get_unmapped_area,
-</span><span class='line'>    }
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
-
-
-<p>snd_pcm_f_ops作为snd_register_device_for_dev的参数被传入，并被记录在snd_minors[minor]中的字段f_ops中。最后，在snd_register_device_for_dev中创建设备节点：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>snd_minors[minor] = preg;
-</span><span class='line'>preg-&gt;dev = device_create(sound_class, device, MKDEV(major, minor),
-</span><span class='line'>              private_data, "%s", name);</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>4.3 层层深入，从应用程序到驱动层pcm 4.3.1 字符设备注册</h5>
-
-<p>在sound/core/sound.c中有alsa_sound_init()函数，定义如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static int __init alsa_sound_init(void)
-</span><span class='line'>{
-</span><span class='line'>    snd_major = major;
-</span><span class='line'>    snd_ecards_limit = cards_limit;
-</span><span class='line'>    if (register_chrdev(major, "alsa", &snd_fops)) {
-</span><span class='line'>        snd_printk(KERN_ERR "unable to register native major device number %d/n", major);
-</span><span class='line'>        return -EIO;
-</span><span class='line'>    }
-</span><span class='line'>    if (snd_info_init() &lt; 0) {
-</span><span class='line'>        unregister_chrdev(major, "alsa");
-</span><span class='line'>        return -ENOMEM;
-</span><span class='line'>    }
-</span><span class='line'>    snd_info_minor_register();
-</span><span class='line'>    return 0;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>register_chrdev中的参数major与之前创建pcm设备是device_create时的major是同一个，这样的结果是，当应用程序open设备文件/dev/snd/pcmCxDxp时，会进入snd_fops的open回调函数，我们将在下一节中讲述open的过程。</p>
-
-<h6>4.3.2 打开pcm设备</h6>
-
-<p>从上一节中我们得知，open一个pcm设备时，将会调用snd_fops的open回调函数，我们先看看snd_fops的定义：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static const struct file_operations snd_fops =
-</span><span class='line'>{
-</span><span class='line'>    .owner =    THIS_MODULE,
-</span><span class='line'>    .open =     snd_open
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
-
-
-<p>跟入snd_open函数，它首先从inode中取出此设备号，然后以次设备号为索引，从snd_minors全局数组中取出当初注册pcm设备时填充的snd_minor结构（参看4.1节的内容），然后从snd_minor结构中取出pcm设备的f_ops，并且把file->f_op替换为pcm设备的f_ops，紧接着直接调用pcm设备的f_ops->open()，然后返回。因为file->f_op已经被替换，以后，应用程序的所有read/write/ioctl调用都会进入pcm设备自己的回调函数中，也就是4.2节中提到的snd_pcm_f_ops结构中定义的回调。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static int snd_open(struct inode *inode, struct file *file)
-</span><span class='line'>{
-</span><span class='line'>    unsigned int minor = iminor(inode);
-</span><span class='line'>    struct snd_minor *mptr = NULL;
-</span><span class='line'>    const struct file_operations *old_fops;
-</span><span class='line'>    int err = 0;
-</span><span class='line'>
-</span><span class='line'>    if (minor &gt;= ARRAY_SIZE(snd_minors))
-</span><span class='line'>        return -ENODEV;
-</span><span class='line'>    mutex_lock(&sound_mutex);
-</span><span class='line'>    mptr = snd_minors[minor];
-</span><span class='line'>    if (mptr == NULL) {
-</span><span class='line'>        mptr = autoload_device(minor);
-</span><span class='line'>        if (!mptr) {
-</span><span class='line'>            mutex_unlock(&sound_mutex);
-</span><span class='line'>            return -ENODEV;
-</span><span class='line'>        }
-</span><span class='line'>    }
-</span><span class='line'>    old_fops = file-&gt;f_op;
-</span><span class='line'>    file-&gt;f_op = fops_get(mptr-&gt;f_ops);
-</span><span class='line'>    if (file-&gt;f_op == NULL) {
-</span><span class='line'>        file-&gt;f_op = old_fops;
-</span><span class='line'>        err = -ENODEV;
-</span><span class='line'>    }
-</span><span class='line'>    mutex_unlock(&sound_mutex);
-</span><span class='line'>    if (err &lt; 0)
-</span><span class='line'>        return err;
-</span><span class='line'>
-</span><span class='line'>    if (file-&gt;f_op-&gt;open) {
-</span><span class='line'>        err = file-&gt;f_op-&gt;open(inode, file);
-</span><span class='line'>        if (err) {
-</span><span class='line'>            fops_put(file-&gt;f_op);
-</span><span class='line'>            file-&gt;f_op = fops_get(old_fops);
-</span><span class='line'>        }
-</span><span class='line'>    }
-</span><span class='line'>    fops_put(old_fops);
-</span><span class='line'>    return err;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>下面的序列图展示了应用程序如何最终调用到snd_pcm_f_ops结构中的回调函数：</p>
-
-<p><img src="/images/kernel/2018-03-03-8.png" alt="" /><br/>
-                                      图4.3.2.1    应用程序操作pcm设备</p>
-
-<h2>Linux ALSA声卡驱动之四：Control设备的创建</h2>
-
-<h4>Control接口</h4>
-
-<p>Control接口主要让用户空间的应用程序（alsa-lib）可以访问和控制音频codec芯片中的多路开关，滑动控件等。对于Mixer（混音）来说，Control接口显得尤为重要，从ALSA 0.9.x版本开始，所有的mixer工作都是通过control接口的API来实现的。</p>
-
-<p>ALSA已经为AC97定义了完整的控制接口模型，如果你的Codec芯片只支持AC97接口，你可以不用关心本节的内容。</p>
-
-<p>&lt;sound/control.h>定义了所有的Control API。如果你要为你的codec实现自己的controls，请在代码中包含该头文件。</p>
-
-<h4>Controls的定义</h4>
-
-<p>要自定义一个Control，我们首先要定义3各回调函数：info，get和put。然后，定义一个snd_kcontrol_new结构：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static struct snd_kcontrol_new my_control __devinitdata = {
-</span><span class='line'>    .iface = SNDRV_CTL_ELEM_IFACE_MIXER,
-</span><span class='line'>    .name = "PCM Playback Switch",
-</span><span class='line'>    .index = 0,
-</span><span class='line'>    .access = SNDRV_CTL_ELEM_ACCESS_READWRITE,
-</span><span class='line'>    .private_value = 0xffff,
-</span><span class='line'>    .info = my_control_info,
-</span><span class='line'>    .get = my_control_get,
-</span><span class='line'>    .put = my_control_put
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
-
-
-<p>iface字段指出了control的类型，alsa定义了几种类型（SNDDRV_CTL_ELEM_IFACE_XXX），常用的类型是MIXER，当然也可以定义属于全局的CARD类型，也可以定义属于某类设备的类型，例如HWDEP，PCMRAWMIDI，TIMER等，这时需要在device和subdevice字段中指出卡的设备逻辑编号。</p>
-
-<p>name字段是该control的名字，从ALSA 0.9.x开始，control的名字是变得比较重要，因为control的作用是按名字来归类的。ALSA已经预定义了一些control的名字，我们再Control Name一节详细讨论。</p>
-
-<p>index字段用于保存该control的在该卡中的编号。如果声卡中有不止一个codec，每个codec中有相同名字的control，这时我们可以通过index来区分这些controls。当index为0时，则可以忽略这种区分策略。</p>
-
-<p>access字段包含了该control的访问类型。每一个bit代表一种访问类型，这些访问类型可以多个“或”运算组合在一起。</p>
-
-<p>private_value字段包含了一个任意的长整数类型值。该值可以通过info，get，put这几个回调函数访问。你可以自己决定如何使用该字段，例如可以把它拆分成多个位域，又或者是一个指针，指向某一个数据结构。</p>
-
-<p>tlv字段为该control提供元数据。</p>
-
-<h4>Control的名字</h4>
-
-<p>control的名字需要遵循一些标准，通常可以分成3部分来定义control的名字：源&ndash;方向&ndash;功能。</p>
-
-<p>  源，可以理解为该control的输入端，alsa已经预定义了一些常用的源，例如：Master，PCM，CD，Line等等。</p>
-
-<p>  方向，代表该control的数据流向，例如：Playback，Capture，Bypass，Bypass Capture等等，也可以不定义方向，这时表示该Control是双向的（playback和capture）。
-  功能，根据control的功能，可以是以下字符串：Switch，Volume，Route等等。</p>
-
-<p>也有一些命名上的特例：</p>
-
-<p>  全局的capture和playback    &ldquo;Capture Source"，"Capture Volume"，"Capture Switch"，它们用于全局的capture source，switch和volume。同理，"Playback Volume"，"Playback Switch"，它们用于全局的输出switch和volume。
-   Tone-controles    音调控制的开关和音量命名为：Tone Control - XXX，例如，"Tone Control - Switch"，"Tone Control - Bass"，"Tone Control - Center"。
-   3D controls    3D控件的命名规则：，"3D Control - Switch"，"3D Control - Center"，"3D Control - Space"。
-   Mic boost    麦克风音量加强控件命名为："Mic Boost"或"Mic Boost(6dB)"。</p>
-
-<h4>访问标志（ACCESS Flags）</h4>
-
-<p>Access字段是一个bitmask，它保存了改control的访问类型。默认的访问类型是：SNDDRV_CTL_ELEM_ACCESS_READWRITE，表明该control支持读和写操作。如果access字段没有定义（.access==0），此时也认为是READWRITE类型。</p>
-
-<p>如果是一个只读control，access应该设置为：SNDDRV_CTL_ELEM_ACCESS_READ，这时，我们不必定义put回调函数。类似地，如果是只写control，access应该设置为：SNDDRV_CTL_ELEM_ACCESS_WRITE，这时，我们不必定义get回调函数。</p>
-
-<p>如果control的值会频繁地改变（例如：电平表），我们可以使用VOLATILE类型，这意味着该control会在没有通知的情况下改变，应用程序应该定时地查询该control的值。</p>
-
-<h4>回调函数  info回调函数</h4>
-
-<p>info回调函数用于获取control的详细信息。它的主要工作就是填充通过参数传入的snd_ctl_elem_info对象，以下例子是一个具有单个元素的boolean型control的info回调：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static int snd_myctl_mono_info(struct snd_kcontrol *kcontrol,
-</span><span class='line'>    struct snd_ctl_elem_info *uinfo)
-</span><span class='line'>{
-</span><span class='line'>    uinfo-&gt;type = SNDRV_CTL_ELEM_TYPE_BOOLEAN;
-</span><span class='line'>    uinfo-&gt;count = 1;
-</span><span class='line'>    uinfo-&gt;value.integer.min = 0;
-</span><span class='line'>    uinfo-&gt;value.integer.max = 1;
-</span><span class='line'>    return 0;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>type字段指出该control的值类型，值类型可以是BOOLEAN, INTEGER, ENUMERATED, BYTES,IEC958和INTEGER64之一。count字段指出了改control中包含有多少个元素单元，比如，立体声的音量control左右两个声道的音量值，它的count字段等于2。value字段是一个联合体（union），value的内容和control的类型有关。其中，boolean和integer类型是相同的。</p>
-
-<p>ENUMERATED类型有些特殊。它的value需要设定一个字符串和字符串的索引，请看以下例子：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static int snd_myctl_enum_info(struct snd_kcontrol *kcontrol,
-</span><span class='line'>struct snd_ctl_elem_info *uinfo)
-</span><span class='line'>{
-</span><span class='line'>    static char *texts[4] = {
-</span><span class='line'>        "First", "Second", "Third", "Fourth"
-</span><span class='line'>    };
-</span><span class='line'>    uinfo-&gt;type = SNDRV_CTL_ELEM_TYPE_ENUMERATED;
-</span><span class='line'>    uinfo-&gt;count = 1;
-</span><span class='line'>    uinfo-&gt;value.enumerated.items = 4;
-</span><span class='line'>    if (uinfo-&gt;value.enumerated.item &gt; 3)
-</span><span class='line'>        uinfo-&gt;value.enumerated.item = 3;
-</span><span class='line'>    strcpy(uinfo-&gt;value.enumerated.name,
-</span><span class='line'>        texts[uinfo-&gt;value.enumerated.item]);
-</span><span class='line'>    return 0;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>alsa已经为我们实现了一些通用的info回调函数，例如：snd_ctl_boolean_mono_info()，snd_ctl_boolean_stereo_info()等等。</p>
-
-<h4>get回调函数</h4>
-
-<p>该回调函数用于读取control的当前值，并返回给用户空间的应用程序。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static int snd_myctl_get(struct snd_kcontrol *kcontrol,
-</span><span class='line'>    struct snd_ctl_elem_value *ucontrol)
-</span><span class='line'>{
-</span><span class='line'>    struct mychip *chip = snd_kcontrol_chip(kcontrol);
-</span><span class='line'>    ucontrol-&gt;value.integer.value[0] = get_some_value(chip);
-</span><span class='line'>    return 0;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>value字段的赋值依赖于control的类型（如同info回调）。很多声卡的驱动利用它存储硬件寄存器的地址、bit-shift和bit-mask，这时，private_value字段可以按以下例子进行设置：</p>
-
-<p> .private_value = reg | (shift &lt;&lt; 16) | (mask &lt;&lt; 24);</p>
-
-<p>然后，get回调函数可以这样实现：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static int snd_sbmixer_get_single(struct snd_kcontrol *kcontrol,
-</span><span class='line'>    struct snd_ctl_elem_value *ucontrol)
-</span><span class='line'>{
-</span><span class='line'>    int reg = kcontrol-&gt;private_value & 0xff;
-</span><span class='line'>    int shift = (kcontrol-&gt;private_value &gt;&gt; 16) & 0xff;
-</span><span class='line'>    int mask = (kcontrol-&gt;private_value &gt;&gt; 24) & 0xff;
-</span><span class='line'>    ....
-</span><span class='line'>
-</span><span class='line'>    //根据以上的值读取相应寄存器的值并填入value中
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>如果control的count字段大于1，表示control有多个元素单元，get回调函数也应该为value填充多个数值。</p>
-
-<h4>put回调函数</h4>
-
-<p>put回调函数用于把应用程序的控制值设置到control中。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static int snd_myctl_put(struct snd_kcontrol *kcontrol,
-</span><span class='line'>    struct snd_ctl_elem_value *ucontrol)
-</span><span class='line'>{
-</span><span class='line'>    struct mychip *chip = snd_kcontrol_chip(kcontrol);
-</span><span class='line'>    int changed = 0;
-</span><span class='line'>    if (chip-&gt;current_value !=
-</span><span class='line'>        ucontrol-&gt;value.integer.value[0]) {
-</span><span class='line'>        change_current_value(chip,
-</span><span class='line'>        ucontrol-&gt;value.integer.value[0]);
-</span><span class='line'>        changed = 1;
-</span><span class='line'>    }
-</span><span class='line'>    return changed;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>如上述例子所示，当control的值被改变时，put回调必须要返回1，如果值没有被改变，则返回0。如果发生了错误，则返回一个负数的错误号。</p>
-
-<p>和get回调一样，当control的count大于1时，put回调也要处理多个control中的元素值。</p>
-
-<h4>创建Controls</h4>
-
-<p>当把以上讨论的内容都准备好了以后，我们就可以创建我们自己的control了。alsa-driver为我们提供了两个用于创建control的API：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>snd_ctl_new1()
-</span><span class='line'>snd_ctl_add()</span></code></pre></td></tr></table></div></figure>
-
-
-<p>我们可以用以下最简单的方式创建control：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>err = snd_ctl_add(card, snd_ctl_new1(&my_control, chip));
-</span><span class='line'>if (err &lt; 0)
-</span><span class='line'>    return err;</span></code></pre></td></tr></table></div></figure>
-
-
-<p>在这里，my_control是一个之前定义好的snd_kcontrol_new对象，chip对象将会被赋值在kcontrol->private_data字段，该字段可以在回调函数中访问。</p>
-
-<p>snd_ctl_new1()会分配一个新的snd_kcontrol实例，并把my_control中相应的值复制到该实例中，所以，在定义my_control时，通常我们可以加上__devinitdata前缀。snd_ctl_add则把该control绑定到声卡对象card当中。</p>
-
-<h4>元数据（Metadata）</h4>
-
-<p>很多mixer control需要提供以dB为单位的信息，我们可以使用DECLARE_TLV_xxx宏来定义一些包含这种信息的变量，然后把control的tlv.p字段指向这些变量，最后，在access字段中加上SNDRV_CTL_ELEM_ACCESS_TLV_READ标志，就像这样：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static DECLARE_TLV_DB_SCALE(db_scale_my_control, -4050, 150, 0);</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>tatic struct snd_kcontrol_new my_control __devinitdata = {
-</span><span class='line'>   ...
-</span><span class='line'>   .access = SNDRV_CTL_ELEM_ACCESS_READWRITE |
-</span><span class='line'>           SNDRV_CTL_ELEM_ACCESS_TLV_READ,
-</span><span class='line'>    ...
-</span><span class='line'>    .tlv.p = db_scale_my_control,
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
-
-
-<p>DECLARE_TLV_DB_SCALE宏定义的mixer control，它所代表的值按一个固定的dB值的步长变化。该宏的第一个参数是要定义变量的名字，第二个参数是最小值，以0.01dB为单位。第三个参数是变化的步长，也是以0.01dB为单位。如果该control处于最小值时会做出mute时，需要把第四个参数设为1。</p>
-
-<p>DECLARE_TLV_DB_LINEAR宏定义的mixer control，它的输出随值的变化而线性变化。 该宏的第一个参数是要定义变量的名字，第二个参数是最小值，以0.01dB为单位。第二个参数是最大值，以0.01dB为单位。如果该control处于最小值时会做出mute时，需要把第二个参数设为TLV_DB_GAIN_MUTE。</p>
-
-<p>这两个宏实际上就是定义一个整形数组，所谓tlv，就是Type-Lenght-Value的意思，数组的第0各元素代表数据的类型，第1个元素代表数据的长度，第三个元素和之后的元素保存该变量的数据。</p>
-
-<h4>Control设备的建立</h4>
-
-<p>Control设备和PCM设备一样，都属于声卡下的逻辑设备。用户空间的应用程序通过alsa-lib访问该Control设备，读取或控制control的控制状态，从而达到控制音频Codec进行各种Mixer等控制操作。</p>
-
-<p>Control设备的创建过程大体上和PCM设备的创建过程相同。详细的创建过程可以参考本博的另一篇文章：Linux音频驱动之三：PCM设备的创建。下面我们只讨论有区别的地方。</p>
-
-<p>我们需要在我们的驱动程序初始化时主动调用snd_pcm_new()函数创建pcm设备，而control设备则在snd_card_create()内被创建，snd_card_create()通过调用snd_ctl_create()函数创建control设备节点。所以我们无需显式地创建control设备，只要建立声卡，control设备被自动地创建。</p>
-
-<p>和pcm设备一样，control设备的名字遵循一定的规则：controlCxx，这里的xx代表声卡的编号。我们也可以通过代码正是这一点，下面的是snd_ctl_dev_register()函数的代码：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/*
-</span><span class='line'> * registration of the control device
-</span><span class='line'> */
-</span><span class='line'>static int snd_ctl_dev_register(struct snd_device *device)
-</span><span class='line'>{
-</span><span class='line'>    struct snd_card *card = device-&gt;device_data;
-</span><span class='line'>    int err, cardnum;
-</span><span class='line'>    char name[16];
-</span><span class='line'>
-</span><span class='line'>    if (snd_BUG_ON(!card))
-</span><span class='line'>        return -ENXIO;
-</span><span class='line'>    cardnum = card-&gt;number;
-</span><span class='line'>    if (snd_BUG_ON(cardnum &lt; 0 || cardnum &gt;= SNDRV_CARDS))
-</span><span class='line'>        return -ENXIO;
-</span><span class='line'>        /* control设备的名字 */
-</span><span class='line'>    sprintf(name, "controlC%i", cardnum);
-</span><span class='line'>    if ((err = snd_register_device(SNDRV_DEVICE_TYPE_CONTROL, card, -1,
-</span><span class='line'>                       &snd_ctl_f_ops, card, name)) &lt; 0)
-</span><span class='line'>        return err;
-</span><span class='line'>    return 0;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>snd_ctl_dev_register()函数会在snd_card_register()中，即声卡的注册阶段被调用。注册完成后，control设备的相关信息被保存在snd_minors[]数组中，用control设备的此设备号作索引，即可在snd_minors[]数组中找出相关的信息。注册完成后的数据结构关系可以用下图进行表述：</p>
-
-<p><img src="/images/kernel/2018-03-03-9.png" alt="" /><br/>
-                                        control设备的操作函数入口</p>
-
-<p>用户程序需要打开control设备时，驱动程序通过snd_minors[]全局数组和此设备号，可以获得snd_ctl_f_ops结构中的各个回调函数，然后通过这些回调函数访问control中的信息和数据（最终会调用control的几个回调函数get，put，info）。详细的代码我就不贴了，大家可以读一下代码：/sound/core/control.c</p>
-
-<h2>Linux ALSA声卡驱动之五：移动设备中的ALSA（ASoC）</h2>
-
-<h4>1.  ASoC的由来</h4>
-
-<p>  ASoC&ndash;ALSA System on Chip ，是建立在标准ALSA驱动层上，为了更好地支持嵌入式处理器和移动设备中的音频Codec的一套软件体系。在ASoc出现之前，内核对于SoC中的音频已经有部分的支持，不过会有一些局限性：</p>
-
-<p>   Codec驱动与SoC CPU的底层耦合过于紧密，这种不理想会导致代码的重复，例如，仅是wm8731的驱动，当时Linux中有分别针对4个平台的驱动代码。</p>
-
-<p>   音频事件没有标准的方法来通知用户，例如耳机、麦克风的插拔和检测，这些事件在移动设备中是非常普通的，而且通常都需要特定于机器的代码进行重新对音频路劲进行配置。</p>
-
-<p>   当进行播放或录音时，驱动会让整个codec处于上电状态，这对于PC没问题，但对于移动设备来说，这意味着浪费大量的电量。同时也不支持通过改变过取样频率和偏置电流来达到省电的目的。</p>
-
-<p>   ASoC正是为了解决上述种种问题而提出的，目前已经被整合至内核的代码树中：sound/soc。ASoC不能单独存在，他只是建立在标准ALSA驱动上的一个它必须和标准的ALSA驱动框架相结合才能工作。</p>
-
-<h4>2.  硬件架构</h4>
-
-<p>  通常，就像软件领域里的抽象和重用一样，嵌入式设备的音频系统可以被划分为板载硬件（Machine）、Soc（Platform）、Codec三大部分，如下图所示：</p>
-
-<p><img src="/images/kernel/2018-03-03-10.png" alt="" /><br/>
-                                        图2.1  音频系统结构</p>
-
-<p>  Machine  是指某一款机器，可以是某款设备，某款开发板，又或者是某款智能手机，由此可以看出Machine几乎是不可重用的，每个Machine上的硬件实现可能都不一样，CPU不一样，Codec不一样，音频的输入、输出设备也不一样，Machine为CPU、Codec、输入输出设备提供了一个载体。</p>
-
-<p>  Platform  一般是指某一个SoC平台，比如pxaxxx,s3cxxxx,omapxxx等等，与音频相关的通常包含该SoC中的时钟、DMA、I2S、PCM等等，只要指定了SoC，那么我们可以认为它会有一个对应的Platform，它只与SoC相关，与Machine无关，这样我们就可以把Platform抽象出来，使得同一款SoC不用做任何的改动，就可以用在不同的Machine中。实际上，把Platform认为是某个SoC更好理解。</p>
-
-<p>  Codec  字面上的意思就是编解码器，Codec里面包含了I2S接口、D/A、A/D、Mixer、PA（功放），通常包含多种输入（Mic、Line-in、I2S、PCM）和多个输出（耳机、喇叭、听筒，Line-out），Codec和Platform一样，是可重用的部件，同一个Codec可以被不同的Machine使用。嵌入式Codec通常通过I2C对内部的寄存器进行控制。</p>
-
-<h4>3.  软件架构</h4>
-
-<p>  在软件层面，ASoC也把嵌入式设备的音频系统同样分为3大部分，Machine，Platform和Codec。</p>
-
-<p>  Codec驱动  ASoC中的一个重要设计原则就是要求Codec驱动是平台无关的，它包含了一些音频的控件（Controls），音频接口，DAMP（动态音频电源管理）的定义和某些Codec IO功能。为了保证硬件无关性，任何特定于平台和机器的代码都要移到Platform和Machine驱动中。所有的Codec驱动都要提供以下特性：</p>
-
-<p>   Codec DAI 和 PCM的配置信息；</p>
-
-<p>   Codec的IO控制方式（I2C，SPI等）；</p>
-
-<p>   Mixer和其他的音频控件；</p>
-
-<p>   Codec的ALSA音频操作接口；</p>
-
-<p>   必要时，也可以提供以下功能：
-     DAPM描述信息；
-     DAPM事件处理程序；
-     DAC数字静音控制</p>
-
-<p>  Platform驱动  它包含了该SoC平台的音频DMA和音频接口的配置和控制（I2S，PCM，AC97等等）；它也不能包含任何与板子或机器相关的代码。</p>
-
-<p>  Machine驱动  Machine驱动负责处理机器特有的一些控件和音频事件（例如，当播放音频时，需要先行打开一个放大器）；单独的Platform和Codec驱动是不能工作的，它必须由Machine驱动把它们结合在一起才能完成整个设备的音频处理工作。</p>
-
-<h4>4.  数据结构</h4>
-
-<p>  整个ASoC是由一些列数据结构组成，要搞清楚ASoC的工作机理，必须要理解这一系列数据结构之间的关系和作用，下面的关系图展示了ASoC中重要的数据结构之间的关联方式：</p>
-
-<p><img src="/images/kernel/2018-03-03-11.png" alt="" /><br/>
-                                          图4.1  Kernel-2.6.35-ASoC中各个结构的静态关系</p>
-
-<p>  ASoC把声卡实现为一个Platform Device，然后利用Platform_device结构中的dev字段：dev.drvdata，它实际上指向一个snd_soc_device结构。可以认为snd_soc_device是整个ASoC数据结构的根本，由他开始，引出一系列的数据结构用于表述音频的各种特性和功能。snd_soc_device结构引出了snd_soc_card和soc_codec_device两个结构，然后snd_soc_card又引出了snd_soc_platform、snd_soc_dai_link和snd_soc_codec结构。如上所述，ASoC被划分为Machine、Platform和Codec三大部分，如果从这些数据结构看来，snd_codec_device和snd_soc_card代表着Machine驱动，snd_soc_platform则代表着Platform驱动，snd_soc_codec和soc_codec_device则代表了Codec驱动，而snd_soc_dai_link则负责连接Platform和Codec。</p>
-
-<h4>5.  3.0版内核对ASoC的改进</h4>
-
-<p>  本来写这篇文章的时候参考的内核版本是2.6.35，不过有CSDN的朋友提出在内核版本3.0版本中，ASoC做了较大的变化。故特意下载了3.0的代码，发现确实有所变化，下面先贴出数据结构的静态关系图：</p>
-
-<p><img src="/images/kernel/2018-03-03-12.png" alt="" /><br/>
-                                          图5.1   Kernel 3.0中的ASoC数据结构</p>
-
-<p>  由上图我们可以看出，3.0中的数据结构更为合理和清晰，取消了snd_soc_device结构，直接用snd_soc_card取代了它，并且强化了snd_soc_pcm_runtime的作用，同时还增加了另外两个数据结构snd_soc_codec_driver和snd_soc_platform_driver，用于明确代表Codec驱动和Platform驱动。</p>
-
-<p>  后续的章节中将会逐一介绍Machine和Platform以及Codec驱动的工作细节和关联</p>
-</div>
-  
-  
-
-
-    </article>
-  
   <div class="pagination">
     
       <a class="prev" href="/posts/7">&larr; Older</a>
@@ -3131,8 +2501,8 @@ ALSA-lib通过mmap机制将硬件申请的内存映射到用户空间，从而�
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(42)</span></li>
-<div id='language' class='catsub'><li><a href='/blog/cats/language~c/?opendiv=language'>c</a><a href='##' onmousedown=showDiv('language~c') id='aexp_language~c'><span class='exp_style' id='exp_language~c'>[+]</span></a><span class='right_span'>24</span></li>
+<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(43)</span></li>
+<div id='language' class='catsub'><li><a href='/blog/cats/language~c/?opendiv=language'>c</a><a href='##' onmousedown=showDiv('language~c') id='aexp_language~c'><span class='exp_style' id='exp_language~c'>[+]</span></a><span class='right_span'>25</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~c')) document.getElementById('aexp_language~c').style.visibility = 'hidden';
 </script>
@@ -3237,7 +2607,7 @@ if (!document.getElementById('system~namespace')) document.getElementById('aexp_
 if (!document.getElementById('system')) document.getElementById('aexp_system').style.visibility = 'hidden';
 if (!document.getElementById('system~ubuntu')) document.getElementById('aexp_system~ubuntu').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/kernel/'>kernel</a><a href='##' onmousedown=showDiv('kernel') id='aexp_kernel'><span class='exp_style' id='exp_kernel'>[+]</span></a><span class='right_span'>(203)</span></li>
+<li class='catclass'><a href='/blog/cats/kernel/'>kernel</a><a href='##' onmousedown=showDiv('kernel') id='aexp_kernel'><span class='exp_style' id='exp_kernel'>[+]</span></a><span class='right_span'>(204)</span></li>
 <div id='kernel' class='catsub'><li><a href='/blog/cats/kernel~base/?opendiv=kernel'>base</a><a href='##' onmousedown=showDiv('kernel~base') id='aexp_kernel~base'><span class='exp_style' id='exp_kernel~base'>[+]</span></a><span class='right_span'>18</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('kernel~base')) document.getElementById('aexp_kernel~base').style.visibility = 'hidden';
@@ -3270,7 +2640,7 @@ if (!document.getElementById('kernel~kexec')) document.getElementById('aexp_kern
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('kernel~mm')) document.getElementById('aexp_kernel~mm').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/kernel~net/?opendiv=kernel'>net</a><a href='##' onmousedown=showDiv('kernel~net') id='aexp_kernel~net'><span class='exp_style' id='exp_kernel~net'>[+]</span></a><span class='right_span'>94</span></li>
+<li><a href='/blog/cats/kernel~net/?opendiv=kernel'>net</a><a href='##' onmousedown=showDiv('kernel~net') id='aexp_kernel~net'><span class='exp_style' id='exp_kernel~net'>[+]</span></a><span class='right_span'>95</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('kernel~net')) document.getElementById('aexp_kernel~net').style.visibility = 'hidden';
 </script>
@@ -3414,8 +2784,9 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2018/'>2018</a><a href='##' onmousedown=showDiv('2018')><span class='exp_style' id='exp_2018'>[+]</span></a><span class='right_span'>(45)</span></li>
-<div id='2018' class='catsub'><li><a href='/blog/cats/2018~10/?opendiv=2018'>2018-10</a><span class='right_span'>1</span></li>
+<li class='catclass'><a href='/blog/cats/2018/'>2018</a><a href='##' onmousedown=showDiv('2018')><span class='exp_style' id='exp_2018'>[+]</span></a><span class='right_span'>(47)</span></li>
+<div id='2018' class='catsub'><li><a href='/blog/cats/2018~11/?opendiv=2018'>2018-11</a><span class='right_span'>2</span></li>
+<li><a href='/blog/cats/2018~10/?opendiv=2018'>2018-10</a><span class='right_span'>1</span></li>
 <li><a href='/blog/cats/2018~09/?opendiv=2018'>2018-09</a><span class='right_span'>1</span></li>
 <li><a href='/blog/cats/2018~08/?opendiv=2018'>2018-08</a><span class='right_span'>1</span></li>
 <li><a href='/blog/cats/2018~07/?opendiv=2018'>2018-07</a><span class='right_span'>7</span></li>
@@ -3523,6 +2894,14 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
   <ul id="recent_posts">
     
       <li class="post">
+        <a href="/blog/2018/11/07/kernel-server/">select,poll,epoll内核实现</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2018/11/07/lang-c-server/">select,poll,epoll</a>
+      </li>
+    
+      <li class="post">
         <a href="/blog/2018/10/28/mysql-conf/">mysql conf</a>
       </li>
     
@@ -3532,14 +2911,6 @@ if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ru
     
       <li class="post">
         <a href="/blog/2018/08/05/debug-crash_shell/">crash执行shell脚本</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2018/07/30/kernel-tcp_metric/">ip tcp_metric, 链路状态历史</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2018/07/23/kernel-ip_tunnel/">IPIP实现IP隧道</a>
       </li>
     
   </ul>
