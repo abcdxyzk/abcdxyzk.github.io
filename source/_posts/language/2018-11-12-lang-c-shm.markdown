@@ -1,0 +1,208 @@
+---
+layout: post
+title: "进程通信--共享内存"
+date: 2018-11-12 02:44:00 +0800
+comments: false
+categories:
+- 2018
+- 2018~11
+- language
+- language~c
+tags:
+---
+
+https://blog.csdn.net/xy913741894/article/details/72571260
+
+https://www.cnblogs.com/fangshenghui/p/4039720.html
+
+#### 1. 共享内存，存在于每个进程的进程地址空间中，通过页表+MMU机制映射为同一块物理内存，因此，它属于每个进程，由于它并不需要系统调用干预和数据复制，它的效率是非常高的，它比我们所学的几种IPC机制（信号量，管道，消息队列）都要快。
+
+#### 2. 既然它性能最好，为什么还需要有其他的IPC机制？直接用它不就好了吗？它虽然很快，但是它不提供同步互斥机制，这样子一来就需要我们程序员来提供，带来了编程的难度。
+
+
+### Linux下相关函数
+#### 1、shmget函数
+
+该函数用来创建共享内存，它的原型为：
+```
+	int shmget(key_ t key, size_t size, int shmflg);
+```
+
+第一个参数，与信号量的semget函数一样，程序需要提供一个参数key（非0整数），它有效地为共享内存段命名，shmget函数成功时返回一个与key相关的共享内存标识符（非负整数），用于后续的共享内存函数。调用失败返回-1.
+
+第二个参数，size以字节为单位指定需要共享的内存容量
+
+第三个参数，shmflg是权限标志，它的作用与open函数的mode参数一样，如果要想在key标识的共享内存不存在时，创建它的话，可以与IPC_CREAT做或操作。共享内存的权限标志与文件的读写权限一样，举例来说，0644,它表示允许一个进程创建的共享内存被内存创建者所拥有的进程向共享内存读取和写入数据，同时其他用户创建的进程只能读取共享内存。
+
+#### 2、shmat函数
+
+第一次创建完共享内存时，它还不能被任何进程访问，shmat函数的作用就是用来启动对该共享内存的访问，并把共享内存连接到当前进程的地址空间。它的原型如下：
+```
+	void *shmat(int shm_id, const void *shm_addr, int shmflg);
+```
+第一个参数，shm_id是由shmget函数返回的共享内存标识。
+
+第二个参数，shm_addr指定共享内存连接到当前进程中的地址位置，通常为空，表示让系统来选择共享内存的地址。
+
+第三个参数，shm_flg是一组标志位，通常为0。
+
+#### 3、shmdt函数
+
+该函数用于将共享内存从当前进程中分离。注意，将共享内存分离并不是删除它，只是使该共享内存对当前进程不再可用。它的原型如下：
+```
+	int shmdt(const void *shmaddr);
+```
+
+参数shmaddr是shmat函数返回的地址指针，调用成功时返回0，失败时返回-1.
+
+#### 4、shmctl函数
+
+与信号量的semctl函数一样，用来控制共享内存，它的原型如下：
+```
+	int shmctl(int shm_id, int command, struct shmid_ds *buf);
+```
+
+第一个参数，shm_id是shmget函数返回的共享内存标识符。
+
+第二个参数，command是要采取的操作，它可以取下面的三个值 ：
+
+IPC_STAT：把shmid_ds结构中的数据设置为共享内存的当前关联值，即用共享内存的当前关联值覆盖shmid_ds的值。  
+IPC_SET： 如果进程有足够的权限，就把共享内存的当前关联值设置为shmid_ds结构中给出的值  
+IPC_RMID：删除共享内存段  
+
+第三个参数，buf是一个结构指针，它指向共享内存模式和访问权限的结构。
+
+
+### 简单互斥机制的样例
+
+确定两个线程的可以用，更多线程需要信号量或互斥锁
+
+#### shmread.c
+
+```
+	#include<unistd.h>
+	#include<stdlib.h>
+	#include<stdio.h>
+	#include<sys/shm.h>
+	
+	#define TEXT_SZ 2048
+	struct shared_use_st {
+		int written;/* 作为一个标志，非0：表示可读，0表示可写 */
+		char text[TEXT_SZ];/* 记录写入和读取的文本 */
+	};
+	
+	#define MEM_KEY (1234)
+	
+	int main()
+	{
+		int running = 1; //程序是否继续运行的标志
+		void *shm = NULL; //分配的共享内存的原始首地址
+		struct shared_use_st *shared;//指向shm
+		int shmid; //共享内存标识符
+		//创建共享内存
+		shmid = shmget((key_t)MEM_KEY, sizeof(struct shared_use_st), 0666|IPC_CREAT);
+		if (shmid == -1) {
+			fprintf(stderr,"shmget failed\n");
+			return -1;
+		}
+		//将共享内存连接到当前进程的地址空间
+		shm = shmat(shmid, 0, 0);
+		if (shm == (void*)-1) {
+			fprintf(stderr,"shmat failed\n");
+			return -2;
+		}
+		printf("\nMemory attached at shmid=%d shm=%p\n", shmid, shm);
+		//设置共享内存
+		shared = (struct shared_use_st*)shm;
+		shared->written = 0;
+		//读取共享内存中的数据
+		while (running) {
+			//没有进程向共享内存定数据有数据可读取
+			while (shared->written == 0) {
+				sleep(1); //有其他进程在写数据，不能读取数据
+			}
+			printf("You wrote: %s", shared->text);
+			sleep(rand() % 3);
+			//输入了end，退出循环（程序）
+			if (strncmp(shared->text, "end", 3) == 0)
+				running = 0;
+			//读取完数据，设置written使共享内存段可写
+			shared->written = 0;
+		}
+		//把共享内存从当前进程中分离
+		if (shmdt(shm) == -1) {
+			fprintf(stderr,"shmdt failed\n");
+			return -3;
+		}
+		//删除共享内存
+		if (shmctl(shmid, IPC_RMID, 0) == -1) {
+			fprintf(stderr,"shmctl(IPC_RMID) failed\n");
+			return -4;
+		}
+		return 0;
+	}
+```
+
+#### shmwrite.c
+```
+	#include<unistd.h>
+	#include<stdlib.h>
+	#include<stdio.h>
+	#include<string.h>
+	#include<sys/shm.h>
+	
+	#define TEXT_SZ 2048
+	struct shared_use_st {
+		int written;/* 作为一个标志，非0：表示可读，0表示可写 */
+		char text[TEXT_SZ];/* 记录写入和读取的文本 */
+	};
+	
+	#define MEM_KEY (1234)
+	
+	int main()
+	{
+		int running = 1;
+		void *shm = NULL;
+		struct shared_use_st *shared = NULL;
+		char buffer[BUFSIZ +1];//用于保存输入的文本
+		int shmid;
+		//创建共享内存
+		shmid = shmget((key_t)MEM_KEY, sizeof(struct shared_use_st), 0666|IPC_CREAT);
+		if (shmid == -1) {
+			fprintf(stderr,"shmget failed\n");
+			return -1;
+		}
+		//将共享内存连接到当前进程的地址空间
+		shm = shmat(shmid, (void*)0, 0);
+		if (shm == (void*)-1) {
+			fprintf(stderr,"shmat failed\n");
+			return -2;
+		}
+		printf("Memory attached at shmid=%d shm=%p\n", shmid, shm);
+		//设置共享内存
+		shared = (struct shared_use_st*)shm;
+		//向共享内存中写数据
+		while (running) {
+			//数据还没有被读取，则等待数据被读取,不能向共享内存中写入文本
+			while (shared->written == 1) {
+				sleep(1);
+				printf("Waiting...\n");
+			}
+			//向共享内存中写入数据
+			printf("Enter some text: ");
+			fgets(buffer, BUFSIZ, stdin);
+			strncpy(shared->text, buffer, TEXT_SZ);
+			//写完数据，设置written使共享内存段可读
+			shared->written = 1;
+			//输入了end，退出循环（程序）
+			if (strncmp(buffer, "end", 3) == 0)
+				running = 0;
+		}
+		//把共享内存从当前进程中分离
+		if (shmdt(shm) == -1) {
+			fprintf(stderr,"shmdt failed\n");
+			return -3;
+		}
+		return 0;
+	}
+```
