@@ -4,7 +4,7 @@
   <title><![CDATA[Category: kernel | kk Blog —— 通用基础]]></title>
   <link href="http://abcdxyzk.github.io/blog/cats/kernel/atom.xml" rel="self"/>
   <link href="http://abcdxyzk.github.io/"/>
-  <updated>2018-11-08T00:11:06+08:00</updated>
+  <updated>2018-11-14T00:29:32+08:00</updated>
   <id>http://abcdxyzk.github.io/</id>
   <author>
     <name><![CDATA[kk]]></name>
@@ -12,6 +12,191 @@
   </author>
   <generator uri="http://octopress.org/">Octopress</generator>
 
+  
+  <entry>
+    <title type="html"><![CDATA[信号量内核源码]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2018/11/14/kernel-sem/"/>
+    <updated>2018-11-14T00:18:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2018/11/14/kernel-sem</id>
+    <content type="html"><![CDATA[<p><a href="https://blog.csdn.net/u012603457/article/details/52971894">https://blog.csdn.net/u012603457/article/details/52971894</a></p>
+
+<p>之前的一片博客介绍了用于Linux内核同步的自旋锁，即使用自旋锁来保护共享资源，今天介绍另外一种Linux内核同步机制——信号量。信号量在内核中的使用非常广泛，用于对各种共享资源的保护。信号量与自旋锁的实现机制是不一样的，用处也是不一样的。首先，自旋锁和信号量都使用了计数器来表示允许同时访问共享资源的最大进程数，但自旋锁的共享计数值是1，也就是说任意时刻只有一个进程在共享代码区运行；信号量却允许使用大于1的共享计数，即共享资源允许被多个不同的进程同时访问，当然，信号量的计数器也能设为1，这时信号量也称为互斥量。其次，自旋锁用于保护短时间能够完成操作的共享资源，使用期间不允许进程睡眠和进程切换；信号量常用于暂时无法获取的共享资源，如果获取失败则进程进入不可中断的睡眠状态，只能由释放资源的进程来唤醒。最后，自旋锁可以用于中断服务程序之中；信号量不能在中断服务程序中使用，因为中断服务程序是不允许进程睡眠的。关于信号量的基本知识已经讲解完毕，接下来看看信号量在内核里面的实现，本文讲解的内核版本是linux-2.6.24。</p>
+
+<h3>1 数据结构</h3>
+
+<pre><code>    struct semaphore {
+        atomic_t count;
+        int sleepers;
+        wait_queue_head_t wait;
+    };
+</code></pre>
+
+<p>信号量使用的数据结构是struct semaphore，包含三个数据成员：count是共享计数值、sleepers是等待当前信号量进入睡眠的进程个数、wait是当前信号量的等待队列。</p>
+
+<h3>2 信号量使用</h3>
+
+<p>使用信号量之前要进行初始化，其实只是简单的设置共享计数和等待队列，睡眠进程数一开始是0。本文重点讲解信号量的使用和实现。信号量操作的API：</p>
+
+<pre><code>    static inline void down(struct semaphore * sem)//获取信号量，获取失败则进入睡眠状态
+    static inline void up(struct semaphore * sem)//释放信号量，并唤醒等待队列中的第一个进程
+</code></pre>
+
+<p>信号量的使用方式如下：</p>
+
+<pre><code>    down(sem);
+    ...临界区...
+    up(sem);
+</code></pre>
+
+<p>内核保证正在访问临界区的进程数小于或等于初始化的共享计数值，获取信号量失败的进程将进入不可中断的睡眠状态，在信号量的等待队列中进行等待。当进程释放信号量的时候就会唤醒等待队列中的第一个进程。</p>
+
+<h3>3 信号量的实现</h3>
+
+<h4>3.1 down(sem)</h4>
+
+<p>首先看函数的定义：</p>
+
+<pre><code>    static inline void down(struct semaphore * sem)
+    {
+        might_sleep();
+        __asm__ __volatile__(
+            "# atomic down operation\n\t"
+            LOCK_PREFIX "decl %0\n\t"    /* --sem-&gt;count */
+            "jns 2f\n"
+            "\tlea %0,%%eax\n\t"
+            "call __down_failed\n"
+            "2:"
+            :"+m" (sem-&gt;count)
+            :
+            :"memory","ax");
+    }
+</code></pre>
+
+<p>这里面包含了一些汇编代码，%0代表sem->count。也就是说先将sem->count减1，LOCK_PREFIX表示执行这条指令时将总线锁住，保证减1操作是原子的。减1之后如果大于或等于0就转到标号2处执行，也就跳过了<strong>down_failed函数直接到函数尾部并返回，成功获取信号量；否则减1之后sem->count小于0则顺序执行后面的</strong>down_failed函数。接下来看__down_failed函数的定义：</p>
+
+<pre><code>    ENTRY(__down_failed)
+        CFI_STARTPROC
+        FRAME
+        pushl %edx
+        CFI_ADJUST_CFA_OFFSET 4
+        CFI_REL_OFFSET edx,0
+        pushl %ecx
+        CFI_ADJUST_CFA_OFFSET 4
+        CFI_REL_OFFSET ecx,0
+        call __down
+        popl %ecx
+        CFI_ADJUST_CFA_OFFSET -4
+        CFI_RESTORE ecx
+        popl %edx
+        CFI_ADJUST_CFA_OFFSET -4
+        CFI_RESTORE edx
+        ENDFRAME
+        ret
+        CFI_ENDPROC
+        END(__down_failed)
+</code></pre>
+
+<p>pushl和popl是用于保存和恢复寄存器的，CFI前缀的指令用于指令对齐调整。重点在函数__down,下面来看该函数的定义：</p>
+
+<pre><code>    fastcall void __sched __down(struct semaphore * sem)
+    {
+        struct task_struct *tsk = current;
+        DECLARE_WAITQUEUE(wait, tsk);
+        unsigned long flags;
+
+        tsk-&gt;state = TASK_UNINTERRUPTIBLE;
+        spin_lock_irqsave(&amp;sem-&gt;wait.lock, flags);
+        add_wait_queue_exclusive_locked(&amp;sem-&gt;wait, &amp;wait);
+
+        sem-&gt;sleepers++;
+        for (;;) {
+            int sleepers = sem-&gt;sleepers;
+
+            /*
+             * Add "everybody else" into it. They aren't
+             * playing, because we own the spinlock in
+             * the wait_queue_head.
+             */
+            if (!atomic_add_negative(sleepers - 1, &amp;sem-&gt;count)) {
+                sem-&gt;sleepers = 0;
+                break;
+            }
+            sem-&gt;sleepers = 1;  /* us - see -1 above */
+            spin_unlock_irqrestore(&amp;sem-&gt;wait.lock, flags);
+
+            schedule();
+
+            spin_lock_irqsave(&amp;sem-&gt;wait.lock, flags);
+            tsk-&gt;state = TASK_UNINTERRUPTIBLE;
+        }
+        remove_wait_queue_locked(&amp;sem-&gt;wait, &amp;wait);
+        wake_up_locked(&amp;sem-&gt;wait);
+        spin_unlock_irqrestore(&amp;sem-&gt;wait.lock, flags);
+        tsk-&gt;state = TASK_RUNNING;
+    }
+</code></pre>
+
+<p>fastcall表示一种快速调用方式，函数的前两个参数由寄存器ecx和edx来传递，其余参数仍使用堆栈传递。首先将进程设为不可中断睡眠状态，即不能通过信号来唤醒，只能是内核亲自唤醒。同时将进程的TASK_EXCLUSIVE标志设为1，则wake_up()只会唤醒等待队列中的第一个进程。然后将睡眠等待数加1，之后进入for循环。函数atomic_add_negative(sleepers - 1, &amp;sem->count)将相当于sem->count += sleepers-1，然后返回sem->count，通过该函数进行信号量获取情况测试，返回结果为0则获取资源，小于0则没有获取。这段代码使用sleepers和sem->count共同表示当前资源的使用情况。进入for循环后有两种情况，一种是atomic_add_negative执行结果为0，即获取了信号量，此时将sleepers设为0并退出循环，同时唤醒等待队列的第一个进程进行信号量获取测试；另一种是没有获取信号量，将sleepers设为1并运行schedule()进入睡眠，被唤醒之后继续执行for循环进行信号量获取测试。</p>
+
+<p>注意，运行完执行一遍for指令后sleepers的值有两种结果，一种是0，一种是1。如果0则表示有一个进程通过了信号量获取的测试，则atomic_add_negative(sleepers - 1, &amp;sem->count)实际上是将sem->count执行了减1操作，这个操作会在下一个进程进行信号量获取测试的时候执行。如果是1则表示进程没有通过信号领获取的测试，则atomic_add_negative(sleepers - 1, &amp;sem->count)操作不会影响sem->count的值。也就是说，当进程进入__down时，sleepers只会有两个值，一个是0，一个是1。0表示之前的进程获取了信号量，1表示之前的进程没有获取信号量。如果之前进程获取了信号量，执行atomic_add_negative(sleepers - 1, &amp;sem->count)时就会将sem->count的值减1；否则sem->count的值将保持不变。但是这个减1操作延迟到了下一个进程的执行期间，考虑到获取信号量之后进程会唤醒等待队列里的第一个进程，这个减1操作应该会很快就得到执行。</p>
+
+<p>细心地小伙伴可能会注意到，首次获取信号量失败的进程不是会执行sem->sleepers++操作吗，这样不就改变了sem->count的值了吗？仔细回想获取信号量的过程，获取失败的时候会执行sem->count–操作的，因此刚好和sem->sleeper++相互呼应，结果就是不会改变sem->count的结果。即只有进程获取信号量后才会对sem->count进行减1操作，这个操作并不是马上执行，而是后续进程进行信号量获取检测的时候进行的</p>
+
+<h3>3.2 up(sem)</h3>
+
+<p>先看函数定义：</p>
+
+<pre><code>    static inline void up(struct semaphore * sem)
+    {
+        __asm__ __volatile__(
+            "# atomic up operation\n\t"
+            LOCK_PREFIX "incl %0\n\t"    /* ++sem-&gt;count */
+            "jg 1f\n\t"
+            "lea %0,%%eax\n\t"
+            "call __up_wakeup\n"
+            "1:"
+            :"+m" (sem-&gt;count)
+            :
+            :"memory","ax");
+    }
+</code></pre>
+
+<p>首先将sem->count加1，是原子操作，如果加1后sem->count大于0则说明没有进程在等待信号量资源，无须唤醒队列中进程，直接跳转到标号1处返回；否则运行__up_wakeup唤醒等待队列中的进程。</p>
+
+<pre><code>    ENTRY(__up_wakeup)
+        CFI_STARTPROC
+        FRAME
+        pushl %edx
+        CFI_ADJUST_CFA_OFFSET 4
+        CFI_REL_OFFSET edx,0
+        pushl %ecx
+        CFI_ADJUST_CFA_OFFSET 4
+        CFI_REL_OFFSET ecx,0
+        call __up
+        popl %ecx
+        CFI_ADJUST_CFA_OFFSET -4
+        CFI_RESTORE ecx
+        popl %edx
+        CFI_ADJUST_CFA_OFFSET -4
+        CFI_RESTORE edx
+        ENDFRAME
+        ret
+        CFI_ENDPROC
+        END(__up_wakeup)
+</code></pre>
+
+<p>同样，我们只关注函数<code>__up</code>的定义：
+<code>
+    fastcall void __up(struct semaphore *sem)
+    {
+        wake_up(&amp;sem-&gt;wait);
+    }
+</code>
+可以看到，__up的的工作就是唤醒等待队列中的所有进程，但是由于sem等待队列中的进程 的TASK_EXCLUSIVE标志为 1，因此不会唤醒后续进程了。也就是说up(sem)操作实际上是将sem->count自增1，然后唤醒等待队列中的第一个进程(如果有的话)。
+4 小结
+信号量作为一种基础的内核同步机制，使用非常广泛。本文基于linux-2.6.24内核版本介绍了信号量使用的数据结构和实现机制，同时介绍了信号量与自旋锁的区别。</p>
+]]></content>
+  </entry>
   
   <entry>
     <title type="html"><![CDATA[select,poll,epoll内核实现]]></title>
@@ -2547,448 +2732,6 @@ B：
     ip rule add from 11.0.0.20 table 1
     ip route add table 1 default dev tunl1
 </code></pre>
-]]></content>
-  </entry>
-  
-  <entry>
-    <title type="html"><![CDATA[linux策略路由]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2018/07/23/kernel-ip_rule/"/>
-    <updated>2018-07-23T02:02:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2018/07/23/kernel-ip_rule</id>
-    <content type="html"><![CDATA[<h2><a href="https://blog.csdn.net/guodong1010/article/category/6149064">https://blog.csdn.net/guodong1010/article/category/6149064</a></h2>
-
-<p><a href="https://www.cnblogs.com/iceocean/articles/1594488.html">https://www.cnblogs.com/iceocean/articles/1594488.html</a></p>
-
-<h3>1.策略路由介绍</h3>
-
-<p>策略性是指对于IP包的路由是以网络管理员根据需要定下的一些策略为主要依据进行路由的。例如我们可以有这样的策略：“所有来直自网A的包，选择X路径；其他选择Y路径”，或者是“所有TOS为A的包选择路径F；其他选者路径K”。</p>
-
-<p>Cisco 的网络操作系统 (Cisco IOS) 从11.0开始就采用新的策略性路由机制。而Linux是在内核2.1开始采用策略性路由机制的。策略性路由机制与传统的路由算法相比主要是引入了多路由表以及规则的概念。</p>
-
-<h3>2.linux方式</h3>
-
-<h4>2.1 多路由表（multiple Routing Tables)</h4>
-
-<p>传统的路由算法是仅使用一张路由表的。但是在有些情形底下，我们是需要使用多路由表的。例如一个子网通过一个路由器与外界相连，路由器与外界有两条线路相连，其中一条的速度比较快，一条的速度比较慢。对于子网内的大多数用户来说对速度并没有特殊的要求，所以可以让他们用比较慢的路由；但是子网内有一些特殊的用户却是对速度的要求比较苛刻，所以他们需要使用速度比较快的路由。如果使用一张路由表上述要求是无法实现的，而如果根据源地址或其它参数，对不同的用户使用不同的路由表，这样就可以大大提高路由器的性能。</p>
-
-<h4>2.2 规则（rule)</h4>
-
-<p>规则是策略性的关键性的新的概念。我们可以用自然语言这样描述规则，例如我门可以指定这样的规则：</p>
-
-<p>规则一：“所有来自192.16.152.24的IP包，使用路由表10，本规则的优先级别是1500”</p>
-
-<p>规则二：“所有的包，使用路由表253，本规则的优先级别是32767”</p>
-
-<p>我们可以看到，规则包含3个要素：</p>
-
-<p>什么样的包，将应用本规则（所谓的SELECTOR，可能是filter更能反映其作用）；</p>
-
-<p>符合本规则的包将对其采取什么动作（ACTION），例如用那个表；</p>
-
-<p>本规则的优先级别。优先级别越高的规则越先匹配（数值越小优先级别越高）。</p>
-
-<h3>3. linux策略路由配置方式</h3>
-
-<p>传统的linux下配置路由的工具是route，而实现策略性路由配置的工具是iproute2工具包。</p>
-
-<h4>3.1 接口地址的配置 IP Addr</h4>
-
-<p>对于接口的配置可以用下面的命令进行：
-<code>
-    Usage: ip addr [ add | del ] IFADDR dev STRING
-</code></p>
-
-<p>例如：
-<code>
-    router&gt;# ip addr add 192.168.0.1/24 broadcast 192.168.0.255 label eth0 dev eth0
-</code></p>
-
-<p>上面表示，给接口eth0赋予地址192.168.0.1 掩码是255.255.255.0(24代表掩码中1的个数)，广播地址是192.168.0.255</p>
-
-<h4>3.2 路由的配置 IP Route</h4>
-
-<p>Linux最多可以支持255张路由表，其中有3张表是内置的：</p>
-
-<pre><code>　　表255 本地路由表（Local table）本地接口地址，广播地址，已及NAT地址都放在这个表。该路由表由系统自动维护，管理员不能直接修改。
-
-　　表254 主路由表（Main table）如果没有指明路由所属的表，所有的路由都默认都放在这个表里，一般来说，旧的路由工具（如route）所添加的路由都会加到这个表。一般是普通的路由。
-
-　　表253 默认路由表（Default table）一般来说默认的路由都放在这张表，但是如果特别指明放的也可以是所有的网关路由。
-
-　　表 0 保留
-</code></pre>
-
-<p>路由配置命令的格式如下：</p>
-
-<h5>Usage: ip route list SELECTOR</h5>
-
-<pre><code>    ip route { change | del | add | append | replace | monitor } ROUTE
-</code></pre>
-
-<p>如果想查看路由表的内容，可以通过命令：</p>
-
-<pre><code>    ip route list table table_number
-</code></pre>
-
-<p>对于路由的操作包括change、del、add 、append 、replace 、 monitor这些。例如添加路由可以用：</p>
-
-<pre><code>    router&gt;# ip route add 0/0 via 192.168.0.4 table main
-    router&gt;# ip route add 192.168.3.0/24 via 192.168.0.3 table 1
-</code></pre>
-
-<p>第一条命令是向主路由表（main table）即表254添加一条路由，路由的内容是设置192.168.0.4成为网关。</p>
-
-<p>第二条命令代表向路由表1添加一条路由，子网192.168.3.0（子网掩码是255.255.255.0）的网关是192.168.0.3。</p>
-
-<p>在多路由表的路由体系里，所有的路由的操作，例如网路由表添加路由，或者在路由表里寻找特定的路由，需要指明要操作的路由表，所有没有指明路由表，默认是对主路由表（表254）进行操作。而在单表体系里，路由的操作是不用指明路由表的。</p>
-
-<h4>3.3 规则的配置 IP Rule</h4>
-
-<p>在Linux里，总共可以定义232个优先级的规则，一个优先级别只能有一条规则，即理论上总共可以有条规则。其中有3个规则是默认的。命令用法如下：</p>
-
-<pre><code>    Usage: ip rule [ list | add | del ] SELECTOR ACTION
-
-    SELECTOR := [ from PREFIX ] [ to PREFIX ] [ tos TOS ]
-        [ dev STRING ] [ pref NUMBER ]
-
-    ACTION := [ table TABLE_ID ] [ nat ADDRESS ]
-        [ prohibit | reject | unreachable ]
-        [ flowid CLASSID ]
-
-    TABLE_ID := [ local | main | default | new | NUMBER
-</code></pre>
-
-<p>首先我们可以看看路由表默认的所有规则：</p>
-
-<pre><code>    root@netmonster# ip rule list
-    0: from all lookup local
-    32766: from all lookup main
-    32767: from all lookup default
-</code></pre>
-
-<p>规则0，它是优先级别最高的规则，规则规定，所有的包，都必须首先使用local表（254）进行路由。本规则不能被更改和删除。</p>
-
-<p>规则32766，规定所有的包，使用表main进行路由。本规则可以被更改和删除。</p>
-
-<p>规则32767，规定所有的包，使用表default进行路由。本规则可以被更改和删除。</p>
-
-<p>在默认情况下进行路由时，首先会根据规则0在本地路由表里寻找路由，如果目的地址是本网络，或是广播地址的话，在这里就可以找到合适的路由；如果路由失败，就会匹配下一个不空的规则，在这里只有32766规则，在这里将会在主路由表里寻找路由;如果失败，就会匹配32767规则，即寻找默认路由表。如果失败，路由将失败。重这里可以看出，策略性路由是往前兼容的。</p>
-
-<p>还可以添加规则：
-<code>
-    router&gt;# ip rule add [from 0/0] table 1 pref 32800
-    router &gt;#ip rule add from 192.168.3.112/32 [tos 0x10] table ２ pref 1500prohibit
-</code></p>
-
-<p>第一条命令将向规则链增加一条规则，规则匹配的对象是所有的数据包，动作是选用路由表1的路由，这条规则的优先级是32800。</p>
-
-<p>第二条命令将向规则链增加一条规则，规则匹配的对象是IP为192.168.3.112，tos等于0x10的包，使用路由表2，这条规则的优先级是1500，动作是。添加以后，我们可以看看系统规则的变化。</p>
-
-<pre><code>    router&gt;# ip rule
-    0: from all lookup local
-    1500 from 192.168.3.112/32 [tos 0x10] lookup 2
-    32766: from all lookup main
-    32767: from all lookup default
-    32800: from all lookup 1
-</code></pre>
-
-<p>上面的规则是以源地址为关键字，作为是否匹配的依据的。除了源地址外，还可以用以下的信息：</p>
-
-<p>From &ndash; 源地址</p>
-
-<p>To &ndash; 目的地址（这里是选择规则时使用，查找路由表时也使用）</p>
-
-<p>Tos &ndash; IP包头的TOS（type of sevice）域</p>
-
-<p>Dev &ndash; 物理接口</p>
-
-<p>Fwmark &ndash; 防火墙参数</p>
-
-<p>采取的动作除了指定表，还可以指定下面的动作：</p>
-
-<p>Table 指明所使用的表</p>
-
-<p>Nat 透明网关</p>
-
-<p>Action prohibit 丢弃该包，并发送 COMM.ADM.PROHIITED的ICMP信息</p>
-
-<p>Reject 单纯丢弃该包</p>
-
-<p>Unreachable丢弃该包，并发送 NET UNREACHABLE的ICMP信息</p>
-
-<h3>4.策略路由的应用</h3>
-
-<h4>4.1 基于源地址选路（ Source-Sensitive Routing）</h4>
-
-<p>如果一个网络通过两条线路接入互联网，一条是比较快的ADSL，另外一条是比较慢的普通的调制解调器。这样的话，网络管理员既可以提供无差别的路由服务，也可以根据源地址的不同，使一些特定的地址使用较快的线路，而普通用户则使用较慢的线路，即基于源址的选路。</p>
-
-<h4>4.2 根据服务级别选路（ Quality of Service）</h4>
-
-<p>网络管理员可以根据IP报头的服务级别域，对于不同的服务要求可以分别对待对于传送速率、吞吐量以及可靠性的有不同要求的数据报根据网络的状况进行不同的路由。</p>
-
-<h4>4.3 节省费用的应用</h4>
-
-<p>网络管理员可以根据通信的状况，让一些比较大的阵发性通信使用一些带宽比较高但是比较贵的路径一段短的时间，然后让基本的通信继续使用原来比较便宜的基本线路。例如，管理员知道，某一台主机与一个特定的地址通信通常是伴随着大量的阵发性通信的，那么网络管理员可以安排一些策略，使得这些主机使用特别的路由，这些路由是按需拨号，带宽比较高的线路，通信完成以后就停止使用，而普通的通信则不受影响。这样既提高网络的性能，又能节省费用。</p>
-
-<h4>4.4 负载平衡（Load Sharing）</h4>
-
-<p>根据网络交通的特征，网络管理员可以在不同的路径之间分配负荷实现负载平衡。</p>
-
-<h3>5 linux下策略路由的实现</h3>
-
-<p>在Linux下，策略性路由是由RPDB实现的。对于RPDB的内部机制的理解，可以加深对于策略性路由使用的理解。文件主要包含：</p>
-
-<pre><code>    fib_hash.c
-    fib_rules.c
-    fib_sematic
-    fib_frontend.c
-    route.c
-</code></pre>
-
-<p>RDPB主要由多路由表和规则组成。路由表以及对其的操作和其对外的接口是整个RPDB的核心部分。路由表主要由table，zone，node这些主要的数据结构构成。对路由表的操作主要包含物理的操作以及语义的操作。路由表除了向IP层提供路由寻找的接口以外还必须与几个元素提供接口：与用户的接口（即更改路由）、proc的接口、IP层控制接口、以及和硬件的接口（网络接口的改变会导致路由表内容的改变）。处在RDPB的中心的规则，由规则选取表。IP层并不直接使用路由表，而是通过一个路由适配层,路由适配层提供为IP层提供高性能的路由服务。</p>
-
-<h3>5.1 路由表（Fib Table）</h3>
-
-<p>数据结构：</p>
-
-<p>在整个策略性路由的框架里，路由表是最重要的的数据结构，我们在上面以及对路由表的概念和结构进行了清楚的说明。Linux里通过下面这些主要的数据结构进行实现的。</p>
-
-<pre><code>    主要数据结构      作用          位置
-    struct fib_table    路由表           ip_fib.h 116
-    struct fn_hash      路由表的哈希数据    fib_hash.c 104
-    struct fn_zone      zone域         fib_hash.c 85
-    struct fib_node     路由节点        fib_hash.c 68
-    struct fib_info     路由信息        ip_fib.h 57
-    struct fib_result   路由结果        ip_fib.h 86
-</code></pre>
-
-<p>数据结构之间的主要关系如下。路由表由路由表号以及路由表的操作函数指针还有表数据组成。这里需要注意的是，路由表结构里并不直接定义zone域，而是通过一个数据指针指向fn_hash。只有当zone里有数据才会连接到fn_zone_list里。</p>
-
-<p>系统的所有的路由表由数组变量<code>*fib_tables[RT_TABLE_MAX+1]</code>维护，其中系统定义RT_TABLE_MAX为254，也就是说系统最大的路由表为255张，所有的路由表的操作都是对这个数组进行的。。同时系统还定义了三长路由表<code>*local_table</code>; <code>*main_table</code>。</p>
-
-<h4>路由表的操作：</h4>
-
-<p>Linux策略路由代码的主要部分是对路由表的操作。对于路由表的操作，物理操作是直观的和易于理解的。对于表的操作不外乎就是添加、删除、更新等的操作。还有一种操作，是所谓的语义操作，语义操作主要是指诸如计算下一条的地址，把节点转换为路由项，寻找指定信息的路由等。</p>
-
-<h5>1、物理操作(operation)：</h5>
-
-<p>路由表的物理操作主要包括如下这些函数：</p>
-
-<p>路由标操作实现函数 位置</p>
-
-<p>新建路由表</p>
-
-<p>删除路由表</p>
-
-<p>搜索路由 fn_hash_lookup fib_hash.c 269</p>
-
-<p>插入路由到路由表 fn_hash_insert fib_hash.c 341</p>
-
-<p>删除路由表的路由 fn_hash_delete</p>
-
-<p>fn_hash_dump</p>
-
-<p>fib_hash.c 433</p>
-
-<p>fib_hash.c 614</p>
-
-<p>更新路由表的路由 fn_hash_flush fib_hash.c 729</p>
-
-<p>显示路由表的路由信息 fn_hash_get_info fib_hash.c 750</p>
-
-<p>选择默认路由 fn_hash_select_default fib_hash.c 842</p>
-
-<h5>2、语义操作(semantics operation)：</h5>
-
-<p>语义操作并不涉及路由表整体框架的理解，而且，函数名也是不言自明的，所以请大家参考fib_semantics.c。</p>
-
-<h5>3、接口(front end)</h5>
-
-<p>对于路由表接口的理解，关键在于理解那里有</p>
-
-<p>IP</p>
-
-<p>首先是路由表于IP层的接口。路由在目前linux的意义上来说，最主要的还是IP层的路由，所以和IP层的的接口是最主要的接口。和ip层的衔接主要是向IP层提供寻找路由、路由控制、寻找指定ip的接口。</p>
-
-<p>Fil_lookup</p>
-
-<p>ip_rt_ioctl fib_frontend.c 286;&ldquo; f</p>
-
-<p>ip_dev_find 145</p>
-
-<p>Inet</p>
-
-<p>路由表还必须提供配置接口，即用户直接操作路由的接口，例如增加和删除一条路由。当然在策略性路由里，还有规则的添加和删除。</p>
-
-<p>inet_rtm_delroute 351</p>
-
-<p>inet_rtm_newroute 366</p>
-
-<p>inet_check_attr 335</p>
-
-<p>proc</p>
-
-<p>在 /proc/net/route 里显示路由信息。</p>
-
-<p>fib_get_procinfo</p>
-
-<h5>4、网络设备（net dev event）</h5>
-
-<p>路由是和硬件关联的，当网络设备启动或关闭的时候，必须通知路由表的管理程序，更新路由表的信息。</p>
-
-<p>fib_disable_ip 567</p>
-
-<p>fib_inetaddr_event 575</p>
-
-<p>fib_netdev_event</p>
-
-<h5>5、内部维护（ magic）</h5>
-
-<p>上面我们提到，本地路由表（local table）的维护是由系统自动进行的。也就是说当用户为硬件设置IP地址等的时候，系统自动在本地路由表里添加本地接口地址以及广播地址。</p>
-
-<p>fib_magic 417</p>
-
-<p>fib_add_ifaddr 459</p>
-
-<p>fib_del_ifaddr 498</p>
-
-<h3>Rule</h3>
-
-<h4>1、数据结构</h4>
-
-<p>规则在fib_rules.c的52行里定义为 struct fib_rule。而RPDB里所有的路由是保存在101行的变量fib_rules里的，注意这个变量很关键，它掌管着所有的规则，规则的添加和删除都是对这个变量进行的。</p>
-
-<h4>2、系统定义规则：</h4>
-
-<p>fib_rules被定义以后被赋予了三条默认的规则：默认规则，本地规则以及主规则。</p>
-
-<p>u 本地规则local_rule</p>
-
-<pre><code>    static struct fib_rule local_rule = {
-        r_next: &amp;main_rule, /*下一条规则是主规则*/
-        r_clntref: ATOMIC_INIT(2),
-        r_table: RT_TABLE_LOCAL, /*指向本地路由表*/
-        r_action: RTN_UNICAST, /*动作是返回路由*/
-    };
-</code></pre>
-
-<p>u 主规则main_rule</p>
-
-<pre><code>    static struct fib_rule main_rule = {
-        r_next: &amp;default_rule,/*下一条规则是默认规则*/
-        r_clntref: ATOMIC_INIT(2),
-        r_preference: 0x7FFE, /*默认规则的优先级32766*/
-        r_table: RT_TABLE_MAIN, /*指向主路由表*/
-        r_action: RTN_UNICAST, /*动作是返回路由*/
-    };
-</code></pre>
-
-<p>u 默认规则default rule</p>
-
-<pre><code>    static struct fib_rule default_rule = {
-        r_clntref: ATOMIC_INIT(2),
-        r_preference: 0x7FFF,/*默认规则的优先级32767*/
-        r_table: RT_TABLE_DEFAULT,/*指默认路由表*/
-        r_action: RTN_UNICAST,/*动作是返回路由*/
-    };
-</code></pre>
-
-<p>规则链的链头指向本地规则。</p>
-
-<h4>RPDB的中心函数fib_lookup</h4>
-
-<p>现在到了讨论RPDB的实现的的中心函数fib_lookup了。RPDB通过提供接口函数fib_lookup，作为寻找路由的入口点，在这里有必要详细讨论这个函数，下面是源代码：，</p>
-
-<pre><code>    310 int fib_lookup(const struct rt_key *key, struct fib_result *res)
-    311 {
-    312     int err;
-    313     struct fib_rule *r, *policy;
-    314     struct fib_table *tb;
-    315
-    316     u32 daddr = key-&gt;dst;
-    317     u32 saddr = key-&gt;src;
-    318
-    321     read_lock(&amp;fib_rules_lock);
-    322     for (r = fib_rules; r; r=r-&gt;r_next) {/*扫描规则链fib_rules里的每一条规则直到匹配为止*/
-    323         if (((saddr^r-&gt;r_src) &amp; r-&gt;r_srcmask) ||
-    324             ((daddr^r-&gt;r_dst) &amp; r-&gt;r_dstmask) ||
-    325 #ifdef CONFIG_IP_ROUTE_TOS
-    326             (r-&gt;r_tos &amp;&amp; r-&gt;r_tos != key-&gt;tos) ||
-    327 #endif
-    328 #ifdef CONFIG_IP_ROUTE_FWMARK
-    329             (r-&gt;r_fwmark &amp;&amp; r-&gt;r_fwmark != key-&gt;fwmark) ||
-    330 #endif
-    331             (r-&gt;r_ifindex &amp;&amp; r-&gt;r_ifindex != key-&gt;iif))
-    332         continue;/*以上为判断规则是否匹配，如果不匹配则扫描下一条规则，否则继续*/
-    335         switch (r-&gt;r_action) {/*好了，开始处理动作了*/
-    336         case RTN_UNICAST:/*没有设置动作*/
-    337         case RTN_NAT: /*动作nat ADDRESS*/
-    338             policy = r;
-    339             break;
-    340         case RTN_UNREACHABLE: /*动作unreachable*/
-    341             read_unlock(&amp;fib_rules_lock);
-    342             return -ENETUNREACH;
-    343         default:
-    344             case RTN_BLACKHOLE:/* 动作reject */
-    345             read_unlock(&amp;fib_rules_lock);
-    346             return -EINVAL;
-    347         case RTN_PROHIBIT:/* 动作prohibit */
-    348             read_unlock(&amp;fib_rules_lock);
-    349             return -EACCES;
-    350         }
-    351         /*选择路由表*/
-    352         if ((tb = fib_get_table(r-&gt;r_table)) == NULL)
-    353             continue;
-            /*在路由表里寻找指定的路由*/
-    354         err = tb-&gt;tb_lookup(tb, key, res);
-    355         if (err == 0) {/*命中目标*/
-    356             res-&gt;r = policy;
-    357             if (policy)
-    358                 atomic_inc(&amp;policy-&gt;r_clntref);
-    359             read_unlock(&amp;fib_rules_lock);
-    360             return 0;
-    361         }
-    362         if (err &lt; 0 &amp;&amp; err != -EAGAIN) {/*路由失败*/
-    363             read_unlock(&amp;fib_rules_lock);
-    364             return err;
-    365         }
-    366     }
-    368     read_unlock(&amp;fib_rules_lock);
-    369     return -ENETUNREACH;
-    370 }
-</code></pre>
-
-<p>上面的这段代码的思路是非常的清晰的。首先程序从优先级高到低扫描所有的规则，如果规则匹配，处理该规则的动作。如果是普通的路由寻址或者是nat地址转换的换，首先从规则得到路由表，然后对该路由表进行操作。这样RPDB终于清晰的显现出来了。</p>
-
-<h4>5.2 IP层路由适配（IP route）</h4>
-
-<p>路由表以及规则组成的系统，可以完成路由的管理以及查找的工作，但是为了使得IP层的路由工作更加的高效，linux的路由体系里，route.c里完成大多数IP层与RPDB的适配工作，以及路由缓冲（route cache）的功能。</p>
-
-<h5>调用接口</h5>
-
-<p>IP层的路由接口分为发送路由接口以及接收路由接口：</p>
-
-<h5>发送路由接口</h5>
-
-<p>IP层在发送数据时如果需要进行路由工作的时候，就会调用ip_route_out函数。这个函数在完成一些键值的简单转换以后，就会调用ip_route_output_key函数，这个函数首先在缓存里寻找路由，如果失败就会调用ip_route_output_slow，ip_route_output_slow里调用fib_lookup在路由表里寻找路由，如果命中，首先在缓存里添加这个路由，然后返回结果。</p>
-
-<p>ip_route_out route.h</p>
-
-<p>ip_route_output_key route.c 1984;</p>
-
-<p>ip_route_output_slow route.c 1690;"</p>
-
-<h5>接收路由接口</h5>
-
-<p>IP层接到一个数据包以后，如果需要进行路由，就调用函数ip_route_input，ip_route_input现在缓存里寻找，如果失败则ip_route_inpu调用ip_route_input_slow， ip_route_input_slow里调用fib_lookup在路由表里寻找路由，如果命中，首先在缓存里添加这个路由，然后返回结果。</p>
-
-<p>ip_route_input_slow route.c 1312;&ldquo; f</p>
-
-<p>ip_route_input route.c 1622;&ldquo; f</p>
-
-<h3>cache</h3>
-
-<p>路由缓存保存的是最近使用的路由。当IP在路由表进行路由以后，如果命中就会在路由缓存里增加该路由。同时系统还会定时检查路由缓存里的项目是否失效，如果失效则清除。</p>
 ]]></content>
   </entry>
   
