@@ -11,6 +11,27 @@ categories:
 tags: 
 ---
 
+### vim .screenrc
+```
+	deflogin off
+	startup_message off
+	defscrollback 100000
+
+	caption always "%H %c | %3n %t%? @%u%?%? [%h]%?%=%c"
+	hardstatus alwayslastline '%{bW}%-w%{.wB}%n %t%{-}%+w %=%{.w}'
+
+	screen -t bash
+	screen -t bash
+```
+
+### vim .bashrc
+```
+	export LANG=en_US.UTF-8	# 有些终端会初始化出 LANG=c
+	export TERM=linux	# screen 的bash默认 TERM=screen，标签的标题就会随 /etc/bashrc 里的变化
+```
+
+--------------
+
 #### 断开控制台而不结束会话-Screen
 
 设想一下，你通过 ssh 连接到了一台服务器，接着你开始编译一个软件。这或许要占用你一个小时甚至更多的时间，突然！你需要离开，或者是断开网络了~  
