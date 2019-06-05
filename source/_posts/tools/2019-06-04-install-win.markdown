@@ -6,8 +6,8 @@ comments: false
 categories:
 - 2019
 - 2019~06
-- tools
-- tools~ubuntu
+- system
+- system~ubuntu
 tags:
 ---
 
