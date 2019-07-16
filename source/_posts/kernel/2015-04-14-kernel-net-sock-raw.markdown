@@ -1,6 +1,6 @@
 ---
 layout: post
-title: " Linux网络编程：原始套接字 SOCK_RAW"
+title: "Linux网络编程：原始套接字 SOCK_RAW, IPV6 rawsocket"
 date: 2015-04-14 21:27:00 +0800
 comments: false
 categories:
@@ -10,6 +10,24 @@ categories:
 - kernel~net
 tags:
 ---
+
+https://stackoverflow.com/questions/31419727/how-to-send-modified-ipv6-packet-through-raw-socket
+
+比较新的内核才支持
+```
+	socket(fd, SOCK_RAW, IPPROTO_UDP); // 指定 TCP/UDP/ICMP
+
+	int val = 1;
+	ret = setsockopt(test->state.sockfd, IPPROTO_IPV6, IPV6_HDRINCL, &val, sizeof(val)); // 比较新的内核才支持
+
+	remote.sin6_port = 0; // 必须设置成0
+	sendto (socketFd, buffer, len, 0, (struct sockaddr *) &remote, sizeof(remote));
+
+```
+
+
+---------------------
+
 http://blog.chinaunix.net/uid-23069658-id-3280895.html
 
 #### 一、修改iphdr+tcphdr
