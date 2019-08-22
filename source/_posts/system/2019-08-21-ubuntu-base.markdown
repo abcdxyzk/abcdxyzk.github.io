@@ -127,3 +127,14 @@ https://www.cnblogs.com/fiberhome/p/8275961.html
 	sudo apt purge ubuntu-unity-desktop
 	sudo dpkg-reconfigure gdm3
 ```
+
+#### 18.04 用synergy1.6.2
+
+https://packages.ubuntu.com/xenial/libcrypto++9v5
+
+https://packages.ubuntu.com/xenial/synergy
+
+[synergy_1.6.2-0ubuntu2_amd64.deb](/download/system/synergy_1.6.2-0ubuntu2_amd64.deb)
+
+[libcrypto++9v5_5.6.1-9ubuntu0.1_amd64.deb](/download/system/libcrypto++9v5_5.6.1-9ubuntu0.1_amd64.deb)
+
