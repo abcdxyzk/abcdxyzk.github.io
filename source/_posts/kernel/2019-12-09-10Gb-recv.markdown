@@ -110,65 +110,6 @@ ixgbe做法是在ixgbe_is_non_eop中将skb放到ntc=next_to_clean+1中的rx_ring
 #### XDP
 XDP是在申请skb之前直接处理数据，如果要丢弃就不用申请skb了。
 
-较新的Linux内核带这个功能，ixgbe官网驱动5.3.8没看到。
-
-ixgbe-5.3.8驱动加上以下patch就能丢弃所有包
-
-```
-	diff --git a/src/ixgbe_main.c b/src/ixgbe_main.c
-	index 0191ee2..4951f83 100644
-	--- a/src/ixgbe_main.c
-	+++ b/src/ixgbe_main.c
-	@@ -1711,6 +1711,9 @@ static bool ixgbe_cleanup_headers(struct ixgbe_ring __maybe_unused *rx_ring,
-	 				  union ixgbe_adv_rx_desc *rx_desc,
-	 				  struct sk_buff *skb)
-	 {
-	+	if (IS_ERR(skb))
-	+		return true;
-	+
-	 	/* verify that the packet does not have any known errors */
-	 	if (unlikely(ixgbe_test_staterr(rx_desc,
-	 					IXGBE_RXDADV_ERR_FRAME_ERR_MASK))) {
-	@@ -1874,10 +1877,10 @@ ixgbe_get_rx_buffer(struct ixgbe_ring *rx_ring,
-	 	 * Only unmap it when EOP is reached
-	 	 */
-	 	if (!ixgbe_test_staterr(rx_desc, IXGBE_RXD_STAT_EOP)) {
-	-		if (!*skb)
-	+		if (!*skb || IS_ERR(*skb))
-	 			goto skip_sync;
-	 	} else {
-	-		if (*skb)
-	+		if (*skb && !IS_ERR(*skb))
-	 			ixgbe_dma_sync_frag(rx_ring, *skb);
-	 	}
-	 
-	@@ -1901,7 +1904,7 @@ static void ixgbe_put_rx_buffer(struct ixgbe_ring *rx_ring,
-	 		/* hand second half of page back to the ring */
-	 		ixgbe_reuse_rx_page(rx_ring, rx_buffer);
-	 	} else {
-	-		if (IXGBE_CB(skb)->dma == rx_buffer->dma) {
-	+		if (!IS_ERR(skb) && IXGBE_CB(skb)->dma == rx_buffer->dma) {
-	 			/* the page has been released from the ring */
-	 			IXGBE_CB(skb)->page_released = true;
-	 		} else {
-	@@ -2058,8 +2061,14 @@ static int ixgbe_clean_rx_irq(struct ixgbe_q_vector *q_vector,
-	 
-	 		rx_buffer = ixgbe_get_rx_buffer(rx_ring, rx_desc, &skb, size);
-	 
-	-		/* retrieve a buffer from the ring */
-	-		if (skb)
-	+		if (!skb)
-	+			skb = ERR_PTR(-1);
-	+
-	+		if (IS_ERR(skb)) {
-	+			rx_buffer->pagecnt_bias++;
-	+			total_rx_packets++;
-	+			total_rx_bytes += size;
-	+		} else if (skb)
-	 			ixgbe_add_rx_frag(rx_ring, rx_buffer, skb, size);
-	 #ifdef HAVE_SWIOTLB_SKIP_CPU_SYNC
-	 		else if (ring_uses_build_skb(rx_ring))
-```
 
 ### 测试
 #### 环境
@@ -178,22 +119,31 @@ X520-T1
 ubuntu 16.04, linux-image-4.15.0-XX
 
 #### netmap
-netmap是一种网卡旁路方法，用netmap测试，只用一个cpu，收包在12Mpps, 使用率 100%。
+netmap是一种网卡旁路方法，用netmap测试，只用一个cpu。
+1个cpu, 2GHz， 12.8Mpps   100%
+1个cpu, 3.6GHz，14.2Mpps  100%
 
-#### 用上面的patch全部丢包
-只用一个cpu，收包14.2Mpps, 使用率 ？
+#### ixgbe全部丢包
+ixgbe-5.6.5 的带了XDP功能, 在 ixgbe_run_xdp 直接 return ERR_PTR(-IXGBE_XDP_CONSUMED);
+1个cpu, 2GHz， 14.2Mpps   <20% ?   用 ixgbe-5.3.8 加上XDP功能 cpu需要 93%
+1个cpu, 3.6GHz，14.2Mpps  <10% ?   用 ixgbe-5.3.8 加上XDP功能 cpu需要 30%
 
 #### pre_routing 丢包
-只用一个cpu，收包5Mpps，使用率100%
-用3个cpppu，收14.2Mpps，每个cpu 90%
+1个cpu, 2GHz， 3.2Mpps   100%
+1个cpu, 3.6GHz，5.5Mpps  100%
 
 #### local_in 丢包
-1个cpu
-4个cpu
-local_in比pre_routing多了路由查找、反向路由检查，这两个都太慢。
+1个cpu, 2GHz， 1.2Mpps   100%
+1个cpu, 3.6GHz，2.1Mpps  100%
+local_in比pre_routing多了路由查找，这个都太慢。
 
+#### 不处理
+1个cpu, 2GHz， 1.2Mpps   100%
+1个cpu, 3.6GHz，2.1Mpps  100%
 
 ### 参考
+
+[linux-source-4.15.0_4.15.0-65.74_all.deb](http://launchpadlibrarian.net/443052277/linux-source-4.15.0_4.15.0-65.74_all.deb)
 
 [二层报文发送之qdisc实现分析](https://blog.csdn.net/one_clouder/article/details/52685249)
 
