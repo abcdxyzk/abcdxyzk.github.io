@@ -1,0 +1,132 @@
+---
+layout: post
+title: "X520-T1 Linux内核发包14Mpps"
+date: 2019-12-09 10:46:00 +0800
+comments: false
+published: false
+categories:
+- 2019
+- 2019~12
+- kernel
+- kernel~10Gb
+tags:
+---
+
+### 目的
+测试并优化Linux内核发包
+
+### 环境
+ga-b250m-d3h
+I7-7700k, 4核8线程，no_trubo=1即最高4.2GHz
+X520-T1
+ubuntu 18.04, linux-image-4.15.0-XX
+
+### netmap
+netmap是一种网卡旁路方法，用netmap测试，发包在 14.3Mpps, 单cpu 70%。测试命令
+```
+```
+
+### Linux多线程发包
+在模块中用kthread创建多线程，每个线程构造skb，然后调dev_queue_xmit(skb)。测试发现cpu全部100%，发包大多在12Mpps
+		tcp		udp
+fq_codel	12.0Mpps/100%	12.8Mpps/100%
+pfifo_fast	12.7Mpps/100%	14.0Mpps/100%
+noqueue		12.0Mpps/100%	12.8Mpps/100%
+
+### 猜测可能优化点
+1. qdisc流控
+2. skb的申请、释放
+
+### 优化qdisc流控
+
+qdisc流控可以简单看作把包存下，然后再发送出去。取消qdisc应该能减少一层消耗。
+
+```
+	dev_queue_xmit -> dev_hard_start_xmit -> xmit_one -> netdev_start_xmit -> __netdev_start_xmit
+```
+将上面的代码copy到模块，就跳过了qdisc。其实noqueue也是这个流程，但为什么noqueue的pps、cpu都没提升呢？
+
+测试发现skb->xmit_more是关键，ixgbe中关于xmit_more的代码：
+
+```
+        if (netif_xmit_stopped(txring_txq(tx_ring)) || !skb->xmit_more) {
+                writel(i, tx_ring->tail);
+
+                /* we need this if more than one processor can write to our tail
+                 * at a time, it synchronizes IO on IA64/Altix systems
+                 */
+                mmiowb();
+        }
+```
+noqueue中没有设置xmit_more，但fq_codel,pfifo_fast等用到qdisc框架的都会设置xmit_more，qdisc是用skb->next将skb串起来，当skb->next != NULL时在dev_hard_start_xmit会设置xmit_more=1。
+
+优化后：在我们的模块中每次申请多个包，将他们用skb->next串起来再发送。优化后发包在14.2Mpps,每个cpu都60%。
+
+### 优化skb的申请、释放
+每秒申请、释放14M的skb有点多。。。
+
+我们可以创建percpu的skb池，申请的时候从池子里拿，释放的时候放回池子。
+1. 怎么做到释放时放回池子？用skb->destructor指向我们的回调函数即可
+2. 怎么做到不让Linux内核释放skb以及skb->data的空间？增加如下内核patch，设置池子里的skb->fclone = SKB_FCLONE_USER即可。
+
+```
+	diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+	index 2742528..cd240a9 100644
+	--- a/include/linux/skbuff.h
+	+++ b/include/linux/skbuff.h
+	@@ -532,6 +532,7 @@ enum {
+	 	SKB_FCLONE_UNAVAILABLE,	/* skb has no fclone (from head_cache) */
+	 	SKB_FCLONE_ORIG,	/* orig skb (from fclone_cache) */
+	 	SKB_FCLONE_CLONE,	/* companion fclone skb (from fclone_cache) */
+	+	SKB_FCLONE_USER,
+	 };
+	 
+	 enum {
+	diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+	index cac95aa..b8fb200 100644
+	--- a/net/core/skbuff.c
+	+++ b/net/core/skbuff.c
+	@@ -585,6 +585,8 @@ static void kfree_skbmem(struct sk_buff *skb)
+	 	case SKB_FCLONE_UNAVAILABLE:
+	 		kmem_cache_free(skbuff_head_cache, skb);
+	 		return;
+	+	case SKB_FCLONE_USER:
+	+		return;
+	 
+	 	case SKB_FCLONE_ORIG:
+	 		fclones = container_of(skb, struct sk_buff_fclones, skb1);
+	@@ -627,7 +629,7 @@ void skb_release_head_state(struct sk_buff *skb)
+	 static void skb_release_all(struct sk_buff *skb)
+	 {
+	 	skb_release_head_state(skb);
+	-	if (likely(skb->head))
+	+	if (likely(skb->head) && skb->fclone != SKB_FCLONE_USER)
+	 		skb_release_data(skb);
+	 }
+```
+
+优化后：
+单独优化skb申请释放：
+发送14.2Mpps 每个cpu 50%
+
+qdisc优化和skb申请释放优化：
+发送14.2Mpps 每个cpu 20%
+
+只用1个cpu：发送9.6Mpps, cpu 100%
+用2个cpu：发送14.2Mpps, 每个cpu 80%
+
+相比netmap单cpu 70%发送14.3Mpps, 两轮优化后还略差些，不过perf看热点已经在ixgbe里了
+
+
+### 参考
+
+[二层报文发送之qdisc实现分析](https://blog.csdn.net/one_clouder/article/details/52685249)
+
+[netmap配置](https://www.cnblogs.com/ne-liqian/p/9294757.html)
+
+[基于82599网卡的二层网络数据包接收](https://tqr.ink/2017/04/16/intel-82599-receive-packet/)
+
+[基于82599网卡的二层网络数据包发送](https://tqr.ink/2017/05/01/intel-82599-transmit-packet/)
+
+[如何在一秒之内丢弃1000万个网络数据包](https://www.ichenfu.com/2019/03/10/how-to-drop-10-million-packets-per-second/)
+

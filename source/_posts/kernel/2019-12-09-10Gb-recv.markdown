@@ -1,0 +1,207 @@
+---
+layout: post
+title: "X520-T1 Linux内核收包14Mpps"
+date: 2019-10-31 14:56:00 +0800
+comments: false
+published: false
+categories:
+- 2019
+- 2019~10
+- kernel
+- kernel~10Gb
+tags:
+---
+
+### 目的
+测试并优化Linux内核收包
+
+### ixgbe收包
+cpu和网卡队列一一绑定。
+
+一些重要变量
+
+rx_ring->next_to_clean	下一个收到的包放这里，所以要预先申请好内存
+rx_ring->next_to_alloc	下一个要申请内存的位置
+rx_ring->next_to_use	[next_to_clean, next_to_use)这个区间的内存是申请好的了，网卡可以直接用。
+			一般取值为[next_to_alloc - IXGBE_RX_BUFFER_WRITE, next_to_alloc], next_to_use 在ixgbe_alloc_rx_buffers里更新。
+
+假设收包队列为512，那么ixgbe初始化之后
+rx_ring->next_to_clean	= 0;
+rx_ring->next_to_use	= 511;
+rx_ring->next_to_alloc	= 511;
+
+这里刚好留了一个位置没申请内存，这个跟reuse有关，后面再看。
+
+初始化流程：
+ixgbe_up -> ixgbe_configure -> ixgbe_configure_rx -> ixgbe_configure_rx_ring -> ixgbe_alloc_rx_buffers(ring, ixgbe_desc_unused(ring))
+
+```
+	static inline u16 ixgbe_desc_unused(struct ixgbe_ring *ring)
+	{
+		u16 ntc = ring->next_to_clean;
+		u16 ntu = ring->next_to_use;
+
+		return ((ntc > ntu) ? 0 : ring->count) + ntc - ntu - 1; // 这里保留一个位置
+	}
+```
+
+#### 收包函数 ixgbe_clean_rx_irq 简化流程为
+
+1. 空了太多就申请内存，空是指 [next_to_use, next_to_clean)这段“没申请”内存的地方
+```
+	if (cleaned_count >= IXGBE_RX_BUFFER_WRITE) {
+		ixgbe_alloc_rx_buffers(rx_ring, cleaned_count);
+		cleaned_count = 0;
+	}
+```
+
+2. 检查是否收到数据
+```
+	rx_desc = IXGBE_RX_DESC(rx_ring, rx_ring->next_to_clean);
+	size = le16_to_cpu(rx_desc->wb.upper.length);
+	if (!size)
+		break;
+```
+
+3. 申请skb
+```
+	rx_buffer = ixgbe_get_rx_buffer(rx_ring, rx_desc, &skb, size);
+	if (skb)
+		ixgbe_add_rx_frag(rx_ring, rx_buffer, skb, size); // EOP 场景才到这里
+	else
+		skb = ixgbe_build_skb(rx_ring, rx_buffer, rx_desc, size);
+```
+
+4. reuse buffer
+```
+	ixgbe_put_rx_buffer(rx_ring, rx_buffer, skb);
+```
+
+5. EOP
+```
+	if (ixgbe_is_non_eop(rx_ring, rx_desc, skb))
+		continue;
+```
+
+#### reuse buffer
+先不看EOP、XDP, 唯一问题是reuse buffer。
+
+其实在ixgbe初始化时申请的内存是可以放两个包的，假设为b1、b2。
+
+网卡收第一个包时，存在了b1，但b2没被使用，在ixgbe_put_rx_buffer里将b2放到next_to_alloc里，所以至少要空一个位置。这时
+rx_ring->next_to_clean	= 1;
+rx_ring->next_to_use	= 511;
+rx_ring->next_to_alloc	= 0;
+
+b1、b2中间隔了510个包
+
+当收第512个包时，网卡把它存在了b2，这时b1如果被消费了（大概率事件），那么b1又是可以被reuse，再把b1放到next_to_alloc。这样在skb及时消费的情况下就不用再申请内存给网卡。
+
+
+#### EOP
+
+EOP = End of Packet
+
+如果收上来的数据没有EOP标志位，说明不是一个完整的包，要等后面的数据。
+一个包对应一个skb结构，第一块数据到的时候就申请了skb，下一个数据到来的时候不需要再申请skb。
+ixgbe做法是在ixgbe_is_non_eop中将skb放到ntc=next_to_clean+1中的rx_ring->rx_buffer_info[ntc].skb = skb; 下一块数据到来时直接在ixgbe_get_rx_buffer中取出这个skb，不需要再申请。数据放到skb_shinfo(skb)->frags[]中。
+
+
+#### XDP
+XDP是在申请skb之前直接处理数据，如果要丢弃就不用申请skb了。
+
+较新的Linux内核带这个功能，ixgbe官网驱动5.3.8没看到。
+
+ixgbe-5.3.8驱动加上以下patch就能丢弃所有包
+
+```
+	diff --git a/src/ixgbe_main.c b/src/ixgbe_main.c
+	index 0191ee2..4951f83 100644
+	--- a/src/ixgbe_main.c
+	+++ b/src/ixgbe_main.c
+	@@ -1711,6 +1711,9 @@ static bool ixgbe_cleanup_headers(struct ixgbe_ring __maybe_unused *rx_ring,
+	 				  union ixgbe_adv_rx_desc *rx_desc,
+	 				  struct sk_buff *skb)
+	 {
+	+	if (IS_ERR(skb))
+	+		return true;
+	+
+	 	/* verify that the packet does not have any known errors */
+	 	if (unlikely(ixgbe_test_staterr(rx_desc,
+	 					IXGBE_RXDADV_ERR_FRAME_ERR_MASK))) {
+	@@ -1874,10 +1877,10 @@ ixgbe_get_rx_buffer(struct ixgbe_ring *rx_ring,
+	 	 * Only unmap it when EOP is reached
+	 	 */
+	 	if (!ixgbe_test_staterr(rx_desc, IXGBE_RXD_STAT_EOP)) {
+	-		if (!*skb)
+	+		if (!*skb || IS_ERR(*skb))
+	 			goto skip_sync;
+	 	} else {
+	-		if (*skb)
+	+		if (*skb && !IS_ERR(*skb))
+	 			ixgbe_dma_sync_frag(rx_ring, *skb);
+	 	}
+	 
+	@@ -1901,7 +1904,7 @@ static void ixgbe_put_rx_buffer(struct ixgbe_ring *rx_ring,
+	 		/* hand second half of page back to the ring */
+	 		ixgbe_reuse_rx_page(rx_ring, rx_buffer);
+	 	} else {
+	-		if (IXGBE_CB(skb)->dma == rx_buffer->dma) {
+	+		if (!IS_ERR(skb) && IXGBE_CB(skb)->dma == rx_buffer->dma) {
+	 			/* the page has been released from the ring */
+	 			IXGBE_CB(skb)->page_released = true;
+	 		} else {
+	@@ -2058,8 +2061,14 @@ static int ixgbe_clean_rx_irq(struct ixgbe_q_vector *q_vector,
+	 
+	 		rx_buffer = ixgbe_get_rx_buffer(rx_ring, rx_desc, &skb, size);
+	 
+	-		/* retrieve a buffer from the ring */
+	-		if (skb)
+	+		if (!skb)
+	+			skb = ERR_PTR(-1);
+	+
+	+		if (IS_ERR(skb)) {
+	+			rx_buffer->pagecnt_bias++;
+	+			total_rx_packets++;
+	+			total_rx_bytes += size;
+	+		} else if (skb)
+	 			ixgbe_add_rx_frag(rx_ring, rx_buffer, skb, size);
+	 #ifdef HAVE_SWIOTLB_SKIP_CPU_SYNC
+	 		else if (ring_uses_build_skb(rx_ring))
+```
+
+### 测试
+#### 环境
+ga-b250m-hd3
+I5-6500, 4核4线程
+X520-T1
+ubuntu 16.04, linux-image-4.15.0-XX
+
+#### netmap
+netmap是一种网卡旁路方法，用netmap测试，只用一个cpu，收包在12Mpps, 使用率 100%。
+
+#### 用上面的patch全部丢包
+只用一个cpu，收包14.2Mpps, 使用率 ？
+
+#### pre_routing 丢包
+只用一个cpu，收包5Mpps，使用率100%
+用3个cpppu，收14.2Mpps，每个cpu 90%
+
+#### local_in 丢包
+1个cpu
+4个cpu
+local_in比pre_routing多了路由查找、反向路由检查，这两个都太慢。
+
+
+### 参考
+
+[二层报文发送之qdisc实现分析](https://blog.csdn.net/one_clouder/article/details/52685249)
+
+[netmap配置](https://www.cnblogs.com/ne-liqian/p/9294757.html)
+
+[基于82599网卡的二层网络数据包接收](https://tqr.ink/2017/04/16/intel-82599-receive-packet/)
+
+[基于82599网卡的二层网络数据包发送](https://tqr.ink/2017/05/01/intel-82599-transmit-packet/)
+
+[如何在一秒之内丢弃1000万个网络数据包](https://www.ichenfu.com/2019/03/10/how-to-drop-10-million-packets-per-second/)
+
