@@ -16,11 +16,11 @@ tags:
 测试并优化Linux内核收包
 
 ### ixgbe收包
-cpu和网卡队列一一绑定。
+前期设置：cpu和网卡队列一一绑定，irqbalance stop等。
 
-一些重要变量
+rx_ring->rx_buffer_info[]是收包用的循环队列。rx_ring中关于循环队列的一些重要变量：
 
-rx_ring->next_to_clean	下一个收到的包放这里，所以要预先申请好内存
+rx_ring->next_to_clean	网卡收到的下一个包放这里，所以要预先申请好内存
 rx_ring->next_to_alloc	下一个要申请内存的位置
 rx_ring->next_to_use	[next_to_clean, next_to_use)这个区间的内存是申请好的了，网卡可以直接用。
 			一般取值为[next_to_alloc - IXGBE_RX_BUFFER_WRITE, next_to_alloc], next_to_use 在ixgbe_alloc_rx_buffers里更新。
@@ -33,8 +33,9 @@ rx_ring->next_to_alloc	= 511;
 这里刚好留了一个位置没申请内存，这个跟reuse有关，后面再看。
 
 初始化流程：
-ixgbe_up -> ixgbe_configure -> ixgbe_configure_rx -> ixgbe_configure_rx_ring -> ixgbe_alloc_rx_buffers(ring, ixgbe_desc_unused(ring))
+ixgbe_up() -> ixgbe_configure() -> ixgbe_configure_rx() -> ixgbe_configure_rx_ring() -> ixgbe_alloc_rx_buffers(ring, ixgbe_desc_unused(ring))
 
+ixgbe_desc_unused 决定了预留一个位置。
 ```
 	static inline u16 ixgbe_desc_unused(struct ixgbe_ring *ring)
 	{
@@ -47,7 +48,7 @@ ixgbe_up -> ixgbe_configure -> ixgbe_configure_rx -> ixgbe_configure_rx_ring -> 
 
 #### 收包函数 ixgbe_clean_rx_irq 简化流程为
 
-1. 空了太多就申请内存，空是指 [next_to_use, next_to_clean)这段“没申请”内存的地方
+1. 预先申请内存，为[next_to_use, next_to_clean)这段“没申请”内存的队列申请
 ```
 	if (cleaned_count >= IXGBE_RX_BUFFER_WRITE) {
 		ixgbe_alloc_rx_buffers(rx_ring, cleaned_count);
@@ -84,11 +85,11 @@ ixgbe_up -> ixgbe_configure -> ixgbe_configure_rx -> ixgbe_configure_rx_ring -> 
 ```
 
 #### reuse buffer
-先不看EOP、XDP, 唯一问题是reuse buffer。
+先不看EOP、XDP, 流程就很简单，唯一问题是reuse buffer。
 
-其实在ixgbe初始化时申请的内存是可以放两个包的，假设为b1、b2。
+其实在ixgbe初始化时rx_ring->rx_buffer_info队列上每个位置申请的内存都可以放两个包的，假设rx_ring->rx_buffer_info[0]上的空间为b1、b2。
 
-网卡收第一个包时，存在了b1，但b2没被使用，在ixgbe_put_rx_buffer里将b2放到next_to_alloc里，所以至少要空一个位置。这时
+网卡收第一个包时，存在了b1，但b2没被使用，在ixgbe_put_rx_buffer()里将b2放到next_to_alloc里，所以前面初始化时至少要空一个位置。这时
 rx_ring->next_to_clean	= 1;
 rx_ring->next_to_use	= 511;
 rx_ring->next_to_alloc	= 0;
@@ -104,12 +105,13 @@ EOP = End of Packet
 
 如果收上来的数据没有EOP标志位，说明不是一个完整的包，要等后面的数据。
 一个包对应一个skb结构，第一块数据到的时候就申请了skb，下一个数据到来的时候不需要再申请skb。
-ixgbe做法是在ixgbe_is_non_eop中将skb放到ntc=next_to_clean+1中的rx_ring->rx_buffer_info[ntc].skb = skb; 下一块数据到来时直接在ixgbe_get_rx_buffer中取出这个skb，不需要再申请。数据放到skb_shinfo(skb)->frags[]中。
+ixgbe做法是在ixgbe_is_non_eop()中将skb放到ntc=next_to_clean+1中的rx_ring->rx_buffer_info[ntc].skb = skb; 下一块数据到来时直接在ixgbe_get_rx_buffer()中取出这个skb，不需要再申请。之后收到的数据会依次放到skb_shinfo(skb)->frags[]中, 具体见ixgbe_add_rx_frag()。
 
 
 #### XDP
-XDP是在申请skb之前直接处理数据，如果要丢弃就不用申请skb了。
+XDP是在申请skb结构之前直接处理网卡收到的数据，如果要丢弃就不用申请skb了。
 
+较新的Linux内核或官网驱动ixgbe-5.6.5中包含该功能。
 
 ### 测试
 #### 环境
@@ -117,14 +119,15 @@ ga-b250m-hd3
 I5-6500, 4核4线程
 X520-T1
 ubuntu 16.04, linux-image-4.15.0-XX
+主板设置只开启一核(直接丢包场景下增加核数处理能力线性增加)
 
 #### netmap
 netmap是一种网卡旁路方法，用netmap测试，只用一个cpu。
 1个cpu, 2GHz， 12.8Mpps   100%
 1个cpu, 3.6GHz，14.2Mpps  100%
 
-#### ixgbe全部丢包
-ixgbe-5.6.5 的带了XDP功能, 在 ixgbe_run_xdp 直接 return ERR_PTR(-IXGBE_XDP_CONSUMED);
+#### 模仿XDP丢包
+ixgbe-5.6.5 的带了XDP功能, 在 ixgbe_run_xdp 直接 return ERR_PTR(-IXGBE_XDP_CONSUMED); 也就是全部丢包。
 1个cpu, 2GHz， 14.2Mpps   <20% ?   用 ixgbe-5.3.8 加上XDP功能 cpu需要 93%
 1个cpu, 3.6GHz，14.2Mpps  <10% ?   用 ixgbe-5.3.8 加上XDP功能 cpu需要 30%
 
