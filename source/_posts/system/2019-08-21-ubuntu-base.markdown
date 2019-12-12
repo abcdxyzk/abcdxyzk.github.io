@@ -11,8 +11,9 @@ categories:
 tags:
 ---
 
-#### amdgpu.dc=0
-4.15.0 以后内核黑屏，需要设置amdgpu.dc=0
+#### amdgpu.dc
+VGA,DIV-D接口 4.15.0 以后内核黑屏，需要设置amdgpu.dc=0
+HDMI,DP接口支持音频，需要设置amdgpu.dc=1
 
 #### 注释掉下面这行将会显示引导菜单
 ```

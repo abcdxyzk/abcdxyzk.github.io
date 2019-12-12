@@ -18,6 +18,11 @@ tags:
 	set cindent
 	set nu
 	set hlsearch
+
+	# vim 乱码
+	set fileencodings=utf-8,ucs-bom,gb18030,gbk,gb2312,cp936
+	set termencoding=utf-8
+	set encoding=utf-8
 ```
 恢复文件关闭之前光标的位置  
 Vim的全局配置/etc/vim/vimrc，被注释的这么几行：取消注释，g后面的'改成`，改好如下
