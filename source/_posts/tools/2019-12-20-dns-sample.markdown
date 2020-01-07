@@ -36,7 +36,7 @@ https://gist.github.com/fffaraz/9d9170b57791c28ccda9255b48315168
 	#define T_MX	15	//Mail server
 	#define T_AAAA	28	// IPv6
 
-	#define NIPQUAD(addr) ((unsigned char *)&addr)[0], ((unsigned char *)&addr)[1], ((unsigned char *)&addr)[2], ((unsigned char *)&addr)[3]
+	#define NIPQUAD(addr) ((unsigned char *)addr)[0], ((unsigned char *)addr)[1], ((unsigned char *)addr)[2], ((unsigned char *)addr)[3]
 
 	//DNS header structure
 	struct DNS_HEADER
