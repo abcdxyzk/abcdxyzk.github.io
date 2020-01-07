@@ -1,6 +1,6 @@
 ---
 layout: post
-title: "NDS示例"
+title: "DNS示例"
 date: 2019-12-20 41:05:00 +0800
 comments: false
 categories:
