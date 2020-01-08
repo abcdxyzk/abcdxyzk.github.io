@@ -11,6 +11,22 @@ categories:
 tags:
 ---
 
+#### 代理设置
+```
+	# cat /etc/apt/apt.conf
+	http_proxy=http://proxy.proxy.com:8080
+	https_proxy=http://proxy.proxy.com:8080
+
+	# cat /etc/environment
+	http_proxy=http://proxy.proxy.com:8080
+	https_proxy=http://proxy.proxy.com:8080
+	no_proxy=localhost,127.0.0.0/8,::1,*.pp.com,*.oa.com
+
+	# cat /etc/systemd/system/docker.service.d/http-proxy.conf
+	[Service]
+	Environment="HTTP_PROXY=http://proxy.proxy.com:8080"
+```
+
 #### amdgpu.dc
 VGA,DIV-D接口 4.15.0 以后内核黑屏，需要设置amdgpu.dc=0
 HDMI,DP接口支持音频，需要设置amdgpu.dc=1
