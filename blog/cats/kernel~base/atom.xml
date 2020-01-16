@@ -4,7 +4,7 @@
   <title><![CDATA[Category: kernel~base | kk Blog —— 通用基础]]></title>
   <link href="http://abcdxyzk.github.io/blog/cats/kernel~base/atom.xml" rel="self"/>
   <link href="http://abcdxyzk.github.io/"/>
-  <updated>2019-12-12T12:13:35+08:00</updated>
+  <updated>2020-01-16T13:29:26+08:00</updated>
   <id>http://abcdxyzk.github.io/</id>
   <author>
     <name><![CDATA[kk]]></name>
@@ -12,6 +12,143 @@
   </author>
   <generator uri="http://octopress.org/">Octopress</generator>
 
+  
+  <entry>
+    <title type="html"><![CDATA[KASLR 内核动态地址]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2020/01/07/KASLR/"/>
+    <updated>2020-01-07T11:23:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2020/01/07/KASLR</id>
+    <content type="html"><![CDATA[<p>/proc/kallsyms 和 /boot/System.map-xxx 一致需要修改 .config
+<code>
+    &lt; # CONFIG_RANDOMIZE_BASE is not set
+    ---
+    &gt; CONFIG_RANDOMIZE_BASE=y
+    &gt; CONFIG_X86_NEED_RELOCS=y
+    &gt; CONFIG_RANDOMIZE_MEMORY=y
+    &gt; CONFIG_RANDOMIZE_MEMORY_PHYSICAL_PADDING=0xa
+</code></p>
+
+<hr />
+
+<p><a href="http://www.wowotech.net/memory_management/441.html">http://www.wowotech.net/memory_management/441.html</a></p>
+
+<h3>引言</h3>
+
+<p>什么是KASLR？KASLR是kernel address space layout randomization的缩写，直译过来就是内核地址空间布局随机化。KASLR技术允许kernel image加载到VMALLOC区域的任何位置。当KASLR关闭的时候，kernel image都会映射到一个固定的链接地址。对于黑客来说是透明的，因此安全性得不到保证。KASLR技术可以让kernel image映射的地址相对于链接地址有个偏移。偏移地址可以通过dts设置。如果bootloader支持每次开机随机生成偏移数值，那么可以做到每次开机kernel image映射的虚拟地址都不一样。因此，对于开启KASLR的kernel来说，不同的产品的kernel image映射的地址几乎都不一样。因此在安全性上有一定的提升。</p>
+
+<p>注：文章代码分析基于linux-4.15，架构基于aarch64（ARM64）。</p>
+
+<h3>如何使用</h3>
+
+<p>打开KASLR功能非常简单，在支持KASLR的内核配置选项添加选项CONFIG_RANDOMIZE_BASE=y。同时还需要告知kernel映射的偏移地址，通过dts传递。在chosen节点下添加kaslr-seed属性。属性值就是偏移地址。另外command line不要带nokaslr，否则KASLR还是关闭。dts信息举例如下。顺便说一下，在dts中&lt;>符号中是一个32 bit的值。但是在ARM64平台，这里的kaslr-seed属性是一个特例，他就是一个64 bit的值。</p>
+
+<pre><code>    / {
+        chosen {
+            kaslr-seed = &lt;0x10000000&gt;;
+        };
+    }; 
+</code></pre>
+
+<h3>如何获取偏移</h3>
+
+<p>kaslr-seed属性的解析在kaslr_early_init函数完成。该函数根据输入参数dtb首地址（物理地址）解析dtb，找到偏移地址，最后返回。kaslr_early_init实现如下。</p>
+
+<pre><code>    u64 __init kaslr_early_init(u64 dt_phys)
+    {
+        void *fdt;
+        u64 seed, offset, mask, module_range;
+        const u8 *cmdline, *str;
+        int size;
+
+        early_fixmap_init();                                         /* 1 */
+        fdt = __fixmap_remap_fdt(dt_phys, &amp;size, PAGE_KERNEL);       /* 1 */
+
+        seed = get_kaslr_seed(fdt);                                  /* 2 */
+        if (!seed)
+            return 0;
+
+        cmdline = get_cmdline(fdt);
+        str = strstr(cmdline, "nokaslr");                            /* 3 */
+        if (str == cmdline || (str &gt; cmdline &amp;&amp; *(str - 1) == ' '))
+            return 0;
+
+        mask = ((1UL &lt;&lt; (VA_BITS - 2)) - 1) &amp; ~(SZ_2M - 1);          /* 4 */
+        offset = seed &amp; mask;
+
+        /* use the top 16 bits to randomize the linear region */
+        memstart_offset_seed = seed &gt;&gt; 48;                           /* 5 */
+
+        if ((((u64)_text + offset) &gt;&gt; SWAPPER_TABLE_SHIFT) !=
+            (((u64)_end + offset) &gt;&gt; SWAPPER_TABLE_SHIFT))
+            offset = round_down(offset, 1 &lt;&lt; SWAPPER_TABLE_SHIFT);   /* 6 */
+
+        return offset;
+    } 
+</code></pre>
+
+<p>由于dtb的地址是物理地址，因此第一步先为dtb区域建立映射。<br/>
+从dtb文件获取kaslr-seed属性的值。<br/>
+确保command line没有传递nokaslr参数，如果传递nokaslr则关闭KASLR。<br/>
+保证传递的偏移地址2M地址对齐，并且保证kernel位于VMALLOC区域大小的一半地址空间以下 (VA_BITS - 2)。当VA_BITS=48时，mask=0x0000_3fff_ffe0_0000。<br/>
+线性映射区地址也会随机化。<br/>
+kernel启动初期只有一个PUD页表，因此希望kernel映射在1G（1 &lt;&lt; SWAPPER_TABLE_SHIFT）大小范围内，这样就不用两个PUD页表。如果kernel加上偏移offset后不满足这点，自然要重新对齐。</p>
+
+<h3>如何创建映射</h3>
+
+<p>kernel启动初期在汇编阶段创建映射关系。代码位于head.S文件。在<code>__primary_switched</code>函数中会调用kaslr_early_init得到偏移地址。保存在x23寄存器中。然后重新创建kernel image的映射。</p>
+
+<pre><code>    __primary_switched:
+        tst x23, ~(MIN_KIMG_ALIGN - 1)  // already running randomized?
+        b.ne    0f
+        mov x0, x21                     // pass FDT address in x0
+        bl  kaslr_early_init            // parse FDT for KASLR options
+        cbz x0, 0f                      // KASLR disabled? just proceed
+        orr x23, x23, x0                // record KASLR offset
+        ldp x29, x30, [sp], #16         // we must enable KASLR, return
+        ret                             // to __primary_switch() 
+</code></pre>
+
+<p>创建映射的函数是<code>__create_page_tables</code>。</p>
+
+<pre><code>    __create_page_tables:
+        /*
+         * Map the kernel image.
+         */
+        adrp    x0, swapper_pg_dir
+        mov_q   x5, KIMAGE_VADDR + TEXT_OFFSET  // compile time __va(_text)
+        add x5, x5, x23                         // add KASLR displacement
+        create_pgd_entry x0, x5, x3, x6
+        adrp    x6, _end                        // runtime __pa(_end)
+        adrp    x3, _text                       // runtime __pa(_text)
+        sub x6, x6, x3                          // _end - _text
+        add x6, x6, x5                          // runtime __va(_end)
+        create_block_map x0, x7, x3, x5, x6
+</code></pre>
+
+<p>这段代码在我的另一篇文章《ARM64 Kernel Image Mapping的变化》已经有分析过，这里就略过了。注意第7行，kernel image映射的虚拟地址加上了一个偏移地址x23。还有一点需要说明，就是对重定位段进行重定位。这部分代码在arch/arm64/kernel/head.S文件<code>__relocate_kernel</code>函数实现。大概说下<code>__relocate_kernel</code>有什么用呢！例如链接脚本中常见的几个变量<em>text、</em>etext、<em>end。这几个你应该很熟悉，他们是一个地址并且他们的值是链接的时候确定下来，那么现在使能kaslr的情况下，代码中再访问</em>text的值就很明显不是运行时的虚拟地址，而是链接时候的值。因此，<code>__relocate_kernel</code>函数可以负责重定位这些变量。保证访问这些变量的值依然是正确的值。这部分涉及编译和链接，有兴趣的可以研究一下《程序员的自我修养》这本书（我不太熟悉）。</p>
+
+<h3>addr2line怎么办</h3>
+
+<p>KASLR在技术上增加了OS安全性，但是对于调试或许增加了些难度。何以见得呢？首先，我们知道编译kernel的时候链接地址和最终运行地址是不一样的，因此如果发生oops，栈的回溯信息中的函数地址其实都是运行地址。如果你使用过addr2line工具的话，应该不会陌生addr2line -e vmlinux 0xffffff8000080000这条命令获取某个地址在代码中的哪一行。那么现在问题是oops中的地址和链接地址有一个偏差，并且这个偏差随着bootloader传递的值而变化。现在摆在我们眼前的是addr2line工具还怎么用？下面就为你答疑解惑。kernel开机log中会打印Virtual kernel memory layout。举例如下。</p>
+
+<pre><code class="`">    Virtual kernel memory layout:
+      modules : 0xffffff8000000000 - 0xffffff8008000000   (   128 MB)
+      vmalloc : 0xffffff8008000000 - 0xffffffbebfff0000   (   250 GB)
+        .text : 0xffffff80ae280000 - 0xffffff80af2e0000   ( 16768 KB)
+      .rodata : 0xffffff80af300000 - 0xffffff80afb60000   (  8576 KB)
+        .init : 0xffffff80afb60000 - 0xffffff80b01e0000   (  6656 KB)
+        .data : 0xffffff80b01e0000 - 0xffffff80b044f200   (  2493 KB)
+         .bss : 0xffffff80b044f200 - 0xffffff80b0e18538   ( 10021 KB)
+      fixed   : 0xffffffbefe7fb000 - 0xffffffbefec00000   (  4116 KB)
+      PCI I/O : 0xffffffbefee00000 - 0xffffffbeffe00000   (    16 MB)
+      vmemmap : 0xffffffbf00000000 - 0xffffffc000000000   (     4 GB maximum)
+            0xffffffbf00000000 - 0xffffffbf03000000   (    48 MB actual)
+      memory  : 0xffffffc000000000 - 0xffffffc0c0000000   (  3072 MB)
+</code></pre>
+
+<p>注意看以上.text区域（kernel代码段）起始地址和结束地址是不是位于VMALLOC区域。如果发生oops，log中函数的地址必然是一个位于.text段的地址，假设是addr_run，但是链接地址应该是KIMAGE_VADDR + TEXT_OFFSET，这两个宏定义参考这篇文章《ARM64 Kernel Image Mapping的变化》。在这个例子中，KIMAGE_VADDR = 0xffffff8008000000，TEXT_OFFSET = 0x80000。addr2line工具使用的必须是链接地址，因此需要将addr_run转换成链接地址。公式很容易推导出来，addr_link = addr_run - .text_start + vmalloc_start + TEXT_OFFSET。在这个例子中就是addr_link = addr_run - 0xffffff80ae280000 + 0xffffff8008000000 + 0x80000。计算的addr_link就可以使用addr2line工具解析了。Have fun！</p>
+]]></content>
+  </entry>
   
   <entry>
     <title type="html"><![CDATA[获取 rip 寄存器]]></title>
@@ -100,7 +237,7 @@
 
 <h3>linux 实时时钟（RTC）驱动</h3>
 
-<p>翻译：窗外云天<a href="&#109;&#x61;&#105;&#108;&#116;&#111;&#x3a;&#121;&#x61;&#111;&#122;&#x68;&#x65;&#110;&#103;&#x75;&#x6f;&#50;&#x30;&#x30;&#54;&#64;&#x31;&#50;&#54;&#x2e;&#x63;&#111;&#x6d;">&#x79;&#x61;&#x6f;&#x7a;&#x68;&#x65;&#x6e;&#103;&#117;&#x6f;&#x32;&#48;&#x30;&#54;&#x40;&#x31;&#50;&#x36;&#x2e;&#x63;&#111;&#109;</a>  最后矫正时间：2011.9.25</p>
+<p>翻译：窗外云天<a href="&#109;&#97;&#x69;&#x6c;&#116;&#111;&#x3a;&#x79;&#97;&#111;&#122;&#x68;&#101;&#x6e;&#103;&#117;&#111;&#50;&#48;&#48;&#54;&#64;&#x31;&#x32;&#54;&#46;&#x63;&#x6f;&#x6d;">&#121;&#x61;&#x6f;&#122;&#104;&#x65;&#x6e;&#103;&#117;&#111;&#x32;&#48;&#48;&#54;&#x40;&#49;&#50;&#x36;&#46;&#99;&#111;&#x6d;</a>  最后矫正时间：2011.9.25</p>
 
 <p>当linux开发者提到“实时时钟”的时候，他们通常所指的就是墙钟时间，这个时间是电池供电的，所以在系统掉电的情况下还能正常工作。除非在MS-Windows启动的时候设置，否则这个时钟不会同步于本地时区和夏令时间。事实上，他被设置成格林威治时间。</p>
 
@@ -933,1630 +1070,591 @@ CPUFREQ_POSTCHANGE    完成调整后的通知。</p>
 </code></p>
 
 <p>至此，一个cpu的policy建立完成，它的频率限制条件、使用的governor策略，sysfs文件节点都已经建立完成。需要注意点是，系统中有多少个cpu，cpufreq_add_dev函数就会被调用多少次，最后，每个cpu都会建立自己的policy，当然，也有可能只有部分cpu建立了真正的policy，而其它cpu则委托这些cpu进行policy的管理，关于这一点，一开始读代码的时候可能有点困扰，为了搞清楚他们之间的关系，我们再跟入cpufreq_add_dev_interface函数看看：
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-<span class='line-number'>58</span>
-<span class='line-number'>59</span>
-<span class='line-number'>60</span>
-<span class='line-number'>61</span>
-<span class='line-number'>62</span>
-<span class='line-number'>63</span>
-<span class='line-number'>64</span>
-<span class='line-number'>65</span>
-<span class='line-number'>66</span>
-<span class='line-number'>67</span>
-<span class='line-number'>68</span>
-<span class='line-number'>69</span>
-<span class='line-number'>70</span>
-<span class='line-number'>71</span>
-<span class='line-number'>72</span>
-<span class='line-number'>73</span>
-<span class='line-number'>74</span>
-<span class='line-number'>75</span>
-<span class='line-number'>76</span>
-<span class='line-number'>77</span>
-<span class='line-number'>78</span>
-<span class='line-number'>79</span>
-<span class='line-number'>80</span>
-<span class='line-number'>81</span>
-<span class='line-number'>82</span>
-<span class='line-number'>83</span>
-<span class='line-number'>84</span>
-<span class='line-number'>85</span>
-<span class='line-number'>86</span>
-<span class='line-number'>87</span>
-<span class='line-number'>88</span>
-<span class='line-number'>89</span>
-<span class='line-number'>90</span>
-<span class='line-number'>91</span>
-<span class='line-number'>92</span>
-<span class='line-number'>93</span>
-<span class='line-number'>94</span>
-<span class='line-number'>95</span>
-<span class='line-number'>96</span>
-<span class='line-number'>97</span>
-<span class='line-number'>98</span>
-<span class='line-number'>99</span>
-<span class='line-number'>100</span>
-<span class='line-number'>101</span>
-<span class='line-number'>102</span>
-<span class='line-number'>103</span>
-<span class='line-number'>104</span>
-<span class='line-number'>105</span>
-<span class='line-number'>106</span>
-<span class='line-number'>107</span>
-<span class='line-number'>108</span>
-<span class='line-number'>109</span>
-<span class='line-number'>110</span>
-<span class='line-number'>111</span>
-<span class='line-number'>112</span>
-<span class='line-number'>113</span>
-<span class='line-number'>114</span>
-<span class='line-number'>115</span>
-<span class='line-number'>116</span>
-<span class='line-number'>117</span>
-<span class='line-number'>118</span>
-<span class='line-number'>119</span>
-<span class='line-number'>120</span>
-<span class='line-number'>121</span>
-<span class='line-number'>122</span>
-<span class='line-number'>123</span>
-<span class='line-number'>124</span>
-<span class='line-number'>125</span>
-<span class='line-number'>126</span>
-<span class='line-number'>127</span>
-<span class='line-number'>128</span>
-<span class='line-number'>129</span>
-<span class='line-number'>130</span>
-<span class='line-number'>131</span>
-<span class='line-number'>132</span>
-<span class='line-number'>133</span>
-<span class='line-number'>134</span>
-<span class='line-number'>135</span>
-<span class='line-number'>136</span>
-<span class='line-number'>137</span>
-<span class='line-number'>138</span>
-<span class='line-number'>139</span>
-<span class='line-number'>140</span>
-<span class='line-number'>141</span>
-<span class='line-number'>142</span>
-<span class='line-number'>143</span>
-<span class='line-number'>144</span>
-<span class='line-number'>145</span>
-<span class='line-number'>146</span>
-<span class='line-number'>147</span>
-<span class='line-number'>148</span>
-<span class='line-number'>149</span>
-<span class='line-number'>150</span>
-<span class='line-number'>151</span>
-<span class='line-number'>152</span>
-<span class='line-number'>153</span>
-<span class='line-number'>154</span>
-<span class='line-number'>155</span>
-<span class='line-number'>156</span>
-<span class='line-number'>157</span>
-<span class='line-number'>158</span>
-<span class='line-number'>159</span>
-<span class='line-number'>160</span>
-<span class='line-number'>161</span>
-<span class='line-number'>162</span>
-<span class='line-number'>163</span>
-<span class='line-number'>164</span>
-<span class='line-number'>165</span>
-<span class='line-number'>166</span>
-<span class='line-number'>167</span>
-<span class='line-number'>168</span>
-<span class='line-number'>169</span>
-<span class='line-number'>170</span>
-<span class='line-number'>171</span>
-<span class='line-number'>172</span>
-<span class='line-number'>173</span>
-<span class='line-number'>174</span>
-<span class='line-number'>175</span>
-<span class='line-number'>176</span>
-<span class='line-number'>177</span>
-<span class='line-number'>178</span>
-<span class='line-number'>179</span>
-<span class='line-number'>180</span>
-<span class='line-number'>181</span>
-<span class='line-number'>182</span>
-<span class='line-number'>183</span>
-<span class='line-number'>184</span>
-<span class='line-number'>185</span>
-<span class='line-number'>186</span>
-<span class='line-number'>187</span>
-<span class='line-number'>188</span>
-<span class='line-number'>189</span>
-<span class='line-number'>190</span>
-<span class='line-number'>191</span>
-<span class='line-number'>192</span>
-<span class='line-number'>193</span>
-<span class='line-number'>194</span>
-<span class='line-number'>195</span>
-<span class='line-number'>196</span>
-<span class='line-number'>197</span>
-<span class='line-number'>198</span>
-<span class='line-number'>199</span>
-<span class='line-number'>200</span>
-<span class='line-number'>201</span>
-<span class='line-number'>202</span>
-<span class='line-number'>203</span>
-<span class='line-number'>204</span>
-<span class='line-number'>205</span>
-<span class='line-number'>206</span>
-<span class='line-number'>207</span>
-<span class='line-number'>208</span>
-<span class='line-number'>209</span>
-<span class='line-number'>210</span>
-<span class='line-number'>211</span>
-<span class='line-number'>212</span>
-<span class='line-number'>213</span>
-<span class='line-number'>214</span>
-<span class='line-number'>215</span>
-<span class='line-number'>216</span>
-<span class='line-number'>217</span>
-<span class='line-number'>218</span>
-<span class='line-number'>219</span>
-<span class='line-number'>220</span>
-<span class='line-number'>221</span>
-<span class='line-number'>222</span>
-<span class='line-number'>223</span>
-<span class='line-number'>224</span>
-<span class='line-number'>225</span>
-<span class='line-number'>226</span>
-<span class='line-number'>227</span>
-<span class='line-number'>228</span>
-<span class='line-number'>229</span>
-<span class='line-number'>230</span>
-<span class='line-number'>231</span>
-<span class='line-number'>232</span>
-<span class='line-number'>233</span>
-<span class='line-number'>234</span>
-<span class='line-number'>235</span>
-<span class='line-number'>236</span>
-<span class='line-number'>237</span>
-<span class='line-number'>238</span>
-<span class='line-number'>239</span>
-<span class='line-number'>240</span>
-<span class='line-number'>241</span>
-<span class='line-number'>242</span>
-<span class='line-number'>243</span>
-<span class='line-number'>244</span>
-<span class='line-number'>245</span>
-<span class='line-number'>246</span>
-<span class='line-number'>247</span>
-<span class='line-number'>248</span>
-<span class='line-number'>249</span>
-<span class='line-number'>250</span>
-<span class='line-number'>251</span>
-<span class='line-number'>252</span>
-<span class='line-number'>253</span>
-<span class='line-number'>254</span>
-<span class='line-number'>255</span>
-<span class='line-number'>256</span>
-<span class='line-number'>257</span>
-<span class='line-number'>258</span>
-<span class='line-number'>259</span>
-<span class='line-number'>260</span>
-<span class='line-number'>261</span>
-<span class='line-number'>262</span>
-<span class='line-number'>263</span>
-<span class='line-number'>264</span>
-<span class='line-number'>265</span>
-<span class='line-number'>266</span>
-<span class='line-number'>267</span>
-<span class='line-number'>268</span>
-<span class='line-number'>269</span>
-<span class='line-number'>270</span>
-<span class='line-number'>271</span>
-<span class='line-number'>272</span>
-<span class='line-number'>273</span>
-<span class='line-number'>274</span>
-<span class='line-number'>275</span>
-<span class='line-number'>276</span>
-<span class='line-number'>277</span>
-<span class='line-number'>278</span>
-<span class='line-number'>279</span>
-<span class='line-number'>280</span>
-<span class='line-number'>281</span>
-<span class='line-number'>282</span>
-<span class='line-number'>283</span>
-<span class='line-number'>284</span>
-<span class='line-number'>285</span>
-<span class='line-number'>286</span>
-<span class='line-number'>287</span>
-<span class='line-number'>288</span>
-<span class='line-number'>289</span>
-<span class='line-number'>290</span>
-<span class='line-number'>291</span>
-<span class='line-number'>292</span>
-<span class='line-number'>293</span>
-<span class='line-number'>294</span>
-<span class='line-number'>295</span>
-<span class='line-number'>296</span>
-<span class='line-number'>297</span>
-<span class='line-number'>298</span>
-<span class='line-number'>299</span>
-<span class='line-number'>300</span>
-<span class='line-number'>301</span>
-<span class='line-number'>302</span>
-<span class='line-number'>303</span>
-<span class='line-number'>304</span>
-<span class='line-number'>305</span>
-<span class='line-number'>306</span>
-<span class='line-number'>307</span>
-<span class='line-number'>308</span>
-<span class='line-number'>309</span>
-<span class='line-number'>310</span>
-<span class='line-number'>311</span>
-<span class='line-number'>312</span>
-<span class='line-number'>313</span>
-<span class='line-number'>314</span>
-<span class='line-number'>315</span>
-<span class='line-number'>316</span>
-<span class='line-number'>317</span>
-<span class='line-number'>318</span>
-<span class='line-number'>319</span>
-<span class='line-number'>320</span>
-<span class='line-number'>321</span>
-<span class='line-number'>322</span>
-<span class='line-number'>323</span>
-<span class='line-number'>324</span>
-<span class='line-number'>325</span>
-<span class='line-number'>326</span>
-<span class='line-number'>327</span>
-<span class='line-number'>328</span>
-<span class='line-number'>329</span>
-<span class='line-number'>330</span>
-<span class='line-number'>331</span>
-<span class='line-number'>332</span>
-<span class='line-number'>333</span>
-<span class='line-number'>334</span>
-<span class='line-number'>335</span>
-<span class='line-number'>336</span>
-<span class='line-number'>337</span>
-<span class='line-number'>338</span>
-<span class='line-number'>339</span>
-<span class='line-number'>340</span>
-<span class='line-number'>341</span>
-<span class='line-number'>342</span>
-<span class='line-number'>343</span>
-<span class='line-number'>344</span>
-<span class='line-number'>345</span>
-<span class='line-number'>346</span>
-<span class='line-number'>347</span>
-<span class='line-number'>348</span>
-<span class='line-number'>349</span>
-<span class='line-number'>350</span>
-<span class='line-number'>351</span>
-<span class='line-number'>352</span>
-<span class='line-number'>353</span>
-<span class='line-number'>354</span>
-<span class='line-number'>355</span>
-<span class='line-number'>356</span>
-<span class='line-number'>357</span>
-<span class='line-number'>358</span>
-<span class='line-number'>359</span>
-<span class='line-number'>360</span>
-<span class='line-number'>361</span>
-<span class='line-number'>362</span>
-<span class='line-number'>363</span>
-<span class='line-number'>364</span>
-<span class='line-number'>365</span>
-<span class='line-number'>366</span>
-<span class='line-number'>367</span>
-<span class='line-number'>368</span>
-<span class='line-number'>369</span>
-<span class='line-number'>370</span>
-<span class='line-number'>371</span>
-<span class='line-number'>372</span>
-<span class='line-number'>373</span>
-<span class='line-number'>374</span>
-<span class='line-number'>375</span>
-<span class='line-number'>376</span>
-<span class='line-number'>377</span>
-<span class='line-number'>378</span>
-<span class='line-number'>379</span>
-<span class='line-number'>380</span>
-<span class='line-number'>381</span>
-<span class='line-number'>382</span>
-<span class='line-number'>383</span>
-<span class='line-number'>384</span>
-<span class='line-number'>385</span>
-<span class='line-number'>386</span>
-<span class='line-number'>387</span>
-<span class='line-number'>388</span>
-<span class='line-number'>389</span>
-<span class='line-number'>390</span>
-<span class='line-number'>391</span>
-<span class='line-number'>392</span>
-<span class='line-number'>393</span>
-<span class='line-number'>394</span>
-<span class='line-number'>395</span>
-<span class='line-number'>396</span>
-<span class='line-number'>397</span>
-<span class='line-number'>398</span>
-<span class='line-number'>399</span>
-<span class='line-number'>400</span>
-<span class='line-number'>401</span>
-<span class='line-number'>402</span>
-<span class='line-number'>403</span>
-<span class='line-number'>404</span>
-<span class='line-number'>405</span>
-<span class='line-number'>406</span>
-<span class='line-number'>407</span>
-<span class='line-number'>408</span>
-<span class='line-number'>409</span>
-<span class='line-number'>410</span>
-<span class='line-number'>411</span>
-<span class='line-number'>412</span>
-<span class='line-number'>413</span>
-<span class='line-number'>414</span>
-<span class='line-number'>415</span>
-<span class='line-number'>416</span>
-<span class='line-number'>417</span>
-<span class='line-number'>418</span>
-<span class='line-number'>419</span>
-<span class='line-number'>420</span>
-<span class='line-number'>421</span>
-<span class='line-number'>422</span>
-<span class='line-number'>423</span>
-<span class='line-number'>424</span>
-<span class='line-number'>425</span>
-<span class='line-number'>426</span>
-<span class='line-number'>427</span>
-<span class='line-number'>428</span>
-<span class='line-number'>429</span>
-<span class='line-number'>430</span>
-<span class='line-number'>431</span>
-<span class='line-number'>432</span>
-<span class='line-number'>433</span>
-<span class='line-number'>434</span>
-<span class='line-number'>435</span>
-<span class='line-number'>436</span>
-<span class='line-number'>437</span>
-<span class='line-number'>438</span>
-<span class='line-number'>439</span>
-<span class='line-number'>440</span>
-<span class='line-number'>441</span>
-<span class='line-number'>442</span>
-<span class='line-number'>443</span>
-<span class='line-number'>444</span>
-<span class='line-number'>445</span>
-<span class='line-number'>446</span>
-<span class='line-number'>447</span>
-<span class='line-number'>448</span>
-<span class='line-number'>449</span>
-<span class='line-number'>450</span>
-<span class='line-number'>451</span>
-<span class='line-number'>452</span>
-<span class='line-number'>453</span>
-<span class='line-number'>454</span>
-<span class='line-number'>455</span>
-<span class='line-number'>456</span>
-<span class='line-number'>457</span>
-<span class='line-number'>458</span>
-<span class='line-number'>459</span>
-<span class='line-number'>460</span>
-<span class='line-number'>461</span>
-<span class='line-number'>462</span>
-<span class='line-number'>463</span>
-<span class='line-number'>464</span>
-<span class='line-number'>465</span>
-<span class='line-number'>466</span>
-<span class='line-number'>467</span>
-<span class='line-number'>468</span>
-<span class='line-number'>469</span>
-<span class='line-number'>470</span>
-<span class='line-number'>471</span>
-<span class='line-number'>472</span>
-<span class='line-number'>473</span>
-<span class='line-number'>474</span>
-<span class='line-number'>475</span>
-<span class='line-number'>476</span>
-<span class='line-number'>477</span>
-<span class='line-number'>478</span>
-<span class='line-number'>479</span>
-<span class='line-number'>480</span>
-<span class='line-number'>481</span>
-<span class='line-number'>482</span>
-<span class='line-number'>483</span>
-<span class='line-number'>484</span>
-<span class='line-number'>485</span>
-<span class='line-number'>486</span>
-<span class='line-number'>487</span>
-<span class='line-number'>488</span>
-<span class='line-number'>489</span>
-<span class='line-number'>490</span>
-<span class='line-number'>491</span>
-<span class='line-number'>492</span>
-<span class='line-number'>493</span>
-<span class='line-number'>494</span>
-<span class='line-number'>495</span>
-<span class='line-number'>496</span>
-<span class='line-number'>497</span>
-<span class='line-number'>498</span>
-<span class='line-number'>499</span>
-<span class='line-number'>500</span>
-<span class='line-number'>501</span>
-<span class='line-number'>502</span>
-<span class='line-number'>503</span>
-<span class='line-number'>504</span>
-<span class='line-number'>505</span>
-<span class='line-number'>506</span>
-<span class='line-number'>507</span>
-<span class='line-number'>508</span>
-<span class='line-number'>509</span>
-<span class='line-number'>510</span>
-<span class='line-number'>511</span>
-<span class='line-number'>512</span>
-<span class='line-number'>513</span>
-<span class='line-number'>514</span>
-<span class='line-number'>515</span>
-<span class='line-number'>516</span>
-<span class='line-number'>517</span>
-<span class='line-number'>518</span>
-<span class='line-number'>519</span>
-<span class='line-number'>520</span>
-<span class='line-number'>521</span>
-<span class='line-number'>522</span>
-<span class='line-number'>523</span>
-<span class='line-number'>524</span>
-<span class='line-number'>525</span>
-<span class='line-number'>526</span>
-<span class='line-number'>527</span>
-<span class='line-number'>528</span>
-<span class='line-number'>529</span>
-<span class='line-number'>530</span>
-<span class='line-number'>531</span>
-<span class='line-number'>532</span>
-<span class='line-number'>533</span>
-<span class='line-number'>534</span>
-<span class='line-number'>535</span>
-<span class='line-number'>536</span>
-<span class='line-number'>537</span>
-<span class='line-number'>538</span>
-<span class='line-number'>539</span>
-<span class='line-number'>540</span>
-<span class='line-number'>541</span>
-<span class='line-number'>542</span>
-<span class='line-number'>543</span>
-<span class='line-number'>544</span>
-<span class='line-number'>545</span>
-<span class='line-number'>546</span>
-<span class='line-number'>547</span>
-<span class='line-number'>548</span>
-<span class='line-number'>549</span>
-<span class='line-number'>550</span>
-<span class='line-number'>551</span>
-<span class='line-number'>552</span>
-<span class='line-number'>553</span>
-<span class='line-number'>554</span>
-<span class='line-number'>555</span>
-<span class='line-number'>556</span>
-<span class='line-number'>557</span>
-<span class='line-number'>558</span>
-<span class='line-number'>559</span>
-<span class='line-number'>560</span>
-<span class='line-number'>561</span>
-<span class='line-number'>562</span>
-<span class='line-number'>563</span>
-<span class='line-number'>564</span>
-<span class='line-number'>565</span>
-<span class='line-number'>566</span>
-<span class='line-number'>567</span>
-<span class='line-number'>568</span>
-<span class='line-number'>569</span>
-<span class='line-number'>570</span>
-<span class='line-number'>571</span>
-<span class='line-number'>572</span>
-<span class='line-number'>573</span>
-<span class='line-number'>574</span>
-<span class='line-number'>575</span>
-<span class='line-number'>576</span>
-<span class='line-number'>577</span>
-<span class='line-number'>578</span>
-<span class='line-number'>579</span>
-<span class='line-number'>580</span>
-<span class='line-number'>581</span>
-<span class='line-number'>582</span>
-<span class='line-number'>583</span>
-<span class='line-number'>584</span>
-<span class='line-number'>585</span>
-<span class='line-number'>586</span>
-<span class='line-number'>587</span>
-<span class='line-number'>588</span>
-<span class='line-number'>589</span>
-<span class='line-number'>590</span>
-<span class='line-number'>591</span>
-<span class='line-number'>592</span>
-<span class='line-number'>593</span>
-<span class='line-number'>594</span>
-<span class='line-number'>595</span>
-<span class='line-number'>596</span>
-<span class='line-number'>597</span>
-<span class='line-number'>598</span>
-<span class='line-number'>599</span>
-<span class='line-number'>600</span>
-<span class='line-number'>601</span>
-<span class='line-number'>602</span>
-<span class='line-number'>603</span>
-<span class='line-number'>604</span>
-<span class='line-number'>605</span>
-<span class='line-number'>606</span>
-<span class='line-number'>607</span>
-<span class='line-number'>608</span>
-<span class='line-number'>609</span>
-<span class='line-number'>610</span>
-<span class='line-number'>611</span>
-<span class='line-number'>612</span>
-<span class='line-number'>613</span>
-<span class='line-number'>614</span>
-<span class='line-number'>615</span>
-<span class='line-number'>616</span>
-<span class='line-number'>617</span>
-<span class='line-number'>618</span>
-<span class='line-number'>619</span>
-<span class='line-number'>620</span>
-<span class='line-number'>621</span>
-<span class='line-number'>622</span>
-<span class='line-number'>623</span>
-<span class='line-number'>624</span>
-<span class='line-number'>625</span>
-<span class='line-number'>626</span>
-<span class='line-number'>627</span>
-<span class='line-number'>628</span>
-<span class='line-number'>629</span>
-<span class='line-number'>630</span>
-<span class='line-number'>631</span>
-<span class='line-number'>632</span>
-<span class='line-number'>633</span>
-<span class='line-number'>634</span>
-<span class='line-number'>635</span>
-<span class='line-number'>636</span>
-<span class='line-number'>637</span>
-<span class='line-number'>638</span>
-<span class='line-number'>639</span>
-<span class='line-number'>640</span>
-<span class='line-number'>641</span>
-<span class='line-number'>642</span>
-<span class='line-number'>643</span>
-<span class='line-number'>644</span>
-<span class='line-number'>645</span>
-<span class='line-number'>646</span>
-<span class='line-number'>647</span>
-<span class='line-number'>648</span>
-<span class='line-number'>649</span>
-<span class='line-number'>650</span>
-<span class='line-number'>651</span>
-<span class='line-number'>652</span>
-<span class='line-number'>653</span>
-<span class='line-number'>654</span>
-<span class='line-number'>655</span>
-<span class='line-number'>656</span>
-<span class='line-number'>657</span>
-<span class='line-number'>658</span>
-<span class='line-number'>659</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static int cpufreq_add_dev_interface(unsigned int cpu,&lt;br/&gt;
-</span><span class='line'>                     struct cpufreq_policy &lt;em&gt;policy,&lt;br/&gt;
-</span><span class='line'>                     struct device &lt;/em&gt;dev)&lt;br/&gt;
-</span><span class='line'>{&lt;br/&gt;
-</span><span class='line'>    &hellip;&hellip;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;    /* prepare interface data */  
-</span><span class='line'>ret = kobject_init_and_add(&amp;policy-&gt;kobj, &amp;ktype_cpufreq,  
-</span><span class='line'>               &amp;dev-&gt;kobj, "cpufreq");  
-</span><span class='line'>......  
-</span><span class='line'>
-</span><span class='line'>/* set up files for this cpu device */  
-</span><span class='line'>drv_attr = cpufreq_driver-&gt;attr;  
-</span><span class='line'>while ((drv_attr) &amp;&amp; (*drv_attr)) {  
-</span><span class='line'>    ret = sysfs_create_file(&amp;policy-&gt;kobj, &amp;((*drv_attr)-&gt;attr));  
-</span><span class='line'>    if (ret)  
-</span><span class='line'>        goto err_out_kobj_put;  
-</span><span class='line'>    drv_attr++;  
-</span><span class='line'>}  
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;函数的一开始，建立cpufreq文件节点，然后在它的下面再建立一系列节点，用户可以通过这些文件节点控制该policy的一些参数。这不是我们的重点，我们看下面这一段代码：
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;for_each_cpu(j, policy-&gt;cpus) {  
-</span><span class='line'>per_cpu(cpufreq_cpu_data, j) = policy;  
-</span><span class='line'>per_cpu(cpufreq_policy_cpu, j) = policy-&gt;cpu;  
-</span><span class='line'>}  
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;前面的代码已经设定了该policy所管理的online cpu：policy-&gt;cpus，通过两个per_cpu变量，这里把每个online cpu的policy都设置为了本cpu（管理cpu）的policy，并且把所有online的cpu的管理cpu也指定为了本cpu。接下来，cpufreq_add_dev_symlink被调用，所有policy-&gt;cpus指定的cpu会建立一个cpufreq链接，指向本cpu（管理cpu）的真实cpufreq节点：
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;ret = cpufreq_add_dev_symlink(cpu, policy);  
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;
-</span><span class='line'>注意，假如这时的cpu是cpu0，也就是说，其它cpu的cpufreq_add_dev还没有被调用，但是在cpufreq_cpu_data中，与之对应的policy指针已经被赋值为cpu0所对应的policy，这样，回到cpufreq_add_dev函数的开头部分，当接下其它被认为使用cpu0托管他们的policy的cpu也会进入cpufreq_add_dev函数，但是，因为cpufreq_cpu_data中对应的policy已经在cpu0的建立阶段被赋值，所以这些cpu他们不会走完所有的流程，在函数的开头的判断部分，判断cpufreq_cpu_data中cpu对应的policy已经被赋值，就直接返回了。
-</span><span class='line'>接着往下看cpufreq_add_dev_interface的代码：
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;memcpy(&amp;new_policy, policy, sizeof(struct cpufreq_policy));  
-</span><span class='line'>/* assure that the starting sequence is run in __cpufreq_set_policy */  
-</span><span class='line'>policy-&gt;governor = NULL;  
-</span><span class='line'>
-</span><span class='line'>/* set default policy */  
-</span><span class='line'>ret = __cpufreq_set_policy(policy, &amp;new_policy);  
-</span><span class='line'>policy-&gt;user_policy.policy = policy-&gt;policy;  
-</span><span class='line'>policy-&gt;user_policy.governor = policy-&gt;governor;  
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;通过`__cpufreq_set_policy`函数，最终使得该policy正式生效。到这里，每个cpu的policy已经建立完毕，并正式开始工作。关于`__cpufreq_set_policy`的代码这里就不展开了，我只给出它的序列图：
-</span><span class='line'>
-</span><span class='line'>![](/images/kernel/2015-08-12-3.png)
-</span><span class='line'>
-</span><span class='line'>图 4.1  设置一个cpufreq_policy
-</span><span class='line'>
-</span><span class='line'>#### 5. 其它API
-</span><span class='line'>
-</span><span class='line'>cpufreq的核心层除了提供上面几节讨论的注册governor，注册cpufreq_driver等API外，还提供了其他一些辅助的API，以方便其它模块的使用。
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;int cpufreq_register_notifier(struct notifier_block *nb, unsigned int list);
-</span><span class='line'>int cpufreq_unregister_notifier(struct notifier_block *nb, unsigned int list);
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;以上两个API用于注册和注销cpufreq系统的通知消息，第二个参数可以选择通知的类型，可以有以下两种类型：
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;CPUFREQ_TRANSITION_NOTIFIER      收到频率变更通知
-</span><span class='line'>CPUFREQ_POLICY_NOTIFIER               收到policy更新通知
-</span><span class='line'>
-</span><span class='line'>
-</span><span class='line'>int cpufreq_driver_target(struct cpufreq_policy *policy,
-</span><span class='line'>             unsigned int target_freq,
-</span><span class='line'>             unsigned int relation);
-</span><span class='line'>int __cpufreq_driver_target(struct cpufreq_policy *policy,
-</span><span class='line'>               unsigned int target_freq,
-</span><span class='line'>               unsigned int relation);
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;以上两个API用来设置cpu的工作频率，区别在于cpufreq_driver_target是带锁的版本，而`__cpufreq_driver_target`是不带锁的版本，如果确定是在governor的上下文中，使用不带锁的版本，否则需要使用带锁的版本。
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;void cpufreq_verify_within_limits(struct cpufreq_policy *policy, unsigned int min, unsigned int max)；
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;这个API用来检查并重新设定policy的最大和最小频率。
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;int cpufreq_update_policy(unsigned int cpu);
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;这个API用来触发cpufreq核心进行policy的更新操作。
-</span><span class='line'>
-</span><span class='line'>
-</span><span class='line'>--------------
-</span><span class='line'>
-</span><span class='line'>### Linux动态频率调节系统CPUFreq之三：governor
-</span><span class='line'>
-</span><span class='line'>在上一篇文章中，介绍了cpufreq的core层，core提供了cpufreq系统的初始化，公共数据结构的建立以及对cpufreq中其它子部件提供注册功能。core的最核心功能是对policy的管理，一个policy通过cpufreq_policy结构中的governor字段，和某个governor相关联，本章的内容正是要对governor进行讨论。
-</span><span class='line'>
-</span><span class='line'>
-</span><span class='line'>通过前面两篇文章的介绍，我们知道，governor的作用是：检测系统的负载状况，然后根据当前的负载，选择出某个可供使用的工作频率，然后把该工作频率传递给cpufreq_driver，完成频率的动态调节。内核默认提供了5种governor供我们使用，在之前的内核版本中，每种governor几乎是独立的代码，它们各自用自己的方式实现对系统的负载进行监测，很多时候，检测的逻辑其实是很相似的，各个governor最大的不同之处其实是根据检测的结果，选择合适频率的策略。所以，为了减少代码的重复，在我现在分析的内核版本中（3.10.0），一些公共的逻辑代码被单独抽象出来，单独用一个文件来实现：/drivers/cpufreq/cpufreq_governor.c，而各个具体的governor则分别有自己的代码文件，如：cpufreq_ondemand.c，cpufreq_performance.c。下面我们先从公共部分讨论。
-</span><span class='line'>
-</span><span class='line'>#### 1. 数据结构
-</span><span class='line'>
-</span><span class='line'>cpu_dbs_common_info  该结构把对计算cpu负载需要使用到的一些辅助变量整合在了一起，通常，每个cpu都需要一个cpu_dbs_common_info结构体，该结构体中的成员会在governor的生命周期期间进行传递，以用于统计当前cpu的负载，它的定义如下：
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;/* Per cpu structures */  
-</span><span class='line'>struct cpu_dbs_common_info {  
-</span><span class='line'>int cpu;  
-</span><span class='line'>u64 prev_cpu_idle;  
-</span><span class='line'>u64 prev_cpu_wall;  
-</span><span class='line'>u64 prev_cpu_nice;  
-</span><span class='line'>struct cpufreq_policy *cur_policy;  
-</span><span class='line'>struct delayed_work work;  
-</span><span class='line'>
-</span><span class='line'>struct mutex timer_mutex;  
-</span><span class='line'>ktime_t time_stamp;  
-</span><span class='line'>};  
-</span><span class='line'>
-</span><span class='line'>cpu  与该结构体相关联的cpu编号。
-</span><span class='line'>prev_cpu_idle  上一次统计时刻该cpu停留在idle状态的总时间。
-</span><span class='line'>prev_cpu_wall  上一次统计时刻对应的总工作时间。
-</span><span class='line'>cur_policy  指向该cpu所使用的cpufreq_policy结构。
-</span><span class='line'>work  工作队列，该工作队列会被定期地触发，然后定期地进行负载的更新和统计工作。
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;
-</span><span class='line'>dbs缩写，实际是：demand based switching，通常，因为cpu_dbs_common_info只包含了经过抽象后的公共部分，所以，各个governor会自己定义的一个包含cpu_dbs_common_info的自定义结构，例如对于ondemand，他会定义：
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;struct od_cpu_dbs_info_s {  
-</span><span class='line'>struct cpu_dbs_common_info cdbs;  
-</span><span class='line'>struct cpufreq_frequency_table *freq_table;  
-</span><span class='line'>unsigned int freq_lo;  
-</span><span class='line'>unsigned int freq_lo_jiffies;  
-</span><span class='line'>unsigned int freq_hi_jiffies;  
-</span><span class='line'>unsigned int rate_mult;  
-</span><span class='line'>unsigned int sample_type:1;  
-</span><span class='line'>};  
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;
-</span><span class='line'>而对于Conservative，他的定义如下：
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;struct cs_cpu_dbs_info_s {  
-</span><span class='line'>struct cpu_dbs_common_info cdbs;  
-</span><span class='line'>unsigned int down_skip;  
-</span><span class='line'>unsigned int requested_freq;  
-</span><span class='line'>unsigned int enable:1;  
-</span><span class='line'>};  
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;
-</span><span class='line'>把它理解为类似于C++语言的基类和子类的概念就是了。
-</span><span class='line'>
-</span><span class='line'>
-</span><span class='line'>common_dbs_data    各个独立的governor，需要和governor的公共层交互，需要实现一套公共的接口，这个接口由common_dbs_data结构来提供：
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;struct common_dbs_data {  
-</span><span class='line'>/* Common across governors */  
-</span><span class='line'>#define GOV_ONDEMAND            0  
-</span><span class='line'>#define GOV_CONSERVATIVE        1  
-</span><span class='line'>int governor;  
-</span><span class='line'>struct attribute_group *attr_group_gov_sys; /* one governor - system */  
-</span><span class='line'>struct attribute_group *attr_group_gov_pol; /* one governor - policy */  
-</span><span class='line'>
-</span><span class='line'>/* Common data for platforms that don't set have_governor_per_policy */  
-</span><span class='line'>struct dbs_data *gdbs_data;  
-</span><span class='line'>
-</span><span class='line'>struct cpu_dbs_common_info *(*get_cpu_cdbs)(int cpu);  
-</span><span class='line'>void *(*get_cpu_dbs_info_s)(int cpu);  
-</span><span class='line'>void (*gov_dbs_timer)(struct work_struct *work);  
-</span><span class='line'>void (*gov_check_cpu)(int cpu, unsigned int load);  
-</span><span class='line'>int (*init)(struct dbs_data *dbs_data);  
-</span><span class='line'>void (*exit)(struct dbs_data *dbs_data);  
-</span><span class='line'>
-</span><span class='line'>/* Governor specific ops, see below */  
-</span><span class='line'>void *gov_ops;  
-</span><span class='line'>};  
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;
-</span><span class='line'>主要的字段意义如下：
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;governor  因为ondemand和conservative的实现部分有很多相似的地方，用该字段做一区分，可以设置为GOV_ONDEMAND或GOV_CONSERVATIVE的其中之一。
-</span><span class='line'>attr_group_gov_sys  该公共的sysfs属性组。
-</span><span class='line'>attr_group_gov_pol  各policy使用的属性组，有时候多个policy会使用同一个governor算法。
-</span><span class='line'>gdbs_data  通常，当没有设置have_governor_per_policy时，表示所有的policy使用了同一种governor，该字段指向该governor的dbs_data结构。
-</span><span class='line'>get_cpu_cdbs  回调函数，公共层用它取得对应cpu的cpu_dbs_common_info结构指针。
-</span><span class='line'>get_cpu_dbs_info_s  回调函数，公共层用它取得对应cpu的cpu_dbs_common_info_s的派生结构指针，例如：od_cpu_dbs_info_s，cs_cpu_dbs_info_s。
-</span><span class='line'>gov_dbs_timer  前面说过，cpu_dbs_common_info_s结构中有一个工作队列，该回调通常用作工作队列的工作函数。
-</span><span class='line'>gov_check_cpu  计算cpu负载的回调函数，通常会直接调用公共层提供的dbs_check_cpu函数完成实际的计算工作。
-</span><span class='line'>init   初始化回调，用于完成该governor的一些额外的初始化工作。
-</span><span class='line'>exit  回调函数，governor被移除时调用。
-</span><span class='line'>gov_ops  各个governor可以用该指针定义各自特有的一些操作接口。
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;
-</span><span class='line'>dbs_data    该结构体通常由governor的公共层代码在governor的初始化阶段动态创建，该结构的一个最重要的字段就是cdata：一个common_dbs_data结构指针，另外，该结构还包含一些定义governor工作方式的一些调节参数。该结构的详细定义如下：
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;struct dbs_data {  
-</span><span class='line'>struct common_dbs_data *cdata;  
-</span><span class='line'>unsigned int min_sampling_rate;  
-</span><span class='line'>int usage_count;  
-</span><span class='line'>void *tuners;  
-</span><span class='line'>
-</span><span class='line'>/* dbs_mutex protects dbs_enable in governor start/stop */  
-</span><span class='line'>struct mutex mutex;  
-</span><span class='line'>};  
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;
-</span><span class='line'>几个主要的字段：
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;cdata  一个common_dbs_data结构指针，通常由具体governor的实现部分定义好，然后作为参数，通过公共层的API：cpufreq_governor_dbs，传递到公共层，cpufreq_governor_dbs函数在创建好dbs_data结构后，把该指针赋值给该字段。
-</span><span class='line'>min_sampling_rate  用于记录统计cpu负载的采样周期。
-</span><span class='line'>usage_count  当没有设置have_governor_per_policy时，意味着所有的policy采用同一个governor，该字段就是用来统计目前该governor被多少个policy引用。
-</span><span class='line'>tuners  指向governor的调节参数结构，不同的governor可以定义自己的tuner结构，公共层代码会在governor的初始化阶段调用common_dbs_data结构的init回调函数，governor的实现可以在init回调中初始化tuners字段。
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;
-</span><span class='line'>如果设置了have_governor_per_policy，每个policy拥有各自独立的governor，也就是说，拥有独立的dbs_data结构，它会记录在cpufreq_policy结构的governor_data字段中，否则，如果没有设置have_governor_per_policy，多个policy共享一个governor，和同一个dbs_data结构关联，此时，dbs_data被赋值在common_dbs_data结构的gdbs_data字段中。
-</span><span class='line'>
-</span><span class='line'>cpufreq_governor  这个结构在本系列文章的第一篇已经介绍过了，请参看Linux动态频率调节系统CPUFreq之一：概述。几个数据结构的关系如下图所示：
-</span><span class='line'>
-</span><span class='line'>![](/images/kernel/2015-08-12-4.png)
-</span><span class='line'>
-</span><span class='line'>图 1.1  governor的数据结构关系
-</span><span class='line'>
-</span><span class='line'>下面我们以ondemand这个系统已经实现的governor为例，说明一下如何实现一个governor。具体的代码请参看：/drivers/cpufreq/cpufreq_ondemand.c。
-</span><span class='line'>
-</span><span class='line'>#### 2. 定义一个governor
-</span><span class='line'>
-</span><span class='line'>要实现一个governor，首先要定义一个cpufreq_governor结构，对于ondeman来说，它的定义如下：
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;struct cpufreq_governor cpufreq_gov_ondemand = {  
-</span><span class='line'>.name                   = "ondemand",  
-</span><span class='line'>.governor               = od_cpufreq_governor_dbs,  
-</span><span class='line'>.max_transition_latency = TRANSITION_LATENCY_LIMIT,  
-</span><span class='line'>.owner                  = THIS_MODULE,  
-</span><span class='line'>};  
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;
-</span><span class='line'>其中，governor是这个结构的核心字段，cpufreq_governor注册后，cpufreq的核心层通过该字段操纵这个governor的行为，包括：初始化、启动、退出等工作。现在，该字段被设置为od_cpufreq_governor_dbs，我们看看它的实现：
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;static int od_cpufreq_governor_dbs(struct cpufreq_policy *policy,  
-</span><span class='line'>    unsigned int event)  
-</span><span class='line'>{  
-</span><span class='line'>return cpufreq_governor_dbs(policy, &amp;od_dbs_cdata, event);  
-</span><span class='line'>}  
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;
-</span><span class='line'>只是简单地调用了governor的公共层提供的API：cpufreq_governor_dbs，关于这个API，我们在后面会逐一进行展开，这里我们注意到参数：&amp;od_dbs_cdata，正是我们前面讨论过得common_dbs_data结构，作为和governor公共层的接口，在这里它的定义如下：
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;static struct common_dbs_data od_dbs_cdata = {  
-</span><span class='line'>.governor = GOV_ONDEMAND,  
-</span><span class='line'>.attr_group_gov_sys = &amp;od_attr_group_gov_sys,  
-</span><span class='line'>.attr_group_gov_pol = &amp;od_attr_group_gov_pol,  
-</span><span class='line'>.get_cpu_cdbs = get_cpu_cdbs,  
-</span><span class='line'>.get_cpu_dbs_info_s = get_cpu_dbs_info_s,  
-</span><span class='line'>.gov_dbs_timer = od_dbs_timer,  
-</span><span class='line'>.gov_check_cpu = od_check_cpu,  
-</span><span class='line'>.gov_ops = &amp;od_ops,  
-</span><span class='line'>.init = od_init,  
-</span><span class='line'>.exit = od_exit,  
-</span><span class='line'>};  
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;
-</span><span class='line'>这里先介绍一下get_cpu_cdbs和get_cpu_dbs_info_s这两个回调，前面介绍cpu_dbs_common_info_s结构的时候已经说过，各个governor需要定义一个cpu_dbs_common_info_s结构的派生结构，对于ondemand来说，这个派生结构是：od_cpu_dbs_info_s。两个回调函数分别用来获得基类和派生类这两个结构的指针。我们先看看od_cpu_dbs_info_s是如何定义的：
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;static DEFINE_PER_CPU(struct od_cpu_dbs_info_s, od_cpu_dbs_info);  
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;
-</span><span class='line'>没错，它被定义为了一个per_cpu变量，也就是说，每个cpu拥有各自独立的od_cpu_dbs_info_s，这很正常，因为每个cpu需要的实时负载是不一样的，需要独立的上下文变量来进行负载的统计。前面也已经列出了od_cpu_dbs_info_s的声明，他的第一个字段cdbs就是一个cpu_dbs_common_info_s结构。内核为我们提供了一个辅助宏来帮助我们定义get_cpu_cdbs和get_cpu_dbs_info_s这两个回调函数：
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;#define define_get_cpu_dbs_routines(_dbs_info)                          \  
-</span><span class='line'>static struct cpu_dbs_common_info *get_cpu_cdbs(int cpu)                \  
-</span><span class='line'>{                                                                       \  
-</span><span class='line'>return &amp;per_cpu(_dbs_info, cpu).cdbs;                           \  
-</span><span class='line'>}                                                                       \  
-</span><span class='line'>                                        \  
-</span><span class='line'>static void *get_cpu_dbs_info_s(int cpu)                                \  
-</span><span class='line'>{                                                                       \  
-</span><span class='line'>return &amp;per_cpu(_dbs_info, cpu);                                \  
-</span><span class='line'>}        
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;
-</span><span class='line'>所以，在cpufreq_ondemand.c中，我们只要简单地使用上述的宏即可定义这两个回调：
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;define_get_cpu_dbs_routines(od_cpu_dbs_info);  
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;
-</span><span class='line'>经过上述这一系列的定义以后，governor的公共层即可通过这两个回调获取各个cpu所对应的cpu_dbs_common_info_s和od_cpu_dbs_info_s的结构指针，用来记录本次统计周期的一些上下文参数（idle时间和运行时间等等）。
-</span><span class='line'>
-</span><span class='line'>#### 3. 初始化一个governor
-</span><span class='line'>
-</span><span class='line'>当一个governor被policy选定后，核心层会通过`__cpufreq_set_policy`函数对该cpu的policy进行设定，参看 Linux动态频率调节系统CPUFreq之二：核心（core）架构与API中的第4节和图4.1。如果policy认为这是一个新的governor（和原来使用的旧的governor不相同），policy会通过`__cpufreq_governor`函数，并传递CPUFREQ_GOV_POLICY_INIT参数，而`__cpufreq_governor`函数实际上是调用cpufreq_governor结构中的governor回调函数，在第2节中我们已经知道，这个回调最后会进入governor公共API：cpufreq_governor_dbs，下面是它收到CPUFREQ_GOV_POLICY_INIT参数时，经过简化后的代码片段：
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;case CPUFREQ_GOV_POLICY_INIT:  
-</span><span class='line'>......  
-</span><span class='line'>
-</span><span class='line'>dbs_data = kzalloc(sizeof(*dbs_data), GFP_KERNEL);  
-</span><span class='line'>......  
-</span><span class='line'>
-</span><span class='line'>dbs_data-&gt;cdata = cdata;  
-</span><span class='line'>dbs_data-&gt;usage_count = 1;  
-</span><span class='line'>rc = cdata-&gt;init(dbs_data);  
-</span><span class='line'>......  
-</span><span class='line'>
-</span><span class='line'>rc = sysfs_create_group(get_governor_parent_kobj(policy),  
-</span><span class='line'>        get_sysfs_attr(dbs_data));  
-</span><span class='line'>......  
-</span><span class='line'>
-</span><span class='line'>policy-&gt;governor_data = dbs_data;  
-</span><span class='line'>
-</span><span class='line'>......  
-</span><span class='line'>/* Bring kernel and HW constraints together */  
-</span><span class='line'>dbs_data-&gt;min_sampling_rate = max(dbs_data-&gt;min_sampling_rate,  
-</span><span class='line'>        MIN_LATENCY_MULTIPLIER * latency);  
-</span><span class='line'>set_sampling_rate(dbs_data, max(dbs_data-&gt;min_sampling_rate,  
-</span><span class='line'>            latency * LATENCY_MULTIPLIER));  
-</span><span class='line'>if ((cdata-&gt;governor == GOV_CONSERVATIVE) &amp;&amp;  
-</span><span class='line'>        (!policy-&gt;governor-&gt;initialized)) {  
-</span><span class='line'>    struct cs_ops *cs_ops = dbs_data-&gt;cdata-&gt;gov_ops;  
-</span><span class='line'>
-</span><span class='line'>    cpufreq_register_notifier(cs_ops-&gt;notifier_block,  
-</span><span class='line'>            CPUFREQ_TRANSITION_NOTIFIER);  
-</span><span class='line'>}  
-</span><span class='line'>
-</span><span class='line'>if (!have_governor_per_policy())  
-</span><span class='line'>    cdata-&gt;gdbs_data = dbs_data;  
-</span><span class='line'>
-</span><span class='line'>return 0;  
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;
-</span><span class='line'>首先，它会给这个policy分配一个dbs_data实例，然后把通过参数cdata传入的common_dbs_data指针，赋值给它的cdata字段，这样，policy就可以通过该字段获得governor的操作接口（通过cdata的一系列回调函数）。然后，调用cdata的init回调函数，对这个governor做进一步的初始化工作，对于ondemand来说，init回调的实际执行函数是：od_init，主要是完成和governor相关的一些调节参数的初始化，然后把初始化好的od_dbs_tuners结构指针赋值到dbs_data的tuners字段中，它的详细代码这里就不贴出了。接着，通过sysfs_create_group函数，建立该governor在sysfs中的节点，以后我们就可以通过这些节点对该governor的算法逻辑进行微调，ondemand在我的电脑中，建立了以下这些节点（sys/devices/system/cpu/cpufreq/ondemand）：
-</span><span class='line'>
-</span><span class='line'>sampling_rate;
-</span><span class='line'>io_is_busy;
-</span><span class='line'>up_threshold;
-</span><span class='line'>sampling_down_factor;
-</span><span class='line'>ignore_nice;
-</span><span class='line'>powersave_bias;
-</span><span class='line'>sampling_rate_min;
-</span><span class='line'>
-</span><span class='line'>继续，把初始化好的dbs_data结构赋值给policy的governor_data字段，以方便以后的访问。最后是通过set_sampling_rate设置governor的采样周期，如果还有设置have_governor_per_policy，把dbs_data结构指针赋值给cdata结构的gdbs_data字段，至此，governor的初始化工作完成，下面是整个过程的序列图：
-</span><span class='line'>
-</span><span class='line'>![](/images/kernel/2015-08-12-5.png)
-</span><span class='line'>
-</span><span class='line'>图 3.1  governor的初始化
-</span><span class='line'>
-</span><span class='line'>#### 4. 启动一个governor
-</span><span class='line'>
-</span><span class='line'>核心层会通过`__cpufreq_set_policy`函数，通过CPUFREQ_GOV_POLICY_INIT参数，在公共层的API：cpufreq_governor_dbs中，完成了对governor的初始化工作，紧接着，`__cpufreq_set_policy`会通过CPUFREQ_GOV_START参数，和初始化governor的流程一样，最终会到达cpufreq_governor_dbs函数中，我们看看它是如何启动一个governor的：
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;case CPUFREQ_GOV_START:  
-</span><span class='line'>if (!policy-&gt;cur)  
-</span><span class='line'>    return -EINVAL;  
-</span><span class='line'>
-</span><span class='line'>mutex_lock(&amp;dbs_data-&gt;mutex);  
-</span><span class='line'>
-</span><span class='line'>for_each_cpu(j, policy-&gt;cpus) {  
-</span><span class='line'>    struct cpu_dbs_common_info *j_cdbs =  
-</span><span class='line'>        dbs_data-&gt;cdata-&gt;get_cpu_cdbs(j);  
-</span><span class='line'>
-</span><span class='line'>    j_cdbs-&gt;cpu = j;  
-</span><span class='line'>    j_cdbs-&gt;cur_policy = policy;  
-</span><span class='line'>    j_cdbs-&gt;prev_cpu_idle = get_cpu_idle_time(j,  
-</span><span class='line'>                   &amp;j_cdbs-&gt;prev_cpu_wall, io_busy);  
-</span><span class='line'>    if (ignore_nice)  
-</span><span class='line'>        j_cdbs-&gt;prev_cpu_nice =  
-</span><span class='line'>            kcpustat_cpu(j).cpustat[CPUTIME_NICE];  
-</span><span class='line'>
-</span><span class='line'>    mutex_init(&amp;j_cdbs-&gt;timer_mutex);  
-</span><span class='line'>    INIT_DEFERRABLE_WORK(&amp;j_cdbs-&gt;work,  
-</span><span class='line'>                 dbs_data-&gt;cdata-&gt;gov_dbs_timer);  
-</span><span class='line'>}  
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;
-</span><span class='line'>首先，遍历使用该policy的所有的处于online状态的cpu，针对每一个cpu，做以下动作：
-</span><span class='line'>
-</span><span class='line'>取出该cpu相关联的cpu_dbs_common_info结构指针，之前已经讨论过，governor定义了一个per_cpu变量来定义各个cpu所对应的cpu_dbs_common_info结构，通过common_dbs_data结构的回调函数可以获取该结构的指针。
-</span><span class='line'>
-</span><span class='line'>初始化cpu_dbs_common_info结构的cpu，cur_policy，prev_cpu_idle，prev_cpu_wall，prev_cpu_nice字段，其中，prev_cpu_idle，prev_cpu_wall这两个字段会被以后的负载计算所使用。
-</span><span class='line'>
-</span><span class='line'>为每个cpu初始化一个工作队列，工作队列的执行函数是common_dbs_data结构中的gov_dbs_timer字段所指向的回调函数，对于ondemand来说，该函数是：od_dbs_timer。这个工作队列会被按照设定好的采样率定期地被唤醒，进行cpu负载的统计工作。
-</span><span class='line'>
-</span><span class='line'>然后，记录目前的时间戳，调度初始化好的工作队列在稍后某个时间点运行：
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;/* Initiate timer time stamp */  
-</span><span class='line'> cpu_cdbs-&gt;time_stamp = ktime_get();  
-</span><span class='line'>
-</span><span class='line'> gov_queue_work(dbs_data, policy,  
-</span><span class='line'>     delay_for_sampling_rate(sampling_rate), true);  
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;
-</span><span class='line'>下图表达了启动一个governor的过程：
-</span><span class='line'>
-</span><span class='line'>![](/images/kernel/2015-08-12-6.png)
-</span><span class='line'>
-</span><span class='line'>图 4.1  启动一个governor
-</span><span class='line'>
-</span><span class='line'>工作队列被调度执行后，会在工作队列的执行函数中进行cpu负载的统计工作，这个我们在下一节中讨论。
-</span><span class='line'>
-</span><span class='line'>#### 5. 系统负载的检测
-</span><span class='line'>
-</span><span class='line'>上一节我们提到，核心层启动一个governor后，会在每个使用该governor的cpu上建立一个工作队列，工作队列的执行函数是在common_dbs_data中gov_dbs_timer字段所指向的函数，理所当然，该函数由各个governor的具体代码来实现，对于ondemand governor，它的实现函数是od_dbs_timer。governor的公共层代码为我们提供了一个API：dbs_check_cpu，该API用来计算两个统计周期期间某个cpu的负载情况，我们先分析一下dbs_check_cpu：
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;void dbs_check_cpu(struct dbs_data *dbs_data, int cpu)  
-</span><span class='line'>{  
-</span><span class='line'>struct cpu_dbs_common_info *cdbs = dbs_data-&gt;cdata-&gt;get_cpu_cdbs(cpu);  
-</span><span class='line'>......  
-</span><span class='line'>
-</span><span class='line'>policy = cdbs-&gt;cur_policy;  
-</span><span class='line'>
-</span><span class='line'>/* Get Absolute Load (in terms of freq for ondemand gov) */  
-</span><span class='line'>for_each_cpu(j, policy-&gt;cpus) {  
-</span><span class='line'>    struct cpu_dbs_common_info *j_cdbs;  
-</span><span class='line'>    ......  
-</span><span class='line'>
-</span><span class='line'>    j_cdbs = dbs_data-&gt;cdata-&gt;get_cpu_cdbs(j);  
-</span><span class='line'>
-</span><span class='line'>    ......  
-</span><span class='line'>    cur_idle_time = get_cpu_idle_time(j, &amp;cur_wall_time, io_busy);  
-</span><span class='line'>
-</span><span class='line'>    wall_time = (unsigned int)  
-</span><span class='line'>        (cur_wall_time - j_cdbs-&gt;prev_cpu_wall);  
-</span><span class='line'>    j_cdbs-&gt;prev_cpu_wall = cur_wall_time;  
-</span><span class='line'>
-</span><span class='line'>    idle_time = (unsigned int)  
-</span><span class='line'>        (cur_idle_time - j_cdbs-&gt;prev_cpu_idle);  
-</span><span class='line'>    j_cdbs-&gt;prev_cpu_idle = cur_idle_time;  
-</span><span class='line'>    ......  
-</span><span class='line'>
-</span><span class='line'>    load = 100 * (wall_time - idle_time) / wall_time;  
-</span><span class='line'>    ......  
-</span><span class='line'>    load *= cur_freq；    /* 实际的代码不是这样，为了简化讨论，精简为实际的计算逻辑*/  
-</span><span class='line'>
-</span><span class='line'>    if (load &gt; max_load)  
-</span><span class='line'>        max_load = load;  
-</span><span class='line'>}  
-</span><span class='line'>
-</span><span class='line'>dbs_data-&gt;cdata-&gt;gov_check_cpu(cpu, max_load);  
-</span><span class='line'>}  
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;
-</span><span class='line'>由代码可以看出，遍历该policy下每个online的cpu，取出该cpu对应的cpu_dbs_common_info结构，该结构中的prev_cpu_idle和prev_cpu_wall保存有上一次采样周期时记录的idle时间和运行时间，负载的计算其实很简单：
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;idle_time = 本次idle时间 - 上次idle时间；
-</span><span class='line'>wall_time = 本次总运行时间 - 上次总运行时间；
-</span><span class='line'>负载load = 100 * （wall_time - idle_time）/ wall_time；
-</span><span class='line'>把所有cpu中，负载最大值记入max_load中，作为选择频率的依据；
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;
-</span><span class='line'>计算出最大负载max_load后，调用具体governor实现的gov_check_cpu回调函数，对于ondemand来说，该回调函数是：od_check_cpu，我们跟进去看看：
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;static void od_check_cpu(int cpu, unsigned int load_freq)  
-</span><span class='line'>{  
-</span><span class='line'>struct od_cpu_dbs_info_s *dbs_info = &amp;per_cpu(od_cpu_dbs_info, cpu);  
-</span><span class='line'>struct cpufreq_policy *policy = dbs_info-&gt;cdbs.cur_policy;  
-</span><span class='line'>struct dbs_data *dbs_data = policy-&gt;governor_data;  
-</span><span class='line'>struct od_dbs_tuners *od_tuners = dbs_data-&gt;tuners;  
-</span><span class='line'>
-</span><span class='line'>dbs_info-&gt;freq_lo = 0;  
-</span><span class='line'>
-</span><span class='line'>/* Check for frequency increase */  
-</span><span class='line'>if (load_freq &gt; od_tuners-&gt;up_threshold * policy-&gt;cur) {  
-</span><span class='line'>    /* If switching to max speed, apply sampling_down_factor */  
-</span><span class='line'>    if (policy-&gt;cur &lt; policy-&gt;max)  
-</span><span class='line'>        dbs_info-&gt;rate_mult =  
-</span><span class='line'>            od_tuners-&gt;sampling_down_factor;  
-</span><span class='line'>    dbs_freq_increase(policy, policy-&gt;max);  
-</span><span class='line'>    return;  
-</span><span class='line'>}  
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;
-</span><span class='line'>当负载比预设的阀值高时（od_tuners-&gt;up_threshold，默认值是95%），立刻选择该policy最大的工作频率作为接下来的工作频率。如果负载没有达到预设的阀值，但是当前频率已经是最低频率了，则什么都不做，直接返回：
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;if (policy-&gt;cur == policy-&gt;min)  
-</span><span class='line'>return;  
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;
-</span><span class='line'>运行到这里，cpu的频率可能已经在上面的过程中被设置为最大频率，实际上我们可能并不需要这么高的频率，所以接着判断，当负载低于另一个预设值时，这时需要计算一个合适于该负载的新频率：
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;if (load_freq &lt; od_tuners-&gt;adj_up_threshold  
-</span><span class='line'>    * policy-&gt;cur) {  
-</span><span class='line'>unsigned int freq_next;  
-</span><span class='line'>freq_next = load_freq / od_tuners-&gt;adj_up_threshold;  
-</span><span class='line'>
-</span><span class='line'>/* No longer fully busy, reset rate_mult */  
-</span><span class='line'>dbs_info-&gt;rate_mult = 1;  
-</span><span class='line'>
-</span><span class='line'>if (freq_next &lt; policy-&gt;min)  
-</span><span class='line'>    freq_next = policy-&gt;min;  
-</span><span class='line'>
-</span><span class='line'>if (!od_tuners-&gt;powersave_bias) {  
-</span><span class='line'>    __cpufreq_driver_target(policy, freq_next,  
-</span><span class='line'>            CPUFREQ_RELATION_L);  
-</span><span class='line'>    return;  
-</span><span class='line'>}  
-</span><span class='line'>
-</span><span class='line'>freq_next = od_ops.powersave_bias_target(policy, freq_next,  
-</span><span class='line'>            CPUFREQ_RELATION_L);  
-</span><span class='line'>__cpufreq_driver_target(policy, freq_next, CPUFREQ_RELATION_L);  
-</span><span class='line'>}  
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;
-</span><span class='line'>对于ondemand来说，因为传入的负载是乘上了当前频率后的归一化值，所以计算新频率时，直接用load_freq除以想要的负载即可。本来计算出来的频率直接通过`__cpufreq_driver_target`函数，交给cpufreq_driver调节频率即可，但是这里的处理考虑了powersave_bias的设置情况，当设置了powersave_bias时，表明我们为了进一步节省电力，我们希望在计算出来的新频率的基础上，再乘以一个powersave_bias设定的百分比，作为真正的运行频率，powersave_bias的值从0-1000，每一步代表0.1%。实际的情况比想象中稍微复杂一点，考虑到乘以一个powersave_bias后的新频率可能不在cpu所支持的频率表中，ondemand算法会在频率表中查找，分别找出最接近新频率的一个区间，由高低两个频率组成，低的频率记入od_cpu_dbs_info_s结构的freq_lo字段中，高的频率通过od_ops.powersave_bias_target回调返回。同时，od_ops.powersave_bias_target回调函数还计算出高低两个频率应该运行的时间，分别记入od_cpu_dbs_info_s结构的freq_hi_jiffies和freq_low_jiffies字段中。原则是，通过两个不同频率的运行时间的组合，使得综合结果接近我们想要的目标频率。详细的计算逻辑请参考函数：generic_powersave_bias_target。
-</span><span class='line'>讨论完上面两个函数，让我们回到本节的开头，负载的计算工作是在一个工作队列中发起的，前面说过，ondemand对应的工作队列的工作函数是od_dbs_timer，我们看看他的实现代码：
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;pre&gt;&lt;code&gt;static void od_dbs_timer(struct work_struct *work)  
-</span><span class='line'>{  
-</span><span class='line'>......  
-</span><span class='line'>
-</span><span class='line'>/* Common NORMAL_SAMPLE setup */  
-</span><span class='line'>core_dbs_info-&gt;sample_type = OD_NORMAL_SAMPLE;  
-</span><span class='line'>if (sample_type == OD_SUB_SAMPLE) {  
-</span><span class='line'>    delay = core_dbs_info-&gt;freq_lo_jiffies;  
-</span><span class='line'>    __cpufreq_driver_target(core_dbs_info-&gt;cdbs.cur_policy,  
-</span><span class='line'>            core_dbs_info-&gt;freq_lo, CPUFREQ_RELATION_H);  
-</span><span class='line'>} else {  
-</span><span class='line'>    dbs_check_cpu(dbs_data, cpu);  
-</span><span class='line'>    if (core_dbs_info-&gt;freq_lo) {  
-</span><span class='line'>        /* Setup timer for SUB_SAMPLE */  
-</span><span class='line'>        core_dbs_info-&gt;sample_type = OD_SUB_SAMPLE;  
-</span><span class='line'>        delay = core_dbs_info-&gt;freq_hi_jiffies;  
-</span><span class='line'>    }  
-</span><span class='line'>}  
-</span><span class='line'>
-</span><span class='line'>max_delay:  
-</span><span class='line'>if (!delay)  
-</span><span class='line'>    delay = delay_for_sampling_rate(od_tuners-&gt;sampling_rate  
-</span><span class='line'>            * core_dbs_info-&gt;rate_mult);  
-</span><span class='line'>
-</span><span class='line'>gov_queue_work(dbs_data, dbs_info-&gt;cdbs.cur_policy, delay, modify_all);  
-</span><span class='line'>mutex_unlock(&amp;core_dbs_info-&gt;cdbs.timer_mutex);  
-</span><span class='line'>}  
-</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;```&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;如果sample_type是OD_SUB_SAMPLE时，表明上一次采样时，需要用高低两个频率来模拟实际的目标频率中的第二步：需要运行freq_lo，并且持续时间为freq_lo_jiffies。否则，调用公共层计算负载的API：dbs_check_cpu，开始一次新的采样，当powersave_bias没有设置时，该函数返回前，所需要的新的目标频率会被设置，考虑到powersave_bias的设置情况，判断一下如果freq_lo被设置，说明需要用高低两个频率来模拟实际的目标频率，高频率已经在dbs_check_cpu返回前被设置（实际的设置工作是在od_check_cpu中），所以把sample_type设置为OD_SUB_SAMPLE，以便下一次运行工作函数进行采样时可以设置低频率运行。最后，调度工作队列在下一个采样时刻再次运行，这样，cpu的工作频率实现了在每个采样周期，根据实际的负载情况，动态地设定合适的工作频率进行运行，既满足了性能的需求，也降低了系统的功耗，达到了cpufreq系统的最终目的，整个流程可以参考下图：&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;&lt;img src="/images/kernel/2015-08-12-7.png" alt="" /&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;图 5.1  负载计算和频率选择&lt;/p&gt;
-</span><span class='line'>]]&gt;&lt;/content&gt;
-</span><span class='line'>  &lt;/entry&gt;
-</span><span class='line'>  
-</span><span class='line'>  &lt;entry&gt;
-</span><span class='line'>&lt;title type="html"&gt;&lt;![CDATA[relay 数据传输]]&gt;&lt;/title&gt;
-</span><span class='line'>&lt;link href="http://abcdxyzk.github.io/blog/2015/08/03/kernel-base-relay/"/&gt;
-</span><span class='line'>&lt;updated&gt;2015-08-03T16:39:00+08:00&lt;/updated&gt;
-</span><span class='line'>&lt;id&gt;http://abcdxyzk.github.io/blog/2015/08/03/kernel-base-relay&lt;/id&gt;
-</span><span class='line'>&lt;content type="html"&gt;&lt;![CDATA[&lt;p&gt;&lt;a href="https://www.ibm.com/developerworks/cn/linux/l-cn-relay/"&gt;https://www.ibm.com/developerworks/cn/linux/l-cn-relay/&lt;/a&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;Relay 要解决的问题&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;对于任何在内核工作的程序而言，如何把大量的调试信息从内核空间传输到用户空间都是一个大麻烦，对于运行中的内核更是如此。特别是对于哪些用于调试内核性能的工具，更是如此。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;对于这种大量数据需要在内核中缓存并传输到用户空间需求，很多传统的方法都已到达了极限，例如内核程序员很熟悉的 printk() 调用。此外，如果不同的内核子系统都开发自己的缓存和传输代码，造成很大的代码冗余，而且也带来维护上的困难。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;这些，都要求开发一套能够高效可靠地将数据从内核空间转发到用户空间的系统，而且这个系统应该独立于各个调试子系统。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;这样就诞生了 RelayFS。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;Relay的发展历史&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;Relay 的前身是 RelayFS，即作为 Linux 的一个新型文件系统。2003年3月，RelayFS的第一个版本的代码被开发出来，在7月14日，第一个针对2.6内核的版本也开始提供下载。经过广泛的试用和改进，直到2005年9月，RelayFS才被加入mainline内核(2.6.14)。同时，RelayFS也被移植到2.4内核中。在2006年2月，从2.6.17开始，RelayFS不再作为单独的文件系统存在，而是成为内核的一部分。它的源码也从fs/目录下转移到kernel/relay.c中，名称中也从RelayFS改成了Relay。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;RelayFS目前已经被越来越多的内核工具使用，包括内核调试工具SystemTap、LTT，以及一些特殊的文件系统例如DebugFS。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;Relay的基本原理&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;总的说来，Relay提供了一种机制，使得内核空间的程序能够通过用户定义的relay通道(channel)将大量数据高效的传输到用户空间。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;一个relay通道由一组和CPU一一对应的内核缓冲区组成。这些缓冲区又被称为relay缓冲区(buffer)，其中的每一个在用户空间都用一个常规文件来表示，这被叫做relay文件(file)。内核空间的用户可以利用relay提供的API接口来写入数据，这些数据会被自动的写入当前的CPU id对应的那个relay缓冲区；同时，这些缓冲区从用户空间看来，是一组普通文件，可以直接使用read()进行读取，也可以使用mmap()进行映射。Relay并不关心数据的格式和内容，这些完全依赖于使用relay的用户程序。Relay的目的是提供一个足够简单的接口，从而使得基本操作尽可能的高效。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;Relay将数据的读和写分离，使得突发性大量数据写入的时候，不需要受限于用户空间相对较慢的读取速度，从而大大提高了效率。Relay作为写入和读取的桥梁，也就是将内核用户写入的数据缓存并转发给用户空间的程序。这种转发机制也正是Relay这个名称的由来。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;下面这个图给出了Relay的基本结构和典型操作：&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;&lt;img src="/images/kernel/2015-08-03.png" alt="" /&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;Relay的基本结构和典型操作&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;可以看到，这里的relay通道由四个relay缓冲区(kbuf0到kbuf3)组成，分别对应于系统中的cpu0到cpu1。每个CPU上的代码调用relay_write()的时候将数据写入自己对应的relay缓冲区内。每个relay缓冲区称一个relay文件，即/cpu0到/cpu3。当文件系统被mount到/mnt/以后，这个relay文件就被映射成映射到用户空间的地址空间。一旦数据可用，用户程序就可以把它的数据读出来写入到硬盘上的文件中，即cpu0.out到cpu3.out。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;Relay的主要API&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;前面提到的 relay_write() 就是 relay API 之一。除此以外，Relay 还提供了更多的 API来支持用户程序完整的使用 relay。这些 API，主要按照面向用户空间和面向内核空间分为两大类，下面我们来分别进行介绍。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h5&gt;面向用户空间的 API&lt;/h5&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;这些 Relay 编程接口向用户空间程序提供了访问 relay 通道缓冲区数据的基本操作的入口，包括：
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>open() - 允许用户打开一个已经存在的通道缓冲区
-</span><span class='line'>mmap() - 使通道缓冲区被映射到位于用户空间的调用者的地址空间。要特别注意的是，我们不能仅对局部区域进行映射。也就是说，必须映射整个缓冲区文件，其大小是 CPU的个数和单个 CPU 缓冲区大小的乘积
-</span><span class='line'>read() - 读取通道缓冲区的内容。这些数据一旦被读出，就意味着他们被用户空间的程序消费掉了，也就不能被之后的读操作看到
-</span><span class='line'>sendfile() - 将数据从通道缓冲区传输到一个输出文件描述符。其中可能的填充字符会被自动去掉，不会被用户看到
-</span><span class='line'>poll() - 支持 POLLIN/POLLRDNORM/POLLERR 信号。每次子缓冲区的边界被越过时，等待着的用户空间程序会得到通知
-</span><span class='line'>close() - 将通道缓冲区的引用数减1。当引用数减为0时，表明没有进程或者内核用户需要打开它，从而这个通道缓冲区被释放。
-</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h5&gt;面向内核空间的 API&lt;/h5&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;这些API接口向位于内核空间的用户提供了管理relay通道、数据写入等功能。下面介绍其中主要的部分，完整的API接口列表请参见这里。
-</span><span class='line'>&lt;code&gt;
-</span><span class='line'>relay_open() - 创建一个relay通道，包括创建每个CPU对应的relay缓冲区。
-</span><span class='line'>relay_close() - 关闭一个relay通道，包括释放所有的relay缓冲区，在此之前会调用relay_switch()来处理这些relay缓冲区以保证已读取但是未满的数据不会丢失
-</span><span class='line'>relay_write() - 将数据写入到当前CPU对应的relay缓冲区内。由于它使用了local_irqsave()保护，因此也可以在中断上下文中使用。
-</span><span class='line'>relay_reserve() - 在relay通道中保留一块连续的区域来留给未来的写入操作。这通常用于那些希望直接写入到relay缓冲区的用户。考虑到性能或者其它因素，这些用户不希望先把数据写到一个临时缓冲区中，然后再通过relay_write()进行写入。
-</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;h4&gt;Relay的例子&lt;/h4&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;我们用一个最简单的例子来介绍怎么使用Relay。这个例子由两部分组成：一部分是位于内核空间将数据写入relay文件的程序，使用时需要作为一个内核模块被加载；另一部分是位于用户空间从relay文件中读取数据的程序，使用时作为普通用户态程序运行。&lt;/p&gt;
-</span><span class='line'>
-</span><span class='line'>&lt;p&gt;内核空间的程序主要操作是：&lt;br/&gt;
-</span><span class='line'>  加载模块时，打开一个relay通道，并且往打开的relay通道中写入消息；&lt;br/&gt;
-</span><span class='line'>  卸载模块时，关闭relay通道。</span></code></pre></td></tr></table></div></figure>
-    #include &lt;linux/module.h>
-    #include &lt;linux/relay.h>
-    #include &lt;linux/debugfs.h></p>
+```
+    static int cpufreq_add_dev_interface(unsigned int cpu,<br/>
+                         struct cpufreq_policy <em>policy,<br/>
+                         struct device </em>dev)<br/>
+    {<br/>
+        &hellip;&hellip;</p>
 
-<pre><code>static struct dentry *create_buf_file_handler(const char *filename, struct dentry *parent, int mode, struct rchan_buf *buf, int *is_global)
-{
-    return debugfs_create_file(filename, mode, parent, buf, &amp;relay_file_operations);
-}
+<pre><code>    /* prepare interface data */  
+    ret = kobject_init_and_add(&amp;policy-&gt;kobj, &amp;ktype_cpufreq,  
+                   &amp;dev-&gt;kobj, "cpufreq");  
+    ......  
 
-static int remove_buf_file_handler(struct dentry *dentry)
-{
-    debugfs_remove(dentry);
-    return 0;
-}
+    /* set up files for this cpu device */  
+    drv_attr = cpufreq_driver-&gt;attr;  
+    while ((drv_attr) &amp;&amp; (*drv_attr)) {  
+        ret = sysfs_create_file(&amp;policy-&gt;kobj, &amp;((*drv_attr)-&gt;attr));  
+        if (ret)  
+            goto err_out_kobj_put;  
+        drv_attr++;  
+    }  
+</code></pre>
 
-static struct rchan_callbacks relay_callbacks =
-{
-    .create_buf_file = create_buf_file_handler,
-    .remove_buf_file = remove_buf_file_handler,
-};
+<pre><code>函数的一开始，建立cpufreq文件节点，然后在它的下面再建立一系列节点，用户可以通过这些文件节点控制该policy的一些参数。这不是我们的重点，我们看下面这一段代码：
+</code></pre>
 
-static struct rchan *hello_rchan;
-struct dentry *dir;
+<pre><code>for_each_cpu(j, policy-&gt;cpus) {  
+    per_cpu(cpufreq_cpu_data, j) = policy;  
+    per_cpu(cpufreq_policy_cpu, j) = policy-&gt;cpu;  
+}  
+</code></pre>
 
-int init_module(void)
-{
-    const char *msg="Hello world\n";
-    dir = debugfs_create_dir("test", NULL);
-#if (LINUX_VERSION_CODE &gt;= KERNEL_VERSION(2,6,32))
-    hello_rchan = relay_open("cpu", dir, 8192, 2, &amp;relay_callbacks, NULL);
-#else   
-    hello_rchan = relay_open("cpu", dir, 8192, 2, &amp;relay_callbacks);
-#endif  
-    if(!hello_rchan){
-        printk("relay_open() failed.\n");
-        return -ENOMEM;
-    }
-    relay_write(hello_rchan, msg, strlen(msg));
-    return 0;
-}
+<pre><code>前面的代码已经设定了该policy所管理的online cpu：policy-&gt;cpus，通过两个per_cpu变量，这里把每个online cpu的policy都设置为了本cpu（管理cpu）的policy，并且把所有online的cpu的管理cpu也指定为了本cpu。接下来，cpufreq_add_dev_symlink被调用，所有policy-&gt;cpus指定的cpu会建立一个cpufreq链接，指向本cpu（管理cpu）的真实cpufreq节点：
+</code></pre>
+
+<pre><code>ret = cpufreq_add_dev_symlink(cpu, policy);  
 </code></pre>
 
 <pre><code>
-查看输出
+注意，假如这时的cpu是cpu0，也就是说，其它cpu的cpufreq_add_dev还没有被调用，但是在cpufreq_cpu_data中，与之对应的policy指针已经被赋值为cpu0所对应的policy，这样，回到cpufreq_add_dev函数的开头部分，当接下其它被认为使用cpu0托管他们的policy的cpu也会进入cpufreq_add_dev函数，但是，因为cpufreq_cpu_data中对应的policy已经在cpu0的建立阶段被赋值，所以这些cpu他们不会走完所有的流程，在函数的开头的判断部分，判断cpufreq_cpu_data中cpu对应的policy已经被赋值，就直接返回了。
+接着往下看cpufreq_add_dev_interface的代码：
 </code></pre>
 
-<pre><code>mount -t debugfs debugfs /media
-cat /media/test/cpu*
+<pre><code>memcpy(&amp;new_policy, policy, sizeof(struct cpufreq_policy));  
+/* assure that the starting sequence is run in __cpufreq_set_policy */  
+policy-&gt;governor = NULL;  
+
+/* set default policy */  
+ret = __cpufreq_set_policy(policy, &amp;new_policy);  
+policy-&gt;user_policy.policy = policy-&gt;policy;  
+policy-&gt;user_policy.governor = policy-&gt;governor;  
 </code></pre>
 
-<pre><code>
----------------
----------------
+<pre><code>通过`__cpufreq_set_policy`函数，最终使得该policy正式生效。到这里，每个cpu的policy已经建立完毕，并正式开始工作。关于`__cpufreq_set_policy`的代码这里就不展开了，我只给出它的序列图：
 
-http://www.cnblogs.com/hoys/archive/2011/04/10/2011270.html
+![](/images/kernel/2015-08-12-3.png)
 
-### 用户空间与内核空间数据交换的方式(4)------relayfs
+图 4.1  设置一个cpufreq_policy
 
-relayfs是一个快速的转发（relay）数据的文件系统，它以其功能而得名。它为那些需要从内核空间转发大量数据到用户空间的工具和应用提供了快速有效的转发机制。
+#### 5. 其它API
 
-Channel是relayfs文件系统定义的一个主要概念，每一个channel由一组内核缓存组成，每一个CPU有一个对应于该channel 的内核缓存，每一个内核缓存用一个在relayfs文件系统中的文件文件表示，内核使用relayfs提供的写函数把需要转发给用户空间的数据快速地写入当前CPU上的channel内核缓存，用户空间应用通过标准的文件I/O函数在对应的channel文件中可以快速地取得这些被转发出的数据mmap 来。写入到channel中的数据的格式完全取决于内核中创建channel的模块或子系统。
-
-#### relayfs的用户空间API：
-
-relayfs实现了四个标准的文件I/O函数，open、mmap、poll和close.
-
-open()，打开一个channel在某一个CPU上的缓存对应的文件。
-
-mmap()，把打开的channel缓存映射到调用者进程的内存空间。
-
-read ()，读取channel缓存，随后的读操作将看不到被该函数消耗的字节，如果channel的操作模式为非覆盖写，那么用户空间应用在有内核模块写时仍 可以读取，但是如果channel的操作模式为覆盖式，那么在读操作期间如果有内核模块进行写，结果将无法预知，因此对于覆盖式写的channel，用户 应当在确认在channel的写完全结束后再进行读。
-
-poll()，用于通知用户空间应用转发数据跨越了子缓存的边界，支持的轮询标志有POLLIN、POLLRDNORM和POLLERR。
-
-close()，关闭open函数返回的文件描述符，如果没有进程或内核模块打开该channel缓存，close函数将释放该channel缓存。
-
-注意：用户态应用在使用上述API时必须保证已经挂载了relayfs文件系统，但内核在创建和使用channel时不需要relayfs已经挂载。下面命令将把relayfs文件系统挂载到/mnt/relay。
+cpufreq的核心层除了提供上面几节讨论的注册governor，注册cpufreq_driver等API外，还提供了其他一些辅助的API，以方便其它模块的使用。
 </code></pre>
 
-<pre><code>mount -t relayfs relayfs /mnt/relay
+<pre><code>int cpufreq_register_notifier(struct notifier_block *nb, unsigned int list);
+int cpufreq_unregister_notifier(struct notifier_block *nb, unsigned int list);
 </code></pre>
 
-<pre><code>
-#### relayfs内核API：
-
-relayfs提供给内核的API包括四类：channel管理、写函数、回调函数和辅助函数。
-
-Channel管理函数包括：
+<pre><code>以上两个API用于注册和注销cpufreq系统的通知消息，第二个参数可以选择通知的类型，可以有以下两种类型：
 </code></pre>
 
-<pre><code>relay_open(base_filename, parent, subbuf_size, n_subbufs, overwrite, callbacks)
-relay_close(chan)
-relay_flush(chan)
-relay_reset(chan)
-relayfs_create_dir(name, parent)
-relayfs_remove_dir(dentry)
-relay_commit(buf, reserved, count)
-relay_subbufs_consumed(chan, cpu, subbufs_consumed)
+<pre><code>CPUFREQ_TRANSITION_NOTIFIER      收到频率变更通知
+CPUFREQ_POLICY_NOTIFIER               收到policy更新通知
+
+
+int cpufreq_driver_target(struct cpufreq_policy *policy,
+                 unsigned int target_freq,
+                 unsigned int relation);
+int __cpufreq_driver_target(struct cpufreq_policy *policy,
+                   unsigned int target_freq,
+                   unsigned int relation);
 </code></pre>
 
-<pre><code>写函数包括：
+<pre><code>以上两个API用来设置cpu的工作频率，区别在于cpufreq_driver_target是带锁的版本，而`__cpufreq_driver_target`是不带锁的版本，如果确定是在governor的上下文中，使用不带锁的版本，否则需要使用带锁的版本。
 </code></pre>
 
-<pre><code>relay_write(chan, data, length)
-__relay_write(chan, data, length)
-relay_reserve(chan, length)
+<pre><code>void cpufreq_verify_within_limits(struct cpufreq_policy *policy, unsigned int min, unsigned int max)；
 </code></pre>
 
-<pre><code>
-回调函数包括：
+<pre><code>这个API用来检查并重新设定policy的最大和最小频率。
 </code></pre>
 
-<pre><code>subbuf_start(buf, subbuf, prev_subbuf_idx, prev_subbuf)
-buf_mapped(buf, filp)
-buf_unmapped(buf, filp)
+<pre><code>int cpufreq_update_policy(unsigned int cpu);
 </code></pre>
 
-<pre><code>
-辅助函数包括：
+<pre><code>这个API用来触发cpufreq核心进行policy的更新操作。
+
+
+--------------
+
+### Linux动态频率调节系统CPUFreq之三：governor
+
+在上一篇文章中，介绍了cpufreq的core层，core提供了cpufreq系统的初始化，公共数据结构的建立以及对cpufreq中其它子部件提供注册功能。core的最核心功能是对policy的管理，一个policy通过cpufreq_policy结构中的governor字段，和某个governor相关联，本章的内容正是要对governor进行讨论。
+
+
+通过前面两篇文章的介绍，我们知道，governor的作用是：检测系统的负载状况，然后根据当前的负载，选择出某个可供使用的工作频率，然后把该工作频率传递给cpufreq_driver，完成频率的动态调节。内核默认提供了5种governor供我们使用，在之前的内核版本中，每种governor几乎是独立的代码，它们各自用自己的方式实现对系统的负载进行监测，很多时候，检测的逻辑其实是很相似的，各个governor最大的不同之处其实是根据检测的结果，选择合适频率的策略。所以，为了减少代码的重复，在我现在分析的内核版本中（3.10.0），一些公共的逻辑代码被单独抽象出来，单独用一个文件来实现：/drivers/cpufreq/cpufreq_governor.c，而各个具体的governor则分别有自己的代码文件，如：cpufreq_ondemand.c，cpufreq_performance.c。下面我们先从公共部分讨论。
+
+#### 1. 数据结构
+
+cpu_dbs_common_info  该结构把对计算cpu负载需要使用到的一些辅助变量整合在了一起，通常，每个cpu都需要一个cpu_dbs_common_info结构体，该结构体中的成员会在governor的生命周期期间进行传递，以用于统计当前cpu的负载，它的定义如下：
 </code></pre>
 
-<pre><code>relay_buf_full(buf)
-subbuf_start_reserve(buf, length)
-</code></pre>
+<pre><code>/* Per cpu structures */  
+struct cpu_dbs_common_info {  
+    int cpu;  
+    u64 prev_cpu_idle;  
+    u64 prev_cpu_wall;  
+    u64 prev_cpu_nice;  
+    struct cpufreq_policy *cur_policy;  
+    struct delayed_work work;  
 
-<pre><code>
-前面已经讲过，每一个channel由一组channel缓存组成，每个CPU对应一个该channel的缓存，每一个缓存又由一个或多个子缓存组成，每一个缓存是子缓存组成的一个环型缓存。
+    struct mutex timer_mutex;  
+    ktime_t time_stamp;  
+};  
 
-函数relay_open用于创建一个channel并分配对应于每一个CPU的缓存，用户空间应用通过在relayfs文件系统中对应的文件可以 访问channel缓存，参数base_filename用于指定channel的文件名，relay_open函数将在relayfs文件系统中创建 base_filename0..base_filenameN-1，即每一个CPU对应一个channel文件，其中N为CPU数，缺省情况下，这些文件将建立在relayfs文件系统的根目录下，但如果参数parent非空，该函数将把channel文件创建于parent目录下，parent目录使 用函数relay_create_dir创建，函数relay_remove_dir用于删除由函数relay_create_dir创建的目录，谁创建的目录，谁就负责在不用时负责删除。参数subbuf_size用于指定channel缓存中每一个子缓存的大小，参数n_subbufs用于指定 channel缓存包含的子缓存数，因此实际的channel缓存大小为(subbuf_size x n_subbufs)，参数overwrite用于指定该channel的操作模式，relayfs提供了两种写模式，一种是覆盖式写，另一种是非覆盖式 写。使用哪一种模式完全取决于函数subbuf_start的实现，覆盖写将在缓存已满的情况下无条件地继续从缓存的开始写数据，而不管这些数据是否已经 被用户应用读取，因此写操作决不失败。在非覆盖写模式下，如果缓存满了，写将失败，但内核将在用户空间应用读取缓存数据时通过函数 relay_subbufs_consumed()通知relayfs。如果用户空间应用没来得及消耗缓存中的数据或缓存已满，两种模式都将导致数据丢失，唯一的区别是，前者丢失数据在缓存开头，而后者丢失数据在缓存末尾。一旦内核再次调用函数relay_subbufs_consumed()，已满的缓存将不再满，因而可以继续写该缓存。当缓存满了以后，relayfs将调用回调函数buf_full()来通知内核模块或子系统。当新的数据太大无法写 入当前子缓存剩余的空间时，relayfs将调用回调函数subbuf_start()来通知内核模块或子系统将需要使用新的子缓存。内核模块需要在该回调函数中实现下述功能：
-
-初始化新的子缓存；
-
-如果1正确，完成当前子缓存；
-
-如果2正确，返回是否正确完成子缓存切换；
-
-在非覆盖写模式下，回调函数subbuf_start()应该如下实现：
-</code></pre>
-
-<pre><code>static int subbuf_start(struct rchan_buf *buf, void *subbuf, void *prev_subbuf, unsigned intprev_padding)
-{
-    if (prev_subbuf)
-        *((unsigned *)prev_subbuf) = prev_padding;
-
-    if (relay_buf_full(buf))
-        return 0;
-
-    subbuf_start_reserve(buf, sizeof(unsigned int));
-    return 1;
-}
+cpu  与该结构体相关联的cpu编号。
+prev_cpu_idle  上一次统计时刻该cpu停留在idle状态的总时间。
+prev_cpu_wall  上一次统计时刻对应的总工作时间。
+cur_policy  指向该cpu所使用的cpufreq_policy结构。
+work  工作队列，该工作队列会被定期地触发，然后定期地进行负载的更新和统计工作。
 </code></pre>
 
 <pre><code>
-如果当前缓存满，即所有的子缓存都没读取，该函数返回0，指示子缓存切换没有成功。当子缓存通过函数relay_subbufs_consumed ()被读取后，读取者将负责通知relayfs，函数relay_buf_full()在已经有读者读取子缓存数据后返回0，在这种情况下，子缓存切换成 功进行。
-
-在覆盖写模式下， subbuf_start()的实现与非覆盖模式类似：
+dbs缩写，实际是：demand based switching，通常，因为cpu_dbs_common_info只包含了经过抽象后的公共部分，所以，各个governor会自己定义的一个包含cpu_dbs_common_info的自定义结构，例如对于ondemand，他会定义：
 </code></pre>
 
-<pre><code>static int subbuf_start(struct rchan_buf *buf, void *subbuf, void *prev_subbuf, unsigned int prev_padding)
-{
-    if (prev_subbuf)
-        *((unsigned *)prev_subbuf) = prev_padding;
-
-    subbuf_start_reserve(buf, sizeof(unsigned int));
-
-    return 1;
-}
-</code></pre>
-
-<pre><code>
-只是不做relay_buf_full()检查，因为此模式下，缓存是环行的，可以无条件地写。因此在此模式下，子缓存切换必定成功，函数 relay_subbufs_consumed() 也无须调用。如果channel写者没有定义subbuf_start()，缺省的实现将被使用。 可以通过在回调函数subbuf_start()中调用辅助函数subbuf_start_reserve()在子缓存中预留头空间，预留空间可以保存任 何需要的信息，如上面例子中，预留空间用于保存子缓存填充字节数，在subbuf_start()实现中，前一个子缓存的填充值被设置。前一个子缓存的填 充值和指向前一个子缓存的指针一道作为subbuf_start()的参数传递给subbuf_start()，只有在子缓存完成后，才能知道填充值。 subbuf_start()也被在channel创建时分配每一个channel缓存的第一个子缓存时调用，以便预留头空间，但在这种情况下，前一个子 缓存指针为NULL。
-
-内核模块使用函数relay_write()或__relay_write()往channel缓存中写需要转发的数据，它们的区别是前者失效了本 地中断，而后者只抢占失效，因此前者可以在任何内核上下文安全使用，而后者应当在没有任何中断上下文将写channel缓存的情况下使用。这两个函数没有 返回值，因此用户不能直接确定写操作是否失败，在缓存满且写模式为非覆盖模式时，relayfs将通过回调函数buf_full来通知内核模块。
-
-函数relay_reserve()用于在channel缓存中预留一段空间以便以后写入，在那些没有临时缓存而直接写入channel缓存的内核 模块可能需要该函数，使用该函数的内核模块在实际写这段预留的空间时可以通过调用relay_commit()来通知relayfs。当所有预留的空间全 部写完并通过relay_commit通知relayfs后，relayfs将调用回调函数deliver()通知内核模块一个完整的子缓存已经填满。由于预留空间的操作并不在写channel的内核模块完全控制之下，因此relay_reserve()不能很好地保护缓存，因此当内核模块调用 relay_reserve()时必须采取恰当的同步机制。
-
-当内核模块结束对channel的使用后需要调用relay_close() 来关闭channel，如果没有任何用户在引用该channel，它将和对应的缓存全部被释放。
-
-函数relay_flush()强制在所有的channel缓存上做一个子缓存切换，它在channel被关闭前使用来终止和处理最后的子缓存。
-
-函数relay_reset()用于将一个channel恢复到初始状态，因而不必释放现存的内存映射并重新分配新的channel缓存就可以使用channel，但是该调用只有在该channel没有任何用户在写的情况下才可以安全使用。
-
-回调函数buf_mapped() 在channel缓存被映射到用户空间时被调用。
-
-回调函数buf_unmapped()在释放该映射时被调用。内核模块可以通过它们触发一些内核操作，如开始或结束channel写操作。
-
-在源代码包中给出了一个使用relayfs的示例程序relayfs_exam.c，它只包含一个内核模块，对于复杂的使用，需要应用程序配合。该模块实现了类似于文章中seq_file示例实现的功能。
-
-当然为了使用relayfs，用户必须让内核支持relayfs，并且要mount它，下面是作者系统上的使用该模块的输出信息：
-</code></pre>
-
-<pre><code>$ mkdir -p /relayfs
-$ insmod ./relayfs-exam.ko
-$ mount -t relayfs relayfs /relayfs
-$ cat /relayfs/example0
-…
-$
+<pre><code>struct od_cpu_dbs_info_s {  
+    struct cpu_dbs_common_info cdbs;  
+    struct cpufreq_frequency_table *freq_table;  
+    unsigned int freq_lo;  
+    unsigned int freq_lo_jiffies;  
+    unsigned int freq_hi_jiffies;  
+    unsigned int rate_mult;  
+    unsigned int sample_type:1;  
+};  
 </code></pre>
 
 <pre><code>
-relayfs是一种比较复杂的内核态与用户态的数据交换方式，本例子程序只提供了一个较简单的使用方式，对于复杂的使用，请参考relayfs用例页面http://relayfs.sourceforge.net/examples.html。
+而对于Conservative，他的定义如下：
 </code></pre>
 
-<pre><code>//kernel module: relayfs-exam.c
-#include &lt;linux/module.h&gt;
-#include &lt;linux/relayfs_fs.h&gt;
-#include &lt;linux/string.h&gt;
-#include &lt;linux/sched.h&gt;
+<pre><code>struct cs_cpu_dbs_info_s {  
+    struct cpu_dbs_common_info cdbs;  
+    unsigned int down_skip;  
+    unsigned int requested_freq;  
+    unsigned int enable:1;  
+};  
+</code></pre>
 
-#define WRITE_PERIOD (HZ * 60)
-static struct rchan * chan;
-static size_t subbuf_size = 65536;
-static size_t n_subbufs = 4;
-static char buffer[256];
-
-void relayfs_exam_write(unsigned long data);
-
-static DEFINE_TIMER(relayfs_exam_timer, relayfs_exam_write, 0, 0);
-
-void relayfs_exam_write(unsigned long data)
-{
-    int len;
-    task_t * p = NULL;
-
-    len = sprintf(buffer, "Current all the processes:\n");
-    len += sprintf(buffer + len, "process name\t\tpid\n");
-    relay_write(chan, buffer, len);
-
-    for_each_process(p) {
-        len = sprintf(buffer, "%s\t\t%d\n", p-&gt;comm, p-&gt;pid);
-        relay_write(chan, buffer, len);
-    }
-    len = sprintf(buffer, "\n\n");
-    relay_write(chan, buffer, len);
-
-    relayfs_exam_timer.expires = jiffies + WRITE_PERIOD;
-    add_timer(&amp;relayfs_exam_timer);
-}
+<pre><code>
+把它理解为类似于C++语言的基类和子类的概念就是了。
 
 
-/*
-* subbuf_start() relayfs callback.
-*
-* Defined so that we can 1) reserve padding counts in the sub-buffers, and
-* 2) keep a count of events dropped due to the buffer-full condition.
-*/
-static int subbuf_start(struct rchan_buf *buf,
-                void *subbuf,
-                void *prev_subbuf,
-                unsigned int prev_padding)
-{
-    if (prev_subbuf)
-        *((unsigned *)prev_subbuf) = prev_padding;
+common_dbs_data    各个独立的governor，需要和governor的公共层交互，需要实现一套公共的接口，这个接口由common_dbs_data结构来提供：
+</code></pre>
 
-    if (relay_buf_full(buf))
-        return 0;
+<pre><code>struct common_dbs_data {  
+    /* Common across governors */  
+    #define GOV_ONDEMAND            0  
+    #define GOV_CONSERVATIVE        1  
+    int governor;  
+    struct attribute_group *attr_group_gov_sys; /* one governor - system */  
+    struct attribute_group *attr_group_gov_pol; /* one governor - policy */  
 
-    subbuf_start_reserve(buf, sizeof(unsigned int));
+    /* Common data for platforms that don't set have_governor_per_policy */  
+    struct dbs_data *gdbs_data;  
 
-    return 1;
-}
+    struct cpu_dbs_common_info *(*get_cpu_cdbs)(int cpu);  
+    void *(*get_cpu_dbs_info_s)(int cpu);  
+    void (*gov_dbs_timer)(struct work_struct *work);  
+    void (*gov_check_cpu)(int cpu, unsigned int load);  
+    int (*init)(struct dbs_data *dbs_data);  
+    void (*exit)(struct dbs_data *dbs_data);  
 
-/*
-* relayfs callbacks
-*/
-static struct rchan_callbacks relayfs_callbacks =
-{
-    .subbuf_start = subbuf_start,
-};
+    /* Governor specific ops, see below */  
+    void *gov_ops;  
+};  
+</code></pre>
 
-/**
-* module init - creates channel management control files
-*
-* Returns 0 on success, negative otherwise.
-*/
-static int init(void)
-{
+<pre><code>
+主要的字段意义如下：
+</code></pre>
 
-    chan = relay_open("example", NULL, subbuf_size,
-    n_subbufs, &amp;relayfs_callbacks);
+<pre><code>governor  因为ondemand和conservative的实现部分有很多相似的地方，用该字段做一区分，可以设置为GOV_ONDEMAND或GOV_CONSERVATIVE的其中之一。
+attr_group_gov_sys  该公共的sysfs属性组。
+attr_group_gov_pol  各policy使用的属性组，有时候多个policy会使用同一个governor算法。
+gdbs_data  通常，当没有设置have_governor_per_policy时，表示所有的policy使用了同一种governor，该字段指向该governor的dbs_data结构。
+get_cpu_cdbs  回调函数，公共层用它取得对应cpu的cpu_dbs_common_info结构指针。
+get_cpu_dbs_info_s  回调函数，公共层用它取得对应cpu的cpu_dbs_common_info_s的派生结构指针，例如：od_cpu_dbs_info_s，cs_cpu_dbs_info_s。
+gov_dbs_timer  前面说过，cpu_dbs_common_info_s结构中有一个工作队列，该回调通常用作工作队列的工作函数。
+gov_check_cpu  计算cpu负载的回调函数，通常会直接调用公共层提供的dbs_check_cpu函数完成实际的计算工作。
+init   初始化回调，用于完成该governor的一些额外的初始化工作。
+exit  回调函数，governor被移除时调用。
+gov_ops  各个governor可以用该指针定义各自特有的一些操作接口。
+</code></pre>
 
-    if (!chan) {
-        printk("relay channel creation failed.\n");
-        return 1;
-    }
-    relayfs_exam_timer.expires = jiffies + WRITE_PERIOD;
-    add_timer(&amp;relayfs_exam_timer);
+<pre><code>
+dbs_data    该结构体通常由governor的公共层代码在governor的初始化阶段动态创建，该结构的一个最重要的字段就是cdata：一个common_dbs_data结构指针，另外，该结构还包含一些定义governor工作方式的一些调节参数。该结构的详细定义如下：
+</code></pre>
 
-    return 0;
-}
+<pre><code>struct dbs_data {  
+    struct common_dbs_data *cdata;  
+    unsigned int min_sampling_rate;  
+    int usage_count;  
+    void *tuners;  
 
-static void cleanup(void)
-{
-    del_timer_sync(&amp;relayfs_exam_timer);
-    if (chan) {
-        relay_close(chan);
-        chan = NULL;
-    }
-}
+    /* dbs_mutex protects dbs_enable in governor start/stop */  
+    struct mutex mutex;  
+};  
+</code></pre>
 
-module_init(init);
-module_exit(cleanup);
-MODULE_LICENSE("GPL");
+<pre><code>
+几个主要的字段：
+</code></pre>
+
+<pre><code>cdata  一个common_dbs_data结构指针，通常由具体governor的实现部分定义好，然后作为参数，通过公共层的API：cpufreq_governor_dbs，传递到公共层，cpufreq_governor_dbs函数在创建好dbs_data结构后，把该指针赋值给该字段。
+min_sampling_rate  用于记录统计cpu负载的采样周期。
+usage_count  当没有设置have_governor_per_policy时，意味着所有的policy采用同一个governor，该字段就是用来统计目前该governor被多少个policy引用。
+tuners  指向governor的调节参数结构，不同的governor可以定义自己的tuner结构，公共层代码会在governor的初始化阶段调用common_dbs_data结构的init回调函数，governor的实现可以在init回调中初始化tuners字段。
+</code></pre>
+
+<pre><code>
+如果设置了have_governor_per_policy，每个policy拥有各自独立的governor，也就是说，拥有独立的dbs_data结构，它会记录在cpufreq_policy结构的governor_data字段中，否则，如果没有设置have_governor_per_policy，多个policy共享一个governor，和同一个dbs_data结构关联，此时，dbs_data被赋值在common_dbs_data结构的gdbs_data字段中。
+
+cpufreq_governor  这个结构在本系列文章的第一篇已经介绍过了，请参看Linux动态频率调节系统CPUFreq之一：概述。几个数据结构的关系如下图所示：
+
+![](/images/kernel/2015-08-12-4.png)
+
+图 1.1  governor的数据结构关系
+
+下面我们以ondemand这个系统已经实现的governor为例，说明一下如何实现一个governor。具体的代码请参看：/drivers/cpufreq/cpufreq_ondemand.c。
+
+#### 2. 定义一个governor
+
+要实现一个governor，首先要定义一个cpufreq_governor结构，对于ondeman来说，它的定义如下：
+</code></pre>
+
+<pre><code>struct cpufreq_governor cpufreq_gov_ondemand = {  
+    .name                   = "ondemand",  
+    .governor               = od_cpufreq_governor_dbs,  
+    .max_transition_latency = TRANSITION_LATENCY_LIMIT,  
+    .owner                  = THIS_MODULE,  
+};  
+</code></pre>
+
+<pre><code>
+其中，governor是这个结构的核心字段，cpufreq_governor注册后，cpufreq的核心层通过该字段操纵这个governor的行为，包括：初始化、启动、退出等工作。现在，该字段被设置为od_cpufreq_governor_dbs，我们看看它的实现：
+</code></pre>
+
+<pre><code>static int od_cpufreq_governor_dbs(struct cpufreq_policy *policy,  
+        unsigned int event)  
+{  
+    return cpufreq_governor_dbs(policy, &amp;od_dbs_cdata, event);  
+}  
+</code></pre>
+
+<pre><code>
+只是简单地调用了governor的公共层提供的API：cpufreq_governor_dbs，关于这个API，我们在后面会逐一进行展开，这里我们注意到参数：&amp;od_dbs_cdata，正是我们前面讨论过得common_dbs_data结构，作为和governor公共层的接口，在这里它的定义如下：
+</code></pre>
+
+<pre><code>static struct common_dbs_data od_dbs_cdata = {  
+    .governor = GOV_ONDEMAND,  
+    .attr_group_gov_sys = &amp;od_attr_group_gov_sys,  
+    .attr_group_gov_pol = &amp;od_attr_group_gov_pol,  
+    .get_cpu_cdbs = get_cpu_cdbs,  
+    .get_cpu_dbs_info_s = get_cpu_dbs_info_s,  
+    .gov_dbs_timer = od_dbs_timer,  
+    .gov_check_cpu = od_check_cpu,  
+    .gov_ops = &amp;od_ops,  
+    .init = od_init,  
+    .exit = od_exit,  
+};  
+</code></pre>
+
+<pre><code>
+这里先介绍一下get_cpu_cdbs和get_cpu_dbs_info_s这两个回调，前面介绍cpu_dbs_common_info_s结构的时候已经说过，各个governor需要定义一个cpu_dbs_common_info_s结构的派生结构，对于ondemand来说，这个派生结构是：od_cpu_dbs_info_s。两个回调函数分别用来获得基类和派生类这两个结构的指针。我们先看看od_cpu_dbs_info_s是如何定义的：
+</code></pre>
+
+<pre><code>static DEFINE_PER_CPU(struct od_cpu_dbs_info_s, od_cpu_dbs_info);  
+</code></pre>
+
+<pre><code>
+没错，它被定义为了一个per_cpu变量，也就是说，每个cpu拥有各自独立的od_cpu_dbs_info_s，这很正常，因为每个cpu需要的实时负载是不一样的，需要独立的上下文变量来进行负载的统计。前面也已经列出了od_cpu_dbs_info_s的声明，他的第一个字段cdbs就是一个cpu_dbs_common_info_s结构。内核为我们提供了一个辅助宏来帮助我们定义get_cpu_cdbs和get_cpu_dbs_info_s这两个回调函数：
+</code></pre>
+
+<pre><code>#define define_get_cpu_dbs_routines(_dbs_info)                          \  
+static struct cpu_dbs_common_info *get_cpu_cdbs(int cpu)                \  
+{                                                                       \  
+    return &amp;per_cpu(_dbs_info, cpu).cdbs;                           \  
+}                                                                       \  
+                                            \  
+static void *get_cpu_dbs_info_s(int cpu)                                \  
+{                                                                       \  
+    return &amp;per_cpu(_dbs_info, cpu);                                \  
+}        
+</code></pre>
+
+<pre><code>
+所以，在cpufreq_ondemand.c中，我们只要简单地使用上述的宏即可定义这两个回调：
+</code></pre>
+
+<pre><code>define_get_cpu_dbs_routines(od_cpu_dbs_info);  
+</code></pre>
+
+<pre><code>
+经过上述这一系列的定义以后，governor的公共层即可通过这两个回调获取各个cpu所对应的cpu_dbs_common_info_s和od_cpu_dbs_info_s的结构指针，用来记录本次统计周期的一些上下文参数（idle时间和运行时间等等）。
+
+#### 3. 初始化一个governor
+
+当一个governor被policy选定后，核心层会通过`__cpufreq_set_policy`函数对该cpu的policy进行设定，参看 Linux动态频率调节系统CPUFreq之二：核心（core）架构与API中的第4节和图4.1。如果policy认为这是一个新的governor（和原来使用的旧的governor不相同），policy会通过`__cpufreq_governor`函数，并传递CPUFREQ_GOV_POLICY_INIT参数，而`__cpufreq_governor`函数实际上是调用cpufreq_governor结构中的governor回调函数，在第2节中我们已经知道，这个回调最后会进入governor公共API：cpufreq_governor_dbs，下面是它收到CPUFREQ_GOV_POLICY_INIT参数时，经过简化后的代码片段：
+</code></pre>
+
+<pre><code>case CPUFREQ_GOV_POLICY_INIT:  
+    ......  
+
+    dbs_data = kzalloc(sizeof(*dbs_data), GFP_KERNEL);  
+    ......  
+
+    dbs_data-&gt;cdata = cdata;  
+    dbs_data-&gt;usage_count = 1;  
+    rc = cdata-&gt;init(dbs_data);  
+    ......  
+
+    rc = sysfs_create_group(get_governor_parent_kobj(policy),  
+            get_sysfs_attr(dbs_data));  
+    ......  
+
+    policy-&gt;governor_data = dbs_data;  
+
+    ......  
+    /* Bring kernel and HW constraints together */  
+    dbs_data-&gt;min_sampling_rate = max(dbs_data-&gt;min_sampling_rate,  
+            MIN_LATENCY_MULTIPLIER * latency);  
+    set_sampling_rate(dbs_data, max(dbs_data-&gt;min_sampling_rate,  
+                latency * LATENCY_MULTIPLIER));  
+    if ((cdata-&gt;governor == GOV_CONSERVATIVE) &amp;&amp;  
+            (!policy-&gt;governor-&gt;initialized)) {  
+        struct cs_ops *cs_ops = dbs_data-&gt;cdata-&gt;gov_ops;  
+
+        cpufreq_register_notifier(cs_ops-&gt;notifier_block,  
+                CPUFREQ_TRANSITION_NOTIFIER);  
+    }  
+
+    if (!have_governor_per_policy())  
+        cdata-&gt;gdbs_data = dbs_data;  
+
+    return 0;  
+</code></pre>
+
+<pre><code>
+首先，它会给这个policy分配一个dbs_data实例，然后把通过参数cdata传入的common_dbs_data指针，赋值给它的cdata字段，这样，policy就可以通过该字段获得governor的操作接口（通过cdata的一系列回调函数）。然后，调用cdata的init回调函数，对这个governor做进一步的初始化工作，对于ondemand来说，init回调的实际执行函数是：od_init，主要是完成和governor相关的一些调节参数的初始化，然后把初始化好的od_dbs_tuners结构指针赋值到dbs_data的tuners字段中，它的详细代码这里就不贴出了。接着，通过sysfs_create_group函数，建立该governor在sysfs中的节点，以后我们就可以通过这些节点对该governor的算法逻辑进行微调，ondemand在我的电脑中，建立了以下这些节点（sys/devices/system/cpu/cpufreq/ondemand）：
+
+sampling_rate;
+io_is_busy;
+up_threshold;
+sampling_down_factor;
+ignore_nice;
+powersave_bias;
+sampling_rate_min;
+
+继续，把初始化好的dbs_data结构赋值给policy的governor_data字段，以方便以后的访问。最后是通过set_sampling_rate设置governor的采样周期，如果还有设置have_governor_per_policy，把dbs_data结构指针赋值给cdata结构的gdbs_data字段，至此，governor的初始化工作完成，下面是整个过程的序列图：
+
+![](/images/kernel/2015-08-12-5.png)
+
+图 3.1  governor的初始化
+
+#### 4. 启动一个governor
+
+核心层会通过`__cpufreq_set_policy`函数，通过CPUFREQ_GOV_POLICY_INIT参数，在公共层的API：cpufreq_governor_dbs中，完成了对governor的初始化工作，紧接着，`__cpufreq_set_policy`会通过CPUFREQ_GOV_START参数，和初始化governor的流程一样，最终会到达cpufreq_governor_dbs函数中，我们看看它是如何启动一个governor的：
+</code></pre>
+
+<pre><code>case CPUFREQ_GOV_START:  
+    if (!policy-&gt;cur)  
+        return -EINVAL;  
+
+    mutex_lock(&amp;dbs_data-&gt;mutex);  
+
+    for_each_cpu(j, policy-&gt;cpus) {  
+        struct cpu_dbs_common_info *j_cdbs =  
+            dbs_data-&gt;cdata-&gt;get_cpu_cdbs(j);  
+
+        j_cdbs-&gt;cpu = j;  
+        j_cdbs-&gt;cur_policy = policy;  
+        j_cdbs-&gt;prev_cpu_idle = get_cpu_idle_time(j,  
+                       &amp;j_cdbs-&gt;prev_cpu_wall, io_busy);  
+        if (ignore_nice)  
+            j_cdbs-&gt;prev_cpu_nice =  
+                kcpustat_cpu(j).cpustat[CPUTIME_NICE];  
+
+        mutex_init(&amp;j_cdbs-&gt;timer_mutex);  
+        INIT_DEFERRABLE_WORK(&amp;j_cdbs-&gt;work,  
+                     dbs_data-&gt;cdata-&gt;gov_dbs_timer);  
+    }  
+</code></pre>
+
+<pre><code>
+首先，遍历使用该policy的所有的处于online状态的cpu，针对每一个cpu，做以下动作：
+
+取出该cpu相关联的cpu_dbs_common_info结构指针，之前已经讨论过，governor定义了一个per_cpu变量来定义各个cpu所对应的cpu_dbs_common_info结构，通过common_dbs_data结构的回调函数可以获取该结构的指针。
+
+初始化cpu_dbs_common_info结构的cpu，cur_policy，prev_cpu_idle，prev_cpu_wall，prev_cpu_nice字段，其中，prev_cpu_idle，prev_cpu_wall这两个字段会被以后的负载计算所使用。
+
+为每个cpu初始化一个工作队列，工作队列的执行函数是common_dbs_data结构中的gov_dbs_timer字段所指向的回调函数，对于ondemand来说，该函数是：od_dbs_timer。这个工作队列会被按照设定好的采样率定期地被唤醒，进行cpu负载的统计工作。
+
+然后，记录目前的时间戳，调度初始化好的工作队列在稍后某个时间点运行：
+</code></pre>
+
+<pre><code>/* Initiate timer time stamp */  
+ cpu_cdbs-&gt;time_stamp = ktime_get();  
+
+ gov_queue_work(dbs_data, policy,  
+         delay_for_sampling_rate(sampling_rate), true);  
+</code></pre>
+
+<pre><code>
+下图表达了启动一个governor的过程：
+
+![](/images/kernel/2015-08-12-6.png)
+
+图 4.1  启动一个governor
+
+工作队列被调度执行后，会在工作队列的执行函数中进行cpu负载的统计工作，这个我们在下一节中讨论。
+
+#### 5. 系统负载的检测
+
+上一节我们提到，核心层启动一个governor后，会在每个使用该governor的cpu上建立一个工作队列，工作队列的执行函数是在common_dbs_data中gov_dbs_timer字段所指向的函数，理所当然，该函数由各个governor的具体代码来实现，对于ondemand governor，它的实现函数是od_dbs_timer。governor的公共层代码为我们提供了一个API：dbs_check_cpu，该API用来计算两个统计周期期间某个cpu的负载情况，我们先分析一下dbs_check_cpu：
+</code></pre>
+
+<pre><code>void dbs_check_cpu(struct dbs_data *dbs_data, int cpu)  
+{  
+    struct cpu_dbs_common_info *cdbs = dbs_data-&gt;cdata-&gt;get_cpu_cdbs(cpu);  
+    ......  
+
+    policy = cdbs-&gt;cur_policy;  
+
+    /* Get Absolute Load (in terms of freq for ondemand gov) */  
+    for_each_cpu(j, policy-&gt;cpus) {  
+        struct cpu_dbs_common_info *j_cdbs;  
+        ......  
+
+        j_cdbs = dbs_data-&gt;cdata-&gt;get_cpu_cdbs(j);  
+
+        ......  
+        cur_idle_time = get_cpu_idle_time(j, &amp;cur_wall_time, io_busy);  
+
+        wall_time = (unsigned int)  
+            (cur_wall_time - j_cdbs-&gt;prev_cpu_wall);  
+        j_cdbs-&gt;prev_cpu_wall = cur_wall_time;  
+
+        idle_time = (unsigned int)  
+            (cur_idle_time - j_cdbs-&gt;prev_cpu_idle);  
+        j_cdbs-&gt;prev_cpu_idle = cur_idle_time;  
+        ......  
+
+        load = 100 * (wall_time - idle_time) / wall_time;  
+        ......  
+        load *= cur_freq；    /* 实际的代码不是这样，为了简化讨论，精简为实际的计算逻辑*/  
+
+        if (load &gt; max_load)  
+            max_load = load;  
+    }  
+
+    dbs_data-&gt;cdata-&gt;gov_check_cpu(cpu, max_load);  
+}  
+</code></pre>
+
+<pre><code>
+由代码可以看出，遍历该policy下每个online的cpu，取出该cpu对应的cpu_dbs_common_info结构，该结构中的prev_cpu_idle和prev_cpu_wall保存有上一次采样周期时记录的idle时间和运行时间，负载的计算其实很简单：
+</code></pre>
+
+<pre><code>idle_time = 本次idle时间 - 上次idle时间；
+wall_time = 本次总运行时间 - 上次总运行时间；
+负载load = 100 * （wall_time - idle_time）/ wall_time；
+把所有cpu中，负载最大值记入max_load中，作为选择频率的依据；
+</code></pre>
+
+<pre><code>
+计算出最大负载max_load后，调用具体governor实现的gov_check_cpu回调函数，对于ondemand来说，该回调函数是：od_check_cpu，我们跟进去看看：
+</code></pre>
+
+<pre><code>static void od_check_cpu(int cpu, unsigned int load_freq)  
+{  
+    struct od_cpu_dbs_info_s *dbs_info = &amp;per_cpu(od_cpu_dbs_info, cpu);  
+    struct cpufreq_policy *policy = dbs_info-&gt;cdbs.cur_policy;  
+    struct dbs_data *dbs_data = policy-&gt;governor_data;  
+    struct od_dbs_tuners *od_tuners = dbs_data-&gt;tuners;  
+
+    dbs_info-&gt;freq_lo = 0;  
+
+    /* Check for frequency increase */  
+    if (load_freq &gt; od_tuners-&gt;up_threshold * policy-&gt;cur) {  
+        /* If switching to max speed, apply sampling_down_factor */  
+        if (policy-&gt;cur &lt; policy-&gt;max)  
+            dbs_info-&gt;rate_mult =  
+                od_tuners-&gt;sampling_down_factor;  
+        dbs_freq_increase(policy, policy-&gt;max);  
+        return;  
+    }  
+</code></pre>
+
+<pre><code>
+当负载比预设的阀值高时（od_tuners-&gt;up_threshold，默认值是95%），立刻选择该policy最大的工作频率作为接下来的工作频率。如果负载没有达到预设的阀值，但是当前频率已经是最低频率了，则什么都不做，直接返回：
+</code></pre>
+
+<pre><code>if (policy-&gt;cur == policy-&gt;min)  
+    return;  
+</code></pre>
+
+<pre><code>
+运行到这里，cpu的频率可能已经在上面的过程中被设置为最大频率，实际上我们可能并不需要这么高的频率，所以接着判断，当负载低于另一个预设值时，这时需要计算一个合适于该负载的新频率：
+</code></pre>
+
+<pre><code>if (load_freq &lt; od_tuners-&gt;adj_up_threshold  
+        * policy-&gt;cur) {  
+    unsigned int freq_next;  
+    freq_next = load_freq / od_tuners-&gt;adj_up_threshold;  
+
+    /* No longer fully busy, reset rate_mult */  
+    dbs_info-&gt;rate_mult = 1;  
+
+    if (freq_next &lt; policy-&gt;min)  
+        freq_next = policy-&gt;min;  
+
+    if (!od_tuners-&gt;powersave_bias) {  
+        __cpufreq_driver_target(policy, freq_next,  
+                CPUFREQ_RELATION_L);  
+        return;  
+    }  
+
+    freq_next = od_ops.powersave_bias_target(policy, freq_next,  
+                CPUFREQ_RELATION_L);  
+    __cpufreq_driver_target(policy, freq_next, CPUFREQ_RELATION_L);  
+}  
+</code></pre>
+
+<pre><code>
+对于ondemand来说，因为传入的负载是乘上了当前频率后的归一化值，所以计算新频率时，直接用load_freq除以想要的负载即可。本来计算出来的频率直接通过`__cpufreq_driver_target`函数，交给cpufreq_driver调节频率即可，但是这里的处理考虑了powersave_bias的设置情况，当设置了powersave_bias时，表明我们为了进一步节省电力，我们希望在计算出来的新频率的基础上，再乘以一个powersave_bias设定的百分比，作为真正的运行频率，powersave_bias的值从0-1000，每一步代表0.1%。实际的情况比想象中稍微复杂一点，考虑到乘以一个powersave_bias后的新频率可能不在cpu所支持的频率表中，ondemand算法会在频率表中查找，分别找出最接近新频率的一个区间，由高低两个频率组成，低的频率记入od_cpu_dbs_info_s结构的freq_lo字段中，高的频率通过od_ops.powersave_bias_target回调返回。同时，od_ops.powersave_bias_target回调函数还计算出高低两个频率应该运行的时间，分别记入od_cpu_dbs_info_s结构的freq_hi_jiffies和freq_low_jiffies字段中。原则是，通过两个不同频率的运行时间的组合，使得综合结果接近我们想要的目标频率。详细的计算逻辑请参考函数：generic_powersave_bias_target。
+讨论完上面两个函数，让我们回到本节的开头，负载的计算工作是在一个工作队列中发起的，前面说过，ondemand对应的工作队列的工作函数是od_dbs_timer，我们看看他的实现代码：
+</code></pre>
+
+<pre><code>static void od_dbs_timer(struct work_struct *work)  
+{  
+    ......  
+
+    /* Common NORMAL_SAMPLE setup */  
+    core_dbs_info-&gt;sample_type = OD_NORMAL_SAMPLE;  
+    if (sample_type == OD_SUB_SAMPLE) {  
+        delay = core_dbs_info-&gt;freq_lo_jiffies;  
+        __cpufreq_driver_target(core_dbs_info-&gt;cdbs.cur_policy,  
+                core_dbs_info-&gt;freq_lo, CPUFREQ_RELATION_H);  
+    } else {  
+        dbs_check_cpu(dbs_data, cpu);  
+        if (core_dbs_info-&gt;freq_lo) {  
+            /* Setup timer for SUB_SAMPLE */  
+            core_dbs_info-&gt;sample_type = OD_SUB_SAMPLE;  
+            delay = core_dbs_info-&gt;freq_hi_jiffies;  
+        }  
+    }  
+
+max_delay:  
+    if (!delay)  
+        delay = delay_for_sampling_rate(od_tuners-&gt;sampling_rate  
+                * core_dbs_info-&gt;rate_mult);  
+
+    gov_queue_work(dbs_data, dbs_info-&gt;cdbs.cur_policy, delay, modify_all);  
+    mutex_unlock(&amp;core_dbs_info-&gt;cdbs.timer_mutex);  
+}  
 </code></pre>
 
 <p>```</p>
+
+<p>如果sample_type是OD_SUB_SAMPLE时，表明上一次采样时，需要用高低两个频率来模拟实际的目标频率中的第二步：需要运行freq_lo，并且持续时间为freq_lo_jiffies。否则，调用公共层计算负载的API：dbs_check_cpu，开始一次新的采样，当powersave_bias没有设置时，该函数返回前，所需要的新的目标频率会被设置，考虑到powersave_bias的设置情况，判断一下如果freq_lo被设置，说明需要用高低两个频率来模拟实际的目标频率，高频率已经在dbs_check_cpu返回前被设置（实际的设置工作是在od_check_cpu中），所以把sample_type设置为OD_SUB_SAMPLE，以便下一次运行工作函数进行采样时可以设置低频率运行。最后，调度工作队列在下一个采样时刻再次运行，这样，cpu的工作频率实现了在每个采样周期，根据实际的负载情况，动态地设定合适的工作频率进行运行，既满足了性能的需求，也降低了系统的功耗，达到了cpufreq系统的最终目的，整个流程可以参考下图：</p>
+
+<p><img src="/images/kernel/2015-08-12-7.png" alt="" /></p>
+
+<p>图 5.1  负载计算和频率选择</p>
 ]]></content>
   </entry>
   
