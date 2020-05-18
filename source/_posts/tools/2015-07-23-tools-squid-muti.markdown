@@ -7,7 +7,7 @@ categories:
 - 2015
 - 2015~07
 - tools
-- tools~base
+- tools~squid
 tags:
 ---
 
