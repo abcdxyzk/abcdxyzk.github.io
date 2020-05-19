@@ -4,7 +4,7 @@
   <title><![CDATA[Category: tools | kk Blog —— 通用基础]]></title>
   <link href="http://abcdxyzk.github.io/blog/cats/tools/atom.xml" rel="self"/>
   <link href="http://abcdxyzk.github.io/"/>
-  <updated>2020-01-16T13:29:26+08:00</updated>
+  <updated>2020-05-19T17:52:20+08:00</updated>
   <id>http://abcdxyzk.github.io/</id>
   <author>
     <name><![CDATA[kk]]></name>
@@ -14,1054 +14,369 @@
 
   
   <entry>
-    <title type="html"><![CDATA[DNS示例]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2019/12/21/dns-sample/"/>
-    <updated>2019-12-21T17:05:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2019/12/21/dns-sample</id>
-    <content type="html"><![CDATA[<p><a href="https://gist.github.com/fffaraz/9d9170b57791c28ccda9255b48315168">https://gist.github.com/fffaraz/9d9170b57791c28ccda9255b48315168</a></p>
-
-<h3>DNS 示例</h3>
-
-<pre><code>    // gcc dns.c -lpthread
-
-    #include &lt;stdio.h&gt;  //printf
-    #include &lt;string.h&gt; //strlen
-    #include &lt;stdlib.h&gt; //malloc
-    #include &lt;sys/socket.h&gt; //you know what this is for
-    #include &lt;arpa/inet.h&gt;  //inet_addr, inet_ntoa, ntohs etc
-    #include &lt;netinet/in.h&gt;
-    #include &lt;unistd.h&gt; //getpid
-    #include &lt;pthread.h&gt;
-    #include &lt;time.h&gt;
-
-    #define T_A 1   //IPv4 address
-    #define T_NS    2   //Nameserver
-    #define T_CNAME 5   // canonical name
-    #define T_SOA   6   /* start of authority zone */
-    #define T_PTR   12  /* domain name pointer */
-    #define T_MX    15  //Mail server
-    #define T_AAAA  28  // IPv6
-
-    #define NIPQUAD(addr) ((unsigned char *)addr)[0], ((unsigned char *)addr)[1], ((unsigned char *)addr)[2], ((unsigned char *)addr)[3]
-
-    //DNS header structure
-    struct DNS_HEADER
-    {
-        unsigned short id;  // identification number
-
-        unsigned char rd :1;    // recursion desired
-        unsigned char tc :1;    // truncated message
-        unsigned char aa :1;    // authoritive answer
-        unsigned char opcode :4;    // purpose of message
-        unsigned char qr :1;    // query/response flag
-
-        unsigned char rcode :4; // response code
-        unsigned char cd :1;    // checking disabled
-        unsigned char ad :1;    // authenticated data
-        unsigned char z :1; // its z! reserved
-        unsigned char ra :1;    // recursion available
-
-        unsigned short q_count; // number of question entries
-        unsigned short ans_count;   // number of answer entries
-        unsigned short auth_count;  // number of authority entries
-        unsigned short add_count; // number of resource entries
-    };
-
-    //Constant sized fields of query structure
-    struct QUESTION
-    {
-        unsigned short qtype;
-        unsigned short qclass;
-    };
-
-    //Constant sized fields of the resource record structure
-    #pragma pack(push, 1)
-    struct R_DATA
-    {
-        unsigned short type;
-        unsigned short _class;
-        unsigned int ttl;
-        unsigned short data_len;
-    };
-    #pragma pack(pop)
-
-    //Pointers to resource record contents
-    struct RES_RECORD
-    {
-        unsigned char *name;
-        struct R_DATA *resource;
-        unsigned char *rdata;
-    };
-
-    //Structure of a Query
-    typedef struct
-    {
-        unsigned char *name;
-        struct QUESTION *ques;
-    } QUERY;
-
-    // convert www.google.com to 3www6google3com
-    void ChangetoDnsNameFormat(unsigned char* dns, unsigned char* host)
-    {
-        int lock = 0, i;
-        for (i = 0; i &lt;= strlen(host); i ++) {
-            if (host[i] == '.' || host[i] == '\0') {
-                *dns++ = i - lock;
-                for( ; lock &lt; i; lock ++)
-                    *dns++ = host[lock];
-                lock ++;
-            }
-        }
-        *dns++ = '\0';
-    }
-
-    // convert 3www6google3com0 to www.google.com
-    void changeToHost(unsigned char *dns)
-    {
-        int i = 0, j = 0, p;
-
-        while (i &lt; 100 &amp;&amp; dns[i] &amp;&amp; dns[i] &lt; 100) {
-            p = dns[i];
-            i = i + p + 1;
-            while (p --) {
-                dns[j] = dns[j+1];
-                j ++;
-            }
-            dns[j++] = '.';
-        }
-        dns[j-1] = '\0'; //remove the last dot
-    }
-
-    int readName(unsigned char *reader, unsigned char *buffer, unsigned char *to, unsigned char *end)
-    {
-        unsigned char *start = reader;
-        unsigned int p = 0, step = 1, offset, count = 0;
-        int i, j;
-
-        //read the names in 3www6google3com format
-
-        while (*reader != 0) {
-            if (*reader &gt;= 0xc0) {
-                offset = (*reader)*256 + *(reader+1) - 0xc000; //49152 = 11000000 00000000
-                reader = buffer + offset;
-                step = 0;
-            } else {
-                to[p++] = *reader ++;
-                count += step;
-            }
-            if (reader &gt; end)
-                goto err;
-        }
-        to[p] = '\0';
-        count += (step == 0) ? 2 : 1;
-
-        if (start + count &gt; end)
-            goto err;
-
-        changeToHost(to);
-
-        return count;
-    err:
-        return 1000000;
-    }
-
-    /*
-     * sending a packet
-     */
-    void sendPacket(int fd, struct sockaddr_in *dest, unsigned char *host, int query_type)
-    {
-        unsigned char buf[65536], *qname, *reader;
-        int i, j;
-
-        struct DNS_HEADER *dns = NULL;
-        struct QUESTION *qinfo = NULL;
-
-        //Set the DNS structure to standard queries
-        dns = (struct DNS_HEADER *)&amp;buf;
-
-        dns-&gt;id = htons(getpid());
-        dns-&gt;qr = 0; //This is a query
-        dns-&gt;opcode = 0; //This is a standard query
-        dns-&gt;aa = 0; //Not Authoritative
-        dns-&gt;tc = 0; //This message is not truncated
-        dns-&gt;rd = 1; //Recursion Desired
-        dns-&gt;ra = 0; //Recursion not available! hey we dont have it (lol)
-        dns-&gt;z = 0;
-        dns-&gt;ad = 0;
-        dns-&gt;cd = 0;
-        dns-&gt;rcode = 0;
-        dns-&gt;q_count = htons(1); //we have only 1 question
-        dns-&gt;ans_count = 0;
-        dns-&gt;auth_count = 0;
-        dns-&gt;add_count = 0;
-
-        //point to the query portion
-        qname = &amp;buf[sizeof(struct DNS_HEADER)];
-
-        ChangetoDnsNameFormat(qname, host);
-        qinfo = (struct QUESTION*)&amp;buf[sizeof(struct DNS_HEADER) + (strlen(qname) + 1)]; //fill it
-
-        qinfo-&gt;qtype = htons(query_type); //type of the query, A, MX, CNAME, NS etc
-        qinfo-&gt;qclass = htons(1); //its internet (lol)
-
-        if (sendto(fd, buf, sizeof(struct DNS_HEADER) + (strlen(qname) + 1) + sizeof(struct QUESTION), 0, (struct sockaddr*)dest, sizeof(*dest)) &lt; 0) {
-            perror("sendto failed");
-        }
-        printf("send Done\n");
-        return;
-    }
-
-    int expBuf(char buf[], int len)
-    {
-        unsigned char *end = buf + len;
-
-        struct DNS_HEADER *dns = NULL;
-        struct QUESTION *qinfo = NULL;
-        struct R_DATA *resource;
-
-        unsigned char *qname, *reader;
-
-        char name[256];
-        char rdata[256];
-        int i, j;
-
-        if (len &lt; sizeof(struct DNS_HEADER))
-            goto err;
-
-        dns = (struct DNS_HEADER*) buf;
-
-        printf("The response contains:\n");
-        printf("%d Questions.\n", ntohs(dns-&gt;q_count));
-        printf("%d Answers.\n", ntohs(dns-&gt;ans_count));
-        printf("%d Authoritative Servers.\n", ntohs(dns-&gt;auth_count));
-        printf("%d Additional records.\n\n", ntohs(dns-&gt;add_count));
-
-        //move ahead of the dns header and the query field
-        //reader = &amp;buf[sizeof(struct DNS_HEADER) + (strlen((const char*)qname) + 1) + sizeof(struct QUESTION)];
-        reader = &amp;buf[sizeof(struct DNS_HEADER)];
-
-        //Start reading answers
-        printf("Questions Records: %d\n", ntohs(dns-&gt;q_count));
-        for (i = 0; i &lt; ntohs(dns-&gt;q_count); i ++) {
-            reader += readName(reader, buf, name, end);
-            qinfo = (struct QUESTION *)reader;
-            reader = reader + sizeof(struct QUESTION);
-            if (reader &gt; end)
-                goto err;
-
-            printf("Name: %s Type: %d\n", name, ntohs(qinfo-&gt;qtype));
-        }
-        printf("\n");
-
-        printf("Answer Records: %d\n", ntohs(dns-&gt;ans_count));
-        for (i = 0; i &lt; ntohs(dns-&gt;ans_count); i++) {
-            reader += readName(reader, buf, name, end);
-            resource = (struct R_DATA*)(reader);
-            reader = reader + sizeof(struct R_DATA);
-            if (reader &gt; end)
-                goto err;
-
-            printf("Name: %s Type: %d ", name, ntohs(resource-&gt;type));
-
-            if (ntohs(resource-&gt;type) == T_A || ntohs(resource-&gt;type) == T_AAAA) { //if its an ipv4 address
-                if (reader + ntohs(resource-&gt;data_len) &gt; end)
-                    goto err;
-                printf("IPv4: %d.%d.%d.%d", NIPQUAD(reader));
-                reader = reader + ntohs(resource-&gt;data_len);
-            } else {
-                reader += readName(reader, buf, rdata, end);
-                if (reader &gt; end)
-                    goto err;
-                if (ntohs(resource-&gt;type) == T_CNAME)
-                    printf("CNAME: %s", rdata);
-            }
-            printf("\n");
-        }
-        printf("\n");
-
-        //read authorities
-        printf("Authoritive Records: %d\n", ntohs(dns-&gt;auth_count));
-        for(i = 0; i &lt; ntohs(dns-&gt;auth_count); i++) {
-            reader += readName(reader, buf, name, end);
-            resource = (struct R_DATA*)(reader);
-            reader += sizeof(struct R_DATA);
-            if (reader &gt; end)
-                goto err;
-
-            reader += readName(reader, buf, rdata, end);
-            if (reader &gt; end)
-                goto err;
-
-            printf("Name: %s Type: %d ", name, ntohs(resource-&gt;type));
-
-            if (ntohs(resource-&gt;type) == T_NS) {
-                printf("nameserver: %s", rdata);
-            }
-            printf("\n");
-        }
-        printf("\n");
-
-        //read additional
-        printf("Additional Records: %d\n", ntohs(dns-&gt;add_count));
-        for(i = 0; i &lt; ntohs(dns-&gt;add_count); i++) {
-            reader += readName(reader, buf, name, end);
-            resource = (struct R_DATA*)(reader);
-            reader += sizeof(struct R_DATA);
-            if (reader &gt; end)
-                goto err;
-
-            printf("Name: %s Type: %d ", name, ntohs(resource-&gt;type));
-
-            if (ntohs(resource-&gt;type) == T_A || ntohs(resource-&gt;type) == T_AAAA) {
-                if (reader + ntohs(resource-&gt;data_len) &gt; end)
-                    goto err;
-                printf("IPv4: %d.%d.%d.%d", NIPQUAD(reader));
-                reader = reader + ntohs(resource-&gt;data_len);
-            } else {
-                reader += readName(reader, buf, rdata, end);
-                if (reader &gt; end)
-                    goto err;
-            }
-            printf("\n");
-        }
-        printf("\n\n");
-        return 0;
-    err:
-        printf("\n\n");
-        return -1;
-    }
-
-    void *recvPacket(void *arg)
-    {
-        int fd = *((int *)arg);
-        struct sockaddr_in dest;
-        unsigned char buf[65536];
-        int s, len;
-
-        while (1) {
-            //Receive the answer
-            s = sizeof(dest);
-            if ((len = recvfrom(fd, buf, 65536, 0, (struct sockaddr*)&amp;dest, (socklen_t*)&amp;s)) &lt; 0) {
-                perror("recvfrom failed");
-            }
-            printf("recv Done. len=%d\n", len);
-            if (expBuf(buf, len)) {
-                printf("exp err\n");
-            }
-        }
-    }
-
-    /*
-     * Get the DNS servers from /etc/resolv.conf file on Linux
-     */
-    void get_dns_servers(char dns_servers[])
-    {
-        FILE *fp;
-        char line[200], *p;
-        if ((fp = fopen("/etc/resolv.conf", "r")) == NULL) {
-            printf("Failed opening /etc/resolv.conf file \n");
-        }
-
-        while (fgets(line, 200, fp)) {
-            if (line[0] == '#') {
-                continue;
-            }
-            if (strncmp(line, "nameserver", 10) == 0) {
-                p = strtok(line, " ");
-                p = strtok(NULL, " ");
-
-                //p now is the dns ip :)
-                //????
-            }
-        }
-
-        strcpy(dns_servers, "127.0.1.1");
-    }
-
-    int main(int argc, char *argv[])
-    {
-        int fd;
-        struct sockaddr_in dest;
-        unsigned char hostname[100];
-        pthread_t tid;
-
-        char dns_servers[100];
-
-        //Get the DNS servers from the resolv.conf file
-        get_dns_servers(dns_servers);
-
-        dest.sin_family = AF_INET;
-        dest.sin_port = htons(53);
-        dest.sin_addr.s_addr = inet_addr(dns_servers);
-
-        fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-
-        if (pthread_create(&amp;tid, NULL, recvPacket, (void *)&amp;fd)) {
-            printf("pthread err\n");
-            exit(-1);
-        }
-
-        while (1) {
-            printf("Enter Hostname to Lookup: ");
-            scanf("%s", hostname);
-            sendPacket(fd, &amp;dest, hostname, T_A);
-            usleep(500000);
-        }
-
-        pthread_join(tid, NULL);
-        return 0;
-    }
+    <title type="html"><![CDATA[gitignore 排除包含]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2020/05/19/tools-gitignore/"/>
+    <updated>2020-05-19T11:11:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2020/05/19/tools-gitignore</id>
+    <content type="html"><![CDATA[<p>想忽略某个文件夹，但又不想忽略这个文件夹下的某个子目录或文件</p>
+
+<pre><code>    application/*
+    !application/language/
+    !application/README
 </code></pre>
 ]]></content>
   </entry>
   
   <entry>
-    <title type="html"><![CDATA[API购买CVM]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2019/12/12/buy-cvm/"/>
-    <updated>2019-12-12T17:26:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2019/12/12/buy-cvm</id>
-    <content type="html"><![CDATA[<h2>python</h2>
-
-<p>代理设置
-export http_proxy=<a href="http://">http://</a>
-export https_proxy=<a href="http://">http://</a></p>
-
-<h4>SDK</h4>
-
-<p><a href="https://github.com/TencentCloud/tencentcloud-sdk-python">https://github.com/TencentCloud/tencentcloud-sdk-python</a></p>
-
-<p>git clone <a href="https://github.com/TencentCloud/tencentcloud-sdk-python.git">https://github.com/TencentCloud/tencentcloud-sdk-python.git</a></p>
-
-<p>sudo apt-get install python-pip
-python setup.py install</p>
-
-<h4>密钥</h4>
-
-<p><a href="https://console.cloud.tencent.com/cam/capi">https://console.cloud.tencent.com/cam/capi</a></p>
-
-<p>export TENCENTCLOUD_SECRET_ID=xx
-export TENCENTCLOUD_SECRET_KEY=xx</p>
-
-<h4>查询</h4>
-
-<p>来自SDK样例</p>
-
-<pre><code>    # -*- coding: utf-8 -*-
-    import os
-
-    from tencentcloud.common import credential
-    from tencentcloud.common.exception.tencent_cloud_sdk_exception import TencentCloudSDKException
-    # 导入对应产品模块的client models。
-    from tencentcloud.cvm.v20170312 import cvm_client, models
-
-    # 导入可选配置类
-    from tencentcloud.common.profile.client_profile import ClientProfile
-    from tencentcloud.common.profile.http_profile import HttpProfile
-    try:
-        # 实例化一个认证对象，入参需要传入腾讯云账户secretId，secretKey
-        cred = credential.Credential(
-            os.environ.get("TENCENTCLOUD_SECRET_ID"),
-            os.environ.get("TENCENTCLOUD_SECRET_KEY"))
-
-        # 实例化一个http选项，可选的，没有特殊需求可以跳过。
-        httpProfile = HttpProfile()
-        httpProfile.reqMethod = "GET"  # post请求(默认为post请求)
-        httpProfile.reqTimeout = 30    # 请求超时时间，单位为秒(默认60秒)
-        httpProfile.endpoint = "cvm.ap-guangzhou.tencentcloudapi.com"  # 指定接入地域域名(默认就近接入)
-
-        # 实例化一个client选项，可选的，没有特殊需求可以跳过。
-        clientProfile = ClientProfile()
-        clientProfile.signMethod = "TC3-HMAC-SHA256"  # 指定签名算法
-        clientProfile.language = "en-US"
-        clientProfile.httpProfile = httpProfile
-
-        # 实例化要请求产品(以cvm为例)的client对象，clientProfile是可选的。
-        client = cvm_client.CvmClient(cred, "ap-hongkong", clientProfile)
-
-        # 实例化一个cvm实例信息查询请求对象,每个接口都会对应一个request对象。
-        req = models.DescribeInstancesRequest()
-
-        # 填充请求参数,这里request对象的成员变量即对应接口的入参。
-        # 你可以通过官网接口文档或跳转到request对象的定义处查看请求参数的定义。
-        respFilter = models.Filter()  # 创建Filter对象, 以zone的维度来查询cvm实例。
-        respFilter.Name = "zone"
-        respFilter.Values = ["ap-hongkong-1", "ap-hongkong-2"]
-        req.Filters = [respFilter]  # Filters 是成员为Filter对象的列表
-
-        # 这里还支持以标准json格式的string来赋值请求参数的方式。下面的代码跟上面的参数赋值是等效的。
-        params = '''{
-            "Filters": [
-                {
-                    "Name": "zone",
-                    "Values": ["ap-hongkong-1", "ap-hongkong-2"]
-                }
-            ]
-        }'''
-        req.from_json_string(params)
-
-        # 通过client对象调用DescribeInstances方法发起请求。注意请求方法名与请求对象是对应的。
-        # 返回的resp是一个DescribeInstancesResponse类的实例，与请求对象对应。
-        resp = client.DescribeInstances(req)
-
-        # 输出json格式的字符串回包
-        print(resp.to_json_string(indent=2))
-
-    except TencentCloudSDKException as err:
-        print(err)
-</code></pre>
-
-<h4>购买 香港-1core-1GB-5Mbps-1小时后销毁</h4>
-
-<p>ImageId 换个公共的 或 自己制作一个</p>
-
-<p><a href="https://console.cloud.tencent.com/cvm/image?rid=5&amp;imageType=PUBLIC_IMAGE">https://console.cloud.tencent.com/cvm/image?rid=5&amp;imageType=PUBLIC_IMAGE</a></p>
-
-<pre><code>    # -*- coding: utf-8 -*-
-    import os
-    import time
-
-    from tencentcloud.common import credential
-    from tencentcloud.common.exception.tencent_cloud_sdk_exception import TencentCloudSDKException
-    # 导入对应产品模块的client models。
-    from tencentcloud.cvm.v20170312 import cvm_client, models
-
-    # 导入可选配置类
-    from tencentcloud.common.profile.client_profile import ClientProfile
-    from tencentcloud.common.profile.http_profile import HttpProfile
-    try:
-        # 实例化一个认证对象，入参需要传入腾讯云账户secretId，secretKey
-        cred = credential.Credential(
-            os.environ.get("TENCENTCLOUD_SECRET_ID"),
-            os.environ.get("TENCENTCLOUD_SECRET_KEY"))
-
-        # 实例化一个http选项，可选的，没有特殊需求可以跳过。
-        httpProfile = HttpProfile()
-        httpProfile.reqMethod = "GET"  # post请求(默认为post请求)
-        httpProfile.reqTimeout = 30    # 请求超时时间，单位为秒(默认60秒)
-        httpProfile.endpoint = "cvm.ap-guangzhou.tencentcloudapi.com"  # 指定接入地域域名(默认就近接入)
-
-        # 实例化一个client选项，可选的，没有特殊需求可以跳过。
-        clientProfile = ClientProfile()
-        clientProfile.signMethod = "TC3-HMAC-SHA256"  # 指定签名算法
-        clientProfile.language = "en-US"
-        clientProfile.httpProfile = httpProfile
-
-        # 实例化要请求产品(以cvm为例)的client对象，clientProfile是可选的。
-        client = cvm_client.CvmClient(cred, "ap-hongkong", clientProfile)
-
-        # 实例化一个cvm实例信息查询请求对象,每个接口都会对应一个request对象。
-        req = models.RunInstancesRequest()
-
-        # 填充请求参数,这里request对象的成员变量即对应接口的入参。
-        # 你可以通过官网接口文档或跳转到request对象的定义处查看请求参数的定义。
-
-        # 这里还支持以标准json格式的string来赋值请求参数的方式。下面的代码跟上面的参数赋值是等效的。
-        params = '''{
-            "Region" : "ap-hongkong",
-            "Placement" : {
-                "Zone" : "ap-hongkong-2"
-            },
-            "ImageId" : "img-7b63u5v2",
-            "InstanceChargeType" : "POSTPAID_BY_HOUR",
-            "InstanceType" : "S2.SMALL1",
-            "InternetAccessible" : {
-                "InternetChargeType" : "TRAFFIC_POSTPAID_BY_HOUR",
-                "InternetMaxBandwidthOut" : 5
-            },
-            "LoginSettings" : {
-                "Password" : "QAZwsx123"
-            },
-            "EnhancedService" : {
-                "SecurityService" : {
-                    "Enabled" : false
-                },
-                "MonitorService" : {
-                    "Enabled" : false
-                }
-            },
-            "ActionTimer" : {
-                "Externals" : {
-                },
-                "TimerAction" : "TerminateInstances",
-                "ActionTime" : "%s"
-            }
-        }''' % (time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time()+3300)))
-
-        req.from_json_string(params)
-
-        #print(req)
-
-        # 通过client对象调用DescribeInstances方法发起请求。注意请求方法名与请求对象是对应的。
-        # 返回的resp是一个DescribeInstancesResponse类的实例，与请求对象对应。
-        resp = client.RunInstances(req)
-
-        # 输出json格式的字符串回包
-        print(resp.to_json_string(indent=2))
-
-    except TencentCloudSDKException as err:
-        print(err)
-</code></pre>
-
-<h4>退还CVM</h4>
-
-<pre><code>    # -*- coding: utf-8 -*-
-    import os
-
-    from tencentcloud.common import credential
-    from tencentcloud.common.exception.tencent_cloud_sdk_exception import TencentCloudSDKException
-    # 导入对应产品模块的client models。
-    from tencentcloud.cvm.v20170312 import cvm_client, models
-
-    # 导入可选配置类
-    from tencentcloud.common.profile.client_profile import ClientProfile
-    from tencentcloud.common.profile.http_profile import HttpProfile
-    try:
-        # 实例化一个认证对象，入参需要传入腾讯云账户secretId，secretKey
-        cred = credential.Credential(
-            os.environ.get("TENCENTCLOUD_SECRET_ID"),
-            os.environ.get("TENCENTCLOUD_SECRET_KEY"))
-
-        # 实例化一个http选项，可选的，没有特殊需求可以跳过。
-        httpProfile = HttpProfile()
-        httpProfile.reqMethod = "GET"  # post请求(默认为post请求)
-        httpProfile.reqTimeout = 30    # 请求超时时间，单位为秒(默认60秒)
-        httpProfile.endpoint = "cvm.ap-guangzhou.tencentcloudapi.com"  # 指定接入地域域名(默认就近接入)
-
-        # 实例化一个client选项，可选的，没有特殊需求可以跳过。
-        clientProfile = ClientProfile()
-        clientProfile.signMethod = "TC3-HMAC-SHA256"  # 指定签名算法
-        clientProfile.language = "en-US"
-        clientProfile.httpProfile = httpProfile
-
-        # 实例化要请求产品(以cvm为例)的client对象，clientProfile是可选的。
-        client = cvm_client.CvmClient(cred, "ap-hongkong", clientProfile)
-
-        # 实例化一个cvm实例信息查询请求对象,每个接口都会对应一个request对象。
-        req = models.TerminateInstancesRequest()
-
-        # 填充请求参数,这里request对象的成员变量即对应接口的入参。
-        params = '''{
-            "InstanceIds" : [
-                "ins-6y6yfpdw"
-            ]
-        }'''
-        req.from_json_string(params)
-
-        #print(req)
-        # 通过client对象调用DescribeInstances方法发起请求。注意请求方法名与请求对象是对应的。
-        # 返回的resp是一个DescribeInstancesResponse类的实例，与请求对象对应。
-        resp = client.TerminateInstances(req)
-
-        # 输出json格式的字符串回包
-        print(resp.to_json_string(indent=2))
-
-    except TencentCloudSDKException as err:
-        print(err)
-</code></pre>
-
-<h2>php</h2>
-
-<p>看 vendor/GuzzleHttp/Client.php 中 configureDefaults ，代理需要设置
-export HTTP_PROXY=tcp://xx
-export HTTPS_PROXY=tcp://xx</p>
-
-<p>或者安装 php-curl 就可以改用
-export http_proxy=<a href="http://">http://</a>
-export https_proxy=<a href="http://">http://</a></p>
-
-<h4>SDK</h4>
-
-<p><a href="https://github.com/TencentCloud/tencentcloud-sdk-php">https://github.com/TencentCloud/tencentcloud-sdk-php</a></p>
-
-<p>git clone <a href="https://github.com/TencentCloud/tencentcloud-sdk-php.git">https://github.com/TencentCloud/tencentcloud-sdk-php.git</a></p>
-
-<h4>密钥</h4>
-
-<p><a href="https://console.cloud.tencent.com/cam/capi">https://console.cloud.tencent.com/cam/capi</a></p>
-
-<p>export TENCENTCLOUD_SECRET_ID=xx
-export TENCENTCLOUD_SECRET_KEY=xx</p>
-
-<h4>查询</h4>
-
-<p>来自SDK样例
-```
-    &lt;?php
-    require_once &lsquo;../../../TCloudAutoLoader.php&rsquo;;
-    // 导入对应产品模块的client
-    use TencentCloud\Cvm\V20170312\CvmClient;
-    // 导入要请求接口对应的Request类
-    use TencentCloud\Cvm\V20170312\Models\DescribeInstancesRequest;
-    use TencentCloud\Cvm\V20170312\Models\Filter;
-    use TencentCloud\Common\Exception\TencentCloudSDKException;
-    use TencentCloud\Common\Credential;
-    // 导入可选配置类
-    use TencentCloud\Common\Profile\ClientProfile;
-    use TencentCloud\Common\Profile\HttpProfile;</p>
-
-<pre><code>try {
-    // 实例化一个证书对象，入参需要传入腾讯云账户secretId，secretKey
-    //$cred = new Credential("secretId", "secretKey");
-    $cred = new Credential(getenv("TENCENTCLOUD_SECRET_ID"), getenv("TENCENTCLOUD_SECRET_KEY"));
-
-    // 实例化一个http选项，可选的，没有特殊需求可以跳过
-    $httpProfile = new HttpProfile();
-    $httpProfile-&gt;setReqMethod("GET");  // post请求(默认为post请求)
-    $httpProfile-&gt;setReqTimeout(30);    // 请求超时时间，单位为秒(默认60秒)
-    $httpProfile-&gt;setEndpoint("cvm.ap-guangzhou.tencentcloudapi.com");  // 指定接入地域域名(默认就近接入)
-
-    // 实例化一个client选项，可选的，没有特殊需求可以跳过
-    $clientProfile = new ClientProfile();
-    $clientProfile-&gt;setSignMethod("TC3-HMAC-SHA256");  // 指定签名算法(默认为HmacSHA256)
-    $clientProfile-&gt;setHttpProfile($httpProfile);
-
-    // 实例化要请求产品(以cvm为例)的client对象,clientProfile是可选的
-    $client = new CvmClient($cred, "ap-hongkong", $clientProfile);
-
-    // 实例化一个cvm实例信息查询请求对象,每个接口都会对应一个request对象。
-    $req = new DescribeInstancesRequest();
-
-    // 填充请求参数,这里request对象的成员变量即对应接口的入参
-    // 你可以通过官网接口文档或跳转到request对象的定义处查看请求参数的定义
-    $respFilter = new Filter();  // 创建Filter对象, 以zone的维度来查询cvm实例
-    $respFilter-&gt;Name = "zone";
-    $respFilter-&gt;Values = ["ap-hongkong-1", "ap-hongkong-2"];
-    $req-&gt;Filters = [$respFilter];  // Filters 是成员为Filter对象的列表
-
-    // 这里还支持以标准json格式的string来赋值请求参数的方式。下面的代码跟上面的参数赋值是等效的
-    $params = [
-        "Filters" =&gt; [
-            [
-                "Name" =&gt; "zone",
-                "Values" =&gt; ["ap-hongkong-1", "ap-hongkong-2"]
-            ]
-        ]
-    ];
-    $req-&gt;fromJsonString(json_encode($params));
-
-    // 通过client对象调用DescribeInstances方法发起请求。注意请求方法名与请求对象是对应的
-    // 返回的resp是一个DescribeInstancesResponse类的实例，与请求对象对应
-    $resp = $client-&gt;DescribeInstances($req);
-
-    // 输出json格式的字符串回包
-    print_r($resp-&gt;toJsonString());
-}
-catch(TencentCloudSDKException $e) {
-    echo $e;
-}
-</code></pre>
-
-<pre><code>
-#### 购买 香港-1core-1GB-5Mbps-1小时后销毁
-
-ImageId 换个公共的 或 自己制作一个
-
-https://console.cloud.tencent.com/cvm/image?rid=5&amp;imageType=PUBLIC_IMAGE
-</code></pre>
-
-<pre><code>&lt;?php
-require_once '../../../TCloudAutoLoader.php';
-// 导入对应产品模块的client
-use TencentCloud\Cvm\V20170312\CvmClient;
-// 导入要请求接口对应的Request类
-use TencentCloud\Cvm\V20170312\Models\RunInstancesRequest;
-use TencentCloud\Cvm\V20170312\Models\Filter;
-use TencentCloud\Common\Exception\TencentCloudSDKException;
-use TencentCloud\Common\Credential;
-// 导入可选配置类
-use TencentCloud\Common\Profile\ClientProfile;
-use TencentCloud\Common\Profile\HttpProfile;
-
-try {
-    // 实例化一个证书对象，入参需要传入腾讯云账户secretId，secretKey
-    //$cred = new Credential("secretId", "secretKey");
-    $cred = new Credential(getenv("TENCENTCLOUD_SECRET_ID"), getenv("TENCENTCLOUD_SECRET_KEY"));
-
-    // 实例化一个http选项，可选的，没有特殊需求可以跳过
-    $httpProfile = new HttpProfile();
-    $httpProfile-&gt;setReqMethod("GET");  // post请求(默认为post请求)
-    $httpProfile-&gt;setReqTimeout(30);    // 请求超时时间，单位为秒(默认60秒)
-    $httpProfile-&gt;setEndpoint("cvm.ap-guangzhou.tencentcloudapi.com");  // 指定接入地域域名(默认就近接入)
-
-    // 实例化一个client选项，可选的，没有特殊需求可以跳过
-    $clientProfile = new ClientProfile();
-    $clientProfile-&gt;setSignMethod("TC3-HMAC-SHA256");  // 指定签名算法(默认为HmacSHA256)
-    $clientProfile-&gt;setHttpProfile($httpProfile);
-
-    // 实例化要请求产品(以cvm为例)的client对象,clientProfile是可选的
-    $client = new CvmClient($cred, "ap-hongkong", $clientProfile);
-
-    // 实例化一个cvm实例信息查询请求对象,每个接口都会对应一个request对象。
-    $req = new RunInstancesRequest();
-
-    // 填充请求参数,这里request对象的成员变量即对应接口的入参
-    // 你可以通过官网接口文档或跳转到request对象的定义处查看请求参数的定义
-    // 这里还支持以标准json格式的string来赋值请求参数的方式。下面的代码跟上面的参数赋值是等效的
-    $params = [
-        "Region" =&gt; "ap-hongkong",
-        "Placement" =&gt; [
-            "Zone" =&gt; "ap-hongkong-2"
-        ],
-        "ImageId" =&gt; "img-7b63u5v2",
-        "InstanceChargeType" =&gt; "POSTPAID_BY_HOUR",
-        "InstanceType" =&gt; "S2.SMALL1",
-        "InternetAccessible" =&gt; [
-            "InternetChargeType" =&gt; "TRAFFIC_POSTPAID_BY_HOUR",
-            "InternetMaxBandwidthOut" =&gt; 5
-        ],
-        "LoginSettings" =&gt; [
-            "Password" =&gt; "QAZwsx123"
-        ],
-        "EnhancedService" =&gt; [
-            "SecurityService" =&gt; [
-                "Enabled" =&gt; false
-            ],
-            "MonitorService" =&gt; [
-                "Enabled" =&gt; false
-            ]
-        ],
-        "ActionTimer" =&gt; [
-            "Externals" =&gt; [
-            ],
-            "TimerAction" =&gt; "TerminateInstances",
-            "ActionTime" =&gt; date('Y-m-d H:i:s', time()+3300),
-        ]
-    ];
-    $req-&gt;fromJsonString(json_encode($params));
-
-    #var_dump($req);
-    // 通过client对象调用DescribeInstances方法发起请求。注意请求方法名与请求对象是对应的
-    // 返回的resp是一个DescribeInstancesResponse类的实例，与请求对象对应
-    $resp = $client-&gt;RunInstances($req);
-
-    // 输出json格式的字符串回包
-    print_r($resp-&gt;toJsonString());
-}
-catch(TencentCloudSDKException $e) {
-    echo $e;
-}
-</code></pre>
-
-<pre><code>
-#### 退还CVM
-</code></pre>
-
-<pre><code>&lt;?php
-require_once '../../../TCloudAutoLoader.php';
-// 导入对应产品模块的client
-use TencentCloud\Cvm\V20170312\CvmClient;
-// 导入要请求接口对应的Request类
-use TencentCloud\Cvm\V20170312\Models\TerminateInstancesRequest;
-use TencentCloud\Cvm\V20170312\Models\Filter;
-use TencentCloud\Common\Exception\TencentCloudSDKException;
-use TencentCloud\Common\Credential;
-// 导入可选配置类
-use TencentCloud\Common\Profile\ClientProfile;
-use TencentCloud\Common\Profile\HttpProfile;
-
-try {
-    // 实例化一个证书对象，入参需要传入腾讯云账户secretId，secretKey
-    //$cred = new Credential("secretId", "secretKey");
-    $cred = new Credential(getenv("TENCENTCLOUD_SECRET_ID"), getenv("TENCENTCLOUD_SECRET_KEY"));
-
-    // 实例化一个http选项，可选的，没有特殊需求可以跳过
-    $httpProfile = new HttpProfile();
-    $httpProfile-&gt;setReqMethod("GET");  // post请求(默认为post请求)
-    $httpProfile-&gt;setReqTimeout(30);    // 请求超时时间，单位为秒(默认60秒)
-    $httpProfile-&gt;setEndpoint("cvm.ap-guangzhou.tencentcloudapi.com");  // 指定接入地域域名(默认就近接入)
-
-    // 实例化一个client选项，可选的，没有特殊需求可以跳过
-    $clientProfile = new ClientProfile();
-    $clientProfile-&gt;setSignMethod("TC3-HMAC-SHA256");  // 指定签名算法(默认为HmacSHA256)
-    $clientProfile-&gt;setHttpProfile($httpProfile);
-
-    // 实例化要请求产品(以cvm为例)的client对象,clientProfile是可选的
-    $client = new CvmClient($cred, "ap-hongkong", $clientProfile);
-
-    // 实例化一个cvm实例信息查询请求对象,每个接口都会对应一个request对象。
-    $req = new TerminateInstancesRequest();
-
-    // 填充请求参数,这里request对象的成员变量即对应接口的入参
-    // 你可以通过官网接口文档或跳转到request对象的定义处查看请求参数的定义
-    // 这里还支持以标准json格式的string来赋值请求参数的方式。下面的代码跟上面的参数赋值是等效的
-    $params = [
-        "InstanceIds" =&gt; [
-            "ins-1rfi3vms"
-        ]
-    ];
-    $req-&gt;fromJsonString(json_encode($params));
-
-    // 通过client对象调用DescribeInstances方法发起请求。注意请求方法名与请求对象是对应的
-    // 返回的resp是一个DescribeInstancesResponse类的实例，与请求对象对应
-    $resp = $client-&gt;TerminateInstances($req);
-
-    // 输出json格式的字符串回包
-    print_r($resp-&gt;toJsonString());
-}
-catch(TencentCloudSDKException $e) {
-    echo $e;
-}
-</code></pre>
-
-<p>```</p>
-]]></content>
-  </entry>
-  
-  <entry>
-    <title type="html"><![CDATA[ssh反向连接]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2019/12/12/ssh-autossh/"/>
-    <updated>2019-12-12T11:04:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2019/12/12/ssh-autossh</id>
-    <content type="html"><![CDATA[<p><a href="https://www.cnblogs.com/eshizhan/archive/2012/07/16/2592902.html">https://www.cnblogs.com/eshizhan/archive/2012/07/16/2592902.html</a></p>
-
-<p>内网主机主动连接到外网主机，又被称作反向连接（Reverse Connection）</p>
-
-<h3>ssh</h3>
-
-<p>A主机：外网，ip：123.123.123.123，sshd端口：2221</p>
-
-<p>B主机：内网，sshd端口：2223</p>
-
-<h4>1.1.首先在B上执行</h4>
-
-<pre><code>    ssh -NfR 1234:localhost:2223 user1@123.123.123.123 -p2221
-</code></pre>
-
-<p>这句话的意思是将A主机的1234端口和B主机的2223端口绑定，相当于远程端口映射（Remote Port Forwarding）。</p>
-
-<p>像平时一样连接到A主机的1234端口就可以控制内网B主机了
-<code>
-    ssh localhost -p1234
-</code></p>
-
-<h3>Autossh的用法</h3>
-
-<pre><code>    autossh -M 5678 -NfR 1234:localhost:2223 user1@123.123.123.123 -p2221
-</code></pre>
-
-<p>比之前的命令添加的一个-M 5678参数，负责通过5678端口监视连接状态，连接有问题时就会自动重连.</p>
-]]></content>
-  </entry>
-  
-  <entry>
-    <title type="html"><![CDATA[nginx ipv6、TCP_DEFER_ACCEPT]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2019/01/28/nignx-conf/"/>
-    <updated>2019-01-28T04:06:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2019/01/28/nignx-conf</id>
-    <content type="html"><![CDATA[<h4>curl 7.61.1</h4>
-
-<p><a href="/download/tools/curl_7.61.1">curl 7.61.1</a></p>
-
-<h4>TCP_DEFER_ACCEPT</h4>
-
-<pre><code>    server {
-        listen  80 deferred;
-        ...
-</code></pre>
-
-<p> deferred
-  instructs to use a deferred accept() (the TCP_DEFER_ACCEPT socket option) on Linux.</p>
-
-<h4>ipv6</h4>
-
-<pre><code>    server {
-        listen  [::]:8080; # ipv6only=on;
-        ...
-</code></pre>
-
-<p> ipv6only=on|off
-  this parameter (0.7.42) determines (via the IPV6_V6ONLY socket option) whether an IPv6 socket listening on a wildcard address [::] will accept only IPv6 connections or both IPv6 and IPv4 connections. This parameter is turned on by default. It can only be set once on start.</p>
-
-<p>  Prior to version 1.3.4, if this parameter was omitted then the operating system’s settings were in effect for the socket.</p>
-]]></content>
-  </entry>
-  
-  <entry>
-    <title type="html"><![CDATA[setterm 防止黑屏]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2018/12/12/command-setterm/"/>
-    <updated>2018-12-12T01:17:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2018/12/12/command-setterm</id>
-    <content type="html"><![CDATA[<p><a href="https://unix.stackexchange.com/questions/8056/disable-screen-blanking-on-text-console">https://unix.stackexchange.com/questions/8056/disable-screen-blanking-on-text-console</a></p>
-
-<h4>防止黑屏</h4>
-
-<pre><code>    setterm -blank 0 -powersave off
-
-    # cat /sys/module/kernel/parameters/consoleblank
-</code></pre>
+    <title type="html"><![CDATA[nginx proxy_pass]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2020/05/18/tools-nginx-proxy_pass/"/>
+    <updated>2020-05-18T19:29:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2020/05/18/tools-nginx-proxy_pass</id>
+    <content type="html"><![CDATA[<p><a href="https://www.cnblogs.com/xuey/p/9515996.html">https://www.cnblogs.com/xuey/p/9515996.html</a></p>
 
 <hr />
 
-<h4>名字</h4>
+<h3>nginx中有两个模块都有proxy_pass指令</h3>
 
-<p>setterm - 设置终端属性</p>
+<h4>ngx_http_proxy_module的proxy_pass</h4>
 
-<h4>概要</h4>
-
-<p>setterm [选项]</p>
-
-<h4>描述</h4>
-
-<p>setterm向终端写一个字符串到标准输出，调用终端的特定功能。在虚拟终端上使用，将会改变虚拟终端的输出特性。不支持的选项将被忽略。</p>
-
-<h4>选项</h4>
-
-<p>对于布尔选项（on或off），默认设置为on。</p>
-
-<pre><code>   简洁8色如下：黑色，红色，绿色，黄色，蓝色，洋红色，青色，或白色
-   black, red, green, yellow, blue, magenta, cyan, or white.
-   16色是8色加上灰度或明暗，在红色、绿色、黄色、蓝色、洋红色、青色或白色之后加上灰度或明暗
-   red, green, yellow, blue, magenta, cyan, or white + grey 或 bright
-   各种颜色选项可以独立设置，其中设置多个模式的结果（例如，下划线和-半明亮）是硬件相关的。
-   -term 终端名字
-        覆盖环境变量TERM.
-   -reset 显示终端重置字符串，它通常将终端重新设置为电源的状态？？(测试未见任何效果)
-   -initialize 清空屏幕。
-   -cursor [on|off] 显示或关闭光标（测试时，没有效果）
-   -repeat [on|off] 只在虚拟主机上有效：键盘打开或关闭（测试时，显示不支持）
-   -appcursorkeys [on|off] 只在虚拟主机上有效
-        将光标键应用程序模式设置为on或off. 
-   -linewrap [on|off] (virtual consoles only)
-        自动换行或关闭。
-   -default：将终端的呈现选项设置为默认值。
-   -foreground 8-color|default 设置前景文本颜色
-   -background 8-color|default 设置背景文本颜色。
-   -ulcolor 16-color (virtual consoles only)为加下划线的字符设置颜色。
-   -hbcolor 16-color (virtual consoles only)设置半明字符的颜色。
-   -inversescreen [on|off] (virtual consoles only)颠倒的屏幕颜色。前台和后台交换，下划线和半亮交换。
-   -bold [on|off] 打开或关闭粗体（额外亮度）模式
-   -half-bright [on|off]将昏暗（半亮度）模式开启或关闭
-   -blink [on|off]开启或关闭闪烁模式
-   -reverse [on|off]打开或关闭反向视频模式，字符和字符背景交换颜色（-inversescreen是全屏交换）
-   -underline [on|off]在开启或关闭状态下显示下划线模式
-   -store 存储终端当前的呈现选项
-   -clear all：同命令clear
-   -clear rest：测试时报参数错误
-   -tabs [tab1 tab2 tab3 ...] 不带参数，测试结果如下。带参数没效果。
-            root@myzr:~# setterm -tabs
-            10        20        30        40        50        60        70
-            12345678901234567890123456789012345678901234567890123456789012345678901234567890
-            T      T       T       T       T       T       T       T       T       T      T
-   -clrtabs [tab1 tab2 tab3 ...] 测试时报终端不支持：setterm: terminal xterm does not support --clrtabs
-   -regtabs [1-160] 测试时报终端不支持：setterm: terminal xterm does not support --regtabs
-   -blank [0-60|force|poke] 设置不活动的时间间隔，在几分钟内，之后屏幕将自动变白（如果可用的话，使用APM）
-        force：即使按键被按下，也要保持屏幕空白。
-        poke：开启屏幕
-   -dump [1-NR_CONS]  将给定虚拟控制台（带有属性）的快照写入-file选项中指定的文件，覆盖该文件，默认文件是screen.dump
-   -append [1-NR_CONS] 类似-dump，但是将其附加到快照文件，而不是重写它。
-   -file dump文件名
-   -msg [on|off] 启用或禁用发送内核printk（）消息到控制台。
-   -msglevel 1-8 设置内核打印等级。
-   -powersave on|vsync 将监视器放入VESA vsync挂起模式。测试无效
-   -powersave hsync 将监视器放入VESA hsync挂起模式。测试无效
-   -powersave powerdown 将监视器放入VESA关闭模式。测试无效
-   -powersave [off]节能模式。测试无效
-   -powerdown [0-60]测试无效
-   -blength [0-2000]：以毫秒为间隔设置钟的持续时间，没有参数，默认是0。测试时不支持
-   -bfreq [freqnumber] 将钟频率设置为赫兹，没有参数，默认是0。测试时不支持
-   -version 输出版本信息
-   -help  输出帮助信息
+<pre><code>    语法: proxy_pass URL;
+    场景: location, if in location, limit_except
+    说明: 设置后端代理服务器的协议(protocol)和地址(address),以及location中可以匹配的一个可选的URI。
+        协议可以是"http"或"https"。地址可以是一个域名或ip地址和端口，或者一个 unix-domain socket 路径。  
+    详见官方文档: http://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_pass
 </code></pre>
+
+<h4>ngx_stream_proxy_module的proxy_pass</h4>
+
+<pre><code>    语法: proxy_pass address;
+    场景: server
+    说明: 设置后端代理服务器的地址。这个地址(address)可以是一个域名或ip地址和端口，或者一个 unix-domain socket路径。  
+    详见官方文档: http://nginx.org/en/docs/stream/ngx_stream_proxy_module.html#proxy_pass
+</code></pre>
+
+<h3>两个proxy_pass的关系和区别</h3>
+
+<p>在两个模块中，两个proxy_pass都是用来做后端代理的指令。</p>
+
+<p>ngx_stream_proxy_module模块的proxy_pass指令只能在server段使用使用, 只需要提供域名或ip地址和端口。可以理解为端口转发，可以是tcp端口，也可以是udp端口。
+ngx_http_proxy_module模块的proxy_pass指令需要在location段，location中的if段，limit_except段中使用，处理需要提供域名或ip地址和端口外，还需要提供协议，如"http"或"https"，还有一个可选的uri可以配置。</p>
+
+<h3>proxy_pass的具体用法</h3>
+
+<p>ngx_stream_proxy_module模块的proxy_pass指令</p>
+
+<pre><code>server {
+    listen 127.0.0.1:12345;
+    proxy_pass 127.0.0.1:8080;
+}
+
+server {
+    listen 12345;
+    proxy_connect_timeout 1s;
+    proxy_timeout 1m;
+    proxy_pass example.com:12345;
+}
+
+server {
+    listen 53 udp;
+    proxy_responses 1;
+    proxy_timeout 20s;
+    proxy_pass dns.example.com:53;
+}
+
+server {
+    listen [::1]:12345;
+    proxy_pass unix:/tmp/stream.socket; #设置源站地址
+}
+</code></pre>
+
+<p>ngx_http_proxy_module模块的proxy_pass指令</p>
+
+<pre><code>server {
+    listen    80;
+    server_name www.test.com;
+
+    # 正常代理，不修改后端url的
+    location /some/path/ {
+        proxy_pass http://127.0.0.1;
+    }
+
+    # 修改后端url地址的代理（本例后端地址中，最后带了一个斜线)
+    location /testb {
+        proxy_pass http://www.other.com:8801/;
+    }
+
+    # 使用 if in location
+    location /google {
+        if ( $geoip_country_code ~ (RU|CN) ) {
+            proxy_pass http://www.google.hk;
+        }
+    }
+
+    location /yongfu/ {
+        # 没有匹配 limit_except 的，代理到 unix:/tmp/backend.socket:/uri/
+        proxy_pass http://unix:/tmp/backend.socket:/uri/;
+
+        # 匹配到请求方法为: PUT or DELETE, 代理到9080
+        limit_except PUT DELETE {
+            proxy_pass http://127.0.0.1:9080;
+        }
+    }
+
+}
+</code></pre>
+
+<h3>proxy_pass后端服务器的url(request_uri)情况分析</h3>
+
+<pre><code>server {
+    listen    80;
+    server_name www.test.com;
+
+    # 情形A
+    # 访问 http://www.test.com/testa/aaaa
+    # 后端的request_uri为: /testa/aaaa
+    location ^~ /testa/ {
+        proxy_pass http://127.0.0.1:8801;
+    }
+
+    # 情形B
+    # 访问 http://www.test.com/testb/bbbb
+    # 后端的request_uri为: /bbbb
+    location ^~ /testb/ {
+        proxy_pass http://127.0.0.1:8801/;
+    }
+
+    # 情形C
+    # 下面这段location是正确的
+    location ~ /testc {
+        proxy_pass http://127.0.0.1:8801;
+    }
+
+    # 情形D
+    # 下面这段location是错误的
+    #
+    # nginx -t 时，会报如下错误: 
+    #
+    # nginx: [emerg] "proxy_pass" cannot have URI part in location given by regular 
+    # expression, or inside named location, or inside "if" statement, or inside 
+    # "limit_except" block in /opt/app/nginx/conf/vhost/test.conf:17
+    # 
+    # 当location为正则表达式时，proxy_pass 不能包含URI部分。本例中包含了"/"
+    location ~ /testd {
+        proxy_pass http://127.0.0.1:8801/;   # 记住，location为正则表达式时，不能这样写！！！
+    }
+
+    # 情形E
+    # 访问 http://www.test.com/ccc/bbbb
+    # 后端的request_uri为: /aaa/ccc/bbbb
+    location /ccc/ {
+        proxy_pass http://127.0.0.1:8801/aaa$request_uri;
+    }
+
+    # 情形F
+    # 访问 http://www.test.com/namea/ddd
+    # 后端的request_uri为: /yongfu?namea=ddd
+    location /namea/ {
+        rewrite /namea/([^/]+) /yongfu?namea=$1 break;
+        proxy_pass http://127.0.0.1:8801;
+    }
+
+    # 情形G
+    # 访问 http://www.test.com/nameb/eee
+    # 后端的request_uri为: /yongfu?nameb=eee
+    location /nameb/ {
+        rewrite /nameb/([^/]+) /yongfu?nameb=$1 break;
+        proxy_pass http://127.0.0.1:8801/;
+    }
+
+    access_log /data/logs/www/www.test.com.log;
+}
+
+server {
+    listen    8801;
+    server_name www.test.com;
+
+    root    /data/www/test;
+    index   index.php index.html;
+
+    rewrite ^(.*)$ /test.php?u=$1 last;
+
+    location ~ \.php$ {
+        try_files $uri =404;
+        fastcgi_pass unix:/tmp/php-cgi.sock;
+        fastcgi_index index.php;
+        include fastcgi.conf;
+    }
+
+    access_log /data/logs/www/www.test.com.8801.log;
+}
+</code></pre>
+
+<h3>小结</h3>
+
+<p>情形A和情形B进行对比，可以知道proxy_pass后带一个URI,可以是斜杠(/)也可以是其他uri，对后端request_uri变量的影响。</p>
+
+<p>情形D说明，当location为正则表达式时，proxy_pass不能包含URI部分（proxy_pass在以下情况下，指令中不能有URI，正则表达式位置、命名的地点、if 块），</p>
+
+<p>情形E通过变量($request_uri, 也可以是其他变量)，对后端的request_uri进行改写。</p>
+
+<p>情形F和情形G通过rewrite配合break标志,对url进行改写，并改写后端的request_uri。需要注意，proxy_pass地址的URI部分在情形G中无效，不管如何设置，都会被忽略。</p>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[nginx https代理配置]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2020/05/18/tools-nginx-proxy-https/"/>
+    <updated>2020-05-18T17:23:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2020/05/18/tools-nginx-proxy-https</id>
+    <content type="html"><![CDATA[<p><a href="https://segmentfault.com/a/1190000019563509">https://segmentfault.com/a/1190000019563509</a></p>
+
+<hr />
+
+<p>NGINX解决HTTPS代理的方式都属于透传(隧道)模式，即不解密不感知上层流量。具体的方式有如下7层和4层的两类解决方案。</p>
+
+<h3>HTTP CONNECT隧道 (7层解决方案)</h3>
+
+<p>客户端给代理服务器发送HTTP CONNECT请求。</p>
+
+<p>代理服务器利用HTTP CONNECT请求中的主机和端口与目的服务器建立TCP连接。</p>
+
+<p>代理服务器给客户端返回HTTP 200响应。</p>
+
+<p>客户端和代理服务器建立起HTTP CONNECT隧道，HTTPS流量到达代理服务器后，直接通过TCP透传给远端目的服务器。代理服务器的角色是透传HTTPS流量，并不需要解密HTTPS。</p>
+
+<h4>NGINX ngx_http_proxy_connect_module模块</h4>
+
+<p>NGINX作为反向代理服务器，官方一直没有支持HTTP CONNECT方法。但是基于NGINX的模块化、可扩展性好的特性，阿里的@chobits提供了ngx_http_proxy_connect_module模块，来支持HTTP CONNECT方法，从而让NGINX可以扩展为正向代理。</p>
+
+<h3>NGINX stream (4层解决方案)</h3>
+
+<p>NGINX官方从1.9.0版本开始支持ngx_stream_core_module模块，模块默认不build，需要configure时加上 <code>--with-stream</code> 选项来开启。</p>
+
+<h4>ngx_stream_ssl_preread_module模块</h4>
+
+<p>要在不解密的情况下拿到HTTPS流量访问的域名，只有利用TLS/SSL握手的第一个Client Hello报文中的扩展地址SNI (Server Name Indication)来获取。NGINX官方从1.11.5版本开始支持利用ngx_stream_ssl_preread_module模块来获得这个能力，模块主要用于获取Client Hello报文中的SNI和ALPN信息。对于4层正向代理来说，从Client Hello报文中提取SNI的能力是至关重要的，否则NGINX stream的解决方案无法成立。同时这也带来了一个限制，要求所有客户端都需要在TLS/SSL握手中带上SNI字段，否则NGINX stream代理完全没办法知道客户端需要访问的目的域名。</p>
+
+<pre><code>    stream {
+        resolver 114.114.114.114;
+        server {
+            listen 443;
+            ssl_preread on;
+            proxy_connect_timeout 5s;
+            proxy_pass $ssl_preread_server_name:$server_port;
+        }
+    }
+</code></pre>
+
+<h3>test</h3>
+
+<p>openssl带servername参数来指定SNI</p>
+
+<pre><code>    openssl s_client -connect www.baidu.com:443 -servername www.baidu.com
+</code></pre>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[nginx 代理配置]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2020/05/18/tools-nginx-proxy/"/>
+    <updated>2020-05-18T16:52:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2020/05/18/tools-nginx-proxy</id>
+    <content type="html"><![CDATA[<h3>正向代理、反向代理 没有区别</h3>
+
+<p>客户端 &mdash;-> 代理服务器(发起访问请求) &mdash;-> 网站<br/>
+客户端 &lt;&mdash;- 代理服务器(响应的内容)   &lt;&mdash;- 网站</p>
+
+<h3>配置：(https 代理配置较麻烦)</h3>
+
+<h4>ngx_http_proxy_module 代理配置：</h4>
+
+<pre><code>    server {
+        listen 88;
+        # resolver 8.8.8.8
+        location / {
+            proxy_pass $http_host$http_request_uri;
+            # proxy_pass http://192.168.56.101:88; 多级代理的中间设备用这条
+
+            # proxy_connect_timeout 600;
+            # ...
+        }
+    }
+</code></pre>
+
+<h4>ngx_stream_proxy_module 代理配置：</h4>
+
+<p>NGINX官方从1.9.0版本开始支持ngx_stream_core_module模块，模块默认不build，需要configure时加上 <code>--with-stream</code> 选项来开启。</p>
+
+<p>配置见 <a href="/blog/2020/05/18/tools-nginx-proxy-https/">nginx https代理配置</a></p>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[squid 代理转发]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2020/05/18/tools-squid-peer/"/>
+    <updated>2020-05-18T14:55:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2020/05/18/tools-squid-peer</id>
+    <content type="html"><![CDATA[<p><a href="https://www.cmdschool.org/archives/4673">https://www.cmdschool.org/archives/4673</a></p>
+
+<h4>Squid的层次结构</h4>
+
+<p><img src="/images/tools/20200518-1.png" alt="" /></p>
+
+<p>图中绿色线代表父子关系的层次结构（上游下游关系）</p>
+
+<p>图中蓝色代表兄弟关系的层次结构（平等关系）</p>
+
+<h4>代理转发</h4>
+
+<p>Squid使用“cache_peer”指令提供父节点的缓存</p>
+
+<h5>cache_peer指令的模式</h5>
+
+<p>never direct模式，父节点失败不能直接连接源服务器，如果父节点失败或无法访问，则每个请求都导致错误消息</p>
+
+<p>prefer direct模式，父节点失败允许直接连接源服务器，如果父节点失败或无法访问，则连接到源服务器而不是父节点</p>
+
+<p>注：失败是指没有ICP或HTCP回复</p>
+
+<h5>never direct模式</h5>
+
+<pre><code>    cache_peer parentcache.foo.com parent 3128 0 no-query default
+    never_direct allow all
+</code></pre>
+
+<p>以上使用never_direct指令宣告父节点失败不能直接连接源服务器</p>
+
+<h5>prefer direct模式</h5>
+
+<pre><code>    cache_peer parentcache.foo.com parent 3128 0 no-query
+    prefer_direct off
+    nonhierarchical_direct off
+</code></pre>
+
+<p>以上使用prefer_direct指令宣告首选从DNS中列出源服务器尝试</p>
+
+<p>以上使用nonhierarchical_direct指令宣告往父节点的请求继续发送</p>
+
+<p>hierarchy_stoplist指令是prefer direct模式的另外一种实现（适用于Squid-3.2之前的版本）</p>
+
+<h5>cache_peer指令的使用</h5>
+
+<pre><code>    cache_peer hostname type http-port icp-port [options]
+</code></pre>
+
+<p>hostname参数，指定转发的代理服务器主机名称（IP地址亦可）</p>
+
+<p>type参数，可选值有“parent”（父母）、“sibling”（兄弟）和“multicast”（多播）</p>
+
+<p>http-port参数，指定转发的代理服务器通讯端口，默认值3128</p>
+
+<p>icp-port参数，查询对象的邻居缓存，如果不支持ICP或HTCP，设置为0</p>
+
+<p>options参数，可选的其他选项（不一一列举）</p>
+
+<p><a href="http://www.squid-cache.org/Doc/config/cache_peer/">http://www.squid-cache.org/Doc/config/cache_peer/</a></p>
 ]]></content>
   </entry>
   
