@@ -1,0 +1,143 @@
+---
+layout: post
+title: "netmap 介绍及使用"
+date: 2020-05-21 17:33:00 +0800
+comments: false
+categories:
+- 2020
+- 2020~05
+- kernel
+- kernel~10Gb
+tags:
+---
+
+https://blog.csdn.net/fengfengdiandia/article/details/52869290
+
+https://blog.csdn.net/liyu123__/article/details/80853150
+
+https://www.cnblogs.com/ne-liqian/p/9294757.html
+
+https://wenku.baidu.com/view/af41b0f065ce05087632137a
+
+netmap官网：http://info.iet.unipi.it/~luigi/netmap/
+
+netmap的githab网址：https://github.com/luigirizzo/netmap
+
+netmap是一个高效的收发报文的 I/O 框架，已经集成在 FreeBSD 的内部了。
+当然，也可以在 Linux 下编译使用 。
+
+### 一、架构
+
+现在的网卡都使用多个 buffer 来发送和接收 packet，并有一个叫NIC ring的环形数组。
+
+NIC ring 是静态分配的，它的槽指向mbufs链的部分缓冲区。
+
+![](/images/kernel/20200521-20.png)
+
+netmap 内存映射网卡的packet buffer到用户态，实现了自己的发送和接收报文的circular ring来对应网卡的 ring，使用 netmap 时，程序运行在用户态，即使出了问题也不会 crash 操作系统。
+
+下图显示了一个接口可以有多个 netmap ring。
+
+将文件描述符绑定到 NIC 时，应用程序可以选择将所有 ring或仅一个 ring附加到文件描述符。
+
+使用所有 ring，相同的代码可以用于单队列或多队列 NIC。
+
+使用一个 ring，可以通过每个 ring 一个进程/CPU core 来构建高性能系统，从而在系统中并行。
+
+![](/images/kernel/20200521-21.png)
+
+netmap 使用poll等待网卡的文件描述符可接收或可发送。
+
+netmap 会建立一个字符设备/dev/netmap，然后通过nm_open来注册网卡为 netmap 模式。
+
+* 注意：这里顺便提一下，网卡进入 netmap 模式后，ifconfig 是看不到网卡统计信息变化的，wireshark 也抓不到报文，因为协议栈被旁路了。
+
+内存映射的区域里面，有网卡的收发队列，这样可以通过将接收缓冲区的地址写在发送的 ring 里面实现零拷贝（Zero-copy）。
+
+### 二、性能
+
+netmap 官网说在 10GigE 上测试，发包速率可以达到 14.88Mpps，收包的速率和发包相近。同时还支持多网卡队列。
+
+![](/images/kernel/20200521-22.png)
+
+
+### 三、编译安装
+
+```
+	git clone https://github.com/luigirizzo/netmap.git
+	或
+	git clone https://github.com/abcdxyzk/netmap.git
+
+	cd netmap/LINUX
+	./configure --drivers=ixgbe --kernel-sources=/usr/src/linux-headers-4.15.18/ --kernel-dir=/usr/src/linux-headers-4.15.18/
+
+	rmmod ixgbe
+
+	insmod netmap.ko
+	insmod ixgbe/ixgbe.ko
+```
+
+### 四、发送、接收
+
+发送
+```
+	./build-apps/pkt-gen/pkt-gen -i enp3s0 -f tx -c 1 -p 1 -z -d 12.0.0.100:80
+```
+
+接收
+```
+	gcc rcv.c -I../sys
+```
+
+cat rcv.c
+```
+	#include <stdio.h>
+	#include <poll.h>
+	 
+	#define NETMAP_WITH_LIBS
+	#include <net/netmap_user.h>
+	 
+	unsigned long pps = 0;
+	 
+	static void receive_packets(struct netmap_ring *ring)
+	{
+		int i;
+		char *buf;
+	 
+		while (!nm_ring_empty(ring)) {
+			i   = ring->cur;
+			buf = NETMAP_BUF(ring, ring->slot[i].buf_idx);
+			pps++;
+	
+			ring->head = ring->cur = nm_ring_next(ring, i); 
+		}
+	}
+	 
+	int main(void)
+	{
+		struct nm_desc *d;
+		struct pollfd fds;
+		struct netmap_ring *ring;
+		int i; 
+	 
+		d = nm_open("netmap:eth1", NULL, 0, 0); 
+	  
+		fds.fd     = d->fd;
+		fds.events = POLLIN;
+	 
+		while (1) {
+			if (poll(&fds, 1, 1) < 0) {
+				perror("poll()");
+				exit(1);
+			}
+	 
+			for (i = d->first_rx_ring; i <= d->last_rx_ring; i++) {
+				ring = NETMAP_RXRING(d->nifp, i);
+				receive_packets(ring);
+			}
+		}
+	
+		return 0;
+	}
+```
+
