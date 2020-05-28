@@ -62,6 +62,22 @@ https://github.com/abcdxyzk/ubuntu-mptcp-v0.95
 
 https://www.cnblogs.com/fenglt/p/8570343.html
 
+### 路由配置
+
+enp0s9: 192.168.2.5  gw 192.168.2.4
+
+enp0s10: 192.168.3.5 gw 192.168.3.4
+
+```
+	ip rule add table 1 from 192.168.2.5
+	ip route add 192.168.2.0/24 dev enp0s9 scope link table 1
+	ip route add default via 192.168.2.4 dev enp0s9 table 1
+
+	ip rule add table 2 from 192.168.3.5
+	ip route add 192.168.3.0/24 dev enp0s10 scope link table 2
+	ip route add default via 192.168.3.4 dev enp0s10 table 2
+```
+
 ### fullmesh, ndiffports, binder
 
 #### 工具
