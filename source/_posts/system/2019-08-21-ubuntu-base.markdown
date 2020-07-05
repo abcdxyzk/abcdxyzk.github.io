@@ -11,6 +11,16 @@ categories:
 tags:
 ---
 
+#### dns
+```
+	sudo apt-get install pppconfig
+	/etc/init.d/dns-clean
+
+	systemd-resolve --statistics
+	systemd-resolve --status
+	systemd-resolve --flush-caches
+```
+
 #### 代理设置
 ```
 	# cat /etc/apt/apt.conf
