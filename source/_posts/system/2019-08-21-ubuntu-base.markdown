@@ -16,6 +16,9 @@ tags:
 	sudo apt-get install pppconfig
 	/etc/init.d/dns-clean
 
+	systemctl stop systemd-resolved
+	systemctl start systemd-resolved
+
 	systemd-resolve --statistics
 	systemd-resolve --status
 	systemd-resolve --flush-caches
