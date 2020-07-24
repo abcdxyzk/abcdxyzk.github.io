@@ -9,6 +9,7 @@ categories:
 - tools
 - tools~git
 tags:
+- git
 ---
 可以保存为count.sh运行 ./count.sh your_name
 ```

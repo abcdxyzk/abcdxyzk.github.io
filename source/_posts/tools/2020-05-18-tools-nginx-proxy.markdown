@@ -9,6 +9,7 @@ categories:
 - tools
 - tools~nginx
 tags:
+- nginx
 ---
 
 ### 正向代理、反向代理 没有区别

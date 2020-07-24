@@ -9,6 +9,8 @@ categories:
 - kernel
 - kernel~net
 tags:
+- 10gb
+- ixgbe
 ---
 http://www.pagefault.info/?p=403
 

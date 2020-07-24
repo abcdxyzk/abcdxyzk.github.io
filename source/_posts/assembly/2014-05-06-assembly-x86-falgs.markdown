@@ -9,6 +9,7 @@ categories:
 - assembly
 - assembly~base
 tags:
+- 汇编
 ---
   鉴于EFLAGS寄存器的重要性，所以将这一部分内容从处理器体系结构及寻址模式一文中单独抽出另成一文，这部分内容主要来自Intel Developer Mannual，在后续的内核系列中遇到的许多和EFLAGS寄存器有关的内容将直接从本文引用。众所周知，IA-32体系结构为通用系统(general system)提供了16个基本的程序执行寄存器：包含一些通用目的寄存器(General-purpose registers)、段寄存器(Segment registers)以及EFLAGS和EIP寄存器，而后两者对于程序的执行来说可谓至关重要。
 

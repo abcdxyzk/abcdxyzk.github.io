@@ -9,6 +9,7 @@ categories:
 - assembly
 - assembly~base
 tags:
+- 汇编
 ---
 AT&T 汇编
 #### 1.Register Reference

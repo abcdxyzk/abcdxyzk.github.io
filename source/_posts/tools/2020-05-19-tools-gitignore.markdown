@@ -9,6 +9,7 @@ categories:
 - tools
 - tools~git
 tags:
+- git
 ---
 
 想忽略某个文件夹，但又不想忽略这个文件夹下的某个子目录或文件

@@ -9,6 +9,7 @@ categories:
 - tools
 - tools~git
 tags:
+- git
 ---
 #### 常用
 ```

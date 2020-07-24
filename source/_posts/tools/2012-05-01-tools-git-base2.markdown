@@ -9,6 +9,7 @@ categories:
 - tools
 - tools~git
 tags:
+- git
 ---
 #### 建一个库
 ##### 服务器

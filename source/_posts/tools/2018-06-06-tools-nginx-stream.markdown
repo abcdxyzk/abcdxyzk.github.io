@@ -9,6 +9,7 @@ categories:
 - tools
 - tools~nginx
 tags:
+- nginx
 ---
 
 nginx rpm: http://nginx.org/packages/mainline/centos/7/x86_64/RPMS/

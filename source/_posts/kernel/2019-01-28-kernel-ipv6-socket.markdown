@@ -9,6 +9,7 @@ categories:
 - kernel
 - kernel~net
 tags:
+- ipv6
 ---
 
 https://blog.csdn.net/u013401853/article/details/55002655

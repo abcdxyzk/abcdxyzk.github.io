@@ -9,6 +9,7 @@ categories:
 - assembly
 - assembly~base
 tags:
+- 汇编
 ---
 _start是汇编程序的入口，main是c程序的入口？  
 gcc 只是一个  外壳而不是真正的编译器，这真的c编译器是/usr/lib/gcc/i486-gun/4.3.2/cc1,gcc调用c编译器、汇编器和链接器完成c 代码的编译链接工作。/usr/lib/gcc/i486-linux-gun/4.3.2/collect2是链接器ld的外壳，它调用ld完成链接。  

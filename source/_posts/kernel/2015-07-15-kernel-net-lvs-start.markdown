@@ -9,6 +9,7 @@ categories:
 - kernel
 - kernel~net
 tags:
+- lvs
 ---
 http://www.cnblogs.com/codebean/archive/2011/07/25/2116043.html
 

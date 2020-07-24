@@ -9,6 +9,7 @@ categories:
 - assembly
 - assembly~base
 tags:
+- 汇编
 ---
 
 TEST对两个参数(目标，源)执行AND逻辑操作,并根据结果设置标志寄存器,结果本身不会保存。TEST AX,BX 与 AND AX,BX 命令有相同效果

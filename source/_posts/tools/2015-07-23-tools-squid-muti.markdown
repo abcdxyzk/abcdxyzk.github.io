@@ -9,6 +9,7 @@ categories:
 - tools
 - tools~squid
 tags:
+- squid
 ---
 
 http://wenku.baidu.com/link?url=UXFXZVxSsQMyXVzoTA5y3Oal6s5zknpozLhfodYZ7d43R_XpziB08h28ynXZy3Sq8r-XH1tdXGvxD_X2Pa_aI4f6pFTBgGXMm0QRaRbEYmq

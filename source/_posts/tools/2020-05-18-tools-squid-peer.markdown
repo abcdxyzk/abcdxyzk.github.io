@@ -9,6 +9,7 @@ categories:
 - tools
 - tools~squid
 tags:
+- squid
 ---
 
 https://www.cmdschool.org/archives/4673

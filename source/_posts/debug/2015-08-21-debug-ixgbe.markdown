@@ -9,6 +9,8 @@ categories:
 - debug
 - debug~mark
 tags:
+- 10gb
+- ixgbe
 ---
 
 http://downloadmirror.intel.com/22919/eng/README.txt

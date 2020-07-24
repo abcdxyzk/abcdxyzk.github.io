@@ -9,6 +9,7 @@ categories:
 - assembly
 - assembly~base
 tags:
+- 汇编
 ---
 
 绝顶好书[Professional_Assembly_Language](/download/assembly/Professional_Assembly_Language.pdf)

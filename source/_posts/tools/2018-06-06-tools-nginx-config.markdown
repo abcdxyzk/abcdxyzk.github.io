@@ -9,6 +9,7 @@ categories:
 - tools
 - tools~nginx
 tags:
+- nginx
 ---
 
 curl wget 不验证证书进行https请求

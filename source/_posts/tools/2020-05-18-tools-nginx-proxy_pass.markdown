@@ -9,6 +9,7 @@ categories:
 - tools
 - tools~nginx
 tags:
+- nginx
 ---
 
 https://www.cnblogs.com/xuey/p/9515996.html

@@ -9,6 +9,7 @@ categories:
 - kernel
 - kernel~net
 tags:
+- ipv6
 ---
 http://www.cnblogs.com/super-king/p/ipv6_implement.html
 

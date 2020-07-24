@@ -9,6 +9,7 @@ categories:
 - assembly
 - assembly~base
 tags:
+- 汇编
 ---
 #### 尾调用
 尾调用大概是这么一种情况：  

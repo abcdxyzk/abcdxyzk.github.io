@@ -9,7 +9,6 @@ categories:
 - system
 - system~ubuntu
 tags:
-- nvidia
 ---
 [http://blog.sina.com.cn/s/blog_6dee445401013sss.html](http://blog.sina.com.cn/s/blog_6dee445401013sss.html)  
 [http://www.cnblogs.com/congbo/archive/2012/09/12/2682105.html](http://www.cnblogs.com/congbo/archive/2012/09/12/2682105.html)  

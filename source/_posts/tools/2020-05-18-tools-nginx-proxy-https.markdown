@@ -9,6 +9,7 @@ categories:
 - tools
 - tools~nginx
 tags:
+- nginx
 ---
 
 https://segmentfault.com/a/1190000019563509

@@ -9,6 +9,8 @@ categories:
 - kernel
 - kernel~10Gb
 tags:
+- 10gb
+- ixgbe
 ---
 
 https://www.cnblogs.com/scottieyuyang/p/5663213.html

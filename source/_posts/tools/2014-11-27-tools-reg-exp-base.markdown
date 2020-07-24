@@ -9,7 +9,6 @@ categories:
 - tools
 - tools~base
 tags:
-- reg_exp
 ---
 <table>
 	<tr>

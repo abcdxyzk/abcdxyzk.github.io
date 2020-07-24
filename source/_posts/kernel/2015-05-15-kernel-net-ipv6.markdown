@@ -9,6 +9,7 @@ categories:
 - kernel
 - kernel~net
 tags:
+- ipv6
 ---
 
 [ipv6初始化和处理流程分析.pdf](/download/kernel/ipv6初始化和处理流程分析.pdf)  

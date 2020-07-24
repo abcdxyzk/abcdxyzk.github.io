@@ -9,7 +9,7 @@ categories:
 - tools
 - tools~git
 tags:
-- patch
+- git
 ---
 #### 1、diff
 ```

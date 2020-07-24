@@ -9,6 +9,8 @@ categories:
 - tools
 - tools~nginx
 tags:
+- ipv6
+- nginx
 ---
 
 #### curl 7.61.1

@@ -9,6 +9,7 @@ categories:
 - assembly
 - assembly~base
 tags:
+- 汇编
 ---
 ### 一, IA-32 硬件特性
 #### 寄存器:

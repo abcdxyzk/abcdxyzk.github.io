@@ -9,6 +9,7 @@ categories:
 - tools
 - tools~squid
 tags:
+- squid
 ---
 
 好像改这行就能直接用了

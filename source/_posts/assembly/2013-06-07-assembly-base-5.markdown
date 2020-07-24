@@ -9,6 +9,7 @@ categories:
 - assembly
 - assembly~base
 tags:
+- 汇编
 ---
 GCC支持在C/C++代码中嵌入汇编代码,这些代码被称作是"GCC Inline ASM"(GCC内联汇编);
 #### 一、基本内联汇编
