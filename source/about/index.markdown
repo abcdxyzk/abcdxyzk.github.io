@@ -9,3 +9,4 @@ footer: true
 
 email: abcdxyzk@sina.com
 
+clone: http://c6wjxs.coding-pages.com/
