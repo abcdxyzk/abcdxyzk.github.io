@@ -7,7 +7,7 @@ categories:
 - 2015
 - 2015~08
 - kernel
-- kernel~base
+- kernel~proc
 tags:
 ---
 https://www.ibm.com/developerworks/cn/linux/l-cn-relay/
