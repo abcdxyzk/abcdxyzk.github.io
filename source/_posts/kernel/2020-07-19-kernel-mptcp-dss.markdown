@@ -1,6 +1,6 @@
 ---
 layout: post
-title: "MPTCP DSS"
+title: "MPTCP DSS && MPTCPHDR_INF"
 date: 2020-07-19 23:33:00 +0800
 comments: false
 categories:
@@ -108,8 +108,6 @@ mptcp_data_ready -> mptcp_prevalidate_skb, mptcp_detect_mapping, mptcp_validate_
 
 ##### mptcp_detect_mapping
 
-infinite_mapping_rcv 正常不开启的
-
 发送一个包可能对应多个接收包，在接收第一个包的时候设置好
 ```
 	tp->mptcp->map_data_len = data_len;
@@ -122,4 +120,40 @@ infinite_mapping_rcv 正常不开启的
 
 处理完一个或多个接收包（=一个发送包）后调mptcp_reset_mapping，重置 map_data_len，map_data_seq，map_subseq，map_data_fin，mapping_present。
 
+
+### MPTCPHDR_INF 模式
+
+MPTCPHDR_INF 模式是取消子流seq，退避回普通tcp，通通让meta_sk处理。
+
+infinite 模式正常不开启的
+
+#### 开启条件
+1. dss_csum != 0 并且没有established连接，见 mptcp_verif_dss_csum()
+
+2. 进入 mptcp_mp_fail_rcvd()
+
+3. 接收到数据时还没established，进入INF模式。见 mptcp_prevalidate_skb()
+
+#### 参数
+
+send_infinite_mapping = 1 发送端出错进入inf模式，需要发送数据通知接收端
+
+infinite_mapping_snd = 1 发送端进入INF模式
+
+infinite_mapping_rcv = 1 接收端进入INF模式, 接收seq映射改用 infinite_rcv_seq
+
+```
+	mptcp_detect_mapping()
+	{
+		if (!data_len) {
+			...
+			set_infinite_rcv = true;
+			...
+		}
+
+		...
+		if (set_infinite_rcv)
+			mpcb->infinite_rcv_seq = tp->mptcp->map_data_seq;
+	}
+```
 
