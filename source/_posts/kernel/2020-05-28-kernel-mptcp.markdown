@@ -1,6 +1,6 @@
 ---
 layout: post
-title: "mptcp使用"
+title: "MPTCP 使用"
 date: 2020-05-28 17:08:00 +0800
 comments: false
 categories:
@@ -79,7 +79,7 @@ enp0s10: 192.168.3.5 gw 192.168.3.4
 	ip route add default via 192.168.3.4 dev enp0s10 table 2
 ```
 
-### fullmesh, ndiffports, binder
+### fullmesh, ndiffports, binder, netlink
 
 #### 工具
 
@@ -92,26 +92,11 @@ https://github.com/abcdxyzk/iproute-mptcp
 make
 
 
-./ip/ip link set dev enp0s3 multipath off/on/backup # backup 不起作用？？
+./ip/ip link set dev enp0s3 multipath off/on/backup
 
 off命令是在MPTCP层面上的，并不是完全关闭该接口，而是控制MPTCP不去试图使用该网卡，换言之，当路由表指向该接口时，该接口还是会被使用的。
 
-backup命令就是将该接口设置为备用模式，只有其他接口不可用时才会使用该接口。
-
-#### fullmesh
-
-两边IP都会建连，即建立 n*m 条连接
-
-IP查看 cat /proc/net/mptcp_fullmesh
-
-
-#### ndiffports 两边只在一组IP上建立多条连接。
-```
-	echo ndiffports > /proc/sys/net/mptcp/mptcp_path_manager
-	echo 5 > /sys/module/mptcp_ndiffports/parameters/num_subflows # 总共建5条，即额外再建4条
-```
-
-#### binder ??
+backup命令就是将该接口设置为backup模式，并且会通过PRIO option通知对方，两边会标记low_prio、rcv_low_prio。但目前所有pm都没有用到low_prio。
 
 
 --------------------------
@@ -137,6 +122,8 @@ http://multipath-tcp.org/pmwiki.php/Users/ConfigureMPTCP
 #### net.mptcp.mptcp_path_manager
 
 MPTCP路径管理，有四个不同的配置值，分别是 default/fullmesh/ndiffports/binder。default/ndiffports/fullmesh分别选择单路、多路或者全路进行传输。其中单路是指跟传统TCP状态一样还是用单一的TCP子流进行传输，多路是当前所有TCP子流中用户选择x条子流数进行传输，全路是指将当前所有可用的TCP子流应用到网络传输中。而binder参考了文献 Binder: a system to aggregate multiple internet gateways in community networks。
+
+fix: default=fullmesh
 
 #### net.mptcp.mptcp_scheduler
 MPTCP子流调度策略，有default/roundrobin两个选项。default优先选择RTT较低的子流直到拥塞窗口满，roundrobin采用轮询策略。

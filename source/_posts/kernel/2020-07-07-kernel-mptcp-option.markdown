@@ -66,7 +66,10 @@ fullmesh 模式通告ip
 	#define MPTCP_SUB_LEN_PRIO_ADDR 4
 	#define MPTCP_SUB_LEN_PRIO_ALIGN        4
 ```
-优先级？
+
+./ip/ip link set dev enp0s3 multipath off/on/backup
+
+backup命令就是将该接口设置为backup模式，并且会通过PRIO option通知对方，两边会标记low_prio、rcv_low_prio。但目前所有pm都没有用到low_prio。
 
 ### MPTCP_SUB_FAIL
 ```
