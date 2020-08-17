@@ -1,6 +1,8 @@
 # encoding: UTF-8
 	module Jekyll
-		class CategoryListTag < Liquid::Tag
+		$category_list_total = 0
+		$category_list_html = ""
+		class CategoryListTotal < Liquid::Tag
 			def render(context)
 				html = ""
 				pre1 = ""
@@ -82,6 +84,7 @@
 						html << "<li class='catclass'><a href='/#{category_dir}/#{category.to_url}/'>#{category}</a><a href='##' onmousedown=showDiv('#{pre1}') id='aexp_#{pre1}'><span class='exp_style' id='exp_#{pre1}'>[+]</span></a>"
 
 						html << "<span class='right_span'>(#{posts_in_category})</span></li>\n"
+						$category_list_total = $category_list_total + posts_in_category
 					end
 				end
 				if l2 > 0
@@ -98,10 +101,19 @@
 					end
 					html << "</script>\n"
 				end
-				html
+				$category_list_html = html
+				totalhtml = ""
+				totalhtml << "<span class='right_span'>(#{$category_list_total})</span>\n"
+				totalhtml
+			end
+		end
+		class CategoryListTag < Liquid::Tag
+			def render(context)
+				$category_list_html
 			end
 		end
 	end
 
 Liquid::Template.register_tag('category_list', Jekyll::CategoryListTag)
+Liquid::Template.register_tag('category_list_total', Jekyll::CategoryListTotal)
 

@@ -1,6 +1,8 @@
 # encoding: UTF-8
 	module Jekyll
-		class DateCategoryListTag < Liquid::Tag
+		$date_list_total = 0
+		$date_list_html = ""
+		class DateCategoryListTotal < Liquid::Tag
 			def render(context)
 				htmltime = ""
 				pret1 = ""
@@ -40,15 +42,25 @@
 						htmltime << "<li class='catclass'><a href='/#{category_dir}/#{category.to_url}/'>#{category}</a><a href='##' onmousedown=showDiv('#{pret1}')><span class='exp_style' id='exp_#{pret1}'>[+]</span></a>"
 
 						htmltime << "<span class='right_span'>(#{posts_in_category})</span></li>\n"
+						$date_list_total = $date_list_total + posts_in_category
 					end
 				end
 				if lt1 > 0
 					htmltime << "</div>"
 				end
-				htmltime
+				$date_list_html = htmltime
+				totalhtml = ""
+				totalhtml << "<span class='right_span'>(#{$date_list_total})</span>\n"
+				totalhtml
+			end
+		end
+		class DateCategoryListTag < Liquid::Tag
+			def render(context)
+				$date_list_html
 			end
 		end
 	end
 
 Liquid::Template.register_tag('date_list', Jekyll::DateCategoryListTag)
+Liquid::Template.register_tag('date_list_total', Jekyll::DateCategoryListTotal)
 
