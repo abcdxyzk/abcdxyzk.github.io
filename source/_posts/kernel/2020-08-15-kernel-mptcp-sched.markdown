@@ -12,6 +12,14 @@ tags:
 - mptcp
 ---
 
+```
+	$ git grep mptcp_register_scheduler net/mptcp/
+	net/mptcp/mptcp_blest.c:        if (mptcp_register_scheduler(&mptcp_sched_blest))
+	net/mptcp/mptcp_redundant.c:    if (mptcp_register_scheduler(&mptcp_sched_red))
+	net/mptcp/mptcp_rr.c:   if (mptcp_register_scheduler(&mptcp_sched_rr))
+	net/mptcp/mptcp_sched.c:int mptcp_register_scheduler(struct mptcp_sched_ops *sched)
+```
+
 #### blest
 
 

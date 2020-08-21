@@ -17,6 +17,15 @@ https://www.cnblogs.com/fenglt/p/8570343.html
 
 http://www.doc88.com/p-2354903996876.html
 
+```
+	$ git grep mptcp_register_path_manager net/
+	net/mptcp/mptcp_binder.c:       if (mptcp_register_path_manager(&binder))
+	net/mptcp/mptcp_fullmesh.c:     ret = mptcp_register_path_manager(&full_mesh);
+	net/mptcp/mptcp_ndiffports.c:   if (mptcp_register_path_manager(&ndiffports))
+	net/mptcp/mptcp_netlink.c:      ret = mptcp_register_path_manager(&mptcp_nl_pm_ops);
+	net/mptcp/mptcp_pm.c:int mptcp_register_path_manager(struct mptcp_pm_ops *pm)
+```
+
 #### fullmesh
 
 两边IP都会建连，即建立 n*m 条连接
