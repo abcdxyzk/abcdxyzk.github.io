@@ -28,7 +28,7 @@ http://www.doc88.com/p-2354903996876.html
 
 #### fullmesh
 
-两边IP都会建连，即建立 n*m 条连接
+两边IP都会建连，即建立 `n*m` 条连接
 
 IP查看 cat /proc/net/mptcp_fullmesh
 
