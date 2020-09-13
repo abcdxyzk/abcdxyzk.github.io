@@ -13,15 +13,11 @@ tags:
 
 ### 方案一
 
-client ---------------> hongkong ----------------> server  
-           xor/drop      squid
-
+client ----- xor;drop ----> hongkong(squid) -----------> server
 
 ### 方案二
 
-client ---------------> guangzhou -------------------> hongkong ----------------> server  
-          xor/drop       squid      xor/drop/icmp+mss    squid
-
+client ----- xor;drop ----> guangzhou(squid) ----- xor;drop;icmp+mss -----> hongkong(squid) ---------> server
 
 
 [squid](/blog/cats/tools~squid/)
