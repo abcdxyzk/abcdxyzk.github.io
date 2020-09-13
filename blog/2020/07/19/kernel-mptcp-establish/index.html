@@ -89,15 +89,153 @@ var ss360Config = {
   </header>
 
 
-<div class="entry-content"><h3>pre_established</h3>
+<div class="entry-content"><h3>一、pre_established</h3>
 
 <p>只在subflow的客户端起作用，在收到synack时置为1，收到第4个ack时置为0，防止在synack到第四个ack期间发送数据包。</p>
 
-<p>因为服务端要用第三个ack初始化一些数据？？？</p>
+<p>因为服务端要用第三个ack建连，客户端收到第四个ack表示建连成功，成功之后才能发数据</p>
 
-<h3>fully_established</h3>
+<h4>mptcp_ack_timer</h4>
 
-<p>普通建连成功标志？？？</p>
+<p>所以客户端需要 mptcp_ack_timer，不停的发送第三个ack，直到收到第四个ack</p>
+
+<h3>二、fully_established</h3>
+
+<p>fully_established 和 pre_established 互不相关</p>
+
+<p>mptcp需要四次握手，四次握手完成后 fully_established=1, 再之后才能建立subflow</p>
+
+<p>tcp三次握手后，client和server两边的 fully_established = 0, 进入fully_established的条件如下：</p>
+
+<ol>
+<li>本端没发送数据包，但一直收到对端的mptcp数据包，见 mptcp_prevalidate_skb()</li>
+</ol>
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (!tp-&gt;mptcp-&gt;fully_established) {
+</span><span class='line'>&#9;tp-&gt;mptcp-&gt;init_rcv_wnd -= skb-&gt;len;
+</span><span class='line'>&#9;if (tp-&gt;mptcp-&gt;init_rcv_wnd &lt; 0)
+</span><span class='line'>&#9;&#9;mptcp_become_fully_estab(sk);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<ol>
+<li>本端发出去的mptcp数据包被mptcp_ack了，见 mptcp_process_data_ack</li>
+</ol>
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (unlikely(!tp-&gt;mptcp-&gt;fully_established) && tp-&gt;mptcp-&gt;snt_isn + 1 != TCP_SKB_CB(skb)-&gt;ack_seq)
+</span><span class='line'>&#9;mptcp_become_fully_estab(sk);</span></code></pre></td></tr></table></div></figure>
+
+
+<ol>
+<li>如果收到非mptcp数据包，则回退普通tcp，回退也会设置fully_established=1，见mptcp_prevalidate_skb()</li>
+</ol>
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (!tp-&gt;mptcp-&gt;fully_established && !mptcp_is_data_seq(skb) &&
+</span><span class='line'>&#9;!tp-&gt;mptcp-&gt;mapping_present && !mpcb-&gt;infinite_mapping_rcv) {
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;if (!is_master_tp(tp)) { // subflow reset，master才回退
+</span><span class='line'>&#9;&#9;MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_FBDATASUB);
+</span><span class='line'>&#9;&#9;mptcp_send_reset(sk);
+</span><span class='line'>&#9;&#9;return 1;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;tp-&gt;mptcp-&gt;fully_established = 1;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<ol>
+<li>如果本端发出去的数据包被不带mptcp的ack ack了，那么大概率是对端没建立mptcp连接。那么本端回退到普通tcp，回退也会设置fully_established=1。</li>
+</ol>
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>tcp_ack() {
+</span><span class='line'>&#9;mptcp_fallback_infinite() {
+</span><span class='line'>&#9;&#9;if (likely(tp-&gt;mptcp-&gt;fully_established))
+</span><span class='line'>&#9;&#9;&#9;return false;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (!(flag & MPTCP_FLAG_DATA_ACKED)) // 被ack的包一定是mptcp数据包
+</span><span class='line'>&#9;&#9;&#9;return false;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (!is_master_tp(tp)) { // subflow reset，master才回退
+</span><span class='line'>&#9;&#9;&#9;MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_FBACKSUB);
+</span><span class='line'>&#9;&#9;&#9;return true;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;...
+</span><span class='line'>&#9;}
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>因为 fully_established = 0 时刚完成3次握手，所以上面说的数据包基本都是第一个数据包</p>
+
+<p>以上条件对于client和server都适用，因为3次握手后谁先发包都是正常的。</p>
+
+<h3>mptcp 连接在 fully_established=1 之后再收到 不含mptcp option的包</h3>
+
+<ol>
+<li>不会进行mapping，见mptcp_detect_mapping()</li>
+</ol>
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (!mptcp_is_data_seq(skb)) {
+</span><span class='line'>&#9;if (!tp-&gt;mptcp-&gt;mapping_present && tp-&gt;rcv_nxt - tp-&gt;copied_seq &gt; 65536) {
+</span><span class='line'>&#9;&#9;mptcp_send_reset(sk);
+</span><span class='line'>&#9;&#9;return 1;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;return 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<ol>
+<li>对于一个map_data_len包，可能被差成了多个包传输：</li>
+</ol>
+
+
+<p>如果多个包全不是mptcp包，则mapping_present=0，那么mptcp_queue_skb() 会直接return，然后 tp->rcv_nxt - tp->copied_seq > 65536, 然后被reset</p>
+
+<p>如果前一部分是mptcp的包，后一部分不是mptcp包，则mapping_present=1，然后会被mptcp_verif_dss_csum() reset</p>
 </div>
 
 

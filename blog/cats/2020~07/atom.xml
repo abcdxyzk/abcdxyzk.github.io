@@ -4,7 +4,7 @@
   <title><![CDATA[Category: 2020~07 | kk Blog —— 通用基础]]></title>
   <link href="http://abcdxyzk.github.io/blog/cats/2020~07/atom.xml" rel="self"/>
   <link href="http://abcdxyzk.github.io/"/>
-  <updated>2020-08-13T01:27:55+08:00</updated>
+  <updated>2020-09-14T03:09:25+08:00</updated>
   <id>http://abcdxyzk.github.io/</id>
   <author>
     <name><![CDATA[kk]]></name>
@@ -20,12 +20,42 @@
     <id>http://abcdxyzk.github.io/blog/2020/07/20/kernel-mptcp-skb-path</id>
     <content type="html"><![CDATA[<h3>发送</h3>
 
+<p>tcp_sendmsg 将 skb 写入 meta_sk 的 sk_write_queue 然后复制一份skb，将 clone_skb 写入subsk的sk_write_queue。</p>
+
+<p>相同的[seq, endseq]会同时存在meta_sk->sk_write_queue, meta_sk->reinject_queue, subsk->sk_write_queue</p>
+
+<p>meta_sk->reinject_queue 跟 meta_sk->sk_write_queue 差不多，目前的pm中reinject_queue的发送优先级高于sk_write_queue。</p>
+
+<p>reinject_queue 中skb的来源有：</p>
+
+<ol>
+<li><p>重传时调mptcp_reinject_data将skb放到meta_sk的reinject_queue，也就是一个subsk重传skb，可以放到另一个subsk</p></li>
+<li><p>subsk 调 tcp_write_queue_purge 时可能这些skb还是要发出去的，所以把skb放到meta_sk的reinject_queue</p></li>
+<li><p>mptcp_sub_retransmit_timer, mptcp_del_sock, mptcp_send_reset_rem_id 等</p></li>
+</ol>
+
+
 <pre><code>    mptcp_write_wakeup
+        reinject = 0
     mptcp_write_xmit
+        if (skb from reinject_queue)
+            reinject = 1
+        else
+            reinject = 0
     mptcp_retransmit_skb
-        -&gt; mptcp_skb_entail
+        reinject = -1
+
+        -&gt; mptcp_skb_entail(, skb, reinject)
             -&gt; mptcp_save_dss_data_seq 设置seq
             -&gt; tcp_add_write_queue_tail 或 tcp_transmit_skb
+
+
+    mptcp_sub_retransmit_timer
+    mptcp_del_sock
+    mptcp_send_reset_rem_id
+    tcp_write_queue_purge
+        -&gt; mptcp_reinject_data
+            -&gt; skb_queue_tail(meta_sk-&gt;reinject_queue, skb)
 </code></pre>
 
 <h3>接收</h3>
@@ -34,6 +64,16 @@
         -&gt; mptcp_queue_skb
             -&gt; tcp_queue_rcv(meta_sk, tmp1, 0, &amp;fragstolen)
             -&gt; tcp_data_queue_ofo(meta_sk, tmp1);
+
+    tcp_validate_incoming
+        -&gt; mptcp_handle_options
+            -&gt; mptcp_process_data_ack
+                -&gt; mptcp_clean_rtx_queue
+                    -&gt; 清理 meta_sk-&gt;sk_write_queue
+                    -&gt; 清理 mpcb-&gt;reinject_queue
+    tcp_ack
+        -&gt; tcp_clean_rtx_queue
+            -&gt; 清理 subsk-&gt;sk_write_queue
 </code></pre>
 ]]></content>
   </entry>
@@ -333,15 +373,101 @@ mptcp_data_ready -> mptcp_prevalidate_skb, mptcp_detect_mapping, mptcp_validate_
     <link href="http://abcdxyzk.github.io/blog/2020/07/19/kernel-mptcp-establish/"/>
     <updated>2020-07-19T01:37:00+08:00</updated>
     <id>http://abcdxyzk.github.io/blog/2020/07/19/kernel-mptcp-establish</id>
-    <content type="html"><![CDATA[<h3>pre_established</h3>
+    <content type="html"><![CDATA[<h3>一、pre_established</h3>
 
 <p>只在subflow的客户端起作用，在收到synack时置为1，收到第4个ack时置为0，防止在synack到第四个ack期间发送数据包。</p>
 
-<p>因为服务端要用第三个ack初始化一些数据？？？</p>
+<p>因为服务端要用第三个ack建连，客户端收到第四个ack表示建连成功，成功之后才能发数据</p>
 
-<h3>fully_established</h3>
+<h4>mptcp_ack_timer</h4>
 
-<p>普通建连成功标志？？？</p>
+<p>所以客户端需要 mptcp_ack_timer，不停的发送第三个ack，直到收到第四个ack</p>
+
+<h3>二、fully_established</h3>
+
+<p>fully_established 和 pre_established 互不相关</p>
+
+<p>mptcp需要四次握手，四次握手完成后 fully_established=1, 再之后才能建立subflow</p>
+
+<p>tcp三次握手后，client和server两边的 fully_established = 0, 进入fully_established的条件如下：</p>
+
+<ol>
+<li><p>本端没发送数据包，但一直收到对端的mptcp数据包，见 mptcp_prevalidate_skb()
+<code>
+ if (!tp-&gt;mptcp-&gt;fully_established) {
+     tp-&gt;mptcp-&gt;init_rcv_wnd -= skb-&gt;len;
+     if (tp-&gt;mptcp-&gt;init_rcv_wnd &lt; 0)
+         mptcp_become_fully_estab(sk);
+ }
+</code></p></li>
+<li><p>本端发出去的mptcp数据包被mptcp_ack了，见 mptcp_process_data_ack
+<code>
+ if (unlikely(!tp-&gt;mptcp-&gt;fully_established) &amp;&amp; tp-&gt;mptcp-&gt;snt_isn + 1 != TCP_SKB_CB(skb)-&gt;ack_seq)
+     mptcp_become_fully_estab(sk);
+</code></p></li>
+<li><p>如果收到非mptcp数据包，则回退普通tcp，回退也会设置fully_established=1，见mptcp_prevalidate_skb()
+<code>
+ if (!tp-&gt;mptcp-&gt;fully_established &amp;&amp; !mptcp_is_data_seq(skb) &amp;&amp;
+     !tp-&gt;mptcp-&gt;mapping_present &amp;&amp; !mpcb-&gt;infinite_mapping_rcv) {
+     ...
+     if (!is_master_tp(tp)) { // subflow reset，master才回退
+         MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_FBDATASUB);
+         mptcp_send_reset(sk);
+         return 1;
+     }
+     ...
+     tp-&gt;mptcp-&gt;fully_established = 1;
+ }
+</code></p></li>
+<li><p>如果本端发出去的数据包被不带mptcp的ack ack了，那么大概率是对端没建立mptcp连接。那么本端回退到普通tcp，回退也会设置fully_established=1。</p></li>
+</ol>
+
+
+<pre><code>    tcp_ack() {
+        mptcp_fallback_infinite() {
+            if (likely(tp-&gt;mptcp-&gt;fully_established))
+                return false;
+
+            if (!(flag &amp; MPTCP_FLAG_DATA_ACKED)) // 被ack的包一定是mptcp数据包
+                return false;
+
+            if (!is_master_tp(tp)) { // subflow reset，master才回退
+                MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_FBACKSUB);
+                return true;
+            }
+            ...
+        }
+    }
+</code></pre>
+
+<p>因为 fully_established = 0 时刚完成3次握手，所以上面说的数据包基本都是第一个数据包</p>
+
+<p>以上条件对于client和server都适用，因为3次握手后谁先发包都是正常的。</p>
+
+<h3>mptcp 连接在 fully_established=1 之后再收到 不含mptcp option的包</h3>
+
+<ol>
+<li>不会进行mapping，见mptcp_detect_mapping()</li>
+</ol>
+
+
+<pre><code>    if (!mptcp_is_data_seq(skb)) {
+        if (!tp-&gt;mptcp-&gt;mapping_present &amp;&amp; tp-&gt;rcv_nxt - tp-&gt;copied_seq &gt; 65536) {
+            mptcp_send_reset(sk);
+            return 1;
+        }
+        return 0;
+    }
+</code></pre>
+
+<ol>
+<li>对于一个map_data_len包，可能被差成了多个包传输：</li>
+</ol>
+
+
+<p>如果多个包全不是mptcp包，则mapping_present=0，那么mptcp_queue_skb() 会直接return，然后 tp->rcv_nxt - tp->copied_seq > 65536, 然后被reset</p>
+
+<p>如果前一部分是mptcp的包，后一部分不是mptcp包，则mapping_present=1，然后会被mptcp_verif_dss_csum() reset</p>
 ]]></content>
   </entry>
   
