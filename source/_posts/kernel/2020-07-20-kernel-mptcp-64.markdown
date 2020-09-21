@@ -137,9 +137,11 @@ MPTCPHDR_SEQ64_INDEX 在发送和接收上有不同用法，在发送上
 ```
 
 #### 3. 33bit
-
-rcv_high_order[i^1] = rcv_high_order[i] + 1; 所以所谓的64bit，其实是33bit。
+```
+	rcv_high_order[i^1] = rcv_high_order[i] + 1;
+```
+所以所谓的64bit，其实是33bit。
 
 #### 4. MPTCPHDR_SEQ64_OFO
 
-33bit seq 超过了 rcv_high_order[i^1]，判定为无效数据，不收取
+33bit seq 超过了 `rcv_high_order[i^1]`，判定为无效数据，不收取
