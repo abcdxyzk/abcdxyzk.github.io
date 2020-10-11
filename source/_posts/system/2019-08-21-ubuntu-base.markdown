@@ -11,6 +11,18 @@ categories:
 tags:
 ---
 
+#### 删除snap，snap会自动更新，严重占带宽
+```
+	snap list
+	sudo snap remove gtk-common-themes
+	...
+	sudo apt-get remove snapd
+
+	df -h | grep snap
+	sudo systemctl stop snap-core-6350.mount
+	sudo systemctl disable snap-core-6350.mount
+```
+
 #### dns
 ```
 	sudo apt-get install pppconfig
