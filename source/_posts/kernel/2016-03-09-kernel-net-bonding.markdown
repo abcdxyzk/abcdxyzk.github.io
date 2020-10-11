@@ -1,13 +1,13 @@
 ---
 layout: post
-title: "七种网卡绑定模式详解"
+title: "bonding七种网卡绑定模式详解"
 date: 2016-03-09 09:50:00 +0800
 comments: false
 categories:
 - 2016
 - 2016~03
 - kernel
-- kernel~net
+- kernel~bonding
 tags:
 ---
 
@@ -251,3 +251,35 @@ max_bonds 配置的bond口个数
 
 mode bond模式，主要有以下几种，在一般的实际应用中，0和1用的比较多。
 
+-----------------
+
+#### ubuntu 18.04 bonding
+
+https://blog.csdn.net/yjwan521/article/details/81045596
+
+vim /etc/network/interfaces
+```
+	auto enp2s0f0
+	iface enp2s0f0 inet manual
+	bond-master bond0
+
+	auto enp2s0f1
+	iface enp2s0f1 inet manual
+	bond-master bond0
+
+	auto bond0
+	iface bond0 inet static
+	address 12.0.0.55
+	netmask 255.255.255.0
+
+	slaves enp2s0f0 enp2s0f1
+```
+
+vim /etc/modprobe.d/bonding.conf
+```
+	alias bond0 bonding
+	options bonding mode=0 miimon=100
+	# options bonding mode=2 miimon=100 xmit_hash_policy=1
+```
+
+但是没有看到轮询、均衡效果？？？

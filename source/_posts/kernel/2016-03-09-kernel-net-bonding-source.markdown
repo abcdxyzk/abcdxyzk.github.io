@@ -7,7 +7,7 @@ categories:
 - 2016
 - 2016~03
 - kernel
-- kernel~net
+- kernel~bonding
 tags:
 ---
 https://github.com/matrix207/bonding
