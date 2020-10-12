@@ -11,6 +11,23 @@ categories:
 tags:
 ---
 
+#### Centos7系统rc.local不起作用
+
+chmod +x /etc/rc.d/rc.local
+
+开头加 #!/bin/bash
+
+启动此项服务：
+
+systemctl list-units --type=service  #来查看一下所有的开启启动项目里面有没有这个rc-local这个服务。
+
+systemctl  status rc-local.service #来查看一下当前是怎么个状态
+
+systemctl enable rc-local.service
+
+systemctl start rc-local.service
+
+-------------
 
 使用gcc时，总是按中文提示。回归英文的提示，方法是：
 首先使用env查看，发现LANGUAGE=zh_CN.UTF-8，接着执行export LANG=en_US.UTF-8就可以，以后的编译是就按英文来提示
