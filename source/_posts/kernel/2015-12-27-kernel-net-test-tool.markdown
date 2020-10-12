@@ -7,9 +7,18 @@ categories:
 - 2015
 - 2015~12
 - kernel
-- kernel~net
+- kernel~tcp
 tags:
 ---
+
+#### curl wget 不验证证书进行https请求
+
+ wget 'https://x.x.x.x/get_ips' --no-check-certificate
+
+curl 'https://x.x.x.x/get_ips' -k
+
+----------
+
 http://297020555.blog.51cto.com/1396304/592386
 
 ```
