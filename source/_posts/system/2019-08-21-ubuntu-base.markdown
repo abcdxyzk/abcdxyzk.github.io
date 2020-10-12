@@ -22,6 +22,26 @@ tags:
 	sudo systemctl stop snap-core-6350.mount
 	sudo systemctl disable snap-core-6350.mount
 ```
+#### ssh 保持连接
+
+服务端
+```
+	ClientAliveInterval 60
+	ClientAliveCountMax 1
+```
+SSH Server 每 60 秒就会自动发送一个信号给 Client，客户端没有回应数超过 ClientAliveCountMax 时，才会断开连接。
+
+客户端
+```
+	TCPKeepAlive yes
+	ServerAliveInterval 300
+```
+前一个参数是说要保持连接，后一个参数表示每过5分钟发一个数据包到服务器
+
+命令行进行设定即：
+```
+	ssh -o TCPKeepAlive=yes -o ServerAliveInterval=300 root@1.2.3.4
+```
 
 #### dns
 ```
