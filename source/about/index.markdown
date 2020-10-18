@@ -7,6 +7,6 @@ sharing: true
 footer: true
 ---
 
-email: abcdxyzk@sina.com
+email: 942655497@qq.com
 
-clone: http://c6wjxs.coding-pages.com/
+clone: http://www.abcdxyzk.xyz
