@@ -7,7 +7,7 @@ categories:
 - 2020
 - 2020~09
 - kernel
-- kernel~net
+- kernel~vpn
 tags:
 ---
 
