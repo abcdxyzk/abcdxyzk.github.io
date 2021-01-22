@@ -76,6 +76,355 @@ var ss360Config = {
       
   <header>
     
+      <h2 class="entry-title"><a href="/blog/2015/08/07/cgroup-5/">devices子系统</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-08-07T16:54:00+08:00'><span class='date'>2015-08-07</span> <span class='time'>16:54:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://www.cnblogs.com/lisperl/archive/2012/04/24/2468170.html">http://www.cnblogs.com/lisperl/archive/2012/04/24/2468170.html</a></p>
+
+<p>使用devices 子系统可以允许或者拒绝cgroup中的进程访问设备。devices子系统有三个控制文件：devices.allow,devices.deny,devices.list。devices.allow用于指定cgroup中的进程可以访问的设备,devices.deny用于指定cgroup中的进程不能访问的设备，devices.list用于报告cgroup中的进程访问的设备。devices.allow文件中包含若干条目，每个条目有四个字段：type、major、minor 和 access。type、major 和 minor 字段中使用的值对应 Linux 分配的设备。</p>
+
+<p>type指定设备类型：<br/>
+a - 应用所有设备，可以是字符设备，也可以是块设备<br/>
+b- 指定块设备<br/>
+c - 指定字符设备</p>
+
+<p>major和minor指定设备的主次设备号。</p>
+
+<p>access 则指定相应的权限：<br/>
+r - 允许任务从指定设备中读取<br/>
+w - 允许任务写入指定设备<br/>
+m - 允许任务生成还不存在的设备文件</p>
+
+<p>devices子系统是通过提供device whilelist 来实现的。与其他子系统一样，devices子系统也有一个内嵌了cgroup_subsystem_state的结构来管理资源。在devices子系统中，这个结构是：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct dev_cgroup {
+</span><span class='line'>&#9;struct cgroup_subsys_state css;
+</span><span class='line'>&#9;struct list_head whitelist;
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这个结构体除了通用的cgroup_subsystem_state之外，就只有一个链表指针，而这个链表指针指向了该cgroup中的进程可以访问的devices whilelist。</p>
+
+<p>下面我们来看一下devices子系统如何管理whilelist。在devices子系统中，定义了一个叫dev_whitelist_item的结构来管理可以访问的device，对应于devices.allow中的一个条目。这个结构体的定义如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct dev_whitelist_item {
+</span><span class='line'>&#9;u32 major, minor;
+</span><span class='line'>&#9;short type;
+</span><span class='line'>&#9;short access;
+</span><span class='line'>&#9;struct list_head list;
+</span><span class='line'>&#9;struct rcu_head rcu;
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>major，minor用于指定设备的主次设备号，type用于指定设备类型，type取值可以是：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define DEV_BLOCK 1
+</span><span class='line'>#define DEV_CHAR  2
+</span><span class='line'>#define DEV_ALL   4 </span></code></pre></td></tr></table></div></figure>
+
+
+<p>对应于之前devices.allow文件中三种情况。</p>
+
+<p>access用于相应的访问权限,access取值可以是:</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define ACC_MKNOD 1
+</span><span class='line'>#define ACC_READ  2
+</span><span class='line'>#define ACC_WRITE 4</span></code></pre></td></tr></table></div></figure>
+
+
+<p>也和之前devices.allow文件中的情况对应。</p>
+
+<p>List字段用于将该结构体连到相应的dev_cgroup中whitelist指向的链表。</p>
+
+<p>通过以上数据结构，devices子系统就能管理一个cgroup的进程可以访问的devices了。 光有数据结构还不行，还要有具体实现才行。devices子系统通过实现两个函数供内核调用来实现控制cgroup中的进程能够访问的devices。首先我们来第一个函数：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int devcgroup_inode_permission(struct inode *inode, int mask)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct dev_cgroup *dev_cgroup;
+</span><span class='line'>&#9;struct dev_whitelist_item *wh;
+</span><span class='line'> 
+</span><span class='line'>&#9;dev_t device = inode-&gt;i_rdev;
+</span><span class='line'>&#9;if (!device)
+</span><span class='line'>&#9;&#9;return 0;
+</span><span class='line'>&#9;if (!S_ISBLK(inode-&gt;i_mode) && !S_ISCHR(inode-&gt;i_mode))
+</span><span class='line'>&#9;&#9;return 0;
+</span><span class='line'> 
+</span><span class='line'>&#9;rcu_read_lock();
+</span><span class='line'> 
+</span><span class='line'>&#9;dev_cgroup = task_devcgroup(current);
+</span><span class='line'> 
+</span><span class='line'>&#9;list_for_each_entry_rcu(wh, &dev_cgroup-&gt;whitelist, list) {
+</span><span class='line'>&#9;&#9;if (wh-&gt;type & DEV_ALL)
+</span><span class='line'>&#9;&#9;&#9;goto found;
+</span><span class='line'>&#9;&#9;if ((wh-&gt;type & DEV_BLOCK) && !S_ISBLK(inode-&gt;i_mode))
+</span><span class='line'>&#9;&#9;&#9;continue;
+</span><span class='line'>&#9;&#9;if ((wh-&gt;type & DEV_CHAR) && !S_ISCHR(inode-&gt;i_mode))
+</span><span class='line'>&#9;&#9;&#9;continue;
+</span><span class='line'>&#9;&#9;if (wh-&gt;major != ~0 && wh-&gt;major != imajor(inode))
+</span><span class='line'>&#9;&#9;&#9;continue;
+</span><span class='line'>&#9;&#9;if (wh-&gt;minor != ~0 && wh-&gt;minor != iminor(inode))
+</span><span class='line'>&#9;&#9;&#9;continue;
+</span><span class='line'> 
+</span><span class='line'>&#9;&#9;if ((mask & MAY_WRITE) && !(wh-&gt;access & ACC_WRITE))
+</span><span class='line'>&#9;&#9;&#9;continue;
+</span><span class='line'>&#9;&#9;if ((mask & MAY_READ) && !(wh-&gt;access & ACC_READ))
+</span><span class='line'>&#9;&#9;&#9;continue;
+</span><span class='line'>&#9;&#9;found:
+</span><span class='line'>&#9;&#9;&#9;rcu_read_unlock();
+</span><span class='line'>&#9;&#9;return 0;
+</span><span class='line'>&#9;}
+</span><span class='line'> 
+</span><span class='line'>&#9;rcu_read_unlock();
+</span><span class='line'> 
+</span><span class='line'>&#9;return -EPERM;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>我们来简单分析一下这个函数，首先如果该inode对应的不是devices，直接返回0，如果既不是块设备也不是字符设备，也返回0，因为devices只控制块设备和字符设备的访问，其他情况不管。接着获得当前进程的dev_cgroup，然后在dev_cgroup中whitelist指针的链表中查找，如果找到对应设备而且mask指定的权限和设备的权限一致就返回0，如果没有找到就返回错误。</p>
+
+<p>这个函数是针对inode节点存在的情况，通过对比权限来控制cgroup中的进程能够访问的devices。还有一个情况是inode不存在，在这种情况下，一个进程要访问一个设备就必须通过mknod建立相应的设备文件。为了达到对这种情况的控制，devices子系统导出了第二个函数：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int devcgroup_inode_mknod(int mode, dev_t dev)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct dev_cgroup *dev_cgroup;
+</span><span class='line'>&#9;struct dev_whitelist_item *wh;
+</span><span class='line'> 
+</span><span class='line'>&#9;if (!S_ISBLK(mode) && !S_ISCHR(mode))
+</span><span class='line'>&#9;&#9;return 0;
+</span><span class='line'> 
+</span><span class='line'>&#9;rcu_read_lock();
+</span><span class='line'> 
+</span><span class='line'>&#9;dev_cgroup = task_devcgroup(current);
+</span><span class='line'> 
+</span><span class='line'>&#9;list_for_each_entry_rcu(wh, &dev_cgroup-&gt;whitelist, list) {
+</span><span class='line'>&#9;&#9;if (wh-&gt;type & DEV_ALL)
+</span><span class='line'>&#9;&#9;&#9;goto found;
+</span><span class='line'>&#9;&#9;if ((wh-&gt;type & DEV_BLOCK) && !S_ISBLK(mode))
+</span><span class='line'>&#9;&#9;&#9;continue;
+</span><span class='line'>&#9;&#9;if ((wh-&gt;type & DEV_CHAR) && !S_ISCHR(mode))
+</span><span class='line'>&#9;&#9;&#9;continue;
+</span><span class='line'>&#9;&#9;if (wh-&gt;major != ~0 && wh-&gt;major != MAJOR(dev))
+</span><span class='line'>&#9;&#9;&#9;continue;
+</span><span class='line'>&#9;&#9;if (wh-&gt;minor != ~0 && wh-&gt;minor != MINOR(dev))
+</span><span class='line'>&#9;&#9;&#9;continue;
+</span><span class='line'> 
+</span><span class='line'>&#9;&#9;if (!(wh-&gt;access & ACC_MKNOD))
+</span><span class='line'>&#9;&#9;&#9;continue;
+</span><span class='line'>&#9;&#9;found:
+</span><span class='line'>&#9;&#9;&#9;rcu_read_unlock();
+</span><span class='line'>&#9;&#9;return 0;
+</span><span class='line'>&#9;}
+</span><span class='line'> 
+</span><span class='line'>&#9;rcu_read_unlock();
+</span><span class='line'> 
+</span><span class='line'>&#9;return -EPERM;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这个函数的实现跟第一个函数类似，这里就不赘述了。</p>
+
+<p>下面我们再来看一下devices子系统本身的一些东西。跟其他子系统一样，devices同样实现了一个cgroup_subsys：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct cgroup_subsys devices_subsys = {
+</span><span class='line'>&#9;.name = "devices",
+</span><span class='line'>&#9;.can_attach = devcgroup_can_attach,
+</span><span class='line'>&#9;.create = devcgroup_create,
+</span><span class='line'>&#9;.destroy = devcgroup_destroy,
+</span><span class='line'>&#9;.populate = devcgroup_populate,
+</span><span class='line'>&#9;.subsys_id = devices_subsys_id,
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>devices相应的三个控制文件：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static struct cftype dev_cgroup_files[] = {
+</span><span class='line'>&#9;{
+</span><span class='line'>&#9;&#9;.name = "allow",
+</span><span class='line'>&#9;&#9;.write_string  = devcgroup_access_write,
+</span><span class='line'>&#9;&#9;.private = DEVCG_ALLOW,
+</span><span class='line'>&#9;},
+</span><span class='line'>&#9;{
+</span><span class='line'>&#9;&#9;.name = "deny",
+</span><span class='line'>&#9;&#9;.write_string = devcgroup_access_write,
+</span><span class='line'>&#9;&#9;.private = DEVCG_DENY,
+</span><span class='line'>&#9;},
+</span><span class='line'>&#9;{
+</span><span class='line'>&#9;&#9;.name = "list",
+</span><span class='line'>&#9;&#9;.read_seq_string = devcgroup_seq_read,
+</span><span class='line'>&#9;&#9;.private = DEVCG_LIST,
+</span><span class='line'>&#9;},
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>其中allow和deny都是通过devcgroup_access_write实现的，只是通过private字段区分，因为二者的实现逻辑有相同的地方。devcgroup_access_write最终通过调用devcgroup_update_access来实现。在devcgroup_update_access根据写入的内容构造一个dev_whitelist_item ，然后根据文件类型做不同的处理：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>switch (filetype) {
+</span><span class='line'>&#9;case DEVCG_ALLOW:
+</span><span class='line'>&#9;&#9;if (!parent_has_perm(devcgroup, &wh))
+</span><span class='line'>&#9;&#9;&#9;return -EPERM;
+</span><span class='line'>&#9;&#9;return dev_whitelist_add(devcgroup, &wh);
+</span><span class='line'>&#9;case DEVCG_DENY:
+</span><span class='line'>&#9;&#9;dev_whitelist_rm(devcgroup, &wh);
+</span><span class='line'>&#9;&#9;break;
+</span><span class='line'>&#9;default:
+</span><span class='line'>&#9;&#9;return -EINVAL;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>allow的话，就将item加入whitelist，deny的话，就将item从whitelist中删去。</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
       <h2 class="entry-title"><a href="/blog/2015/08/07/cgroup-4/">cpu子系统</a></h2>
     
     
@@ -1903,63 +2252,6 @@ var ss360Config = {
 
     </article>
   
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/08/06/namespace1/">Linux Namespaces机制</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-08-06T15:26:00+08:00'><span class='date'>2015-08-06</span> <span class='time'>15:26:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://www.cnblogs.com/lisperl/archive/2012/05/03/2480316.html">http://www.cnblogs.com/lisperl/archive/2012/05/03/2480316.html</a></p>
-
-<p>Linux Namespaces机制提供一种资源隔离方案。PID,IPC,Network等系统资源不再是全局性的，而是属于特定的Namespace。每个Namespace里面的资源对其他Namespace都是透明的。要创建新的Namespace，只需要在调用clone时指定相应的flag。Linux Namespaces机制为实现基于容器的虚拟化技术提供了很好的基础，LXC（Linux containers）就是利用这一特性实现了资源的隔离。不同container内的进程属于不同的Namespace，彼此透明，互不干扰。下面我们就从clone系统调用的flag出发，来介绍各个Namespace。</p>
-
-<h4>CLONE_NEWPID</h4>
-
-<p>当调用clone时，设定了CLONE_NEWPID，就会创建一个新的PID Namespace，clone出来的新进程将成为Namespace里的第一个进程。一个PID Namespace为进程提供了一个独立的PID环境，PID Namespace内的PID将从1开始，在Namespace内调用fork，vfork或clone都将产生一个在该Namespace内独立的PID。新创建的Namespace里的第一个进程在该Namespace内的PID将为1，就像一个独立的系统里的init进程一样。该Namespace内的孤儿进程都将以该进程为父进程，当该进程被结束时，该Namespace内所有的进程都会被结束。PID Namespace是层次性，新创建的Namespace将会是创建该Namespace的进程属于的Namespace的子Namespace。子Namespace中的进程对于父Namespace是可见的，一个进程将拥有不止一个PID，而是在所在的Namespace以及所有直系祖先Namespace中都将有一个PID。系统启动时，内核将创建一个默认的PID Namespace，该Namespace是所有以后创建的Namespace的祖先，因此系统所有的进程在该Namespace都是可见的。</p>
-
-<h4>CLONE_NEWIPC</h4>
-
-<p>当调用clone时，设定了CLONE_NEWIPC，就会创建一个新的IPC Namespace，clone出来的进程将成为Namespace里的第一个进程。一个IPC Namespace有一组System V IPC objects 标识符构成，这标识符有IPC相关的系统调用创建。在一个IPC Namespace里面创建的IPC object对该Namespace内的所有进程可见，但是对其他Namespace不可见，这样就使得不同Namespace之间的进程不能直接通信，就像是在不同的系统里一样。当一个IPC Namespace被销毁，该Namespace内的所有IPC object会被内核自动销毁。</p>
-
-<p>PID Namespace和IPC Namespace可以组合起来一起使用，只需在调用clone时，同时指定CLONE_NEWPID和CLONE_NEWIPC，这样新创建的Namespace既是一个独立的PID空间又是一个独立的IPC空间。不同Namespace的进程彼此不可见，也不能互相通信，这样就实现了进程间的隔离。</p>
-
-<h4>CLONE_NEWNS</h4>
-
-<p>当调用clone时，设定了CLONE_NEWNS，就会创建一个新的mount Namespace。每个进程都存在于一个mount Namespace里面，mount Namespace为进程提供了一个文件层次视图。如果不设定这个flag，子进程和父进程将共享一个mount Namespace，其后子进程调用mount或umount将会影响到所有该Namespace内的进程。如果子进程在一个独立的mount Namespace里面，就可以调用mount或umount建立一份新的文件层次视图。该flag配合pivot_root系统调用，可以为进程创建一个独立的目录空间。</p>
-
-<h4>CLONE_NEWNET</h4>
-
-<p>当调用clone时，设定了CLONE_NEWNET，就会创建一个新的Network Namespace。一个Network Namespace为进程提供了一个完全独立的网络协议栈的视图。包括网络设备接口，IPv4和IPv6协议栈，IP路由表，防火墙规则，sockets等等。一个Network Namespace提供了一份独立的网络环境，就跟一个独立的系统一样。一个物理设备只能存在于一个Network Namespace中，可以从一个Namespace移动另一个Namespace中。虚拟网络设备(virtual network device)提供了一种类似管道的抽象，可以在不同的Namespace之间建立隧道。利用虚拟化网络设备，可以建立到其他Namespace中的物理设备的桥接。当一个Network Namespace被销毁时，物理设备会被自动移回init Network Namespace，即系统最开始的Namespace。</p>
-
-<h4>CLONE_NEWUTS</h4>
-
-<p>当调用clone时，设定了CLONE_NEWUTS，就会创建一个新的UTS Namespace。一个UTS Namespace就是一组被uname返回的标识符。新的UTS Namespace中的标识符通过复制调用进程所属的Namespace的标识符来初始化。Clone出来的进程可以通过相关系统调用改变这些标识符，比如调用sethostname来改变该Namespace的hostname。这一改变对该Namespace内的所有进程可见。CLONE_NEWUTS和CLONE_NEWNET一起使用，可以虚拟出一个有独立主机名和网络空间的环境，就跟网络上一台独立的主机一样。</p>
-
-<p>以上所有clone flag都可以一起使用，为进程提供了一个独立的运行环境。LXC正是通过在clone时设定这些flag，为进程创建一个有独立PID，IPC，FS，Network，UTS空间的container。一个container就是一个虚拟的运行环境，对container里的进程是透明的，它会以为自己是直接在一个系统上运行的。</p>
-
-<p>一个container就像传统虚拟化技术里面的一台安装了OS的虚拟机，但是开销更小，部署更为便捷。</p>
-</div>
-  
-  
-
-
-    </article>
-  
   <div class="pagination">
     
       <a class="prev" href="/posts/47">&larr; Older</a>
@@ -1974,7 +2266,7 @@ var ss360Config = {
   
     <section>
 <h1>Categories
-<span class='right_span'>(634)</span>
+<span class='right_span'>(635)</span>
 
 </h1>
 <head>
@@ -2005,7 +2297,7 @@ if (!document.getElementById('blog~octopress')) document.getElementById('aexp_bl
 if (!document.getElementById('blog')) document.getElementById('aexp_blog').style.visibility = 'hidden';
 if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ruby').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(51)</span></li>
+<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(52)</span></li>
 <div id='language' class='catsub'><li><a href='/blog/cats/language~c/?opendiv=language'>c</a><a href='##' onmousedown=showDiv('language~c') id='aexp_language~c'><span class='exp_style' id='exp_language~c'>[+]</span></a><span class='right_span'>30</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~c')) document.getElementById('aexp_language~c').style.visibility = 'hidden';
@@ -2017,6 +2309,10 @@ if (!document.getElementById('language~java')) document.getElementById('aexp_lan
 <li><a href='/blog/cats/language~jsp/?opendiv=language'>jsp</a><a href='##' onmousedown=showDiv('language~jsp') id='aexp_language~jsp'><span class='exp_style' id='exp_language~jsp'>[+]</span></a><span class='right_span'>3</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~jsp')) document.getElementById('aexp_language~jsp').style.visibility = 'hidden';
+</script>
+<li><a href='/blog/cats/language~php/?opendiv=language'>php</a><a href='##' onmousedown=showDiv('language~php') id='aexp_language~php'><span class='exp_style' id='exp_language~php'>[+]</span></a><span class='right_span'>1</span></li>
+<script language='javascript' type='text/javascript'>
+if (!document.getElementById('language~php')) document.getElementById('aexp_language~php').style.visibility = 'hidden';
 </script>
 <li><a href='/blog/cats/language~python/?opendiv=language'>python</a><a href='##' onmousedown=showDiv('language~python') id='aexp_language~python'><span class='exp_style' id='exp_language~python'>[+]</span></a><span class='right_span'>1</span></li>
 <script language='javascript' type='text/javascript'>
@@ -2308,7 +2604,7 @@ if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algo
 
 <section>
 <h1>Date Categories
-<span class='right_span'>(634)</span>
+<span class='right_span'>(635)</span>
 
 </h1>
 <head>
@@ -2316,7 +2612,9 @@ if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algo
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2020/'>2020</a><a href='##' onmousedown=showDiv('2020')><span class='exp_style' id='exp_2020'>[+]</span></a><span class='right_span'>(70)</span></li>
+<li class='catclass'><a href='/blog/cats/2021/'>2021</a><a href='##' onmousedown=showDiv('2021')><span class='exp_style' id='exp_2021'>[+]</span></a><span class='right_span'>(1)</span></li>
+<div id='2021' class='catsub'><li><a href='/blog/cats/2021~01/?opendiv=2021'>2021-01</a><span class='right_span'>1</span></li>
+</div><li class='catclass'><a href='/blog/cats/2020/'>2020</a><a href='##' onmousedown=showDiv('2020')><span class='exp_style' id='exp_2020'>[+]</span></a><span class='right_span'>(70)</span></li>
 <div id='2020' class='catsub'><li><a href='/blog/cats/2020~12/?opendiv=2020'>2020-12</a><span class='right_span'>6</span></li>
 <li><a href='/blog/cats/2020~11/?opendiv=2020'>2020-11</a><span class='right_span'>11</span></li>
 <li><a href='/blog/cats/2020~10/?opendiv=2020'>2020-10</a><span class='right_span'>8</span></li>
@@ -2447,6 +2745,10 @@ if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algo
   <ul id="recent_posts">
     
       <li class="post">
+        <a href="/blog/2021/01/22/lang-php-month/">php获取月初和月尾时间</a>
+      </li>
+    
+      <li class="post">
         <a href="/blog/2020/12/20/lang-jsp-idea-mvc/">idea Spring MVC</a>
       </li>
     
@@ -2460,10 +2762,6 @@ if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algo
     
       <li class="post">
         <a href="/blog/2020/12/11/command-scrot/">Linux命令行截屏</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2020/12/11/kernel-gre/">gre</a>
       </li>
     
   </ul>
@@ -2547,7 +2845,7 @@ if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algo
     </div>
   </div>
   <footer role="contentinfo"><p>
-  Copyright &copy; 2020 - kk -
+  Copyright &copy; 2021 - kk -
   <span class="credit">Powered by <a href="http://octopress.org">Octopress</a></span>
   <a title="Top" href="#" id="scroll2top" style="position: fixed; height: 50px; bottom: 30px; right: 25px; cursor: pointer; z-index: 9999; display: block; opacity: 1;"><img src="/images/scrollup.png"></a>
   <script src="/javascripts/scroll2top.js"></script>
