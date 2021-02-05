@@ -76,6 +76,430 @@ var ss360Config = {
       
   <header>
     
+      <h2 class="entry-title"><a href="/blog/2015/05/21/kernel-sched-waitqueue/">Linux内核中的等待队列</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-05-21T15:58:00+08:00'><span class='date'>2015-05-21</span> <span class='time'>15:58:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://blog.sina.com.cn/s/blog_49d5604e010008bn.html">http://blog.sina.com.cn/s/blog_49d5604e010008bn.html</a></p>
+
+<p>等待队列可以参考net/ipv4/tcp_probe.c的实现</p>
+
+<p><a href="/blog/2015/05/21/kernel-sched-waitqueue-sample/">简单样例</a></p>
+
+<h4>Linux内核中的等待队列</h4>
+
+<p>  Linux内核的等待队列是以双循环链表为基础数据结构，与进程调度机制紧密结合，能够用于实现核心的异步事件通知机制。在Linux2.4.21中，等待队列在源代码树include/linux/wait.h中，这是一个通过list_head连接的典型双循环链表，</p>
+
+<p>如下图所示。</p>
+
+<p><img src="/images/kernel/2015-05-21.jpg" alt="" /></p>
+
+<p>  在这个链表中，有两种数据结构：等待队列头（wait_queue_head_t）和等待队列项（wait_queue_t）。等待队列头和等待队列项中都包含一个list_head类型的域作为"连接件"。由于我们只需要对队列进行添加和删除操作，并不会修改其中的对象（等待队列项），因此，我们只需要提供一把保护整个基础设施和所有对象的锁，这把锁保存在等待队列头中，为wq_lock_t类型。在实现中，可以支持读写锁（rwlock）或自旋锁（spinlock）两种类型，通过一个宏定义来切换。如果使用读写锁，将wq_lock_t定义为rwlock_t类型；如果是自旋锁，将wq_lock_t定义为spinlock_t类型。无论哪种情况，分别相应设置wq_read_lock、wq_read_unlock、wq_read_lock_irqsave、wq_read_unlock_irqrestore、wq_write_lock_irq、wq_write_unlock、wq_write_lock_irqsave和wq_write_unlock_irqrestore等宏。</p>
+
+<h5>等待队列头</h5>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct __wait_queue_head {
+</span><span class='line'>&#9;wq_lock_t lock;
+</span><span class='line'>&#9;struct list_head task_list;
+</span><span class='line'>};
+</span><span class='line'>typedef struct __wait_queue_head wait_queue_head_t;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  前面已经说过，等待队列的主体是进程，这反映在每个等待队列项中，是一个任务结构指针（struct task_struct * task）。flags为该进程的等待标志，当前只支持互斥。</p>
+
+<h5>等待队列项</h5>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct __wait_queue {
+</span><span class='line'>&#9;unsigned int flags;
+</span><span class='line'>#define WQ_FLAG_EXCLUSIVE 0x01
+</span><span class='line'>&#9;struct task_struct * task;
+</span><span class='line'>&#9;struct list_head task_list;
+</span><span class='line'>};
+</span><span class='line'>typedef struct __wait_queue wait_queue_t;</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>声明和初始化</h5>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define DECLARE_WAITQUEUE(name, tsk)            \
+</span><span class='line'>&#9;wait_queue_t name = __WAITQUEUE_INITIALIZER(name, tsk)
+</span><span class='line'>#define __WAITQUEUE_INITIALIZER(name, tsk) {    \
+</span><span class='line'>&#9;task:  tsk,                                 \
+</span><span class='line'>&#9;task_list: { NULL, NULL },                  \
+</span><span class='line'>&#9;__WAITQUEUE_DEBUG_INIT(name)}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  通过DECLARE_WAITQUEUE宏将等待队列项初始化成对应的任务结构，并且用于连接的相关指针均设置为空。其中加入了调试相关代码。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define DECLARE_WAIT_QUEUE_HEAD(name)                    \
+</span><span class='line'>&#9;wait_queue_head_t name = __WAIT_QUEUE_HEAD_INITIALIZER(name)
+</span><span class='line'>#define __WAIT_QUEUE_HEAD_INITIALIZER(name) {            \
+</span><span class='line'>&#9;lock:  WAITQUEUE_RW_LOCK_UNLOCKED,                   \
+</span><span class='line'>&#9;task_list: { &(name).task_list, &(name).task_list }, \
+</span><span class='line'>&#9;__WAITQUEUE_HEAD_DEBUG_INIT(name)}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  通过DECLARE_WAIT_QUEUE_HEAD宏初始化一个等待队列头，使得其所在链表为空，并设置链表为"未上锁"状态。其中加入了调试相关代码。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static inline void init_waitqueue_head(wait_queue_head_t *q)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>该函数初始化一个已经存在的等待队列头，它将整个队列设置为"未上锁"状态，并将链表指针prev和next指向它自身。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>{
+</span><span class='line'>&#9;q-&gt;lock = WAITQUEUE_RW_LOCK_UNLOCKED;
+</span><span class='line'>&#9;INIT_LIST_HEAD(&q-&gt;task_list);
+</span><span class='line'>}
+</span><span class='line'>static inline void init_waitqueue_entry(wait_queue_t *q, struct task_struct *p)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>该函数初始化一个已经存在的等待队列项，它设置对应的任务结构，同时将标志位清0。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>{
+</span><span class='line'>&#9;q-&gt;flags = 0;
+</span><span class='line'>&#9;q-&gt;task = p;
+</span><span class='line'>}
+</span><span class='line'>static inline int waitqueue_active(wait_queue_head_t *q)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>该函数检查等待队列是否为空。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>{
+</span><span class='line'>&#9;return !list_empty(&q-&gt;task_list);
+</span><span class='line'>}
+</span><span class='line'>static inline void __add_wait_queue(wait_queue_head_t *head, wait_queue_t *new)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>将指定的等待队列项new添加到等待队列头head所在的链表头部，该函数假设已经获得锁。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>{
+</span><span class='line'>&#9;list_add(&new-&gt;task_list, &head-&gt;task_list);
+</span><span class='line'>}
+</span><span class='line'>static inline void __add_wait_queue_tail(wait_queue_head_t *head, wait_queue_t *new)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>将指定的等待队列项new添加到等待队列头head所在的链表尾部，该函数假设已经获得锁。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>{
+</span><span class='line'>&#9;list_add_tail(&new-&gt;task_list, &head-&gt;task_list);
+</span><span class='line'>}
+</span><span class='line'>static inline void __remove_wait_queue(wait_queue_head_t *head, wait_queue_t *old)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>将函数从等待队列头head所在的链表中删除指定等待队列项old，该函数假设已经获得锁，并且old在head所在链表中。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>{
+</span><span class='line'>&#9;list_del(&old-&gt;task_list);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>睡眠和唤醒操作</h4>
+
+<p>对等待队列的操作包括睡眠和唤醒（相关函数保存在源代码树的/kernel/sched.c和include/linux/sched.h中）。思想是更改当前进程（CURRENT）的任务状态，并要求重新调度，因为这时这个进程的状态已经改变，不再在调度表的就绪队列中，因此无法再获得执行机会，进入"睡眠"状态，直至被"唤醒"，即其任务状态重新被修改回就绪态。</p>
+
+<p>常用的睡眠操作有interruptible_sleep_on和sleep_on。两个函数类似，只不过前者将进程的状态从就绪态（TASK_RUNNING）设置为TASK_INTERRUPTIBLE，允许通过发送signal唤醒它（即可中断的睡眠状态）；而后者将进程的状态设置为TASK_UNINTERRUPTIBLE，在这种状态下，不接收任何singal。</p>
+
+<p>以interruptible_sleep_on为例，其展开后的代码是：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void interruptible_sleep_on(wait_queue_head_t *q)
+</span><span class='line'>{
+</span><span class='line'>&#9;unsigned long flags;
+</span><span class='line'>&#9;wait_queue_t wait;
+</span><span class='line'>&#9;/* 构造当前进程对应的等待队列项 */
+</span><span class='line'>&#9;init_waitqueue_entry(&wait, current);
+</span><span class='line'>
+</span><span class='line'>&#9;/* 将当前进程的状态从TASK_RUNNING改为TASK_INTERRUPTIBLE */
+</span><span class='line'>&#9;current-&gt;state = TASK_INTERRUPTIBLE;
+</span><span class='line'>
+</span><span class='line'>&#9;/* 将等待队列项添加到指定链表中 */
+</span><span class='line'>&#9;wq_write_lock_irqsave(&q-&gt;lock,flags);
+</span><span class='line'>&#9;__add_wait_queue(q, &wait); 
+</span><span class='line'>&#9;wq_write_unlock(&q-&gt;lock);
+</span><span class='line'>
+</span><span class='line'>&#9;/* 进程重新调度，放弃执行权 */
+</span><span class='line'>&#9;schedule();
+</span><span class='line'>
+</span><span class='line'>&#9;/* 本进程被唤醒，重新获得执行权，首要之事是将等待队列项从链表中删除 */
+</span><span class='line'>&#9;wq_write_lock_irq(&q-&gt;lock);
+</span><span class='line'>&#9;__remove_wait_queue(q, &wait);
+</span><span class='line'>&#9;wq_write_unlock_irqrestore(&q-&gt;lock,flags);
+</span><span class='line'>&#9;/* 至此，等待过程结束，本进程可以正常执行下面的逻辑 */
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>对应的唤醒操作包括wake_up_interruptible和wake_up。wake_up函数不仅可以唤醒状态为TASK_UNINTERRUPTIBLE的进程，而且可以唤醒状态为TASK_INTERRUPTIBLE的进程。</p>
+
+<p>wake_up_interruptible只负责唤醒状态为TASK_INTERRUPTIBLE的进程。这两个宏的定义如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define wake_up(x)   __wake_up((x),TASK_UNINTERRUPTIBLE | TASK_INTERRUPTIBLE, 1)
+</span><span class='line'>#define wake_up_interruptible(x) __wake_up((x),TASK_INTERRUPTIBLE, 1)</span></code></pre></td></tr></table></div></figure>
+
+
+<p><strong>wake_up函数主要是获取队列操作的锁，具体工作是调用</strong>wake_up_common完成的。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void __wake_up(wait_queue_head_t *q, unsigned int mode, int nr)
+</span><span class='line'>{
+</span><span class='line'>&#9;if (q) {
+</span><span class='line'>&#9;    unsigned long flags;
+</span><span class='line'>&#9;    wq_read_lock_irqsave(&q-&gt;lock, flags);
+</span><span class='line'>&#9;    __wake_up_common(q, mode, nr, 0);
+</span><span class='line'>&#9;    wq_read_unlock_irqrestore(&q-&gt;lock, flags);
+</span><span class='line'>&#9;}
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>/<em> The core wakeup function.  Non-exclusive wakeups (nr_exclusive == 0) just wake everything up.  If it&rsquo;s an exclusive wakeup (nr_exclusive == small +ve number) then we wake all the non-exclusive tasks and one exclusive task.
+There are circumstances in which we can try to wake a task which has already started to run but is not in state TASK_RUNNING.  try_to_wake_up() returns zero in this (rare) case, and we handle it by contonuing to scan the queue. </em>/</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static inline void __wake_up_common (wait_queue_head_t *q, unsigned int mode, int nr_exclusive, const int sync)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>参数q表示要操作的等待队列，mode表示要唤醒任务的状态，如TASK_UNINTERRUPTIBLE或TASK_INTERRUPTIBLE等。nr_exclusive是要唤醒的互斥进程数目，在这之前遇到的非互斥进程将被无条件唤醒。sync表示？？？</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>{
+</span><span class='line'>&#9;struct list_head *tmp;
+</span><span class='line'>&#9;struct task_struct *p;
+</span><span class='line'>
+</span><span class='line'>&#9;CHECK_MAGIC_WQHEAD(q);
+</span><span class='line'>&#9;WQ_CHECK_LIST_HEAD(&q-&gt;task_list);
+</span><span class='line'>
+</span><span class='line'>&#9;/* 遍历等待队列 */
+</span><span class='line'>&#9;list_for_each(tmp,&q-&gt;task_list) {
+</span><span class='line'>&#9;    unsigned int state;
+</span><span class='line'>&#9;    /* 获得当前等待队列项 */
+</span><span class='line'>&#9;    wait_queue_t *curr = list_entry(tmp, wait_queue_t, task_list);
+</span><span class='line'>
+</span><span class='line'>&#9;    CHECK_MAGIC(curr-&gt;__magic);
+</span><span class='line'>&#9;    /* 获得对应的进程 */
+</span><span class='line'>&#9;    p = curr-&gt;task;
+</span><span class='line'>&#9;    state = p-&gt;state;
+</span><span class='line'>
+</span><span class='line'>&#9;    /* 如果我们需要处理这种状态的进程 */
+</span><span class='line'>&#9;    if (state & mode) {
+</span><span class='line'>&#9;        WQ_NOTE_WAKER(curr);
+</span><span class='line'>&#9;        if (try_to_wake_up(p, sync) && (curr-&gt;flags&WQ_FLAG_EXCLUSIVE) && !--nr_exclusive)
+</span><span class='line'>&#9;            break;
+</span><span class='line'>&#9;    }
+</span><span class='line'>&#9;}
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>/<em> 唤醒一个进程，将它放到运行队列中，如果它还不在运行队列的话。"当前"进程总是在运行队列中的（except when the actual re-schedule is in progress)，and as such you&rsquo;re allowed to do the simpler &ldquo;current->state = TASK_RUNNING&rdquo; to mark yourself runnable without the overhead of this. </em>/</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static inline int try_to_wake_up(struct task_struct * p, int synchronous)
+</span><span class='line'>{
+</span><span class='line'>&#9;unsigned long flags;
+</span><span class='line'>&#9;int success = 0;
+</span><span class='line'>
+</span><span class='line'>&#9;/* 由于我们需要操作运行队列，必须获得对应的锁 */
+</span><span class='line'>&#9;spin_lock_irqsave(&runqueue_lock, flags);
+</span><span class='line'>&#9;/* 将进程状态设置为TASK_RUNNING */
+</span><span class='line'>&#9;p-&gt;state = TASK_RUNNING;
+</span><span class='line'>&#9;/* 如果进程已经在运行队列中，释放锁退出 */
+</span><span class='line'>&#9;if (task_on_runqueue(p))
+</span><span class='line'>&#9;    goto out;
+</span><span class='line'>&#9;/* 否则将进程添加到运行队列中 */
+</span><span class='line'>&#9;add_to_runqueue(p);
+</span><span class='line'>
+</span><span class='line'>&#9;/* 如果设置了同步标志 */
+</span><span class='line'>&#9;if (!synchronous || !(p-&gt;cpus_allowed & (1UL &lt;&lt; smp_processor_id())))
+</span><span class='line'>&#9;    reschedule_idle(p);
+</span><span class='line'>&#9;/* 唤醒成功，释放锁退出 */
+</span><span class='line'>&#9;success = 1;
+</span><span class='line'>out:
+</span><span class='line'>&#9;spin_unlock_irqrestore(&runqueue_lock, flags);
+</span><span class='line'>&#9;return success;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>等待队列应用模式</h4>
+
+<p>等待队列的的应用涉及两个进程，假设为A和B。A是资源的消费者，B是资源的生产者。A在消费的时候必须确保资源已经生产出来，为此定义一个资源等待队列。这个队列同时要被进程A和进程B使用，我们可以将它定义为一个全局变量。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>DECLARE_WAIT_QUEUE_HEAD(rsc_queue); /* 全局变量 */</span></code></pre></td></tr></table></div></figure>
+
+
+<p>在进程A中，执行逻辑如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>while (resource is unavaiable) {
+</span><span class='line'>&#9;interruptible_sleep_on( &wq );
+</span><span class='line'>}
+</span><span class='line'>consume_resource();</span></code></pre></td></tr></table></div></figure>
+
+
+<p>在进程B中，执行逻辑如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>produce_resource();
+</span><span class='line'>wake_up_interruptible( &wq );</span></code></pre></td></tr></table></div></figure>
+
+
+
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
       <h2 class="entry-title"><a href="/blog/2015/05/21/kernel-base-chardev/">字符设备驱动程序</a></h2>
     
     
@@ -2494,359 +2918,6 @@ urgent机制，是用于通知应用层需要接收urgent data，在urgent data�
 
     </article>
   
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/05/15/debug-mark-tcp_collapse-bug/">tcp_collapse do not copy headers</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-05-15T10:08:00+08:00'><span class='date'>2015-05-15</span> <span class='time'>10:08:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>commit b3d6cb92fd190d720a01075c4d20cdca896663fc
-</span><span class='line'>Author: Eric Dumazet &lt;edumazet@google.com&gt;
-</span><span class='line'>Date:   Mon Sep 15 04:19:53 2014 -0700
-</span><span class='line'>
-</span><span class='line'>    tcp: do not copy headers in tcp_collapse()
-</span><span class='line'>
-</span><span class='line'>    tcp_collapse() wants to shrink skb so that the overhead is minimal.
-</span><span class='line'>
-</span><span class='line'>    Now we store tcp flags into TCP_SKB_CB(skb)-&gt;tcp_flags, we no longer
-</span><span class='line'>    need to keep around full headers.
-</span><span class='line'>    Whole available space is dedicated to the payload.
-</span><span class='line'>
-</span><span class='line'>    Signed-off-by: Eric Dumazet &lt;edumazet@google.com&gt;
-</span><span class='line'>    Acked-by: Neal Cardwell &lt;ncardwell@google.com&gt;
-</span><span class='line'>    Signed-off-by: David S. Miller &lt;davem@davemloft.net&gt;</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>diff --git a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
-</span><span class='line'>index 228bf0c..ea92f23 100644
-</span><span class='line'>--- a/net/ipv4/tcp_input.c
-</span><span class='line'>+++ b/net/ipv4/tcp_input.c
-</span><span class='line'>@@ -4535,26 +4535,13 @@ restart:
-</span><span class='line'>      return;
-</span><span class='line'> 
-</span><span class='line'>  while (before(start, end)) {
-</span><span class='line'>+     int copy = min_t(int, SKB_MAX_ORDER(0, 0), end - start);
-</span><span class='line'>      struct sk_buff *nskb;
-</span><span class='line'>-     unsigned int header = skb_headroom(skb);
-</span><span class='line'>-     int copy = SKB_MAX_ORDER(header, 0);
-</span><span class='line'> 
-</span><span class='line'>-     /* Too big header? This can happen with IPv6. */
-</span><span class='line'>-     if (copy &lt; 0)
-</span><span class='line'>-         return;
-</span><span class='line'>-     if (end - start &lt; copy)
-</span><span class='line'>-         copy = end - start;
-</span><span class='line'>-     nskb = alloc_skb(copy + header, GFP_ATOMIC);
-</span><span class='line'>+     nskb = alloc_skb(copy, GFP_ATOMIC);
-</span><span class='line'>      if (!nskb)
-</span><span class='line'>          return;
-</span><span class='line'> 
-</span><span class='line'>-     skb_set_mac_header(nskb, skb_mac_header(skb) - skb-&gt;head);
-</span><span class='line'>-     skb_set_network_header(nskb, (skb_network_header(skb) -
-</span><span class='line'>-                       skb-&gt;head));
-</span><span class='line'>-     skb_set_transport_header(nskb, (skb_transport_header(skb) -
-</span><span class='line'>-                     skb-&gt;head));
-</span><span class='line'>-     skb_reserve(nskb, header);
-</span><span class='line'>-     memcpy(nskb-&gt;head, skb-&gt;head, header);
-</span><span class='line'>      memcpy(nskb-&gt;cb, skb-&gt;cb, sizeof(skb-&gt;cb));
-</span><span class='line'>      TCP_SKB_CB(nskb)-&gt;seq = TCP_SKB_CB(nskb)-&gt;end_seq = start;
-</span><span class='line'>      __skb_queue_before(list, skb, nskb);</span></code></pre></td></tr></table></div></figure>
-
-
-<hr />
-
-<p>这个改进无形中修了一个BUG，但是这BUG正常情况下不会触发，除非我们对skb进行改动导致skb->data - skb->head = 4k时，如果此时内存紧张，且满足tcp_collapse合并条件才触发。</p>
-
-<p>BUG：
-tcp_collapse代码中有：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>&#9;while (before(start, end)) {
-</span><span class='line'>&#9;&#9;struct sk_buff *nskb;
-</span><span class='line'>&#9;&#9;unsigned int header = skb_headroom(skb);
-</span><span class='line'>&#9;&#9;int copy = SKB_MAX_ORDER(header, 0);
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;/* Too big header? This can happen with IPv6. */
-</span><span class='line'>&#9;&#9;if (copy &lt; 0) 
-</span><span class='line'>&#9;&#9;&#9;return;
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;......
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;/* Copy data, releasing collapsed skbs. */
-</span><span class='line'>&#9;&#9;while (copy &gt; 0) { 
-</span><span class='line'>&#9;&#9;&#9;int offset = start - TCP_SKB_CB(skb)-&gt;seq;
-</span><span class='line'>&#9;&#9;&#9;int size = TCP_SKB_CB(skb)-&gt;end_seq - start;</span></code></pre></td></tr></table></div></figure>
-
-
-<p>也就是说如果header = 4k，那么copy = 0，那么会一直申请len=0的skb插入到receive队列，直到申请skb失败。这样就会造成tcp_recvmsg出错</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>&#9;&#9;skb_queue_walk(&sk-&gt;sk_receive_queue, skb) {
-</span><span class='line'>&#9;&#9;&#9;/* Now that we have two receive queues this
-</span><span class='line'>&#9;&#9;&#9; * shouldn't happen.
-</span><span class='line'>&#9;&#9;&#9; */
-</span><span class='line'>&#9;&#9;&#9;if (WARN(before(*seq, TCP_SKB_CB(skb)-&gt;seq),
-</span><span class='line'>&#9;&#9;&#9;&#9; KERN_INFO "recvmsg bug: copied %X "
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;   "seq %X rcvnxt %X fl %X\n", *seq,
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;   TCP_SKB_CB(skb)-&gt;seq, tp-&gt;rcv_nxt,
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;   flags))
-</span><span class='line'>&#9;&#9;&#9;&#9;break;
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;offset = *seq - TCP_SKB_CB(skb)-&gt;seq;
-</span><span class='line'>&#9;&#9;&#9;if (tcp_hdr(skb)-&gt;syn)
-</span><span class='line'>&#9;&#9;&#9;&#9;offset--;
-</span><span class='line'>&#9;&#9;&#9;if (offset &lt; skb-&gt;len)
-</span><span class='line'>&#9;&#9;&#9;&#9;goto found_ok_skb;
-</span><span class='line'>&#9;&#9;&#9;if (tcp_hdr(skb)-&gt;fin)
-</span><span class='line'>&#9;&#9;&#9;&#9;goto found_fin_ok;
-</span><span class='line'>&#9;&#9;&#9;WARN(!(flags & MSG_PEEK), KERN_INFO "recvmsg bug 2: "
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;"copied %X seq %X rcvnxt %X fl %X\n",
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;*seq, TCP_SKB_CB(skb)-&gt;seq,
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;tp-&gt;rcv_nxt, flags);
-</span><span class='line'>&#9;&#9;}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>因为offset = 0, len = 0, if (offset &lt; skb->len)就不符合，报WARN。而且如果申请的len=0的skb过多，会导致一直在这里循环，因为WARN有打印堆栈，执行很慢。</p>
-
-<p>错误如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>WARNING: at net/ipv4/tcp.c:1457 tcp_recvmsg+0x96a/0xc20() (Tainted: G    W  ---------------   )
-</span><span class='line'>Hardware name: PowerEdge R620
-</span><span class='line'>Modules linked in: sha256_generic ws_st_tcp_cubic(U) ws_st(U) autofs4 i2c_dev i2c_core bonding 8021q garp stp llc be2iscsi iscsi_boot_sysfs ib]
-</span><span class='line'>Pid: 6964, comm: squid Tainted: G        W  ---------------    2.6.32-358.6.1.x86_64 #1
-</span><span class='line'>Call Trace:
-</span><span class='line'> [&lt;ffffffff8144f1ca&gt;] ? tcp_recvmsg+0x96a/0xc20
-</span><span class='line'> [&lt;ffffffff8144f1ca&gt;] ? tcp_recvmsg+0x96a/0xc20
-</span><span class='line'> [&lt;ffffffff81069aa8&gt;] ? warn_slowpath_common+0x98/0xc0
-</span><span class='line'> [&lt;ffffffff81069bce&gt;] ? warn_slowpath_fmt+0x6e/0x70
-</span><span class='line'> [&lt;ffffffff814ce08e&gt;] ? _spin_lock_bh+0x2e/0x40
-</span><span class='line'> [&lt;ffffffff813fea53&gt;] ? skb_release_data+0xb3/0x100
-</span><span class='line'> [&lt;ffffffff813feb56&gt;] ? __kfree_skb+0x46/0xa0
-</span><span class='line'> [&lt;ffffffff8144f1ca&gt;] ? tcp_recvmsg+0x96a/0xc20
-</span><span class='line'> [&lt;ffffffff813f93c7&gt;] ? sock_common_recvmsg+0x37/0x50
-</span><span class='line'> [&lt;ffffffff813f6b05&gt;] ? sock_aio_read+0x185/0x190
-</span><span class='line'> [&lt;ffffffff81171912&gt;] ? do_sync_read+0xf2/0x130
-</span><span class='line'> [&lt;ffffffff81090e60&gt;] ? autoremove_wake_function+0x0/0x40
-</span><span class='line'> [&lt;ffffffff811b4a2c&gt;] ? sys_epoll_wait+0x21c/0x3f0
-</span><span class='line'> [&lt;ffffffff8120b3b6&gt;] ? security_file_permission+0x16/0x20
-</span><span class='line'> [&lt;ffffffff81171bab&gt;] ? vfs_read+0x18b/0x1a0
-</span><span class='line'> [&lt;ffffffff81172df5&gt;] ? sys_read+0x55/0x90
-</span><span class='line'> [&lt;ffffffff8100af72&gt;] ? system_call_fastpath+0x16/0x1b
-</span><span class='line'>---[ end trace ef9663ba0fc61730 ]---
-</span><span class='line'>------------[ cut here ]------------
-</span><span class='line'>WARNING: at net/ipv4/tcp.c:1457 tcp_recvmsg+0x96a/0xc20() (Tainted: G        W  ---------------   )
-</span><span class='line'>Hardware name: PowerEdge R620
-</span><span class='line'>Modules linked in: sha256_generic ws_st_tcp_cubic(U) ws_st(U) autofs4 i2c_dev i2c_core bonding 8021q garp stp llc be2iscsi iscsi_boot_sysfs ib]
-</span><span class='line'>Pid: 6964, comm: squid Tainted: G        W  ---------------    2.6.32-358.6.1.x86_64 #1
-</span><span class='line'>Call Trace:
-</span><span class='line'> [&lt;ffffffff8144f1ca&gt;] ? tcp_recvmsg+0x96a/0xc20
-</span><span class='line'> [&lt;ffffffff8144f1ca&gt;] ? tcp_recvmsg+0x96a/0xc20
-</span><span class='line'> [&lt;ffffffff81069aa8&gt;] ? warn_slowpath_common+0x98/0xc0
-</span><span class='line'> [&lt;ffffffff81069bce&gt;] ? warn_slowpath_fmt+0x6e/0x70
-</span><span class='line'> [&lt;ffffffff814ce08e&gt;] ? _spin_lock_bh+0x2e/0x40
-</span><span class='line'> [&lt;ffffffff813fea53&gt;] ? skb_release_data+0xb3/0x100
-</span><span class='line'> [&lt;ffffffff813feb56&gt;] ? __kfree_skb+0x46/0xa0
-</span><span class='line'> [&lt;ffffffff8144f1ca&gt;] ? tcp_recvmsg+0x96a/0xc20
-</span><span class='line'> [&lt;ffffffff813f93c7&gt;] ? sock_common_recvmsg+0x37/0x50
-</span><span class='line'> [&lt;ffffffff813f6b05&gt;] ? sock_aio_read+0x185/0x190
-</span><span class='line'> [&lt;ffffffff81171912&gt;] ? do_sync_read+0xf2/0x130
-</span><span class='line'> [&lt;ffffffff81090e60&gt;] ? autoremove_wake_function+0x0/0x40
-</span><span class='line'> [&lt;ffffffff811b4a2c&gt;] ? sys_epoll_wait+0x21c/0x3f0
-</span><span class='line'> [&lt;ffffffff8120b3b6&gt;] ? security_file_permission+0x16/0x20
-</span><span class='line'> [&lt;ffffffff81171bab&gt;] ? vfs_read+0x18b/0x1a0
-</span><span class='line'> [&lt;ffffffff81172df5&gt;] ? sys_read+0x55/0x90
-</span><span class='line'> [&lt;ffffffff8100af72&gt;] ? system_call_fastpath+0x16/0x1b
-</span><span class='line'>---[ end trace ef9663ba0fc61731 ]---
-</span><span class='line'>------------[ cut here ]------------
-</span><span class='line'>
-</span><span class='line'>.......
-</span></code></pre></td></tr></table></div></figure>
-
-
-<p>如果skb申请的不多，很快就能看到tcp_cleanup_rbuf的WARN，仔细观察会发现，这里打印的end_seq和上面的seq是一样的。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>void tcp_cleanup_rbuf(struct sock *sk, int copied)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
-</span><span class='line'>&#9;int time_to_ack = 0;
-</span><span class='line'>
-</span><span class='line'>#if TCP_DEBUG
-</span><span class='line'>&#9;struct sk_buff *skb = skb_peek(&sk-&gt;sk_receive_queue);
-</span><span class='line'>
-</span><span class='line'>&#9;WARN(skb && !before(tp-&gt;copied_seq, TCP_SKB_CB(skb)-&gt;end_seq),
-</span><span class='line'>&#9;&#9; KERN_INFO "cleanup rbuf bug: copied %X seq %X rcvnxt %X\n",
-</span><span class='line'>&#9;&#9; tp-&gt;copied_seq, TCP_SKB_CB(skb)-&gt;end_seq, tp-&gt;rcv_nxt);
-</span><span class='line'>#endif</span></code></pre></td></tr></table></div></figure>
-
-</div>
-  
-  
-
-
-    </article>
-  
   <div class="pagination">
     
       <a class="prev" href="/posts/61">&larr; Older</a>
@@ -2861,7 +2932,7 @@ tcp_collapse代码中有：</p>
   
     <section>
 <h1>Categories
-<span class='right_span'>(635)</span>
+<span class='right_span'>(636)</span>
 
 </h1>
 <head>
@@ -2892,7 +2963,7 @@ if (!document.getElementById('blog~octopress')) document.getElementById('aexp_bl
 if (!document.getElementById('blog')) document.getElementById('aexp_blog').style.visibility = 'hidden';
 if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ruby').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(52)</span></li>
+<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(53)</span></li>
 <div id='language' class='catsub'><li><a href='/blog/cats/language~c/?opendiv=language'>c</a><a href='##' onmousedown=showDiv('language~c') id='aexp_language~c'><span class='exp_style' id='exp_language~c'>[+]</span></a><span class='right_span'>30</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~c')) document.getElementById('aexp_language~c').style.visibility = 'hidden';
@@ -2905,7 +2976,7 @@ if (!document.getElementById('language~java')) document.getElementById('aexp_lan
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~jsp')) document.getElementById('aexp_language~jsp').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/language~php/?opendiv=language'>php</a><a href='##' onmousedown=showDiv('language~php') id='aexp_language~php'><span class='exp_style' id='exp_language~php'>[+]</span></a><span class='right_span'>1</span></li>
+<li><a href='/blog/cats/language~php/?opendiv=language'>php</a><a href='##' onmousedown=showDiv('language~php') id='aexp_language~php'><span class='exp_style' id='exp_language~php'>[+]</span></a><span class='right_span'>2</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~php')) document.getElementById('aexp_language~php').style.visibility = 'hidden';
 </script>
@@ -3199,7 +3270,7 @@ if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algo
 
 <section>
 <h1>Date Categories
-<span class='right_span'>(635)</span>
+<span class='right_span'>(636)</span>
 
 </h1>
 <head>
@@ -3207,8 +3278,9 @@ if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algo
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2021/'>2021</a><a href='##' onmousedown=showDiv('2021')><span class='exp_style' id='exp_2021'>[+]</span></a><span class='right_span'>(1)</span></li>
-<div id='2021' class='catsub'><li><a href='/blog/cats/2021~01/?opendiv=2021'>2021-01</a><span class='right_span'>1</span></li>
+<li class='catclass'><a href='/blog/cats/2021/'>2021</a><a href='##' onmousedown=showDiv('2021')><span class='exp_style' id='exp_2021'>[+]</span></a><span class='right_span'>(2)</span></li>
+<div id='2021' class='catsub'><li><a href='/blog/cats/2021~02/?opendiv=2021'>2021-02</a><span class='right_span'>1</span></li>
+<li><a href='/blog/cats/2021~01/?opendiv=2021'>2021-01</a><span class='right_span'>1</span></li>
 </div><li class='catclass'><a href='/blog/cats/2020/'>2020</a><a href='##' onmousedown=showDiv('2020')><span class='exp_style' id='exp_2020'>[+]</span></a><span class='right_span'>(70)</span></li>
 <div id='2020' class='catsub'><li><a href='/blog/cats/2020~12/?opendiv=2020'>2020-12</a><span class='right_span'>6</span></li>
 <li><a href='/blog/cats/2020~11/?opendiv=2020'>2020-11</a><span class='right_span'>11</span></li>
@@ -3340,6 +3412,10 @@ if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algo
   <ul id="recent_posts">
     
       <li class="post">
+        <a href="/blog/2021/02/05/lang-phpexcel/">PHPExcel防止大数以科学计数法显示</a>
+      </li>
+    
+      <li class="post">
         <a href="/blog/2021/01/22/lang-php-month/">php获取月初和月尾时间</a>
       </li>
     
@@ -3353,10 +3429,6 @@ if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algo
     
       <li class="post">
         <a href="/blog/2020/12/20/lang-jsp-init/">jsp 环境初始化</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2020/12/11/command-scrot/">Linux命令行截屏</a>
       </li>
     
   </ul>

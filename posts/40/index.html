@@ -76,6 +76,924 @@ var ss360Config = {
       
   <header>
     
+      <h2 class="entry-title"><a href="/blog/2015/09/30/kernel-net-keepalive/">TCP的定时器系列 — 保活定时器</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-09-30T15:32:00+08:00'><span class='date'>2015-09-30</span> <span class='time'>15:32:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://blog.csdn.net/zhangskd/article/details/44177475">http://blog.csdn.net/zhangskd/article/details/44177475</a></p>
+
+<p>主要内容：保活定时器的实现，TCP_USER_TIMEOUT选项的实现。<br/>
+内核版本：3.15.2</p>
+
+<h4>原理</h4>
+
+<p>HTTP有Keepalive功能，TCP也有Keepalive功能，虽然都叫Keepalive，但是它们的目的却是不一样的。为了说明这一点，先来看下长连接和短连接的定义。</p>
+
+<p>连接的“长短”是什么？<br/>
+短连接：建立一条连接，传输一个请求，马上关闭连接。<br/>
+长连接：建立一条连接，传输一个请求，过会儿，又传输若干个请求，最后再关闭连接。</p>
+
+<p>长连接的好处是显而易见的，多个请求可以复用一条连接，省去连接建立和释放的时间开销和系统调用，但也意味着服务器的一部分资源会被长时间占用着。</p>
+
+<p>HTTP的Keepalive，顾名思义，目的在于延长连接的时间，以便在同一条连接中传输多个HTTP请求。</p>
+
+<p>HTTP服务器一般会提供Keepalive Timeout参数，用来决定连接保持多久，什么时候关闭连接。</p>
+
+<p>当连接使用了Keepalive功能时，对于客户端发送过来的一个请求，服务器端会发送一个响应，然后开始计时，如果经过Timeout时间后，客户端没有再发送请求过来，服务器端就把连接关了，不再保持连接了。</p>
+
+<p>TCP的Keepalive，是挂羊头卖狗肉的，目的在于看看对方有没有发生异常，如果有异常就及时关闭连接。</p>
+
+<p>当传输双方不主动关闭连接时，就算双方没有交换任何数据，连接也是一直有效的。</p>
+
+<p>如果这个时候对端、中间网络出现异常而导致连接不可用，本端如何得知这一信息呢？</p>
+
+<p>答案就是保活定时器。它每隔一段时间会超时，超时后会检查连接是否空闲太久了，如果空闲的时间超过了设置时间，就会发送探测报文。然后通过对端是否响应、响应是否符合预期，来判断对端是否正常，如果不正常，就主动关闭连接，而不用等待HTTP层的关闭了。</p>
+
+<p>当服务器发送探测报文时，客户端可能处于4种不同的情况：仍然正常运行、已经崩溃、已经崩溃并重启了、由于中间链路问题不可达。在不同的情况下，服务器会得到不一样的反馈。</p>
+
+<p>(1) 客户主机依然正常运行，并且从服务器端可达</p>
+
+<p>客户端的TCP响应正常，从而服务器端知道对方是正常的。保活定时器会在两小时以后继续触发。</p>
+
+<p>(2) 客户主机已经崩溃，并且关闭或者正在重新启动</p>
+
+<p>客户端的TCP没有响应，服务器没有收到对探测包的响应，此后每隔75s发送探测报文，一共发送9次。</p>
+
+<p>socket函数会返回-1，errno设置为ETIMEDOUT，表示连接超时。</p>
+
+<p>(3) 客户主机已经崩溃，并且重新启动了</p>
+
+<p>客户端的TCP发送RST，服务器端收到后关闭此连接。</p>
+
+<p>socket函数会返回-1，errno设置为ECONNRESET，表示连接被对端复位了。</p>
+
+<p>(4) 客户主机依然正常运行，但是从服务器不可达</p>
+
+<p>双方的反应和第二种是一样的，因为服务器不能区分对端异常与中间链路异常。</p>
+
+<p>socket函数会返回-1，errno设置为EHOSTUNREACH，表示对端不可达。</p>
+
+<h4>选项</h4>
+
+<p>内核默认并不使用TCP Keepalive功能，除非用户设置了SO_KEEPALIVE选项。</p>
+
+<p>有两种方式可以自行调整保活定时器的参数：一种是修改TCP参数，一种是使用TCP层选项。</p>
+
+<p>(1) TCP参数</p>
+
+<p>tcp_keepalive_time</p>
+
+<p>最后一次数据交换到TCP发送第一个保活探测报文的时间，即允许连接空闲的时间，默认为7200s。</p>
+
+<p>tcp_keepalive_intvl</p>
+
+<p>保活探测报文的重传时间，默认为75s。</p>
+
+<p>tcp_keepalive_probes</p>
+
+<p>保活探测报文的发送次数，默认为9次。</p>
+
+<p>Q：一次完整的保活探测需要花费多长时间？</p>
+
+<p>A：tcp_keepalive_time + tcp_keepalive_intvl * tcp_keepalive_probes，默认值为7875s。如果觉得两个多小时太长了，可以自行调整上述参数。</p>
+
+<p>(2) TCP层选项</p>
+
+<p>TCP_KEEPIDLE：含义同tcp_keepalive_time。</p>
+
+<p>TCP_KEEPINTVL：含义同tcp_keepalive_intvl。</p>
+
+<p>TCP_KEEPCNT：含义同tcp_keepalive_probes。</p>
+
+<p>Q：既然有了TCP参数可供调整，为什么还增加了上述的TCP层选项？</p>
+
+<p>A：TCP参数是面向本机的所有TCP连接，一旦调整了，对所有的连接都有效。而TCP层选项是面向一条连接的，一旦调整了，只对本条连接有效。</p>
+
+<h4>激活</h4>
+
+<p>在连接建立后，可以通过设置SO_KEEPALIVE选项，来激活保活定时器。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int keepalive = 1;
+</span><span class='line'>setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int sock_setsockopt(struct socket *sock, int level, int optname, char __user *optval,   
+</span><span class='line'>&#9;unsigned int optlen)  
+</span><span class='line'>{  
+</span><span class='line'>&#9;...  
+</span><span class='line'>&#9;case SO_KEEPALIVE:  
+</span><span class='line'>#ifdef CONFIG_INET  
+</span><span class='line'>&#9;&#9;if (sk-&gt;sk_protocol == IPPROTO_TCP && sk-&gt;sk_type == SOCK_STREAM)  
+</span><span class='line'>&#9;&#9;&#9;tcp_set_keepalive(sk, valbool); /* 激活或删除保活定时器 */  
+</span><span class='line'>#endif  
+</span><span class='line'>&#9;&#9;sock_valbool_flag(sk, SOCK_KEEPOPEN, valbool); /* 设置或取消SOCK_KEEPOPEN标志位 */  
+</span><span class='line'>&#9;&#9;break;  
+</span><span class='line'>&#9;...  
+</span><span class='line'>}  
+</span><span class='line'>  
+</span><span class='line'>static inline void sock_valbool_flag (struct sock *sk, int bit, int valbool)  
+</span><span class='line'>{  
+</span><span class='line'>&#9;if (valbool)  
+</span><span class='line'>&#9;&#9;sock_set_flag(sk, bit);  
+</span><span class='line'>&#9;else  
+</span><span class='line'>&#9;&#9;sock_reset_flag(sk, bit);  
+</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void tcp_set_keepalive(struct sock *sk, int val)  
+</span><span class='line'>{  
+</span><span class='line'>&#9;/* 不在以下两个状态设置保活定时器： 
+</span><span class='line'>&#9; * TCP_CLOSE：sk_timer用作FIN_WAIT2定时器 
+</span><span class='line'>&#9; * TCP_LISTEN：sk_timer用作SYNACK重传定时器 
+</span><span class='line'>&#9; */  
+</span><span class='line'>&#9;if ((1 &lt;&lt; sk-&gt;sk_state) & (TCPF_CLOSE | TCPF_LISTEN))  
+</span><span class='line'>&#9;&#9;return;  
+</span><span class='line'>  
+</span><span class='line'>&#9;/* 如果SO_KEEPALIVE选项值为1，且此前没有设置SOCK_KEEPOPEN标志， 
+</span><span class='line'>&#9; * 则激活sk_timer，用作保活定时器。 
+</span><span class='line'>&#9; */  
+</span><span class='line'>&#9;if (val && !sock_flag(sk, SOCK_KEEPOPEN))  
+</span><span class='line'>&#9;&#9;inet_csk_reset_keepalive_timer(sk, keepalive_time_when(tcp_sk(sk)));  
+</span><span class='line'>&#9;else if (!val)  
+</span><span class='line'>&#9;&#9;/* 如果SO_KEEPALIVE选项值为0，则删除保活定时器 */  
+</span><span class='line'>&#9;&#9;inet_csk_delete_keepalive_timer(sk);  
+</span><span class='line'>}  
+</span><span class='line'>   
+</span><span class='line'>/* 保活定时器的超时时间 */  
+</span><span class='line'>static inline int keepalive_time_when(const struct tcp_sock *tp)  
+</span><span class='line'>{  
+</span><span class='line'>&#9;return tp-&gt;keepalive_time ? : sysctl_tcp_keepalive_time;  
+</span><span class='line'>}  
+</span><span class='line'>  
+</span><span class='line'>void inet_csk_reset_keepalive_timer (struc sock *sk, unsigned long len)  
+</span><span class='line'>{  
+</span><span class='line'>&#9;sk_reset_timer(sk, &sk-&gt;sk_timer, jiffies + len);  
+</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>可以使用TCP层选项来动态调整保活定时器的参数。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int keepidle = 600;
+</span><span class='line'>int keepintvl = 10;
+</span><span class='line'>int keepcnt = 6;
+</span><span class='line'>
+</span><span class='line'>setsockopt(fd, SOL_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle));
+</span><span class='line'>setsockopt(fd, SOL_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
+</span><span class='line'>setsockopt(fd, SOL_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct tcp_sock {  
+</span><span class='line'>&#9;...  
+</span><span class='line'>&#9;/* 最后一次接收到ACK的时间 */  
+</span><span class='line'>&#9;u32 rcv_tstamp; /* timestamp of last received ACK (for keepalives) */  
+</span><span class='line'>&#9;...  
+</span><span class='line'>&#9;/* time before keep alive takes place, 空闲多久后才发送探测报文 */  
+</span><span class='line'>&#9;unsigned int keepalive_time;  
+</span><span class='line'>&#9;/* time iterval between keep alive probes */  
+</span><span class='line'>&#9;unsigned int keepalive_intvl; /* 探测报文之间的时间间隔 */  
+</span><span class='line'>&#9;/* num of allowed keep alive probes */  
+</span><span class='line'>&#9;u8 keepalive_probes; /* 探测报文的发送次数 */  
+</span><span class='line'>&#9;...  
+</span><span class='line'>&#9;struct {  
+</span><span class='line'>&#9;&#9;...  
+</span><span class='line'>&#9;&#9;/* 最后一次接收到带负荷的报文的时间 */  
+</span><span class='line'>&#9;&#9;__u32 lrcvtime; /* timestamp of last received data packet */  
+</span><span class='line'>&#9;&#9;...  
+</span><span class='line'>&#9;} icsk_ack;  
+</span><span class='line'>&#9;...  
+</span><span class='line'>};  
+</span><span class='line'>  
+</span><span class='line'>#define TCP_KEEPIDLE 4 /* Start Keepalives after this period */  
+</span><span class='line'>#define TCP_KEEPINTVL 5 /* Interval between keepalives */  
+</span><span class='line'>#define TCP_KEEPCNT 6 /* Number of keepalives before death */  
+</span><span class='line'>   
+</span><span class='line'>#define MAX_TCP_KEEPIDLE 32767  
+</span><span class='line'>#define MAX_TCP_KEEPINTVL 32767  
+</span><span class='line'>#define MAX_TCP_KEEPCNT 127  </span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int do_tcp_setsockopt(struct sock *sk, int level, int optname, char __user *optval,  
+</span><span class='line'>&#9;unsigned int optlen)  
+</span><span class='line'>{  
+</span><span class='line'>&#9;...  
+</span><span class='line'>&#9;case TCP_KEEPIDLE:  
+</span><span class='line'>&#9;   if (val &lt; 1 || val &gt; MAX_TCP_KEEPIDLE)  
+</span><span class='line'>&#9;&#9;   err = -EINVAL;  
+</span><span class='line'>&#9;&#9;else {  
+</span><span class='line'>&#9;&#9;&#9;tp-&gt;keepalive_time = val * HZ; /* 设置新的空闲时间 */  
+</span><span class='line'>  
+</span><span class='line'>&#9;&#9;&#9;/* 如果有使用SO_KEEPALIVE选项，连接处于非监听非结束的状态。 
+</span><span class='line'>&#9;&#9;&#9; * 这个时候保活定时器已经在计时了，这里设置新的超时时间。 
+</span><span class='line'>&#9;&#9;&#9; */  
+</span><span class='line'>&#9;&#9;&#9;if (sock_flag(sk, SOCK_KEEPOPEN) &&   
+</span><span class='line'>&#9;&#9;&#9;&#9;!((1 &lt;&lt; sk-&gt;sk_state) & (TCPF_CLOSE | TCPF_LISTEN))) {  
+</span><span class='line'>&#9;&#9;&#9;&#9;u32 elapsed = keepalive_time_elapsed(tp); /* 连接已经经历的空闲时间 */  
+</span><span class='line'>  
+</span><span class='line'>&#9;&#9;&#9;&#9;if (tp-&gt;keepalive_time &gt; elapsed)  
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;elapsed = tp-&gt;keepalive_time - elapsed; /* 接着等待的时间，然后超时 */  
+</span><span class='line'>&#9;&#9;&#9;&#9;else  
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;elapsed = 0; /* 会导致马上超时 */  
+</span><span class='line'>&#9;&#9;&#9;&#9;inet_csk_reset_keepalive_timer(sk, elapsed);  
+</span><span class='line'>&#9;&#9;&#9;}  
+</span><span class='line'>&#9;&#9;}  
+</span><span class='line'>&#9;&#9;break;  
+</span><span class='line'>  
+</span><span class='line'>&#9;case TCP_KEEPINTVL:  
+</span><span class='line'>&#9;&#9;if (val &lt; 1 || val &gt; MAX_TCP_KEEPINTVL)  
+</span><span class='line'>&#9;&#9;&#9;err = -EINVAL;  
+</span><span class='line'>&#9;&#9;else  
+</span><span class='line'>&#9;&#9;&#9;tp-&gt;keepalive_intvl = val * HZ; /* 设置新的探测报文间隔 */  
+</span><span class='line'>&#9;&#9;break;  
+</span><span class='line'>  
+</span><span class='line'>&#9;case TCP_KEEPCNT:  
+</span><span class='line'>&#9;&#9;if (val &lt; 1 || val &gt; MAX_TCP_KEEPCNT)  
+</span><span class='line'>&#9;&#9;&#9;err = -EINVAL;  
+</span><span class='line'>&#9;&#9;else  
+</span><span class='line'>&#9;&#9;&#9;tp-&gt;keepalive_probes = val; /* 设置新的探测次数 */  
+</span><span class='line'>&#9;&#9;break;  
+</span><span class='line'>&#9;...  
+</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>到目前为止，连接已经经历的空闲时间，即最后一次接收到报文至今的时间。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static inline u32 keepalive_time_elapsed (const struct tcp_sock *tp)  
+</span><span class='line'>{  
+</span><span class='line'>&#9;const struct inet_connection_sock *icsk = &tp-&gt;inet_conn;  
+</span><span class='line'>  
+</span><span class='line'>&#9;/* lrcvtime是最后一次接收到数据报的时间 
+</span><span class='line'>&#9; * rcv_tstamp是最后一次接收到ACK的时间 
+</span><span class='line'>&#9; * 返回值就是最后一次接收到报文，到现在的时间，即经历的空闲时间。 
+</span><span class='line'>&#9; */  
+</span><span class='line'>&#9;return min_t(u32, tcp_time_stamp - icsk-&gt;icsk_ack.lrcvtime,  
+</span><span class='line'>&#9;&#9;tcp_time_stamp - tp-&gt;rcv_tstamp);  
+</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
+
+
+<h4>超时处理函数</h4>
+
+<p>我们知道保活定时器、SYNACK重传定时器、FIN_WAIT2定时器是共用一个定时器实例sk->sk_timer，所以它们的超时处理函数也是一样的，都为tcp_keepalive_timer()。而在函数内部，可以根据此时连接所处的状态，来判断是哪个定时器触发了超时。</p>
+
+<p>Q：什么时候判断对端为异常并关闭连接？</p>
+
+<p>A：分两种情况。</p>
+
+<ol>
+<li><p>用户使用了TCP_USER_TIMEOUT选项。当连接的空闲时间超过了用户设置的时间，且有发送过探测报文。</p></li>
+<li><p>用户没有使用TCP_USER_TIMEOUT选项。当发送保活探测包的次数达到了保活探测的最大次数时。</p></li>
+</ol>
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+<span class='line-number'>82</span>
+<span class='line-number'>83</span>
+<span class='line-number'>84</span>
+<span class='line-number'>85</span>
+<span class='line-number'>86</span>
+<span class='line-number'>87</span>
+<span class='line-number'>88</span>
+<span class='line-number'>89</span>
+<span class='line-number'>90</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void tcp_keepalive_timer (unsigned long data)  
+</span><span class='line'>{  
+</span><span class='line'>&#9;struct sock *sk = (struct sock *) data;  
+</span><span class='line'>&#9;struct inet_connection_sock *icsk = inet_csk(sk);  
+</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);  
+</span><span class='line'>&#9;u32 elapsed;  
+</span><span class='line'>  
+</span><span class='line'>&#9;/* Only process if socket is not in use. */  
+</span><span class='line'>&#9;bh_lock_sock(sk);  
+</span><span class='line'>  
+</span><span class='line'>&#9;/* 加锁以保证在此期间，连接状态不会被用户进程修改。 
+</span><span class='line'>&#9; * 如果用户进程正在使用此sock，那么过50ms再来看看。 
+</span><span class='line'>&#9; */  
+</span><span class='line'>&#9;if (sock_owned_by_user(sk)) {  
+</span><span class='line'>&#9;&#9;/* Try again later. */  
+</span><span class='line'>&#9;&#9;inet_csk_reset_keepalive_timer(sk, HZ/20);  
+</span><span class='line'>&#9;&#9;goto out;  
+</span><span class='line'>&#9;}  
+</span><span class='line'>  
+</span><span class='line'>&#9;/* 三次握手期间，用作SYNACK定时器 */  
+</span><span class='line'>&#9;if (sk-&gt;sk_state == TCP_LISTEN) {  
+</span><span class='line'>&#9;&#9;tcp_synack_timer(sk);  
+</span><span class='line'>&#9;&#9;goto out;  
+</span><span class='line'>&#9;}      
+</span><span class='line'>  
+</span><span class='line'>&#9;/* 连接释放期间，用作FIN_WAIT2定时器 */  
+</span><span class='line'>&#9;if (sk-&gt;sk_state == TCP_FIN_WAIT2 && sock_flag(sk, SOCK_DEAD)) {  
+</span><span class='line'>&#9;&#9;...  
+</span><span class='line'>&#9;}  
+</span><span class='line'>  
+</span><span class='line'>&#9;/* 接下来就是用作保活定时器了 */  
+</span><span class='line'>&#9;if (!sock_flag(sk, SOCK_KEEPOPEN) || sk-&gt;sk_state == TCP_CLOSE)  
+</span><span class='line'>&#9;&#9;goto out;  
+</span><span class='line'>  
+</span><span class='line'>&#9;elapsed = keepalive_time_when(tp); /* 连接的空闲时间超过此值，就发送保活探测报文 */  
+</span><span class='line'>  
+</span><span class='line'>&#9;/* It is alive without keepalive. 
+</span><span class='line'>&#9; * 如果网络中有发送且未确认的数据包，或者发送队列不为空，说明连接不是idle的？ 
+</span><span class='line'>&#9; * 既然连接不是idle的，就没有必要探测对端是否正常。 
+</span><span class='line'>&#9; * 保活定时器重新开始计时即可。 
+</span><span class='line'>&#9; *  
+</span><span class='line'>&#9; * 而实际上当网络中有发送且未确认的数据包时，对端也可能会发生异常而没有响应。 
+</span><span class='line'>&#9; * 这个时候会导致数据包的不断重传，只能依靠重传超过了允许的最大时间，来判断连接超时。 
+</span><span class='line'>&#9; * 为了解决这一问题，引入了TCP_USER_TIMEOUT，允许用户指定超时时间，可见下文：） 
+</span><span class='line'>&#9; */  
+</span><span class='line'>&#9;if (tp-&gt;packets_out || tcp_send_head(sk))  
+</span><span class='line'>&#9;&#9;goto resched; /* 保活定时器重新开始计时 */  
+</span><span class='line'>  
+</span><span class='line'>&#9;/* 连接经历的空闲时间，即上次收到报文至今的时间 */  
+</span><span class='line'>&#9;elapsed = keepalive_time_elapsed(tp);  
+</span><span class='line'>  
+</span><span class='line'>&#9;/* 如果连接空闲的时间超过了设置的时间值 */  
+</span><span class='line'>&#9;if (elapsed &gt;= keepalive_time_when(tp)) {  
+</span><span class='line'>  
+</span><span class='line'>&#9;&#9;/* 什么时候关闭连接？ 
+</span><span class='line'>&#9;&#9; * 1. 使用了TCP_USER_TIMEOUT选项。当连接空闲时间超过了用户设置的时间，且有发送过探测报文。 
+</span><span class='line'>&#9;&#9; * 2. 用户没有使用选项。当发送的保活探测包达到了保活探测的最大次数。 
+</span><span class='line'>&#9;&#9; */  
+</span><span class='line'>&#9;&#9;if (icsk-&gt;icsk_user_timeout != 0 && elapsed &gt;= icsk-&gt;icsk_user_timeout &&  
+</span><span class='line'>&#9;&#9;&#9;icsk-&gt;icsk_probes_out &gt; 0) || (icsk-&gt;icsk_user_timeout == 0 &&  
+</span><span class='line'>&#9;&#9;&#9;icsk-&gt;icsk_probes_out &gt;= keepalive_probes(tp))) {  
+</span><span class='line'>&#9;&#9;&#9;tcp_send_active_reset(sk, GFP_ATOMIC); /* 构造一个RST包并发送 */  
+</span><span class='line'>&#9;&#9;&#9;tcp_write_err(sk); /* 报告错误，关闭连接 */  
+</span><span class='line'>&#9;&#9;&#9;goto out;  
+</span><span class='line'>&#9;&#9;}  
+</span><span class='line'>  
+</span><span class='line'>&#9;&#9;/* 如果还不到关闭连接的时候，就继续发送保活探测包 */  
+</span><span class='line'>&#9;&#9;if (tcp_write_wakeup(sk) &lt;= 0) {  
+</span><span class='line'>&#9;&#9;&#9;icsk-&gt;icsk_probes_out++; /* 已发送的保活探测包个数 */  
+</span><span class='line'>&#9;&#9;&#9;elapsed = keepalive_intvl_when(tp); /* 下次超时的时间，默认为75s */  
+</span><span class='line'>&#9;&#9;} else {  
+</span><span class='line'>&#9;&#9;&#9;/* If keepalive was lost due to local congestion, try harder. */  
+</span><span class='line'>&#9;&#9;&#9;elapsd = TCP_RESOURCE_PROBE_INTERVAL; /* 默认为500ms，会使超时更加频繁 */  
+</span><span class='line'>&#9;&#9;}  
+</span><span class='line'>  
+</span><span class='line'>&#9;} else {  
+</span><span class='line'>&#9;&#9;/* 如果连接的空闲时间，还没有超过设定值，则接着等待 */  
+</span><span class='line'>&#9;&#9;elapsed = keepalive_time_when(tp) - elapsed;  
+</span><span class='line'>&#9;}   
+</span><span class='line'>  
+</span><span class='line'>&#9;sk_mem_reclaim(sk);  
+</span><span class='line'>  
+</span><span class='line'>resched: /* 重设保活定时器 */  
+</span><span class='line'>&#9;inet_csk_reset_keepalive_timer(sk, elapsed);  
+</span><span class='line'>&#9;goto out;   
+</span><span class='line'>  
+</span><span class='line'>out:  
+</span><span class='line'>&#9;bh_unlock_sock(sk);  
+</span><span class='line'>&#9;sock_put(sk);  
+</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>Q：TCP是如何发送Keepalive探测报文的？</p>
+
+<p>A：分两种情况。</p>
+
+<ol>
+<li><p>有新的数据段可供发送，且对端接收窗口还没被塞满。发送新的数据段，来作为探测包。</p></li>
+<li><p>没有新的数据段可供发送，或者对端的接收窗口满了。发送序号为snd_una - 1、长度为0的ACK包作为探测包。</p></li>
+</ol>
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* Initiate keepalive or window probe from timer. */  
+</span><span class='line'>  
+</span><span class='line'>int tcp_write_wakeup (struct sock *sk)  
+</span><span class='line'>{  
+</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);  
+</span><span class='line'>&#9;struct sk_buff *skb;  
+</span><span class='line'>  
+</span><span class='line'>&#9;if (sk-&gt;sk_state == TCP_CLOSE)  
+</span><span class='line'>&#9;&#9;return -1;  
+</span><span class='line'>  
+</span><span class='line'>&#9;/* 如果还有未发送过的数据包，并且对端的接收窗口还没有满 */  
+</span><span class='line'>&#9;if ((skb = tcp_send_head(sk)) != NULL && before(TCP_SKB_CB(skb)-&gt;seq, tcp_wnd_end(tp))) {  
+</span><span class='line'>&#9;&#9;int err;  
+</span><span class='line'>&#9;&#9;unsigned int mss = tcp_current_mss(sk); /* 当前的MSS */  
+</span><span class='line'>&#9;&#9;/* 对端接收窗口所允许的最大报文长度 */  
+</span><span class='line'>&#9;&#9;unsigned int seg_size = tcp_wnd_end(tp) - TCP_SKB_CB(skb)-&gt;seq;  
+</span><span class='line'>  
+</span><span class='line'>&#9;&#9;/* pushed_seq记录发送出去的最后一个字节的序号 */  
+</span><span class='line'>&#9;&#9;if (before(tp-&gt;pushed_seq, TCP_SKB_CB(skb)-&gt;end_seq))  
+</span><span class='line'>&#9;&#9;&#9;tp-&gt;pushed_seq = TCP_SKB_CB(skb)-&gt;end_seq;  
+</span><span class='line'>  
+</span><span class='line'>&#9;&#9;/* 如果对端接收窗口小于此数据段的长度，或者此数据段的长度超过了MSS，那么就要进行分段 */  
+</span><span class='line'>&#9;&#9;if (seg_size &lt; TCP_SKB_CB(skb)-&gt;end_seq - TCP_SKB_CB(skb)-&gt;seq || skb-&gt;len &gt; mss) {  
+</span><span class='line'>&#9;&#9;&#9;seg_size = min(seg_size, mss);  
+</span><span class='line'>&#9;&#9;&#9;TCP_SKB_CB(skb)-&gt;tcp_flags |= TCPHDR_PSH; /* 设置PSH标志，让对端马上把数据提交给程序 */  
+</span><span class='line'>&#9;&#9;&#9;if (tcp_fragment(sk, skb, seg_size, mss)) /* 进行分段 */  
+</span><span class='line'>&#9;&#9;&#9;&#9;return -1;  
+</span><span class='line'>&#9;&#9;} else if (! tcp_skb_pcount(skb)) /* 进行TSO分片 */  
+</span><span class='line'>&#9;&#9;&#9;tcp_set_skb_tso_segs(sk, skb, mss); /* 初始化分片相关变量 */  
+</span><span class='line'>  
+</span><span class='line'>&#9;&#9;TCP_SKB_CB(skb)-&gt;tcp_flags |= TCPHDR_PSH;  
+</span><span class='line'>&#9;&#9;TCP_SKB_CB(skb)-&gt;when = tcp_time_stamp;  
+</span><span class='line'>&#9;&#9;err = tcp_transmit_skb(sk, skb, 1, GFP_ATOMIC); /* 发送此数据段 */  
+</span><span class='line'>&#9;&#9;if (!err)  
+</span><span class='line'>&#9;&#9;&#9;tcp_event_new_data_sent(sk, skb); /* 发送了新的数据，更新相关参数 */  
+</span><span class='line'>  
+</span><span class='line'>&#9;} else { /* 如果没有新的数据段可用作探测报文发送，或者对端的接收窗口为0 */  
+</span><span class='line'>  
+</span><span class='line'>&#9;   /* 处于紧急模式时，额外发送一个序号为snd_una的ACK包，告诉对端紧急指针 */  
+</span><span class='line'>&#9;   if (between(tp-&gt;snd_up, tp-&gt;snd_una + 1, tp-&gt;snd_una + 0xFFFF))  
+</span><span class='line'>&#9;&#9;   tcp_xmit_probe_skb(sk, 1);  
+</span><span class='line'>  
+</span><span class='line'>&#9;&#9;/* 发送一个序号为snd_una -1的ACK包，长度为0，这是一个序号过时的报文。 
+</span><span class='line'>&#9;&#9; * snd_una: first byte we want an ack for，所以snd_una - 1序号的字节已经被确认过了。 
+</span><span class='line'>&#9;&#9; * 对端会响应一个ACK。 
+</span><span class='line'>&#9;&#9; */  
+</span><span class='line'>&#9;&#9;return tcp_xmit_probe_skb(sk, 0);  
+</span><span class='line'>&#9;}  
+</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>Q：当没有新的数据可以用作探测包、或者对端的接收窗口为0时，怎么办呢？</p>
+
+<p>A：发送一个序号为snd_una - 1、长度为0的ACK包，对端收到此包后会发送一个ACK响应。如此一来本端就能够知道对端是否还活着、接收窗口是否打开了。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* This routine sends a packet with an out of date sequence number. 
+</span><span class='line'> * It assumes the other end will try to ack it. 
+</span><span class='line'> *  
+</span><span class='line'> * Question: what should we make while urgent mode? 
+</span><span class='line'> * 4.4BSD forces sending single byte of data. We cannot send out of window 
+</span><span class='line'> * data, because we have SND.NXT == SND.MAX... 
+</span><span class='line'> *  
+</span><span class='line'> * Current solution: to send TWO zero-length segments in urgent mode: 
+</span><span class='line'> * one is with SEG.SEG=SND.UNA to deliver urgent pointer, another is out-of-date with 
+</span><span class='line'> * SND.UNA - 1 to probe window. 
+</span><span class='line'> */  
+</span><span class='line'>  
+</span><span class='line'>static int tcp_xmit_probe_skb (struct sock *sk, int urgent)  
+</span><span class='line'>{  
+</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);  
+</span><span class='line'>&#9;struct sk_buff *skb;  
+</span><span class='line'>  
+</span><span class='line'>&#9;/* We don't queue it, tcp_transmit_skb() sets ownership. */  
+</span><span class='line'>&#9;skb = alloc_skb(MAX_TCP_HEADER, sk_gfp_atomic(sk, GFP_ATOMIC));  
+</span><span class='line'>&#9;if (skb == NULL)  
+</span><span class='line'>&#9;&#9;return -1;  
+</span><span class='line'>  
+</span><span class='line'>&#9;/* Reserve space for headers and set control bits. */  
+</span><span class='line'>&#9;skb_reserve(skb, MAX_TCP_HEADER);  
+</span><span class='line'>  
+</span><span class='line'>&#9;/* Use a previous sequence. This should cause the other end to send an ack. 
+</span><span class='line'>&#9; * Don't queue or clone SKB, just send it. 
+</span><span class='line'>&#9; */  
+</span><span class='line'>&#9;/* 如果没有设置紧急指针，那么发送的序号为snd_una - 1，否则发送的序号为snd_una */  
+</span><span class='line'>&#9;tcp_init_nondata_skb(skb, tp-&gt;snd_una - !urgent, TCPHDR_ACK);  
+</span><span class='line'>&#9;TCP_SKB_CB(skb)-&gt;when = tcp_time_stamp;  
+</span><span class='line'>&#9;return tcp_transmit_skb(sk, skb, 0, GFP_ATOMIC); /* 发送探测包 */  
+</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>发送RST包。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* We get here when a process closes a file descriptor (either due to an explicit close() 
+</span><span class='line'> * or as a byproduct of exit()'ing) and there was unread data in the receive queue. 
+</span><span class='line'> * This behavior is recommended by RFC 2525, section 2.17. -DaveM 
+</span><span class='line'> */  
+</span><span class='line'>  
+</span><span class='line'>void tcp_send_active_reset (struct sock *sk, gfp_t priority)  
+</span><span class='line'>{  
+</span><span class='line'>&#9;struct sk_buff *skb;  
+</span><span class='line'>&#9;/* NOTE: No TCP options attached and we never retransmit this. */  
+</span><span class='line'>&#9;skb = alloc_skb(MAX_TCP_HEADER, priority);  
+</span><span class='line'>&#9;if (!skb) {  
+</span><span class='line'>&#9;&#9;NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPABORTFAILED);  
+</span><span class='line'>&#9;&#9;return;  
+</span><span class='line'>&#9;}  
+</span><span class='line'>  
+</span><span class='line'>&#9;/* Reserve space for headers and prepare control bits. */  
+</span><span class='line'>&#9;skb_reserve(skb, MAX_TCP_HEADER); /* 为报文头部预留空间 */  
+</span><span class='line'>&#9;/* 初始化不携带数据的skb的一些控制字段 */  
+</span><span class='line'>&#9;tcp_init_nondata_skb(skb, tcp_acceptable_seq(sk), TCPHDR_ACK | TCPHDR_RST);  
+</span><span class='line'>  
+</span><span class='line'>&#9;/* Send if off，发送此RST包*/  
+</span><span class='line'>&#9;TCP_SKB_CB(skb)-&gt;when = tcp_time_stamp;  
+</span><span class='line'>&#9;if (tcp_transmit_skb(sk, skb, 0, priority))  
+</span><span class='line'>&#9;&#9;NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPABORTFAILED);  
+</span><span class='line'>&#9;TCP_INC_STATS(sock_net(sk), TCP_MIB_OUTRSTS);  
+</span><span class='line'>}  
+</span><span class='line'>  
+</span><span class='line'>static inline __u32 tcp_acceptable_seq (const struct sock *sk)  
+</span><span class='line'>{  
+</span><span class='line'>&#9;const struct tcp_sock *tp = tcp_sk(sk);  
+</span><span class='line'>  
+</span><span class='line'>&#9;/* 如果snd_nxt在对端接收窗口范围内 */  
+</span><span class='line'>&#9;if (! before(tcp_wnd_end(tp), tp-&gt;snd_nxt))  
+</span><span class='line'>&#9;&#9;return tp-&gt;snd_nxt;  
+</span><span class='line'>&#9;else  
+</span><span class='line'>&#9;&#9;return tcp_wnd_end(tp);  
+</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
+
+
+<h4>TCP_USER_TIMEOUT选项</h4>
+
+<p>从上文可知同时符合以下条件时，保活定时器才会发送探测报文：</p>
+
+<ol>
+<li><p>网络中没有发送且未确认的数据包。</p></li>
+<li><p>发送队列为空。</p></li>
+<li><p>连接的空闲时间超过了设定的时间。</p></li>
+</ol>
+
+
+<p>Q：如果网络中有发送且未确认的数据包、或者发送队列不为空时，保活定时器不起作用了，岂不是不能够检测到对端的异常了？</p>
+
+<p>A：可以使用TCP_USER_TIMEOUT，显式的指定当发送数据多久后还没有得到响应，就判定连接超时，从而主动关闭连接。</p>
+
+<p>TCP_USER_TIMEOUT选项会影响到超时重传定时器和保活定时器。</p>
+
+<p>(1) 超时重传定时器</p>
+
+<p>判断连接是否超时，分3种情况：</p>
+
+<ol>
+<li><p>SYN包：当SYN包的重传次数达到上限时，判定连接超时。(默认允许重传5次，初始超时时间为1s，总共历时31s)</p></li>
+<li><p>非SYN包，用户使用TCP_USER_TIMEOUT：当数据包发出去后的等待时间超过用户设置的时间时，判定连接超时。</p></li>
+<li><p>非SYN包，用户没有使用TCP_USER_TIMEOUT：当数据包发出去后的等待时间超过以TCP_RTO_MIN为初始超时时间，重传boundary次所花费的时间后，判定连接超时。(boundary的最大值为tcp_retries2，默认值为15)</p></li>
+</ol>
+
+
+<p>(2) 保活定时器</p>
+
+<p>判断连接是否异常，分2种情况：</p>
+
+<ol>
+<li><p>用户使用了TCP_USER_TIMEOUT选项。当连接的空闲时间超过了用户设置的时间，且有发送过探测报文。</p></li>
+<li><p>用户没有使用TCP_USER_TIMEOUT选项。当发送保活探测包的次数达到了保活探测的最大次数时。</p></li>
+</ol>
+
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
       <h2 class="entry-title"><a href="/blog/2015/09/30/debug-loop_ack/">ack loop</a></h2>
     
     
@@ -3310,158 +4228,6 @@ to be an old duplicate".</p>
 
     </article>
   
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/09/23/kernel-fs-inode/">Linux的inode的理解</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-09-23T17:53:00+08:00'><span class='date'>2015-09-23</span> <span class='time'>17:53:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://www.cnblogs.com/itech/archive/2012/05/15/2502284.html">http://www.cnblogs.com/itech/archive/2012/05/15/2502284.html</a></p>
-
-<h4>一、inode是什么？</h4>
-
-<p>理解inode，要从文件储存说起。</p>
-
-<p>文件储存在硬盘上，硬盘的最小存储单位叫做"扇区"（Sector）。每个扇区储存512字节（相当于0.5KB）。</p>
-
-<p>操作系统读取硬盘的时候，不会一个个扇区地读取，这样效率太低，而是一次性连续读取多个扇区，即一次性读取一个"块"（block）。这种由多个扇区组成的"块"，是文件存取的最小单位。"块"的大小，最常见的是4KB，即连续八个 sector组成一个 block。</p>
-
-<p>文件数据都储存在"块"中，那么很显然，我们还必须找到一个地方储存文件的元信息，比如文件的创建者、文件的创建日期、文件的大小等等。这种储存文件元信息的区域就叫做inode，中文译名为"索引节点"。</p>
-
-<h4>二、inode的内容</h4>
-
-<p>inode包含文件的元信息，具体来说有以下内容：
-* 文件的字节数<br/>
-* 文件拥有者的User ID<br/>
-* 文件的Group ID<br/>
-* 文件的读、写、执行权限<br/>
-* 文件的时间戳，共有三个：ctime指inode上一次变动的时间，mtime指文件内容上一次变动的时间，atime指文件上一次打开的时间。<br/>
-* 链接数，即有多少文件名指向这个inode<br/>
-* 文件数据block的位置</p>
-
-<p>可以用stat命令，查看某个文件的inode信息：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>stat example.txt</span></code></pre></td></tr></table></div></figure>
-
-
-<p>总之，除了文件名以外的所有文件信息，都存在inode之中。至于为什么没有文件名，下文会有详细解释。</p>
-
-<h4>三、inode的大小</h4>
-
-<p>inode也会消耗硬盘空间，所以硬盘格式化的时候，操作系统自动将硬盘分成两个区域。一个是数据区，存放文件数据；另一个是inode区（inode table），存放inode所包含的信息。
-每个inode节点的大小，一般是128字节或256字节。inode节点的总数，在格式化时就给定，一般是每1KB或每2KB就设置一个inode。假定在一块1GB的硬盘中，每个inode节点的大小为128字节，每1KB就设置一个inode，那么inode table的大小就会达到128MB，占整块硬盘的12.8%。</p>
-
-<p>查看每个硬盘分区的inode总数和已经使用的数量，可以使用df命令。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>df -i</span></code></pre></td></tr></table></div></figure>
-
-
-<p>查看每个inode节点的大小，可以用如下命令：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>sudo dumpe2fs -h /dev/hda | grep "Inode size"</span></code></pre></td></tr></table></div></figure>
-
-
-<p>由于每个文件都必须有一个inode，因此有可能发生inode已经用光，但是硬盘还未存满的情况。这时，就无法在硬盘上创建新文件。</p>
-
-<h4>四、inode号码</h4>
-
-<p>每个inode都有一个号码，操作系统用inode号码来识别不同的文件。</p>
-
-<p>这里值得重复一遍，Unix/Linux系统内部不使用文件名，而使用inode号码来识别文件。对于系统来说，文件名只是inode号码便于识别的别称或者绰号。表面上，用户通过文件名，打开文件。实际上，系统内部这个过程分成三步：首先，系统找到这个文件名对应的inode号码；其次，通过inode号码，获取inode信息；最后，根据inode信息，找到文件数据所在的block，读出数据。</p>
-
-<p>使用ls -i命令，可以看到文件名对应的inode号码：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>ls -i example.txt</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>五、目录文件</h4>
-
-<p>Unix/Linux系统中，目录（directory）也是一种文件。打开目录，实际上就是打开目录文件。</p>
-
-<p>目录文件的结构非常简单，就是一系列目录项（dirent）的列表。每个目录项，由两部分组成：所包含文件的文件名，以及该文件名对应的inode号码。</p>
-
-<p>ls命令只列出目录文件中的所有文件名：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>ls /etc</span></code></pre></td></tr></table></div></figure>
-
-
-<p>ls -i命令列出整个目录文件，即文件名和inode号码：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>ls -i /etc</span></code></pre></td></tr></table></div></figure>
-
-
-<p>如果要查看文件的详细信息，就必须根据inode号码，访问inode节点，读取信息。ls -l命令列出文件的详细信息。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>ls -l /etc</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>六、硬链接</h4>
-
-<p>一般情况下，文件名和inode号码是"一一对应"关系，每个inode号码对应一个文件名。但是，Unix/Linux系统允许，多个文件名指向同一个inode号码。这意味着，可以用不同的文件名访问同样的内容；对文件内容进行修改，会影响到所有文件名；但是，删除一个文件名，不影响另一个文件名的访问。这种情况就被称为"硬链接"（hard link）。</p>
-
-<p>ln命令可以创建硬链接：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>ln 源文件 目标文件</span></code></pre></td></tr></table></div></figure>
-
-
-<p>运行上面这条命令以后，源文件与目标文件的inode号码相同，都指向同一个inode。inode信息中有一项叫做"链接数"，记录指向该inode的文件名总数，这时就会增加1。反过来，删除一个文件名，就会使得inode节点中的"链接数"减1。当这个值减到0，表明没有文件名指向这个inode，系统就会回收这个inode号码，以及其所对应block区域。</p>
-
-<p>这里顺便说一下目录文件的"链接数"。创建目录时，默认会生成两个目录项：".&ldquo;和&rdquo;..&ldquo;。前者的inode号码就是当前目录的inode号码，等同于当前目录的"硬链接"；后者的inode号码就是当前目录的父目录的inode号码，等同于父目录的"硬链接"。所以，任何一个目录的"硬链接"总数，总是等于2加上它的子目录总数（含隐藏目录）,这里的2是父目录对其的“硬链接”和当前目录下的&rdquo;.硬链接“。</p>
-
-<h4>七、软链接</h4>
-
-<p>除了硬链接以外，还有一种特殊情况。文件A和文件B的inode号码虽然不一样，但是文件A的内容是文件B的路径。读取文件A时，系统会自动将访问者导向文件B。因此，无论打开哪一个文件，最终读取的都是文件B。这时，文件A就称为文件B的"软链接"（soft link）或者"符号链接（symbolic link）。</p>
-
-<p>这意味着，文件A依赖于文件B而存在，如果删除了文件B，打开文件A就会报错："No such file or directory"。这是软链接与硬链接最大的不同：文件A指向文件B的文件名，而不是文件B的inode号码，文件B的inode"链接数"不会因此发生变化。</p>
-
-<p>ln -s命令可以创建软链接。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>ln -s 源文文件或目录 目标文件或目录</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>八、inode的特殊作用</h4>
-
-<p>由于inode号码与文件名分离，这种机制导致了一些Unix/Linux系统特有的现象。</p>
-
-<ol>
-<li><p>有时，文件名包含特殊字符，无法正常删除。这时，直接删除inode节点，就能起到删除文件的作用。</p></li>
-<li><p>移动文件或重命名文件，只是改变文件名，不影响inode号码。</p></li>
-<li><p>打开一个文件以后，系统就以inode号码来识别这个文件，不再考虑文件名。因此，通常来说，系统无法从inode号码得知文件名。</p></li>
-</ol>
-
-
-<p>第3点使得软件更新变得简单，可以在不关闭软件的情况下进行更新，不需要重启。因为系统通过inode号码，识别运行中的文件，不通过文件名。更新的时候，新版文件以同样的文件名，生成一个新的inode，不会影响到运行中的文件。等到下一次运行这个软件的时候，文件名就自动指向新版文件，旧版文件的inode则被回收。</p>
-</div>
-  
-  
-
-
-    </article>
-  
   <div class="pagination">
     
       <a class="prev" href="/posts/41">&larr; Older</a>
@@ -3476,7 +4242,7 @@ to be an old duplicate".</p>
   
     <section>
 <h1>Categories
-<span class='right_span'>(635)</span>
+<span class='right_span'>(636)</span>
 
 </h1>
 <head>
@@ -3507,7 +4273,7 @@ if (!document.getElementById('blog~octopress')) document.getElementById('aexp_bl
 if (!document.getElementById('blog')) document.getElementById('aexp_blog').style.visibility = 'hidden';
 if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ruby').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(52)</span></li>
+<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(53)</span></li>
 <div id='language' class='catsub'><li><a href='/blog/cats/language~c/?opendiv=language'>c</a><a href='##' onmousedown=showDiv('language~c') id='aexp_language~c'><span class='exp_style' id='exp_language~c'>[+]</span></a><span class='right_span'>30</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~c')) document.getElementById('aexp_language~c').style.visibility = 'hidden';
@@ -3520,7 +4286,7 @@ if (!document.getElementById('language~java')) document.getElementById('aexp_lan
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~jsp')) document.getElementById('aexp_language~jsp').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/language~php/?opendiv=language'>php</a><a href='##' onmousedown=showDiv('language~php') id='aexp_language~php'><span class='exp_style' id='exp_language~php'>[+]</span></a><span class='right_span'>1</span></li>
+<li><a href='/blog/cats/language~php/?opendiv=language'>php</a><a href='##' onmousedown=showDiv('language~php') id='aexp_language~php'><span class='exp_style' id='exp_language~php'>[+]</span></a><span class='right_span'>2</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~php')) document.getElementById('aexp_language~php').style.visibility = 'hidden';
 </script>
@@ -3814,7 +4580,7 @@ if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algo
 
 <section>
 <h1>Date Categories
-<span class='right_span'>(635)</span>
+<span class='right_span'>(636)</span>
 
 </h1>
 <head>
@@ -3822,8 +4588,9 @@ if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algo
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2021/'>2021</a><a href='##' onmousedown=showDiv('2021')><span class='exp_style' id='exp_2021'>[+]</span></a><span class='right_span'>(1)</span></li>
-<div id='2021' class='catsub'><li><a href='/blog/cats/2021~01/?opendiv=2021'>2021-01</a><span class='right_span'>1</span></li>
+<li class='catclass'><a href='/blog/cats/2021/'>2021</a><a href='##' onmousedown=showDiv('2021')><span class='exp_style' id='exp_2021'>[+]</span></a><span class='right_span'>(2)</span></li>
+<div id='2021' class='catsub'><li><a href='/blog/cats/2021~02/?opendiv=2021'>2021-02</a><span class='right_span'>1</span></li>
+<li><a href='/blog/cats/2021~01/?opendiv=2021'>2021-01</a><span class='right_span'>1</span></li>
 </div><li class='catclass'><a href='/blog/cats/2020/'>2020</a><a href='##' onmousedown=showDiv('2020')><span class='exp_style' id='exp_2020'>[+]</span></a><span class='right_span'>(70)</span></li>
 <div id='2020' class='catsub'><li><a href='/blog/cats/2020~12/?opendiv=2020'>2020-12</a><span class='right_span'>6</span></li>
 <li><a href='/blog/cats/2020~11/?opendiv=2020'>2020-11</a><span class='right_span'>11</span></li>
@@ -3955,6 +4722,10 @@ if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algo
   <ul id="recent_posts">
     
       <li class="post">
+        <a href="/blog/2021/02/05/lang-phpexcel/">PHPExcel防止大数以科学计数法显示</a>
+      </li>
+    
+      <li class="post">
         <a href="/blog/2021/01/22/lang-php-month/">php获取月初和月尾时间</a>
       </li>
     
@@ -3968,10 +4739,6 @@ if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algo
     
       <li class="post">
         <a href="/blog/2020/12/20/lang-jsp-init/">jsp 环境初始化</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2020/12/11/command-scrot/">Linux命令行截屏</a>
       </li>
     
   </ul>

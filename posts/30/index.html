@@ -76,6 +76,217 @@ var ss360Config = {
       
   <header>
     
+      <h2 class="entry-title"><a href="/blog/2018/01/04/kernel-net-sk-lock/">sk 的锁，spin_lock_bh、lock_sock</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2018-01-04T02:20:00+08:00'><span class='date'>2018-01-04</span> <span class='time'>02:20:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><h4>一、修改sk的锁 sk_lock.slock</h4>
+
+<p>tcp协议栈对struct sock <em>sk有两把锁，第一把是sk_lock.slock，第二把则是sk_lock.owned。sk_lock.slock用于获取struct sock </em>sk对象的成员的修改权限；sk_lock.owned用于区分当前是进程上下文或是软中断上下文，为进程上下文时sk_lock.owned会被置1，中断上下文为0。</p>
+
+<p>如果是要对sk修改，首先是必须拿锁sk_lock.slock，其后是判断当前是软中断或是进程上下文，如果是进程上下文，那么一般也不能修改sk</p>
+
+<p>中断上下文可以用下面的锁，也就是下面的锁只有 spin_lock</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* BH context may only use the following locking interface. */
+</span><span class='line'>#define bh_lock_sock(__sk)      spin_lock(&((__sk)-&gt;sk_lock.slock))
+</span><span class='line'>#define bh_lock_sock_nested(__sk) \
+</span><span class='line'>&#9;&#9;&#9;&#9;spin_lock_nested(&((__sk)-&gt;sk_lock.slock), \
+</span><span class='line'>&#9;&#9;&#9;&#9;SINGLE_DEPTH_NESTING)
+</span><span class='line'>#define bh_unlock_sock(__sk)    spin_unlock(&((__sk)-&gt;sk_lock.slock))</span></code></pre></td></tr></table></div></figure>
+
+
+<p>非中断上下文可以直接用 spin_lock_bh(&amp;((sk)->sk_lock.slock))</p>
+
+<p>获得sk_lock.slock 锁后还要判断 sock_owned_by_user(sk), 如果被进程上下文占用也一般不能操作sk</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define sock_owned_by_user(sk)  ((sk)-&gt;sk_lock.owned)</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>二、进程上下文获取sk</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static inline void lock_sock(struct sock *sk)
+</span><span class='line'>{
+</span><span class='line'>&#9;lock_sock_nested(sk, 0);
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>void lock_sock_nested(struct sock *sk, int subclass)
+</span><span class='line'>{
+</span><span class='line'>&#9;might_sleep();
+</span><span class='line'>
+</span><span class='line'>&#9;// 先获取 sk_lock.slock 锁
+</span><span class='line'>&#9;spin_lock_bh(&sk-&gt;sk_lock.slock);
+</span><span class='line'>&#9;// 如果有进程占用sk，则调__lock_sock等待占用sk的进程结束
+</span><span class='line'>&#9;if (sk-&gt;sk_lock.owned)
+</span><span class='line'>&#9;&#9;__lock_sock(sk);
+</span><span class='line'>
+</span><span class='line'>&#9;// 此时占用sk的进程结束了，但前进程就可以占用sk
+</span><span class='line'>&#9;sk-&gt;sk_lock.owned = 1;
+</span><span class='line'>&#9;// 进程占用sk时不占 sk_lock.slock
+</span><span class='line'>&#9;spin_unlock(&sk-&gt;sk_lock.slock);
+</span><span class='line'>
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * The sk_lock has mutex_lock() semantics here:
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;mutex_acquire(&sk-&gt;sk_lock.dep_map, subclass, 0, _RET_IP_);
+</span><span class='line'>&#9;local_bh_enable();
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>static void __lock_sock(struct sock *sk)
+</span><span class='line'>&#9;__releases(&sk-&gt;sk_lock.slock)
+</span><span class='line'>&#9;__acquires(&sk-&gt;sk_lock.slock)
+</span><span class='line'>{
+</span><span class='line'>&#9;DEFINE_WAIT(wait);
+</span><span class='line'>
+</span><span class='line'>&#9;for (;;) {
+</span><span class='line'>&#9;&#9;prepare_to_wait_exclusive(&sk-&gt;sk_lock.wq, &wait,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;TASK_UNINTERRUPTIBLE);
+</span><span class='line'>&#9;&#9;spin_unlock_bh(&sk-&gt;sk_lock.slock);
+</span><span class='line'>&#9;&#9;schedule();
+</span><span class='line'>&#9;&#9;spin_lock_bh(&sk-&gt;sk_lock.slock);
+</span><span class='line'>&#9;&#9;if (!sock_owned_by_user(sk))
+</span><span class='line'>&#9;&#9;&#9;break;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;finish_wait(&sk-&gt;sk_lock.wq, &wait);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void release_sock(struct sock *sk)
+</span><span class='line'>{
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * The sk_lock has mutex_unlock() semantics:
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;mutex_release(&sk-&gt;sk_lock.dep_map, 1, _RET_IP_);
+</span><span class='line'>
+</span><span class='line'>&#9;spin_lock_bh(&sk-&gt;sk_lock.slock);
+</span><span class='line'>&#9;if (sk-&gt;sk_backlog.tail)
+</span><span class='line'>&#9;&#9;__release_sock(sk); // 处理backlog的包
+</span><span class='line'>
+</span><span class='line'>&#9;/* Warning : release_cb() might need to release sk ownership,
+</span><span class='line'>&#9; * ie call sock_release_ownership(sk) before us.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;if (sk-&gt;sk_prot-&gt;release_cb)
+</span><span class='line'>&#9;&#9;sk-&gt;sk_prot-&gt;release_cb(sk);
+</span><span class='line'>
+</span><span class='line'>&#9;// 获取sk_lock.slock，然后清除 sk_lock.owned
+</span><span class='line'>&#9;sock_release_ownership(sk);
+</span><span class='line'>&#9;if (waitqueue_active(&sk-&gt;sk_lock.wq))
+</span><span class='line'>&#9;&#9;wake_up(&sk-&gt;sk_lock.wq);
+</span><span class='line'>&#9;spin_unlock_bh(&sk-&gt;sk_lock.slock);
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>static inline void sock_release_ownership(struct sock *sk)
+</span><span class='line'>{
+</span><span class='line'>&#9;sk-&gt;sk_lock.owned = 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
       <h2 class="entry-title"><a href="/blog/2018/01/04/kernel-net-df/">本地IP包分片--local_df,ignore_df</a></h2>
     
     
@@ -944,408 +1155,6 @@ NOHZ_MODE_LOWRES
 
     </article>
   
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2017/07/23/kernel-clock-7/">Linux时间子系统之七：定时器的应用--msleep()，hrtimer_nanosleep()</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2017-07-23T18:06:00+08:00'><span class='date'>2017-07-23</span> <span class='time'>18:06:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://blog.csdn.net/DroidPhone/article/details/8104433">http://blog.csdn.net/DroidPhone/article/details/8104433</a></p>
-
-<p>我们已经在前面几章介绍了低分辨率定时器和高精度定时器的实现原理，内核为了方便其它子系统，在时间子系统中提供了一些用于延时或调度的API，例如msleep，hrtimer_nanosleep等等，这些API基于低分辨率定时器或高精度定时器来实现，本章的内容就是讨论这些方便、好用的API是如何利用定时器系统来完成所需的功能的。</p>
-
-<h4>1. msleep</h4>
-
-<p>msleep相信大家都用过，它可能是内核用使用最广泛的延时函数之一，它会使当前进程被调度并让出cpu一段时间，因为这一特性，它不能用于中断上下文，只能用于进程上下文中。要想在中断上下文中使用延时函数，请使用会阻塞cpu的无调度版本mdelay。msleep的函数原型如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>void msleep(unsigned int msecs)</span></code></pre></td></tr></table></div></figure>
-
-
-<p>延时的时间由参数msecs指定，单位是毫秒，事实上，msleep的实现基于低分辨率定时器，所以msleep的实际精度只能也是1/HZ级别。内核还提供了另一个比较类似的延时函数msleep_interruptible：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>unsigned long msleep_interruptible(unsigned int msecs)</span></code></pre></td></tr></table></div></figure>
-
-
-<p>延时的单位同样毫秒数，它们的区别如下：</p>
-
-<pre><code>函数                    延时单位        返回值          是否可被信号中断
-msleep                  毫秒            无              否
-msleep_interruptible    毫秒            未完成的毫秒数  是
-</code></pre>
-
-<p>最主要的区别就是msleep会保证所需的延时一定会被执行完，而msleep_interruptible则可以在延时进行到一半时被信号打断而退出延时，剩余的延时数则通过返回值返回。两个函数最终的代码都会到达schedule_timeout函数，它们的调用序列如下图所示：</p>
-
-<p><img src="/images/kernel/2017-07-23-7.png" alt="" /></p>
-
-<p>图1.1  两个延时函数的调用序列</p>
-
-<p>下面我们看看schedule_timeout函数的实现，函数首先处理两种特殊情况，一种是传入的延时jiffies数是个负数，则打印一句警告信息，然后马上返回，另一种是延时jiffies数是MAX_SCHEDULE_TIMEOUT，表明需要一直延时，直接执行调度即可：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>signed long __sched schedule_timeout(signed long timeout)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct timer_list timer;
-</span><span class='line'>&#9;unsigned long expire;
-</span><span class='line'>
-</span><span class='line'>&#9;switch (timeout)
-</span><span class='line'>&#9;{
-</span><span class='line'>&#9;case MAX_SCHEDULE_TIMEOUT:
-</span><span class='line'>&#9;&#9;schedule();
-</span><span class='line'>&#9;&#9;goto out;
-</span><span class='line'>&#9;default:
-</span><span class='line'>&#9;&#9;if (timeout &lt; 0) {
-</span><span class='line'>&#9;&#9;&#9;printk(KERN_ERR "schedule_timeout: wrong timeout "
-</span><span class='line'>&#9;&#9;&#9;&#9;"value %lx\n", timeout);
-</span><span class='line'>&#9;&#9;&#9;dump_stack();
-</span><span class='line'>&#9;&#9;&#9;current-&gt;state = TASK_RUNNING;
-</span><span class='line'>&#9;&#9;&#9;goto out;
-</span><span class='line'>&#9;&#9;}
-</span><span class='line'>&#9;}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>然后计算到期的jiffies数，并在堆栈上建立一个低分辨率定时器，把到期时间设置到该定时器中，启动定时器后，通过schedule把当前进程调度出cpu的运行队列：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>expire = timeout + jiffies;
-</span><span class='line'>
-</span><span class='line'>setup_timer_on_stack(&timer, process_timeout, (unsigned long)current);
-</span><span class='line'>__mod_timer(&timer, expire, false, TIMER_NOT_PINNED);
-</span><span class='line'>schedule();</span></code></pre></td></tr></table></div></figure>
-
-
-<p>到这个时候，进程已经被调度走，那它如何返回继续执行？我们看到定时器的到期回调函数是process_timeout，参数是当前进程的task_struct指针，看看它的实现：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static void process_timeout(unsigned long __data)
-</span><span class='line'>{
-</span><span class='line'>&#9;wake_up_process((struct task_struct *)__data);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>噢，没错，定时器一旦到期，进程会被唤醒并继续执行：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>&#9;del_singleshot_timer_sync(&timer);
-</span><span class='line'>
-</span><span class='line'>&#9;/* Remove the timer from the object tracker */
-</span><span class='line'>&#9;destroy_timer_on_stack(&timer);
-</span><span class='line'>
-</span><span class='line'>&#9;timeout = expire - jiffies;
-</span><span class='line'>
-</span><span class='line'> out:
-</span><span class='line'>&#9;return timeout &lt; 0 ? 0 : timeout;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>schedule返回后，说明要不就是定时器到期，要不就是因为其它时间导致进程被唤醒，函数要做的就是删除在堆栈上建立的定时器，返回剩余未完成的jiffies数。</p>
-
-<p>说完了关键的schedule_timeout函数，我们看看msleep如何实现：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>signed long __sched schedule_timeout_uninterruptible(signed long timeout)
-</span><span class='line'>{
-</span><span class='line'>&#9;__set_current_state(TASK_UNINTERRUPTIBLE);
-</span><span class='line'>&#9;return schedule_timeout(timeout);
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>void msleep(unsigned int msecs)
-</span><span class='line'>{
-</span><span class='line'>&#9;unsigned long timeout = msecs_to_jiffies(msecs) + 1;
-</span><span class='line'>
-</span><span class='line'>&#9;while (timeout)
-</span><span class='line'>&#9;&#9;timeout = schedule_timeout_uninterruptible(timeout);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>msleep先是把毫秒转换为jiffies数，通过一个while循环保证所有的延时被执行完毕，延时操作通过schedule_timeout_uninterruptible函数完成，它仅仅是在把进程的状态修改为TASK_UNINTERRUPTIBLE后，调用上述的schedule_timeout来完成具体的延时操作，TASK_UNINTERRUPTIBLE状态保证了msleep不会被信号唤醒，也就意味着在msleep期间，进程不能被kill掉。</p>
-
-<p>看看msleep_interruptible的实现：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>signed long __sched schedule_timeout_interruptible(signed long timeout)
-</span><span class='line'>{
-</span><span class='line'>&#9;__set_current_state(TASK_INTERRUPTIBLE);
-</span><span class='line'>&#9;return schedule_timeout(timeout);
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>unsigned long msleep_interruptible(unsigned int msecs)
-</span><span class='line'>{
-</span><span class='line'>&#9;unsigned long timeout = msecs_to_jiffies(msecs) + 1;
-</span><span class='line'>
-</span><span class='line'>&#9;while (timeout && !signal_pending(current))
-</span><span class='line'>&#9;&#9;timeout = schedule_timeout_interruptible(timeout);
-</span><span class='line'>&#9;return jiffies_to_msecs(timeout);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>msleep_interruptible通过schedule_timeout_interruptible中转，schedule_timeout_interruptible的唯一区别就是把进程的状态设置为了TASK_INTERRUPTIBLE，说明在延时期间有信号通知，while循环会马上终止，剩余的jiffies数被转换成毫秒返回。实际上，你也可以利用schedule_timeout_interruptible或schedule_timeout_uninterruptible构造自己的延时函数，同时，内核还提供了另外一个类似的函数，不用我解释，看代码就知道它的用意了：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>signed long __sched schedule_timeout_killable(signed long timeout)
-</span><span class='line'>{
-</span><span class='line'>&#9;__set_current_state(TASK_KILLABLE);
-</span><span class='line'>&#9;return schedule_timeout(timeout);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>2. hrtimer_nanosleep</h4>
-
-<p>第一节讨论的msleep函数基于时间轮定时系统，只能提供毫秒级的精度，实际上，它的精度取决于HZ的配置值，如果HZ小于1000，它甚至无法达到毫秒级的精度，要想得到更为精确的延时，我们自然想到的是要利用高精度定时器来实现。没错，linux为用户空间提供了一个api：nanosleep，它能提供纳秒级的延时精度，该用户空间函数对应的内核实现是sys_nanosleep，它的工作交由高精度定时器系统的hrtimer_nanosleep函数实现，最终的大部分工作则由do_nanosleep完成。调用过程如下图所示：</p>
-
-<p><img src="/images/kernel/2017-07-23-8.png" alt="" /></p>
-
-<p>图  2.1  nanosleep的调用过程</p>
-
-<p>与msleep的实现相类似，hrtimer_nanosleep函数首先在堆栈中创建一个高精度定时器，设置它的到期时间，然后通过do_nanosleep完成最终的延时工作，当前进程在挂起相应的延时时间后，退出do_nanosleep函数，销毁堆栈中的定时器并返回0值表示执行成功。不过do_nanosleep可能在没有达到所需延时数量时由于其它原因退出，如果出现这种情况，hrtimer_nanosleep的最后部分把剩余的延时时间记入进程的restart_block中，并返回ERESTART_RESTARTBLOCK错误代码，系统或者用户空间可以根据此返回值决定是否重新调用nanosleep以便把剩余的延时继续执行完成。下面是hrtimer_nanosleep的代码：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>long hrtimer_nanosleep(struct timespec *rqtp, struct timespec __user *rmtp,
-</span><span class='line'>&#9;&#9;&#9;   const enum hrtimer_mode mode, const clockid_t clockid)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct restart_block *restart;
-</span><span class='line'>&#9;struct hrtimer_sleeper t;
-</span><span class='line'>&#9;int ret = 0;
-</span><span class='line'>&#9;unsigned long slack;
-</span><span class='line'>
-</span><span class='line'>&#9;slack = current-&gt;timer_slack_ns;
-</span><span class='line'>&#9;if (rt_task(current))
-</span><span class='line'>&#9;&#9;slack = 0;
-</span><span class='line'>
-</span><span class='line'>&#9;hrtimer_init_on_stack(&t.timer, clockid, mode);
-</span><span class='line'>&#9;hrtimer_set_expires_range_ns(&t.timer, timespec_to_ktime(*rqtp), slack);
-</span><span class='line'>&#9;if (do_nanosleep(&t, mode))
-</span><span class='line'>&#9;&#9;goto out;
-</span><span class='line'>
-</span><span class='line'>&#9;/* Absolute timers do not update the rmtp value and restart: */
-</span><span class='line'>&#9;if (mode == HRTIMER_MODE_ABS) {
-</span><span class='line'>&#9;&#9;ret = -ERESTARTNOHAND;
-</span><span class='line'>&#9;&#9;goto out;
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;if (rmtp) {
-</span><span class='line'>&#9;&#9;ret = update_rmtp(&t.timer, rmtp);
-</span><span class='line'>&#9;&#9;if (ret &lt;= 0)
-</span><span class='line'>&#9;&#9;&#9;goto out;
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;restart = ¤t_thread_info()-&gt;restart_block;
-</span><span class='line'>&#9;restart-&gt;fn = hrtimer_nanosleep_restart;
-</span><span class='line'>&#9;restart-&gt;nanosleep.clockid = t.timer.base-&gt;clockid;
-</span><span class='line'>&#9;restart-&gt;nanosleep.rmtp = rmtp;
-</span><span class='line'>&#9;restart-&gt;nanosleep.expires = hrtimer_get_expires_tv64(&t.timer);
-</span><span class='line'>
-</span><span class='line'>&#9;ret = -ERESTART_RESTARTBLOCK;
-</span><span class='line'>out:
-</span><span class='line'>&#9;destroy_hrtimer_on_stack(&t.timer);
-</span><span class='line'>&#9;return ret;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>接着我们看看do_nanosleep的实现代码，它首先通过hrtimer_init_sleeper函数，把定时器的回调函数设置为hrtimer_wakeup，把当前进程的task_struct结构指针保存在hrtimer_sleeper结构的task字段中：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>void hrtimer_init_sleeper(struct hrtimer_sleeper *sl, struct task_struct *task)
-</span><span class='line'>{
-</span><span class='line'>&#9;sl-&gt;timer.function = hrtimer_wakeup;
-</span><span class='line'>&#9;sl-&gt;task = task;
-</span><span class='line'>}
-</span><span class='line'>EXPORT_SYMBOL_GPL(hrtimer_init_sleeper);
-</span><span class='line'>
-</span><span class='line'>static int __sched do_nanosleep(struct hrtimer_sleeper *t, enum hrtimer_mode mode)
-</span><span class='line'>{
-</span><span class='line'>&#9;hrtimer_init_sleeper(t, current);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>然后，通过一个do/while循环内：启动定时器，挂起当前进程，等待定时器或其它事件唤醒进程。这里的循环体实现比较怪异，它使用hrtimer_active函数间接地判断定时器是否到期，如果hrtimer_active返回false，说明定时器已经过期，然后把hrtimer_sleeper结构的task字段设置为NULL，从而导致循环体的结束，另一个结束条件是当前进程收到了信号事件，所以，当因为是定时器到期而退出时，do_nanosleep返回true，否则返回false，上述的hrtimer_nanosleep正是利用了这一特性来决定它的返回值。以下是do_nanosleep循环体的代码：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>&#9;do {
-</span><span class='line'>&#9;&#9;set_current_state(TASK_INTERRUPTIBLE);
-</span><span class='line'>&#9;&#9;hrtimer_start_expires(&t-&gt;timer, mode);
-</span><span class='line'>&#9;&#9;if (!hrtimer_active(&t-&gt;timer))
-</span><span class='line'>&#9;&#9;&#9;t-&gt;task = NULL;
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;if (likely(t-&gt;task))
-</span><span class='line'>&#9;&#9;&#9;schedule();
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;hrtimer_cancel(&t-&gt;timer);
-</span><span class='line'>&#9;&#9;mode = HRTIMER_MODE_ABS;
-</span><span class='line'>
-</span><span class='line'>&#9;} while (t-&gt;task && !signal_pending(current));
-</span><span class='line'>
-</span><span class='line'>&#9;__set_current_state(TASK_RUNNING);
-</span><span class='line'>
-</span><span class='line'>&#9;return t-&gt;task == NULL;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>除了hrtimer_nanosleep，高精度定时器系统还提供了几种用于延时/挂起进程的api：</p>
-
-<pre><code>schedule_hrtimeout    使得当前进程休眠指定的时间，使用CLOCK_MONOTONIC计时系统；
-schedule_hrtimeout_range    使得当前进程休眠指定的时间范围，使用CLOCK_MONOTONIC计时系统；
-schedule_hrtimeout_range_clock    使得当前进程休眠指定的时间范围，可以自行指定计时系统；
-usleep_range 使得当前进程休眠指定的微妙数，使用CLOCK_MONOTONIC计时系统；
-</code></pre>
-
-<p>它们之间的调用关系如下：</p>
-
-<p><img src="/images/kernel/2017-07-23-9.png" alt="" /></p>
-
-<p>图 2.2  schedule_hrtimeout_xxxx系列函数</p>
-
-<p>最终，所有的实现都会进入到schedule_hrtimeout_range_clock函数。需要注意的是schedule_hrtimeout_xxxx系列函数在调用前，最好利用set_current_state函数先设置进程的状态，在这些函数返回前，进城的状态会再次被设置为TASK_RUNNING。如果事先把状态设置为TASK_UNINTERRUPTIBLE，它们会保证函数返回前一定已经经过了所需的延时时间，如果事先把状态设置为TASK_INTERRUPTIBLE，则有可能在尚未到期时由其它信号唤醒进程从而导致函数返回。主要实现该功能的函数schedule_hrtimeout_range_clock和前面的do_nanosleep函数实现原理基本一致。大家可以自行参考内核的代码，它们位于：kernel/hrtimer.c。</p>
-</div>
-  
-  
-
-
-    </article>
-  
   <div class="pagination">
     
       <a class="prev" href="/posts/31">&larr; Older</a>
@@ -1360,7 +1169,7 @@ usleep_range 使得当前进程休眠指定的微妙数，使用CLOCK_MONOTONIC�
   
     <section>
 <h1>Categories
-<span class='right_span'>(635)</span>
+<span class='right_span'>(636)</span>
 
 </h1>
 <head>
@@ -1391,7 +1200,7 @@ if (!document.getElementById('blog~octopress')) document.getElementById('aexp_bl
 if (!document.getElementById('blog')) document.getElementById('aexp_blog').style.visibility = 'hidden';
 if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ruby').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(52)</span></li>
+<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(53)</span></li>
 <div id='language' class='catsub'><li><a href='/blog/cats/language~c/?opendiv=language'>c</a><a href='##' onmousedown=showDiv('language~c') id='aexp_language~c'><span class='exp_style' id='exp_language~c'>[+]</span></a><span class='right_span'>30</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~c')) document.getElementById('aexp_language~c').style.visibility = 'hidden';
@@ -1404,7 +1213,7 @@ if (!document.getElementById('language~java')) document.getElementById('aexp_lan
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~jsp')) document.getElementById('aexp_language~jsp').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/language~php/?opendiv=language'>php</a><a href='##' onmousedown=showDiv('language~php') id='aexp_language~php'><span class='exp_style' id='exp_language~php'>[+]</span></a><span class='right_span'>1</span></li>
+<li><a href='/blog/cats/language~php/?opendiv=language'>php</a><a href='##' onmousedown=showDiv('language~php') id='aexp_language~php'><span class='exp_style' id='exp_language~php'>[+]</span></a><span class='right_span'>2</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~php')) document.getElementById('aexp_language~php').style.visibility = 'hidden';
 </script>
@@ -1698,7 +1507,7 @@ if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algo
 
 <section>
 <h1>Date Categories
-<span class='right_span'>(635)</span>
+<span class='right_span'>(636)</span>
 
 </h1>
 <head>
@@ -1706,8 +1515,9 @@ if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algo
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2021/'>2021</a><a href='##' onmousedown=showDiv('2021')><span class='exp_style' id='exp_2021'>[+]</span></a><span class='right_span'>(1)</span></li>
-<div id='2021' class='catsub'><li><a href='/blog/cats/2021~01/?opendiv=2021'>2021-01</a><span class='right_span'>1</span></li>
+<li class='catclass'><a href='/blog/cats/2021/'>2021</a><a href='##' onmousedown=showDiv('2021')><span class='exp_style' id='exp_2021'>[+]</span></a><span class='right_span'>(2)</span></li>
+<div id='2021' class='catsub'><li><a href='/blog/cats/2021~02/?opendiv=2021'>2021-02</a><span class='right_span'>1</span></li>
+<li><a href='/blog/cats/2021~01/?opendiv=2021'>2021-01</a><span class='right_span'>1</span></li>
 </div><li class='catclass'><a href='/blog/cats/2020/'>2020</a><a href='##' onmousedown=showDiv('2020')><span class='exp_style' id='exp_2020'>[+]</span></a><span class='right_span'>(70)</span></li>
 <div id='2020' class='catsub'><li><a href='/blog/cats/2020~12/?opendiv=2020'>2020-12</a><span class='right_span'>6</span></li>
 <li><a href='/blog/cats/2020~11/?opendiv=2020'>2020-11</a><span class='right_span'>11</span></li>
@@ -1839,6 +1649,10 @@ if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algo
   <ul id="recent_posts">
     
       <li class="post">
+        <a href="/blog/2021/02/05/lang-phpexcel/">PHPExcel防止大数以科学计数法显示</a>
+      </li>
+    
+      <li class="post">
         <a href="/blog/2021/01/22/lang-php-month/">php获取月初和月尾时间</a>
       </li>
     
@@ -1852,10 +1666,6 @@ if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algo
     
       <li class="post">
         <a href="/blog/2020/12/20/lang-jsp-init/">jsp 环境初始化</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2020/12/11/command-scrot/">Linux命令行截屏</a>
       </li>
     
   </ul>
