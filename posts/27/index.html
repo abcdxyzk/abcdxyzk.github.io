@@ -76,6 +76,709 @@ var ss360Config = {
       
   <header>
     
+      <h2 class="entry-title"><a href="/blog/2018/03/12/kernel-crypto-sample/">Linux内核的加密函数</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2018-03-12T02:45:00+08:00'><span class='date'>2018-03-12</span> <span class='time'>02:45:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://bbs.chinaunix.net/thread-1984676-1-1.html">http://bbs.chinaunix.net/thread-1984676-1-1.html</a></p>
+
+<p>  Linux内核支持很多加密算法，包括对称加密算法，如AES；摘要算法，如sha1,md5；压缩算法，如deflate。不过内核好像不支持非对称加密算法。这些算法作为加密函数框架的最底层，提供加密和解密的实际操作。这些函数可以在内核crypto文件夹下，相应的文件中找到。不过内核模块不能直接调用这些函数，因为它们并没有export。内核提供一个统一的框架，来管理这些算法。加密算法通过crypto_register_alg()和crypto_unregister_alg()注册。</p>
+
+<p>内核将加密算法分为三类，1）cipher，2）compress，3）digest。加密函数框架中有相应的API封装，提供给模块调用。</p>
+
+<p>  对于使用这些加密函数，首先通过crypto_alloc_tfm()来分配一个加密函数对象的实例。初始化这些实例，然后就可以通过框架提供的API对数据进行加密和解密。完成以后，必须通过crypto_free_tfm()撤销实例。</p>
+
+<p>下面是几个代码，或许能够够对内核的加密框架有更直观的了解：</p>
+
+<h4>1 digest算法（sha1）</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;linux/kernel.h&gt;
+</span><span class='line'>#include &lt;linux/module.h&gt;
+</span><span class='line'>#include &lt;linux/crypto.h&gt;
+</span><span class='line'>#include &lt;linux/scatterlist.h&gt;
+</span><span class='line'>#include &lt;linux/gfp.h&gt;
+</span><span class='line'>#include &lt;linux/err.h&gt;
+</span><span class='line'>#include &lt;linux/syscalls.h&gt;
+</span><span class='line'>#include &lt;linux/slab.h&gt;
+</span><span class='line'>
+</span><span class='line'>struct crypto_tfm *tfm;
+</span><span class='line'>struct scatterlist sg[1];
+</span><span class='line'>char * code1 = "2ew34123132513451345";
+</span><span class='line'>char * code2 = "234123132513451345";
+</span><span class='line'>
+</span><span class='line'>char *do_digest(char * code) {
+</span><span class='line'>&#9;char *result;
+</span><span class='line'>&#9;int code_len = strlen(code);
+</span><span class='line'>
+</span><span class='line'>&#9;tfm = crypto_alloc_tfm("sha1",0);
+</span><span class='line'>&#9;if(IS_ERR(tfm))
+</span><span class='line'>&#9;&#9;return 0;
+</span><span class='line'>&#9;sg_init_one(sg,code,code_len);
+</span><span class='line'>
+</span><span class='line'>&#9;crypto_digest_init(tfm);
+</span><span class='line'>&#9;crypto_digest_update(tfm,sg,1);
+</span><span class='line'>&#9;result = (char *)kmalloc(sizeof(char)*50,GFP_KERNEL);
+</span><span class='line'>&#9;if(result == NULL) {
+</span><span class='line'>&#9;&#9;crypto_free_tfm(tfm);
+</span><span class='line'>&#9;&#9;return 0;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;memset(result,0,sizeof(char)*50);
+</span><span class='line'>&#9;crypto_digest_final(tfm,result);
+</span><span class='line'>&#9;crypto_free_tfm(tfm);
+</span><span class='line'>&#9;return result;
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>static int __init test_init(void)
+</span><span class='line'>{
+</span><span class='line'>&#9;char *result1,*result2;
+</span><span class='line'>&#9;result1 = do_digest(code1);
+</span><span class='line'>&#9;if(!result1)
+</span><span class='line'>&#9;&#9;goto failed2;
+</span><span class='line'>&#9;result2 = do_digest(code2);
+</span><span class='line'>&#9;if(!result2)
+</span><span class='line'>&#9;&#9;goto failed1;
+</span><span class='line'>
+</span><span class='line'>&#9;if(memcmp(result1,result2,50) != 0)
+</span><span class='line'>&#9;&#9;printk("&lt;1&gt;code1 != code2\n");
+</span><span class='line'>&#9;else
+</span><span class='line'>&#9;&#9;printk("&lt;1&gt;code1 == code2\n");
+</span><span class='line'>&#9;kfree(result2);
+</span><span class='line'>failed1:
+</span><span class='line'>&#9;kfree(result1);
+</span><span class='line'>failed2:
+</span><span class='line'>&#9;return 0;
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>static void __exit test_exit(void)
+</span><span class='line'>{
+</span><span class='line'>
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>module_init(test_init);
+</span><span class='line'>module_exit(test_exit);
+</span><span class='line'>
+</span><span class='line'>MODULE_LICENSE("GPL");</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>2 compress算法（deflate）</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;linux/module.h&gt;
+</span><span class='line'>#include &lt;linux/kernel.h&gt;
+</span><span class='line'>#include &lt;linux/crypto.h&gt;
+</span><span class='line'>#include &lt;linux/scatterlist.h&gt;
+</span><span class='line'>#include &lt;linux/gfp.h&gt;
+</span><span class='line'>#include &lt;linux/err.h&gt;
+</span><span class='line'>#include &lt;linux/syscalls.h&gt;
+</span><span class='line'>#include &lt;linux/slab.h&gt;
+</span><span class='line'>
+</span><span class='line'>struct crypto_tfm *tfm;
+</span><span class='line'>char * code = "Hello everyone, I'm richardhesidu from chinaunix.net !";
+</span><span class='line'>
+</span><span class='line'>
+</span><span class='line'>static inline void hexdump(unsigned char *buf,unsigned int len) {
+</span><span class='line'>&#9;while(len--)
+</span><span class='line'>&#9;&#9;printk("0x%02x,",*buf++);
+</span><span class='line'>&#9;printk("\n");
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>static int __init test_init(void) {
+</span><span class='line'>&#9;int ret,result_len,temp_len;
+</span><span class='line'>&#9;char result[512];
+</span><span class='line'>&#9;char temp[512];
+</span><span class='line'>
+</span><span class='line'>&#9;printk("&lt;1&gt;%s\n",code); 
+</span><span class='line'> 
+</span><span class='line'>&#9;/* Allocate transform for deflate */
+</span><span class='line'>&#9;&#9;&#9;
+</span><span class='line'>&#9;tfm = crypto_alloc_tfm("deflate",0);
+</span><span class='line'>&#9;if(IS_ERR(tfm)) {
+</span><span class='line'>&#9;&#9;printk("&lt;1&gt;failed to load transform for deflate !\n");
+</span><span class='line'>&#9;&#9;return 0;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;memset(result,0,sizeof(result));
+</span><span class='line'>
+</span><span class='line'>&#9;temp_len = 512;
+</span><span class='line'>&#9;ret = crypto_comp_compress(tfm,code,strlen(code),temp,&temp_len);
+</span><span class='line'>&#9;if(ret) {
+</span><span class='line'>&#9;&#9;printk("&lt;1&gt;failed to compress !\n");
+</span><span class='line'>&#9;&#9;return 0;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;hexdump(temp,strlen(temp));
+</span><span class='line'>
+</span><span class='line'>&#9;memset(result,0,sizeof(result));
+</span><span class='line'>
+</span><span class='line'>&#9;result_len = 512;
+</span><span class='line'>&#9;ret = crypto_comp_decompress(tfm,temp,strlen(temp),result,&result_len);
+</span><span class='line'>&#9;if(ret) {
+</span><span class='line'>&#9;&#9;printk("&lt;1&gt;failed to decompress !\n");
+</span><span class='line'>&#9;&#9;return 0;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;printk("&lt;1&gt;%s\n",result);
+</span><span class='line'>
+</span><span class='line'>&#9;if(memcmp(code,result,strlen(code)) != 0)
+</span><span class='line'>&#9;&#9;printk("&lt;1&gt;decompressed was not successful\n");
+</span><span class='line'>&#9;else
+</span><span class='line'>&#9;&#9;printk("&lt;1&gt;decompressed was successful\n");
+</span><span class='line'>
+</span><span class='line'>&#9;crypto_free_tfm(tfm);
+</span><span class='line'>&#9;return 0;
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>static void __exit test_exit(void)
+</span><span class='line'>{
+</span><span class='line'>
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>module_init(test_init);
+</span><span class='line'>module_exit(test_exit);
+</span><span class='line'>
+</span><span class='line'>MODULE_LICENSE("GPL");</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>3 cipher算法（aes）</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+<span class='line-number'>82</span>
+<span class='line-number'>83</span>
+<span class='line-number'>84</span>
+<span class='line-number'>85</span>
+<span class='line-number'>86</span>
+<span class='line-number'>87</span>
+<span class='line-number'>88</span>
+<span class='line-number'>89</span>
+<span class='line-number'>90</span>
+<span class='line-number'>91</span>
+<span class='line-number'>92</span>
+<span class='line-number'>93</span>
+<span class='line-number'>94</span>
+<span class='line-number'>95</span>
+<span class='line-number'>96</span>
+<span class='line-number'>97</span>
+<span class='line-number'>98</span>
+<span class='line-number'>99</span>
+<span class='line-number'>100</span>
+<span class='line-number'>101</span>
+<span class='line-number'>102</span>
+<span class='line-number'>103</span>
+<span class='line-number'>104</span>
+<span class='line-number'>105</span>
+<span class='line-number'>106</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;linux/module.h&gt;
+</span><span class='line'>#include &lt;linux/kernel.h&gt;
+</span><span class='line'>#include &lt;linux/crypto.h&gt;
+</span><span class='line'>#include &lt;linux/scatterlist.h&gt;
+</span><span class='line'>#include &lt;linux/gfp.h&gt;
+</span><span class='line'>#include &lt;linux/err.h&gt;
+</span><span class='line'>#include &lt;linux/syscalls.h&gt;
+</span><span class='line'>#include &lt;linux/slab.h&gt;
+</span><span class='line'>#include &lt;linux/highmem.h&gt;
+</span><span class='line'>
+</span><span class='line'>struct crypto_tfm *tfm;
+</span><span class='line'>#if 1
+</span><span class='line'>char *code = "Hello everyone,I'm Richardhesidu"
+</span><span class='line'>&#9;&#9;"Hello everyone,I'm Richardhesidu"
+</span><span class='line'>&#9;&#9;"Hello everyone,I'm Richardhesidu";
+</span><span class='line'>
+</span><span class='line'>char *key = "00112233445566778899aabbccddeeff";
+</span><span class='line'>#endif
+</span><span class='line'>
+</span><span class='line'>#if 0
+</span><span class='line'>char code[] = {0x00,0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88,0x99,0xaa,
+</span><span class='line'>&#9;&#9;0xbb,0xcc,0xdd,0xee,0xff};
+</span><span class='line'>char key[] = {0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0a,
+</span><span class='line'>&#9;&#9;0x0b,0x0c,0x0d,0x0e,0x0f};
+</span><span class='line'>#endif
+</span><span class='line'>
+</span><span class='line'>static inline void hexdump(unsigned char *buf,unsigned int len) {
+</span><span class='line'>&#9;while(len--)
+</span><span class='line'>&#9;&#9;printk("%02x",*buf++);
+</span><span class='line'>&#9;printk("\n");
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>static int __init test_init(void) {
+</span><span class='line'>&#9;int ret,templen,keylen,codelen;
+</span><span class='line'>&#9;struct scatterlist sg[1];
+</span><span class='line'>&#9;char *result;
+</span><span class='line'>&#9;char *temp;
+</span><span class='line'>
+</span><span class='line'>&#9;keylen = 16;
+</span><span class='line'>&#9;codelen = strlen(code)/2;
+</span><span class='line'>#if 0
+</span><span class='line'>&#9;printk("&lt;1&gt;%s, codelen=%d\n",code,strlen(code));
+</span><span class='line'>&#9;printk("&lt;1&gt;%s, keylen=%d\n",key,strlen(key)); 
+</span><span class='line'>#endif 
+</span><span class='line'>&#9;/* Allocate transform for AES ECB mode */
+</span><span class='line'>&#9;&#9;&#9;
+</span><span class='line'>&#9;tfm = crypto_alloc_tfm("aes",CRYPTO_TFM_MODE_ECB);
+</span><span class='line'>&#9;if(IS_ERR(tfm)) {
+</span><span class='line'>&#9;&#9;printk("&lt;1&gt;failed to load transform for aes ECB mode !\n");
+</span><span class='line'>&#9;&#9;return 0;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;ret = crypto_cipher_setkey(tfm,key,keylen);
+</span><span class='line'>&#9;if(ret) {
+</span><span class='line'>&#9;&#9;printk("&lt;1&gt;failed to setkey \n");
+</span><span class='line'>&#9;&#9;goto failed1;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;sg_init_one(sg,code,codelen);
+</span><span class='line'>&#9;&#9;
+</span><span class='line'>&#9;/* start encrypt */
+</span><span class='line'>
+</span><span class='line'>&#9;ret = crypto_cipher_encrypt(tfm,sg,sg,codelen);
+</span><span class='line'>&#9;if(ret) {
+</span><span class='line'>&#9;&#9;printk("&lt;1&gt;encrypt failed \n");
+</span><span class='line'>&#9;&#9;goto failed1;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;temp = kmap(sg[0].page) + sg[0].offset;
+</span><span class='line'>
+</span><span class='line'>&#9;hexdump(temp,sg[0].length);
+</span><span class='line'>
+</span><span class='line'>&#9;/* start dencrypt */
+</span><span class='line'>&#9;templen = strlen(temp)/2;
+</span><span class='line'>&#9;sg_init_one(sg,temp,templen);
+</span><span class='line'>&#9;ret = crypto_cipher_decrypt(tfm,sg,sg,templen);
+</span><span class='line'>&#9;if(ret) {
+</span><span class='line'>&#9;&#9;printk("&lt;1&gt;dencrypt failed \n");
+</span><span class='line'>&#9;&#9;goto failed1;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;result = kmap(sg[0].page) + sg[0].offset;
+</span><span class='line'>&#9;printk("&lt;1&gt;%s\n",result);
+</span><span class='line'>//    hexdump(result,sg[0].length);
+</span><span class='line'>
+</span><span class='line'>
+</span><span class='line'>#if 0
+</span><span class='line'>&#9;if(memcmp(code,result,strlen(code)) != 0)
+</span><span class='line'>&#9;&#9;printk("&lt;1&gt;dencrpt was not successful\n");
+</span><span class='line'>&#9;else
+</span><span class='line'>&#9;&#9;printk("&lt;1&gt;dencrypt was successful\n");
+</span><span class='line'>#endif
+</span><span class='line'>failed1:
+</span><span class='line'>&#9;crypto_free_tfm(tfm);
+</span><span class='line'>&#9;return 0;
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>static void __exit test_exit(void)
+</span><span class='line'>{
+</span><span class='line'>
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>module_init(test_init);
+</span><span class='line'>module_exit(test_exit);
+</span><span class='line'>
+</span><span class='line'>MODULE_LICENSE("GPL");</span></code></pre></td></tr></table></div></figure>
+
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2018/03/03/kernel-alsa-4/">截获alsa-pcm音频</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2018-03-03T19:25:00+08:00'><span class='date'>2018-03-03</span> <span class='time'>19:25:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://blog.csdn.net/killmice/article/details/51777205">http://blog.csdn.net/killmice/article/details/51777205</a></p>
+
+<p><a href="https://www.linuxidc.com/Linux/2014-11/109948.htm">https://www.linuxidc.com/Linux/2014-11/109948.htm</a></p>
+
+<p><a href="http://www.ituring.com.cn/article/201363">http://www.ituring.com.cn/article/201363</a></p>
+
+<h4>avconv 命令录制</h4>
+
+<p>arecord -l</p>
+
+<p>avconv -f alsa -i hw:0 output.wav</p>
+
+<hr />
+
+<h4>截获 alsa 框架中 pcm 缓冲区</h4>
+
+<p>sound/core/pcm_native.c</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>const struct file_operations snd_pcm_f_ops[2] = {
+</span><span class='line'>&#9;{
+</span><span class='line'>&#9;&#9;.owner =                THIS_MODULE,
+</span><span class='line'>&#9;&#9;.write =                snd_pcm_write,
+</span><span class='line'>&#9;&#9;.aio_write =            snd_pcm_aio_write,
+</span><span class='line'>&#9;&#9;.open =                 snd_pcm_playback_open,
+</span><span class='line'>&#9;&#9;.release =              snd_pcm_release,
+</span><span class='line'>&#9;&#9;.llseek =               no_llseek,
+</span><span class='line'>&#9;&#9;.poll =                 snd_pcm_playback_poll,
+</span><span class='line'>&#9;&#9;.unlocked_ioctl =       snd_pcm_playback_ioctl,
+</span><span class='line'>&#9;&#9;.compat_ioctl =         snd_pcm_ioctl_compat,
+</span><span class='line'>&#9;&#9;.mmap =                 snd_pcm_mmap,
+</span><span class='line'>&#9;&#9;.fasync =               snd_pcm_fasync,
+</span><span class='line'>&#9;&#9;.get_unmapped_area =    snd_pcm_get_unmapped_area,
+</span><span class='line'>&#9;},   
+</span><span class='line'>&#9;{
+</span><span class='line'>&#9;&#9;.owner =                THIS_MODULE,
+</span><span class='line'>&#9;&#9;.read =                 snd_pcm_read,
+</span><span class='line'>&#9;&#9;.aio_read =             snd_pcm_aio_read,
+</span><span class='line'>&#9;&#9;.open =                 snd_pcm_capture_open,
+</span><span class='line'>&#9;&#9;.release =              snd_pcm_release,
+</span><span class='line'>&#9;&#9;.llseek =               no_llseek,
+</span><span class='line'>&#9;&#9;.poll =                 snd_pcm_capture_poll,
+</span><span class='line'>&#9;&#9;.unlocked_ioctl =       snd_pcm_capture_ioctl,
+</span><span class='line'>&#9;&#9;.compat_ioctl =         snd_pcm_ioctl_compat,
+</span><span class='line'>&#9;&#9;.mmap =                 snd_pcm_mmap,
+</span><span class='line'>&#9;&#9;.fasync =               snd_pcm_fasync,
+</span><span class='line'>&#9;&#9;.get_unmapped_area =    snd_pcm_get_unmapped_area,
+</span><span class='line'>&#9;}
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>在进入 snd_pcm_playback_ioctl 时 cmd=SNDRV_PCM_IOCTL_HWSYNC 时 copy 出 runtime->dma_area 对应数据</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct snd_pcm_substream *substream = (struct snd_pcm_substream *)regs-&gt;si;
+</span><span class='line'>struct snd_pcm_runtime *runtime = substream-&gt;runtime;
+</span><span class='line'>struct snd_pcm_mmap_status *status = runtime-&gt;status;
+</span><span class='line'>struct snd_pcm_mmap_control *control = runtime-&gt;control;
+</span><span class='line'>
+</span><span class='line'>if (substream_now == substream) {
+</span><span class='line'>&#9;unsigned int i, bytes = runtime-&gt;dma_bytes;
+</span><span class='line'>&#9;unsigned char *ch = runtime-&gt;dma_area;
+</span><span class='line'>
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9;printk("ioctl1: size=%d hw_ptr=%d appl_ptr=%d avail_min=%d audio_tstamp=%d\n",
+</span><span class='line'>&#9;&#9;(int)runtime-&gt;dma_bytes, (int)status-&gt;hw_ptr, (int)control-&gt;appl_ptr,
+</span><span class='line'>&#9;&#9;(int)control-&gt;avail_min, (int)status-&gt;audio_tstamp.tv_sec);
+</span><span class='line'>&#9;*/
+</span><span class='line'>
+</span><span class='line'>&#9;if (status-&gt;hw_ptr &gt; hw_ptr) {
+</span><span class='line'>&#9;&#9;hw_ptr = status-&gt;hw_ptr;
+</span><span class='line'>&#9;&#9;hw_ptr_err ++; 
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;for (i = hw_ptr * 4; before(i, control-&gt;appl_ptr * 4) && len &lt; LEN; i ++, len ++)
+</span><span class='line'>&#9;&#9;dest[len] = ch[i % bytes];
+</span><span class='line'>
+</span><span class='line'>&#9;hw_ptr = control-&gt;appl_ptr;
+</span><span class='line'>}
+</span></code></pre></td></tr></table></div></figure>
+
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
       <h2 class="entry-title"><a href="/blog/2018/03/03/kernel-alsa-3/">Alsa之pcm</a></h2>
     
     
@@ -2423,1123 +3126,6 @@ ALSA-lib通过mmap机制将硬件申请的内存映射到用户空间，从而�
 
     </article>
   
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2018/03/03/kernel-wav/">wav音频文件格式</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2018-03-03T17:10:00+08:00'><span class='date'>2018-03-03</span> <span class='time'>17:10:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'># mp3 转 wav
-</span><span class='line'>ffmpeg -i source.mp3 output.wav
-</span><span class='line'>
-</span><span class='line'># wav 转 mp3
-</span><span class='line'>ffmpeg -i source.wav output.mp3
-</span><span class='line'>
-</span><span class='line'># 从视频中提取音频
-</span><span class='line'>ffmpeg -i source.mp4 -vn output.wav</span></code></pre></td></tr></table></div></figure>
-
-
-<p><a href="http://blog.csdn.net/mcgrady_tracy/article/details/52502263">http://blog.csdn.net/mcgrady_tracy/article/details/52502263</a></p>
-
-<p><a href="http://blog.csdn.net/u013286409/article/details/47414273">http://blog.csdn.net/u013286409/article/details/47414273</a></p>
-
-<p>wav是微软开发的一种音频文件格式，注意，wav文件格式是无损音频文件格式，相对于其他音频格式文件数据是没有经过压缩的，通常文件也相对比较大些。</p>
-
-<p>文件格式如图所示：</p>
-
-<p><img src="/images/kernel/2018-03-03-1.gif" alt="" /></p>
-
-<p>解析代码如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;stdio.h&gt;
-</span><span class='line'>#include &lt;stdint.h&gt;
-</span><span class='line'>#include &lt;stdlib.h&gt;
-</span><span class='line'>
-</span><span class='line'>struct WAV_Format {
-</span><span class='line'>&#9;uint32_t ChunkID; /* "RIFF" */
-</span><span class='line'>&#9;uint32_t ChunkSize;   /* 36 + Subchunk2Size */
-</span><span class='line'>&#9;uint32_t Format;  /* "WAVE" */
-</span><span class='line'>
-</span><span class='line'>&#9;/* sub-chunk "fmt" */
-</span><span class='line'>&#9;uint32_t Subchunk1ID; /* "fmt " */
-</span><span class='line'>&#9;uint32_t Subchunk1Size;   /* 16 for PCM */
-</span><span class='line'>&#9;uint16_t AudioFormat; /* PCM = 1*/
-</span><span class='line'>&#9;uint16_t NumChannels; /* Mono = 1, Stereo = 2, etc. */
-</span><span class='line'>&#9;uint32_t SampleRate;  /* 8000, 44100, etc. */
-</span><span class='line'>&#9;uint32_t ByteRate;    /* = SampleRate * NumChannels * BitsPerSample/8 */
-</span><span class='line'>&#9;uint16_t BlockAlign;  /* = NumChannels * BitsPerSample/8 */
-</span><span class='line'>&#9;uint16_t BitsPerSample;   /* 8bits, 16bits, etc. */
-</span><span class='line'>&#9;// LIST 包含歌手歌名专辑等
-</span><span class='line'>
-</span><span class='line'>&#9;/* sub-chunk "data" */
-</span><span class='line'>&#9;uint32_t Subchunk2ID;   /* "data" */
-</span><span class='line'>&#9;uint32_t Subchunk2Size; /* data size */
-</span><span class='line'>};
-</span><span class='line'>
-</span><span class='line'>int main(void)
-</span><span class='line'>{
-</span><span class='line'>&#9;FILE *fp = NULL;
-</span><span class='line'>&#9;struct WAV_Format wav;
-</span><span class='line'>
-</span><span class='line'>&#9;fp = fopen("test.wav", "rb");
-</span><span class='line'>&#9;if (!fp) {
-</span><span class='line'>&#9;&#9;printf("can't open audio file\n");
-</span><span class='line'>&#9;&#9;exit(1);
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;fread(&wav, 1, sizeof(struct WAV_Format), fp);
-</span><span class='line'>
-</span><span class='line'>&#9;printf("ChunkID \t%x\n", wav.ChunkID);
-</span><span class='line'>&#9;printf("ChunkSize \t%d\n", wav.ChunkSize);
-</span><span class='line'>&#9;printf("Format \t\t%x\n", wav.Format);
-</span><span class='line'>&#9;printf("Subchunk1ID \t%x\n", wav.Subchunk1ID);
-</span><span class='line'>&#9;printf("Subchunk1Size \t%d\n", wav.Subchunk1Size);
-</span><span class='line'>&#9;printf("AudioFormat \t%d\n", wav.AudioFormat);
-</span><span class='line'>&#9;printf("NumChannels \t%d\n", wav.NumChannels);
-</span><span class='line'>&#9;printf("SampleRate \t%d\n", wav.SampleRate);
-</span><span class='line'>&#9;printf("ByteRate \t%d\n", wav.ByteRate);
-</span><span class='line'>&#9;printf("BlockAlign \t%d\n", wav.BlockAlign);
-</span><span class='line'>&#9;printf("BitsPerSample \t%d\n", wav.BitsPerSample);
-</span><span class='line'>&#9;printf("Subchunk2ID \t%x\n", wav.Subchunk2ID);
-</span><span class='line'>&#9;printf("Subchunk2Size \t%d\n", wav.Subchunk2Size);
-</span><span class='line'>
-</span><span class='line'>&#9;fclose(fp);
-</span><span class='line'>
-</span><span class='line'>&#9;return 0;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>wav概述</h4>
-
-<p>WAV为微软公司（Microsoft)开发的一种声音文件格式，它符合RIFF(Resource Interchange File Format)文件规范，用于保存Windows平台的音频信息资源，被Windows平台及其应用程序所广泛支持，该格式也支持MSADPCM，CCITT A LAW等多种压缩运算法，支持多种音频数字，取样频率和声道，标准格式化的WAV文件和CD格式一样，也是44.1K的取样频率，16位量化数字，因此在声音文件质量和CD相差无几！ WAV打开工具是WINDOWS的媒体播放器。</p>
-
-<p>通常使用三个参数来表示声音，量化位数，取样频率和采样点振幅。量化位数分为8位，16位，24位三种，声道有单声道和立体声之分，单声道振幅数据为n<em>1矩阵点，立体声为n</em>2矩阵点，取样频率一般有11025Hz(11kHz) ，22050Hz(22kHz)和44100Hz(44kHz) 三种，不过尽管音质出色，但在压缩后的文件体积过大！相对其他音频格式而言是一个缺点，其文件大小的计算方式为：WAV格式文件所占容量（B) = （取样频率 X量化位数X 声道） X 时间 / 8 (字节= 8bit) 每一分钟WAV格式的音频文件的大小为10MB，其大小不随音量大小及清晰度的变化而变化。</p>
-
-<h4>RIFF文件</h4>
-
-<ol>
-<li><p>简介RIFF全称为资源互换文件格式（ResourcesInterchange FileFormat），RIFF文件是windows环境下大部分多媒体文件遵循的一种文件结构,RIFF文件所包含的数据类型由该文件的扩展名来标识，能以RIFF文件存储的数据包括：音频视频交错格式数据（.AVI) 波形格式数据（.WAV) 位图格式数据（.RDI) MIDI格式数据（.RMI)调色板格式（.PAL)多媒体电影（.RMN)动画光标（.ANI)其它RIFF文件（.BND)</p></li>
-<li><p>CHUNK
-chunk是组成RIFF文件的基本单元，它的基本结构如下：</p></li>
-</ol>
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct chunk {
-</span><span class='line'>&#9;u32 id;       /* 块标志 */
-</span><span class='line'>&#9;u32 size; /* 块大小 */
-</span><span class='line'>&#9;u8 dat[size]; /* 块内容 */
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
-
-
-<p>id 由4个ASCII字符组成，用以识别块中所包含的数据。如：'RIFF',&lsquo;LIST&rsquo;,&lsquo;fmt&rsquo;,&lsquo;data&rsquo;,&lsquo;WAV&rsquo;,&lsquo;AVI'等等，由于这种文件结构最初是由Microsoft和IBM为PC机所定义,RIFF文件是按照little-endian[2] 字节顺序写入的。</p>
-
-<p>size（块大小） 是存储在data域中数据的长度,id与size域的大小则不包括在该值内。</p>
-
-<p>dat（块内容） 中所包含的数据是以字(WORD)为单位排列的，如果该数据结构长度是奇数，则在最后添加一个空(NULL)字节。</p>
-
-<h4>chunk块中有且仅有两种类型块：'RIFF'和'LIST'类型可以包含其他块，而其它块仅能含有数据。</h4>
-
-<p>&lsquo;RIFF'和'LIST'类型的chunk结构如下</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct chunk {
-</span><span class='line'>&#9;u32 id;       /* 块标志 */
-</span><span class='line'>&#9;u32 size; /* 块大小 */
-</span><span class='line'>&#9;/*此时的dat = type + restdat */
-</span><span class='line'>&#9;u32 type; /* 类型 */
-</span><span class='line'>&#9;u8 restdat[size]; /* dat中除type4个字节后剩余的数据*/
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
-
-
-<p>可以看出，'RIFF'和'LIST'也是chunk,只是它的dat由两部分组成type和restdat。</p>
-
-<p>type,由4个ASCII字符组成，代表RIFF文件的类型，如'WAV',&lsquo;AVI '；或者'LIST'块的类型，如avi文件中的列表'hdrl&rsquo;,&lsquo;movi'。</p>
-
-<p>restdat,dat中除type4个字节后剩余的数据，包括块内容，包含若干chunk和'LIST'</p>
-
-<p>2.1 FOURCC 一个FOURCC(fourcharacter code）是一个占4个字节的数据，一般表示4个ASCII字符。在RIFF文件格式中，FOURCC非常普遍,structchunk 中的id成员，'LIST',&lsquo;RIFF'的type成员，起始标识等信息都是用FOURCC表示的。FOURCC一般是四个字符，如'abcd'这样的形式，也可以三个字符包含一个空格，如'abc'这样的形式。</p>
-
-<p>RIFF文件的FileData部分由若干个'LIST'和chunk组成，而'LIST'的ListData又可以由若干个'LIST'和chunk组成，即'LIST'是可以嵌套的。
-&lsquo;RIFF&rsquo;,FileType,&lsquo;LIST&rsquo;,ListType,ChunkID都是FOURCC,即使用4字节的ASIIC字符标识类型。</p>
-
-<p>FileSize,ListSize,ChunkSize为little-endian32-bit正整数，表示Type（只有'RIFF',&lsquo;LIST'chunk有Type)+Data一起的大小，注意它是little-endian表示，如：0x00123456,存储地址由低到高，在little-endian系统中的存储表示为0x56341200（字节由低位到高位存储），而在big-endian为0x00123456（字节由高位到低位存储）。32bit整数0x00123456存储地址低&mdash;&mdash;&mdash;>；高little-endian（字节由低位到高位存储）56341200big-endian（字节由高位到低位存储）00123456</p>
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2018/02/09/kernel-signature-source/">内核模块签名--详解</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2018-02-09T02:33:00+08:00'><span class='date'>2018-02-09</span> <span class='time'>02:33:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><h3>验证模块签名</h3>
-
-<p>kernel/module.c</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>SYSCALL_DEFINE3(init_module, void __user *, umod,
-</span><span class='line'>&#9;&#9;unsigned long, len, const char __user *, uargs)
-</span><span class='line'>{
-</span><span class='line'>&#9;int err; 
-</span><span class='line'>&#9;struct load_info info = { }; 
-</span><span class='line'>
-</span><span class='line'>&#9;err = may_init_module();
-</span><span class='line'>&#9;if (err)
-</span><span class='line'>&#9;&#9;return err; 
-</span><span class='line'>
-</span><span class='line'>&#9;pr_debug("init_module: umod=%p, len=%lu, uargs=%p\n",
-</span><span class='line'>&#9;       umod, len, uargs);
-</span><span class='line'>
-</span><span class='line'>&#9;err = copy_module_from_user(umod, len, &info);
-</span><span class='line'>&#9;if (err)
-</span><span class='line'>&#9;&#9;return err; 
-</span><span class='line'>
-</span><span class='line'>&#9;return load_module(&info, uargs, 0);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/* Allocate and load the module: note that size of section 0 is always
-</span><span class='line'>   zero, and we rely on this for optional sections. */
-</span><span class='line'>static int load_module(struct load_info *info, const char __user *uargs,
-</span><span class='line'>&#9;&#9;       int flags)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct module *mod;
-</span><span class='line'>&#9;struct module_ext *mod_ext;
-</span><span class='line'>&#9;long err;
-</span><span class='line'>
-</span><span class='line'>&#9;err = module_sig_check(info);
-</span><span class='line'>&#9;if (err)
-</span><span class='line'>&#9;&#9;goto free_copy;
-</span><span class='line'>&#9;...</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static int module_sig_check(struct load_info *info)
-</span><span class='line'>{
-</span><span class='line'>&#9;int err = -ENOKEY;
-</span><span class='line'>&#9;const unsigned long markerlen = sizeof(MODULE_SIG_STRING) - 1;
-</span><span class='line'>&#9;const void *mod = info-&gt;hdr;
-</span><span class='line'>
-</span><span class='line'>&#9;# 模块最后是 MODULE_SIG_STRING 字符串
-</span><span class='line'>&#9;if (info-&gt;len &gt; markerlen &&
-</span><span class='line'>&#9;    memcmp(mod + info-&gt;len - markerlen, MODULE_SIG_STRING, markerlen) == 0) {
-</span><span class='line'>&#9;&#9;/* We truncate the module to discard the signature */
-</span><span class='line'>&#9;&#9;info-&gt;len -= markerlen;
-</span><span class='line'>&#9;&#9;err = mod_verify_sig(mod, &info-&gt;len); // 检验签名
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;if (!err) {
-</span><span class='line'>&#9;&#9;info-&gt;sig_ok = true;
-</span><span class='line'>&#9;&#9;return 0;
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;/* Not having a signature is only an error if we're strict. */
-</span><span class='line'>&#9;if ((err == -ENOKEY && !sig_enforce) && (get_securelevel() &lt;= 0))
-</span><span class='line'>&#9;&#9;err = 0;
-</span><span class='line'>
-</span><span class='line'>&#9;return err;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-<span class='line-number'>58</span>
-<span class='line-number'>59</span>
-<span class='line-number'>60</span>
-<span class='line-number'>61</span>
-<span class='line-number'>62</span>
-<span class='line-number'>63</span>
-<span class='line-number'>64</span>
-<span class='line-number'>65</span>
-<span class='line-number'>66</span>
-<span class='line-number'>67</span>
-<span class='line-number'>68</span>
-<span class='line-number'>69</span>
-<span class='line-number'>70</span>
-<span class='line-number'>71</span>
-<span class='line-number'>72</span>
-<span class='line-number'>73</span>
-<span class='line-number'>74</span>
-<span class='line-number'>75</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/*
-</span><span class='line'> * Verify the signature on a module.
-</span><span class='line'> */
-</span><span class='line'>int mod_verify_sig(const void *mod, unsigned long *_modlen)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct public_key_signature *pks;
-</span><span class='line'>&#9;struct module_signature ms;
-</span><span class='line'>&#9;struct key *key;
-</span><span class='line'>&#9;const void *sig;
-</span><span class='line'>&#9;size_t modlen = *_modlen, sig_len;
-</span><span class='line'>&#9;int ret;
-</span><span class='line'>
-</span><span class='line'>&#9;pr_devel("==&gt;%s(,%zu)\n", __func__, modlen);
-</span><span class='line'>
-</span><span class='line'>&#9;if (modlen &lt;= sizeof(ms))
-</span><span class='line'>&#9;&#9;return -EBADMSG;
-</span><span class='line'>
-</span><span class='line'>&#9;# 去除 MODULE_SIG_STRING 后，文件末尾是定义个字段长度的结构
-</span><span class='line'>&#9;memcpy(&ms, mod + (modlen - sizeof(ms)), sizeof(ms));
-</span><span class='line'>&#9;modlen -= sizeof(ms);
-</span><span class='line'>
-</span><span class='line'>&#9;# 签名长度
-</span><span class='line'>&#9;sig_len = be32_to_cpu(ms.sig_len);
-</span><span class='line'>&#9;if (sig_len &gt;= modlen)
-</span><span class='line'>&#9;&#9;return -EBADMSG;
-</span><span class='line'>&#9;modlen -= sig_len;
-</span><span class='line'>
-</span><span class='line'>&#9;# 签名者长度，签名的标识ID长度，ID一般是一个20B的串
-</span><span class='line'>&#9;if ((size_t)ms.signer_len + ms.key_id_len &gt;= modlen)
-</span><span class='line'>&#9;&#9;return -EBADMSG;
-</span><span class='line'>&#9;modlen -= (size_t)ms.signer_len + ms.key_id_len;
-</span><span class='line'>
-</span><span class='line'>&#9;*_modlen = modlen;
-</span><span class='line'>&#9;sig = mod + modlen;
-</span><span class='line'>
-</span><span class='line'>&#9;/* For the moment, only support RSA and X.509 identifiers */
-</span><span class='line'>&#9;if (ms.algo != PKEY_ALGO_RSA ||
-</span><span class='line'>&#9;    ms.id_type != PKEY_ID_X509)
-</span><span class='line'>&#9;&#9;return -ENOPKG;
-</span><span class='line'>
-</span><span class='line'>&#9;if (ms.hash &gt;= PKEY_HASH__LAST ||
-</span><span class='line'>&#9;    !hash_algo_name[ms.hash])
-</span><span class='line'>&#9;&#9;return -ENOPKG;
-</span><span class='line'>
-</span><span class='line'>&#9;# 查找 .system_keyring
-</span><span class='line'>&#9;key = request_asymmetric_key(sig, ms.signer_len,
-</span><span class='line'>&#9;&#9;&#9;&#9;     sig + ms.signer_len, ms.key_id_len);
-</span><span class='line'>&#9;if (IS_ERR(key))
-</span><span class='line'>&#9;&#9;return PTR_ERR(key);
-</span><span class='line'>
-</span><span class='line'>&#9;# 摘要
-</span><span class='line'>&#9;pks = mod_make_digest(ms.hash, mod, modlen);
-</span><span class='line'>&#9;if (IS_ERR(pks)) {
-</span><span class='line'>&#9;&#9;ret = PTR_ERR(pks);
-</span><span class='line'>&#9;&#9;goto error_put_key;
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;# hash算法的额外前缀
-</span><span class='line'>&#9;ret = mod_extract_mpi_array(pks, sig + ms.signer_len + ms.key_id_len,
-</span><span class='line'>&#9;&#9;&#9;&#9;    sig_len);
-</span><span class='line'>&#9;if (ret &lt; 0)
-</span><span class='line'>&#9;&#9;goto error_free_pks;
-</span><span class='line'>
-</span><span class='line'>&#9;# 验证签名
-</span><span class='line'>&#9;ret = verify_signature(key, pks);
-</span><span class='line'>&#9;pr_devel("verify_signature() = %d\n", ret);
-</span><span class='line'>
-</span><span class='line'>error_free_pks:
-</span><span class='line'>&#9;mpi_free(pks-&gt;rsa.s);
-</span><span class='line'>&#9;kfree(pks);
-</span><span class='line'>error_put_key:
-</span><span class='line'>&#9;key_put(key);
-</span><span class='line'>&#9;pr_devel("&lt;==%s() = %d\n", __func__, ret);
-</span><span class='line'>&#9;return ret;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-<span class='line-number'>58</span>
-<span class='line-number'>59</span>
-<span class='line-number'>60</span>
-<span class='line-number'>61</span>
-<span class='line-number'>62</span>
-<span class='line-number'>63</span>
-<span class='line-number'>64</span>
-<span class='line-number'>65</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/*
-</span><span class='line'> * Request an asymmetric key.
-</span><span class='line'> */
-</span><span class='line'>static struct key *request_asymmetric_key(const char *signer, size_t signer_len,
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;  const u8 *key_id, size_t key_id_len)
-</span><span class='line'>{
-</span><span class='line'>&#9;key_ref_t key;
-</span><span class='line'>&#9;size_t i;
-</span><span class='line'>&#9;char *id, *q;
-</span><span class='line'>
-</span><span class='line'>&#9;pr_devel("==&gt;%s(,%zu,,%zu)\n", __func__, signer_len, key_id_len);
-</span><span class='line'>
-</span><span class='line'>&#9;/* Construct an identifier. */
-</span><span class='line'>&#9;id = kmalloc(signer_len + 2 + key_id_len * 2 + 1, GFP_KERNEL);
-</span><span class='line'>&#9;if (!id)
-</span><span class='line'>&#9;&#9;return ERR_PTR(-ENOKEY);
-</span><span class='line'>
-</span><span class='line'>&#9;memcpy(id, signer, signer_len);
-</span><span class='line'>
-</span><span class='line'>&#9;q = id + signer_len;
-</span><span class='line'>&#9;*q++ = ':';
-</span><span class='line'>&#9;*q++ = ' ';
-</span><span class='line'>&#9;for (i = 0; i &lt; key_id_len; i++) {
-</span><span class='line'>&#9;&#9;*q++ = hex_asc[*key_id &gt;&gt; 4];
-</span><span class='line'>&#9;&#9;*q++ = hex_asc[*key_id++ & 0x0f];
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;*q = 0;
-</span><span class='line'>
-</span><span class='line'>&#9;pr_debug("Look up: \"%s\"\n", id);
-</span><span class='line'>
-</span><span class='line'>#ifdef CONFIG_SYSTEM_BLACKLIST_KEYRING
-</span><span class='line'>&#9;key = keyring_search(make_key_ref(system_blacklist_keyring, 1),
-</span><span class='line'>&#9;&#9;&#9;&#9;   &key_type_asymmetric, id);
-</span><span class='line'>&#9;if (!IS_ERR(key)) {
-</span><span class='line'>&#9;&#9;/* module is signed with a cert in the blacklist.  reject */
-</span><span class='line'>&#9;&#9;pr_err("Module key '%s' is in blacklist\n", id);
-</span><span class='line'>&#9;&#9;key_ref_put(key);
-</span><span class='line'>&#9;&#9;kfree(id);
-</span><span class='line'>&#9;&#9;return ERR_PTR(-EKEYREJECTED);
-</span><span class='line'>&#9;}
-</span><span class='line'>#endif
-</span><span class='line'>
-</span><span class='line'>&#9;key = keyring_search(make_key_ref(system_trusted_keyring, 1),
-</span><span class='line'>&#9;&#9;&#9;     &key_type_asymmetric, id);
-</span><span class='line'>&#9;if (IS_ERR(key))
-</span><span class='line'>&#9;&#9;pr_warn("Request for unknown module key '%s' err %ld\n",
-</span><span class='line'>&#9;&#9;&#9;id, PTR_ERR(key));
-</span><span class='line'>&#9;kfree(id);
-</span><span class='line'>
-</span><span class='line'>&#9;if (IS_ERR(key)) {
-</span><span class='line'>&#9;&#9;switch (PTR_ERR(key)) {
-</span><span class='line'>&#9;&#9;&#9;/* Hide some search errors */
-</span><span class='line'>&#9;&#9;case -EACCES:
-</span><span class='line'>&#9;&#9;case -ENOTDIR:
-</span><span class='line'>&#9;&#9;case -EAGAIN:
-</span><span class='line'>&#9;&#9;&#9;return ERR_PTR(-ENOKEY);
-</span><span class='line'>&#9;&#9;default:
-</span><span class='line'>&#9;&#9;&#9;return ERR_CAST(key);
-</span><span class='line'>&#9;&#9;}
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;pr_devel("&lt;==%s() = 0 [%x]\n", __func__, key_serial(key_ref_to_ptr(key)));
-</span><span class='line'>&#9;return key_ref_to_ptr(key);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<h3>内核密匙注册</h3>
-
-<h4>kernel/system_keyring.c</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-<span class='line-number'>58</span>
-<span class='line-number'>59</span>
-<span class='line-number'>60</span>
-<span class='line-number'>61</span>
-<span class='line-number'>62</span>
-<span class='line-number'>63</span>
-<span class='line-number'>64</span>
-<span class='line-number'>65</span>
-<span class='line-number'>66</span>
-<span class='line-number'>67</span>
-<span class='line-number'>68</span>
-<span class='line-number'>69</span>
-<span class='line-number'>70</span>
-<span class='line-number'>71</span>
-<span class='line-number'>72</span>
-<span class='line-number'>73</span>
-<span class='line-number'>74</span>
-<span class='line-number'>75</span>
-<span class='line-number'>76</span>
-<span class='line-number'>77</span>
-<span class='line-number'>78</span>
-<span class='line-number'>79</span>
-<span class='line-number'>80</span>
-<span class='line-number'>81</span>
-<span class='line-number'>82</span>
-<span class='line-number'>83</span>
-<span class='line-number'>84</span>
-<span class='line-number'>85</span>
-<span class='line-number'>86</span>
-<span class='line-number'>87</span>
-<span class='line-number'>88</span>
-<span class='line-number'>89</span>
-<span class='line-number'>90</span>
-<span class='line-number'>91</span>
-<span class='line-number'>92</span>
-<span class='line-number'>93</span>
-<span class='line-number'>94</span>
-<span class='line-number'>95</span>
-<span class='line-number'>96</span>
-<span class='line-number'>97</span>
-<span class='line-number'>98</span>
-<span class='line-number'>99</span>
-<span class='line-number'>100</span>
-<span class='line-number'>101</span>
-<span class='line-number'>102</span>
-<span class='line-number'>103</span>
-<span class='line-number'>104</span>
-<span class='line-number'>105</span>
-<span class='line-number'>106</span>
-<span class='line-number'>107</span>
-<span class='line-number'>108</span>
-<span class='line-number'>109</span>
-<span class='line-number'>110</span>
-<span class='line-number'>111</span>
-<span class='line-number'>112</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;linux/export.h&gt;
-</span><span class='line'>#include &lt;linux/kernel.h&gt;
-</span><span class='line'>#include &lt;linux/sched.h&gt;
-</span><span class='line'>#include &lt;linux/cred.h&gt;
-</span><span class='line'>#include &lt;linux/err.h&gt;
-</span><span class='line'>#include &lt;keys/asymmetric-type.h&gt;
-</span><span class='line'>#include &lt;keys/system_keyring.h&gt;
-</span><span class='line'>#include "module-internal.h"
-</span><span class='line'>
-</span><span class='line'>struct key *system_trusted_keyring;
-</span><span class='line'>EXPORT_SYMBOL_GPL(system_trusted_keyring);
-</span><span class='line'>#ifdef CONFIG_SYSTEM_BLACKLIST_KEYRING
-</span><span class='line'>struct key *system_blacklist_keyring;
-</span><span class='line'>#endif
-</span><span class='line'>
-</span><span class='line'>extern __initconst const u8 system_certificate_list[];
-</span><span class='line'>extern __initconst const unsigned long system_certificate_list_size;
-</span><span class='line'>
-</span><span class='line'>/*
-</span><span class='line'> * Load the compiled-in keys
-</span><span class='line'> */
-</span><span class='line'>static __init int system_trusted_keyring_init(void)
-</span><span class='line'>{
-</span><span class='line'>&#9;pr_notice("Initialise system trusted keyring\n");
-</span><span class='line'>
-</span><span class='line'>&#9;system_trusted_keyring =
-</span><span class='line'>&#9;&#9;keyring_alloc(".system_keyring",
-</span><span class='line'>&#9;&#9;&#9;      KUIDT_INIT(0), KGIDT_INIT(0), current_cred(),
-</span><span class='line'>&#9;&#9;&#9;      ((KEY_POS_ALL & ~KEY_POS_SETATTR) |
-</span><span class='line'>&#9;&#9;&#9;      KEY_USR_VIEW | KEY_USR_READ | KEY_USR_SEARCH),
-</span><span class='line'>&#9;&#9;&#9;      KEY_ALLOC_NOT_IN_QUOTA, NULL);
-</span><span class='line'>&#9;if (IS_ERR(system_trusted_keyring))
-</span><span class='line'>&#9;&#9;panic("Can't allocate system trusted keyring\n");
-</span><span class='line'>
-</span><span class='line'>&#9;set_bit(KEY_FLAG_TRUSTED_ONLY, &system_trusted_keyring-&gt;flags);
-</span><span class='line'>
-</span><span class='line'>#ifdef CONFIG_SYSTEM_BLACKLIST_KEYRING
-</span><span class='line'>&#9;system_blacklist_keyring = keyring_alloc(".system_blacklist_keyring",
-</span><span class='line'>&#9;&#9;&#9;&#9;    KUIDT_INIT(0), KGIDT_INIT(0),
-</span><span class='line'>&#9;&#9;&#9;&#9;    current_cred(),
-</span><span class='line'>&#9;&#9;&#9;&#9;    (KEY_POS_ALL & ~KEY_POS_SETATTR) |
-</span><span class='line'>&#9;&#9;&#9;&#9;    KEY_USR_VIEW | KEY_USR_READ,
-</span><span class='line'>&#9;&#9;&#9;&#9;    KEY_ALLOC_NOT_IN_QUOTA, NULL);
-</span><span class='line'>&#9;if (IS_ERR(system_blacklist_keyring))
-</span><span class='line'>&#9;&#9;panic("Can't allocate system blacklist keyring\n");
-</span><span class='line'>
-</span><span class='line'>&#9;set_bit(KEY_FLAG_TRUSTED_ONLY, &system_blacklist_keyring-&gt;flags);
-</span><span class='line'>#endif
-</span><span class='line'>
-</span><span class='line'>&#9;return 0;
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>/*
-</span><span class='line'> * Must be initialised before we try and load the keys into the keyring.
-</span><span class='line'> */
-</span><span class='line'>device_initcall(system_trusted_keyring_init);
-</span><span class='line'>
-</span><span class='line'>/*
-</span><span class='line'> * Load the compiled-in list of X.509 certificates.
-</span><span class='line'> */
-</span><span class='line'>static __init int load_system_certificate_list(void)
-</span><span class='line'>{
-</span><span class='line'>&#9;key_ref_t key;
-</span><span class='line'>&#9;const u8 *p, *end;
-</span><span class='line'>&#9;size_t plen;
-</span><span class='line'>
-</span><span class='line'>&#9;pr_notice("Loading compiled-in X.509 certificates\n");
-</span><span class='line'>
-</span><span class='line'>&#9;p = system_certificate_list;
-</span><span class='line'>&#9;end = p + system_certificate_list_size;
-</span><span class='line'>&#9;while (p &lt; end) {
-</span><span class='line'>&#9;&#9;/* Each cert begins with an ASN.1 SEQUENCE tag and must be more
-</span><span class='line'>&#9;&#9; * than 256 bytes in size.
-</span><span class='line'>&#9;&#9; */
-</span><span class='line'>&#9;&#9;if (end - p &lt; 4)
-</span><span class='line'>&#9;&#9;&#9;goto dodgy_cert;
-</span><span class='line'>&#9;&#9;if (p[0] != 0x30 &&
-</span><span class='line'>&#9;&#9;    p[1] != 0x82)
-</span><span class='line'>&#9;&#9;&#9;goto dodgy_cert;
-</span><span class='line'>&#9;&#9;plen = (p[2] &lt;&lt; 8) | p[3];
-</span><span class='line'>&#9;&#9;plen += 4;
-</span><span class='line'>&#9;&#9;if (plen &gt; end - p)
-</span><span class='line'>&#9;&#9;&#9;goto dodgy_cert;
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;key = key_create_or_update(make_key_ref(system_trusted_keyring, 1),
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;   "asymmetric",
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;   NULL,
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;   p,
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;   plen,
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;   ((KEY_POS_ALL & ~KEY_POS_SETATTR) |
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;   KEY_USR_VIEW | KEY_USR_READ),
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;   KEY_ALLOC_NOT_IN_QUOTA |
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;   KEY_ALLOC_TRUSTED);
-</span><span class='line'>&#9;&#9;if (IS_ERR(key)) {
-</span><span class='line'>&#9;&#9;&#9;pr_err("Problem loading in-kernel X.509 certificate (%ld)\n",
-</span><span class='line'>&#9;&#9;&#9;       PTR_ERR(key));
-</span><span class='line'>&#9;&#9;} else {
-</span><span class='line'>&#9;&#9;&#9;set_bit(KEY_FLAG_BUILTIN, &key_ref_to_ptr(key)-&gt;flags);
-</span><span class='line'>&#9;&#9;&#9;pr_notice("Loaded X.509 cert '%s'\n",
-</span><span class='line'>&#9;&#9;&#9;&#9;  key_ref_to_ptr(key)-&gt;description);
-</span><span class='line'>&#9;&#9;&#9;key_ref_put(key);
-</span><span class='line'>&#9;&#9;}
-</span><span class='line'>&#9;&#9;p += plen;
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;return 0;
-</span><span class='line'>
-</span><span class='line'>dodgy_cert:
-</span><span class='line'>&#9;pr_err("Problem parsing in-kernel X.509 certificate list\n");
-</span><span class='line'>&#9;return 0;
-</span><span class='line'>}
-</span><span class='line'>late_initcall(load_system_certificate_list);</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>内核信任密匙是在编译的时候收集到的。收集 *.x509</h4>
-
-<h4>kernel/Makefile</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>obj-$(CONFIG_SYSTEM_TRUSTED_KEYRING) += system_keyring.o system_certificates.o
-</span><span class='line'>...
-</span><span class='line'>...
-</span><span class='line'>
-</span><span class='line'>###############################################################################
-</span><span class='line'>#
-</span><span class='line'># Roll all the X.509 certificates that we can find together and pull them into
-</span><span class='line'># the kernel so that they get loaded into the system trusted keyring during
-</span><span class='line'># boot.
-</span><span class='line'>#
-</span><span class='line'># We look in the source root and the build root for all files whose name ends
-</span><span class='line'># in ".x509".  Unfortunately, this will generate duplicate filenames, so we
-</span><span class='line'># have make canonicalise the pathnames and then sort them to discard the
-</span><span class='line'># duplicates.
-</span><span class='line'>#
-</span><span class='line'>###############################################################################
-</span><span class='line'>ifeq ($(CONFIG_SYSTEM_TRUSTED_KEYRING),y)
-</span><span class='line'>X509_CERTIFICATES-y := $(wildcard *.x509) $(wildcard $(srctree)/*.x509)
-</span><span class='line'>X509_CERTIFICATES-$(CONFIG_MODULE_SIG) += signing_key.x509
-</span><span class='line'>X509_CERTIFICATES := $(sort $(foreach CERT,$(X509_CERTIFICATES-y), \
-</span><span class='line'>&#9;&#9;&#9;$(or $(realpath $(CERT)),$(CERT))))
-</span><span class='line'>
-</span><span class='line'>X509_TOOL_CERTIFICATES := $(wildcard $(srctree)/tool_certs/*.pub)
-</span><span class='line'>
-</span><span class='line'>ifeq ($(X509_CERTIFICATES),)
-</span><span class='line'>$(warning *** No X.509 certificates found ***)
-</span><span class='line'>endif
-</span><span class='line'>
-</span><span class='line'>ifneq ($(wildcard $(obj)/.x509.list),)
-</span><span class='line'>ifneq ($(shell cat $(obj)/.x509.list),$(X509_CERTIFICATES))
-</span><span class='line'>$(info X.509 certificate list changed)
-</span><span class='line'>$(shell rm $(obj)/.x509.list)
-</span><span class='line'>endif
-</span><span class='line'>endif
-</span><span class='line'>
-</span><span class='line'>ifneq ($(wildcard $(obj)/.tool_x509.list),)
-</span><span class='line'>ifneq ($(shell cat $(obj)/.tool_x509.list),$(X509_TOOL_CERTIFICATES))
-</span><span class='line'>$(info X.509 tool_certificate list changed)
-</span><span class='line'>$(shell rm $(obj)/.tool_x509.list)
-</span><span class='line'>endif
-</span><span class='line'>endif
-</span><span class='line'>
-</span><span class='line'>kernel/system_certificates.o: $(obj)/x509_certificate_list $(obj)/x509_tool_certificate_list
-</span><span class='line'>
-</span><span class='line'>quiet_cmd_x509certs  = CERTS   $@  
-</span><span class='line'>&#9;cmd_x509certs  = cat $(X509_CERTIFICATES) /dev/null &gt;$@ $(foreach X509,$(X509_CERTIFICATES),; echo "  - Including cert $(X509)")
-</span><span class='line'>quiet_cmd_tool_x509certs  = CERTS   $@  
-</span><span class='line'>&#9;cmd_tool_x509certs  = cat $(X509_TOOL_CERTIFICATES) /dev/null &gt;$@ $(foreach X509,$(X509_TOOL_CERTIFICATES),; echo "  - Including cert $(X509)")
-</span><span class='line'>
-</span><span class='line'>targets += $(obj)/x509_certificate_list
-</span><span class='line'>$(obj)/x509_certificate_list: $(X509_CERTIFICATES) $(obj)/.x509.list
-</span><span class='line'>&#9;$(call if_changed,x509certs)
-</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>kernel/system_certificates.S</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;linux/export.h&gt;
-</span><span class='line'>#include &lt;linux/init.h&gt;
-</span><span class='line'>
-</span><span class='line'>&#9;__INITRODATA
-</span><span class='line'>
-</span><span class='line'>&#9;.align 8
-</span><span class='line'>&#9;.globl VMLINUX_SYMBOL(system_certificate_list)
-</span><span class='line'>VMLINUX_SYMBOL(system_certificate_list):
-</span><span class='line'>__cert_list_start:
-</span><span class='line'>#ifdef CONFIG_MODULE_SIG
-</span><span class='line'>#ifdef CONFIG_MODULE_SIG_FORCE
-</span><span class='line'>&#9;.incbin "kernel/x509_certificate_list"
-</span><span class='line'>#endif
-</span><span class='line'>#endif
-</span><span class='line'>__cert_list_end:
-</span><span class='line'>
-</span><span class='line'>&#9;.align 8
-</span><span class='line'>&#9;.globl VMLINUX_SYMBOL(system_certificate_list_size)
-</span><span class='line'>VMLINUX_SYMBOL(system_certificate_list_size):
-</span><span class='line'>#ifdef CONFIG_64BIT
-</span><span class='line'>&#9;.quad __cert_list_end - __cert_list_start
-</span><span class='line'>#else
-</span><span class='line'>&#9;.long __cert_list_end - __cert_list_start
-</span><span class='line'>#endif
-</span><span class='line'>
-</span><span class='line'>&#9;.align 8
-</span><span class='line'>&#9;.globl VMLINUX_SYMBOL(tool_certificate_list)
-</span><span class='line'>VMLINUX_SYMBOL(tool_certificate_list):
-</span><span class='line'>__tool_cert_list_start:
-</span><span class='line'>#ifdef CONFIG_MODULE_SIG
-</span><span class='line'>#ifdef CONFIG_MODULE_SIG_FORCE
-</span><span class='line'>&#9;.incbin "kernel/x509_tool_certificate_list"
-</span><span class='line'>#endif
-</span><span class='line'>#endif
-</span><span class='line'>__tool_cert_list_end:
-</span><span class='line'>
-</span><span class='line'>&#9;.align 8
-</span><span class='line'>&#9;.globl VMLINUX_SYMBOL(tool_certificate_list_size)
-</span><span class='line'>VMLINUX_SYMBOL(tool_certificate_list_size):
-</span><span class='line'>#ifdef CONFIG_64BIT
-</span><span class='line'>&#9;.quad __tool_cert_list_end - __tool_cert_list_start
-</span><span class='line'>#else
-</span><span class='line'>&#9;.long __tool_cert_list_end - __tool_cert_list_start
-</span><span class='line'>#endif</span></code></pre></td></tr></table></div></figure>
-
-
-<h3>往内核插入自己密匙</h3>
-
-<p>kernel/system_keyring.c copy出来独立模块，将自己公匙导入系统</p>
-</div>
-  
-  
-
-
-    </article>
-  
   <div class="pagination">
     
       <a class="prev" href="/posts/28">&larr; Older</a>
@@ -3554,7 +3140,7 @@ chunk是组成RIFF文件的基本单元，它的基本结构如下：</p></li>
   
     <section>
 <h1>Categories
-<span class='right_span'>(637)</span>
+<span class='right_span'>(639)</span>
 
 </h1>
 <head>
@@ -3631,12 +3217,12 @@ if (!document.getElementById('assembly~arm')) document.getElementById('aexp_asse
 if (!document.getElementById('assembly')) document.getElementById('aexp_assembly').style.visibility = 'hidden';
 if (!document.getElementById('assembly~base')) document.getElementById('aexp_assembly~base').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(88)</span></li>
+<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(90)</span></li>
 <div id='tools' class='catsub'><li><a href='/blog/cats/tools~apache2/?opendiv=tools'>apache2</a><a href='##' onmousedown=showDiv('tools~apache2') id='aexp_tools~apache2'><span class='exp_style' id='exp_tools~apache2'>[+]</span></a><span class='right_span'>2</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~apache2')) document.getElementById('aexp_tools~apache2').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/tools~base/?opendiv=tools'>base</a><a href='##' onmousedown=showDiv('tools~base') id='aexp_tools~base'><span class='exp_style' id='exp_tools~base'>[+]</span></a><span class='right_span'>14</span></li>
+<li><a href='/blog/cats/tools~base/?opendiv=tools'>base</a><a href='##' onmousedown=showDiv('tools~base') id='aexp_tools~base'><span class='exp_style' id='exp_tools~base'>[+]</span></a><span class='right_span'>15</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~base')) document.getElementById('aexp_tools~base').style.visibility = 'hidden';
 </script>
@@ -3672,7 +3258,7 @@ if (!document.getElementById('tools~haproxy')) document.getElementById('aexp_too
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~isal')) document.getElementById('aexp_tools~isal').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/tools~mysql/?opendiv=tools'>mysql</a><a href='##' onmousedown=showDiv('tools~mysql') id='aexp_tools~mysql'><span class='exp_style' id='exp_tools~mysql'>[+]</span></a><span class='right_span'>8</span></li>
+<li><a href='/blog/cats/tools~mysql/?opendiv=tools'>mysql</a><a href='##' onmousedown=showDiv('tools~mysql') id='aexp_tools~mysql'><span class='exp_style' id='exp_tools~mysql'>[+]</span></a><span class='right_span'>9</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~mysql')) document.getElementById('aexp_tools~mysql').style.visibility = 'hidden';
 </script>
@@ -3892,7 +3478,7 @@ if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algo
 
 <section>
 <h1>Date Categories
-<span class='right_span'>(637)</span>
+<span class='right_span'>(639)</span>
 
 </h1>
 <head>
@@ -3900,8 +3486,9 @@ if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algo
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2021/'>2021</a><a href='##' onmousedown=showDiv('2021')><span class='exp_style' id='exp_2021'>[+]</span></a><span class='right_span'>(3)</span></li>
-<div id='2021' class='catsub'><li><a href='/blog/cats/2021~03/?opendiv=2021'>2021-03</a><span class='right_span'>2</span></li>
+<li class='catclass'><a href='/blog/cats/2021/'>2021</a><a href='##' onmousedown=showDiv('2021')><span class='exp_style' id='exp_2021'>[+]</span></a><span class='right_span'>(5)</span></li>
+<div id='2021' class='catsub'><li><a href='/blog/cats/2021~04/?opendiv=2021'>2021-04</a><span class='right_span'>2</span></li>
+<li><a href='/blog/cats/2021~03/?opendiv=2021'>2021-03</a><span class='right_span'>2</span></li>
 <li><a href='/blog/cats/2021~01/?opendiv=2021'>2021-01</a><span class='right_span'>1</span></li>
 </div><li class='catclass'><a href='/blog/cats/2020/'>2020</a><a href='##' onmousedown=showDiv('2020')><span class='exp_style' id='exp_2020'>[+]</span></a><span class='right_span'>(70)</span></li>
 <div id='2020' class='catsub'><li><a href='/blog/cats/2020~12/?opendiv=2020'>2020-12</a><span class='right_span'>6</span></li>
@@ -4034,6 +3621,14 @@ if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algo
   <ul id="recent_posts">
     
       <li class="post">
+        <a href="/blog/2021/04/04/vim-args/">vim 查找多个文件, 替换</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2021/04/04/mysql-row_number/">mysql 分组后的组内排序</a>
+      </li>
+    
+      <li class="post">
         <a href="/blog/2021/03/02/python-dbf/">python读写dbf数据库</a>
       </li>
     
@@ -4043,14 +3638,6 @@ if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algo
     
       <li class="post">
         <a href="/blog/2021/01/22/lang-php-month/">php获取月初和月尾时间</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2020/12/20/lang-jsp-idea-mvc/">idea Spring MVC</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2020/12/20/lang-jsp-idea/">idea 安装</a>
       </li>
     
   </ul>
