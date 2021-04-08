@@ -76,6 +76,257 @@ var ss360Config = {
       
   <header>
     
+      <h2 class="entry-title"><a href="/blog/2015/08/27/kernel-net-napi/">NAPI机制分析</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-08-27T01:29:00+08:00'><span class='date'>2015-08-27</span> <span class='time'>01:29:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://blog.csdn.net/shanshanpt/article/details/20564845">http://blog.csdn.net/shanshanpt/article/details/20564845</a></p>
+
+<p>NAPI 的核心在于：在一个繁忙网络，每次有网络数据包到达时，不需要都引发中断，因为高频率的中断可能会影响系统的整体效率，假象一个场景，我们此时使用标准的 100M 网卡，可能实际达到的接收速率为 80MBits/s，而此时数据包平均长度为 1500Bytes，则每秒产生的中断数目为：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>80M bits/s / (8 Bits/Byte * 1500 Byte) = 6667 个中断 /s</span></code></pre></td></tr></table></div></figure>
+
+
+<p>每秒 6667 个中断，对于系统是个很大的压力，此时其实可以转为使用轮询 (polling) 来处理，而不是中断;但轮询在网络流量较小的时没有效率，因此低流量时，基于中断的方式则比较合适，这就是 NAPI 出现的原因，在低流量时候使用中断接收数据包，而在高流量时候则使用基于轮询的方式接收。</p>
+
+<p>现在内核中 NIC 基本上已经全部支持 NAPI 功能，由前面的叙述可知，NAPI 适合处理高速率数据包的处理，而带来的好处则是：</p>
+
+<p>  1、中断缓和 (Interrupt mitigation)，由上面的例子可以看到，在高流量下，网卡产生的中断可能达到每秒几千次，而如果每次中断都需要系统来处理，是一个很大的压力，而 NAPI 使用轮询时是禁止了网卡的接收中断的，这样会减小系统处理中断的压力；</p>
+
+<p>  2、数据包节流 (Packet throttling)，NAPI 之前的 Linux NIC 驱动总在接收到数据包之后产生一个 IRQ，接着在中断服务例程里将这个 skb 加入本地的 softnet，然后触发本地 NET_RX_SOFTIRQ 软中断后续处理。如果包速过高，因为 IRQ 的优先级高于 SoftIRQ，导致系统的大部分资源都在响应中断，但 softnet 的队列大小有限，接收到的超额数据包也只能丢掉，所以这时这个模型是在用宝贵的系统资源做无用功。而 NAPI 则在这样的情况下，直接把包丢掉，不会继续将需要丢掉的数据包扔给内核去处理，这样，网卡将需要丢掉的数据包尽可能的早丢弃掉，内核将不可见需要丢掉的数据包，这样也减少了内核的压力。</p>
+
+<p>对NAPI 的使用，一般包括以下的几个步骤：</p>
+
+<p>  1、在中断处理函数中，先禁止接收中断，且告诉网络子系统，将以轮询方式快速收包，其中禁止接收中断完全由硬件功能决定，而告诉内核将以轮询方式处理包则是使用函数 netif_rx_schedule()，也可以使用下面的方式，其中的 netif_rx_schedule_prep 是为了判定现在是否已经进入了轮询模式：</p>
+
+<p>将网卡预定为轮询模式</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void netif_rx_schedule(struct net_device *dev);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>或者</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (netif_rx_schedule_prep(dev))
+</span><span class='line'>&#9;__netif_rx_schedule(dev);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  2、在驱动中创建轮询函数，它的工作是从网卡获取数据包并将其送入到网络子系统，其原型是：</p>
+
+<p>NAPI 的轮询方法</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int (*poll)(struct net_device *dev, int *budget);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这里的轮询函数用于在将网卡切换为轮询模式之后，用 poll() 方法处理接收队列中的数据包，如队列为空，则重新切换为中断模式。切换回中断模式需要先关闭轮询模式，使用的是函数 netif_rx_complete ()，接着开启网卡接收中断 .。</p>
+
+<p>退出轮询模式</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void netif_rx_complete(struct net_device *dev);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  3、在驱动中创建轮询函数，需要和实际的网络设备 struct net_device 关联起来，这一般在网卡的初始化时候完成，示例代码如下：</p>
+
+<p>设置网卡支持轮询模式</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>dev-&gt;poll = my_poll;
+</span><span class='line'>dev-&gt;weight = 64;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>里面另外一个字段为权重 (weight)，该值并没有一个非常严格的要求，实际上是个经验数据，一般 10Mb 的网卡，我们设置为 16，而更快的网卡，我们则设置为 64。</p>
+
+<p>NAPI的一些相关Interface</p>
+
+<p>下面是 NAPI 功能的一些接口，在前面都基本有涉及，我们简单看看：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>netif_rx_schedule(dev)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>在网卡的中断处理函数中调用，用于将网卡的接收模式切换为轮询</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>netif_rx_schedule_prep(dev)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>在网卡是 Up 且运行状态时，将该网卡设置为准备将其加入到轮询列表的状态，可以将该函数看做是 netif_rx_schedule(dev) 的前半部分</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>__netif_rx_schedule(dev)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>将设备加入轮询列表，前提是需要 netif_schedule_prep(dev) 函数已经返回了 1</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>__netif_rx_schedule_prep(dev)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>与 netif_rx_schedule_prep(dev) 相似，但是没有判断网卡设备是否 Up 及运行，不建议使用</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>netif_rx_complete(dev)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>用于将网卡接口从轮询列表中移除，一般在轮询函数完成之后调用该函数。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>__netif_rx_complete(dev)</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>Newer newer NAPI</h4>
+
+<p>其实之前的 NAPI(New API) 这样的命名已经有点让人忍俊不禁了，可见 Linux 的内核极客们对名字的掌控，比对代码的掌控差太多，于是乎，连续的两次对 NAPI 的重构，被戏称为 Newer newer NAPI 了。</p>
+
+<p>与 netif_rx_complete(dev) 类似，但是需要确保本地中断被禁止</p>
+
+<p>Newer newer NAPI</p>
+
+<p>在最初实现的 NAPI 中，有 2 个字段在结构体 net_device 中，分别为轮询函数 poll() 和权重 weight，而所谓的 Newer newer NAPI，是在 2.6.24 版内核之后，对原有的 NAPI 实现的几次重构，其核心是将 NAPI 相关功能和 net_device 分离，这样减少了耦合，代码更加的灵活，因为 NAPI 的相关信息已经从特定的网络设备剥离了，不再是以前的一对一的关系了。例如有些网络适配器，可能提供了多个 port，但所有的 port 却是共用同一个接受数据包的中断，这时候，分离的 NAPI 信息只用存一份，同时被所有的 port 来共享，这样，代码框架上更好地适应了真实的硬件能力。Newer newer NAPI 的中心结构体是napi_struct:</p>
+
+<p>NAPI 结构体</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* 
+</span><span class='line'> * Structure for NAPI scheduling similar to tasklet but with weighting 
+</span><span class='line'>*/ 
+</span><span class='line'>struct napi_struct { 
+</span><span class='line'>&#9;/* The poll_list must only be managed by the entity which 
+</span><span class='line'>&#9; * changes the state of the NAPI_STATE_SCHED bit.  This means 
+</span><span class='line'>&#9; * whoever atomically sets that bit can add this napi_struct 
+</span><span class='line'>&#9; * to the per-cpu poll_list, and whoever clears that bit 
+</span><span class='line'>&#9; * can remove from the list right before clearing the bit. 
+</span><span class='line'>&#9; */ 
+</span><span class='line'>&#9;struct list_head      poll_list; 
+</span><span class='line'>
+</span><span class='line'>&#9;unsigned long          state; 
+</span><span class='line'>&#9;int              weight; 
+</span><span class='line'>&#9;int              (*poll)(struct napi_struct *, int); 
+</span><span class='line'> #ifdef CONFIG_NETPOLL 
+</span><span class='line'>&#9;spinlock_t          poll_lock; 
+</span><span class='line'>&#9;int              poll_owner; 
+</span><span class='line'> #endif 
+</span><span class='line'>
+</span><span class='line'>&#9;unsigned int          gro_count; 
+</span><span class='line'>
+</span><span class='line'>&#9;struct net_device      *dev; 
+</span><span class='line'>&#9;struct list_head      dev_list; 
+</span><span class='line'>&#9;struct sk_buff          *gro_list; 
+</span><span class='line'>&#9;struct sk_buff          *skb; 
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>熟悉老的 NAPI 接口实现的话，里面的字段 poll_list、state、weight、poll、dev、没什么好说的，gro_count 和 gro_list 会在后面讲述 GRO 时候会讲述。需要注意的是，与之前的 NAPI 实现的最大的区别是该结构体不再是 net_device 的一部分，事实上，现在希望网卡驱动自己单独分配与管理 napi 实例，通常将其放在了网卡驱动的私有信息，这样最主要的好处在于，如果驱动愿意，可以创建多个 napi_struct，因为现在越来越多的硬件已经开始支持多接收队列 (multiple receive queues)，这样，多个 napi_struct 的实现使得多队列的使用也更加的有效。</p>
+
+<p>与最初的 NAPI 相比较，轮询函数的注册有些变化，现在使用的新接口是：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void netif_napi_add(struct net_device *dev, struct napi_struct *napi, 
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;int (*poll)(struct napi_struct *, int), int weight)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>熟悉老的 NAPI 接口的话，这个函数也没什么好说的。</p>
+
+<p>值得注意的是，前面的轮询 poll() 方法原型也开始需要一些小小的改变：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int (*poll)(struct napi_struct *napi, int budget);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>大部分 NAPI 相关的函数也需要改变之前的原型，下面是打开轮询功能的 API：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void netif_rx_schedule(struct net_device *dev, 
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;struct napi_struct *napi); 
+</span><span class='line'>/* ...or... */ 
+</span><span class='line'>int netif_rx_schedule_prep(struct net_device *dev, 
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;struct napi_struct *napi); 
+</span><span class='line'>void __netif_rx_schedule(struct net_device *dev, 
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;struct napi_struct *napi);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>轮询功能的关闭则需要使用：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void netif_rx_complete(struct net_device *dev, 
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;struct napi_struct *napi);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>因为可能存在多个 napi_struct 的实例，要求每个实例能够独立的使能或者禁止，因此，需要驱动作者保证在网卡接口关闭时，禁止所有的 napi_struct 的实例。</p>
+
+<p>函数 netif_poll_enable() 和 netif_poll_disable() 不再需要，因为轮询管理不再和 net_device 直接管理，取而代之的是下面的两个函数：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void napi_enable(struct napi *napi); 
+</span><span class='line'>void napi_disable(struct napi *napi);</span></code></pre></td></tr></table></div></figure>
+
+
+
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
       <h2 class="entry-title"><a href="/blog/2015/08/25/kernel-net-ipv4/">linux下ip协议(V4)的实现</a></h2>
     
     
@@ -3279,233 +3530,6 @@ raw_sendmsg() -> ip_route_output_flow() -> <strong>ip_route_output_key() -> ip_r
 
     </article>
   
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/08/21/tools-command-iostat/">iostat 命令</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-08-21T15:57:00+08:00'><span class='date'>2015-08-21</span> <span class='time'>15:57:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://blog.csdn.net/zhangjay/article/details/6656771">http://blog.csdn.net/zhangjay/article/details/6656771</a></p>
-
-<p><a href="http://www.cnblogs.com/mfryf/archive/2012/03/12/2392000.html">http://www.cnblogs.com/mfryf/archive/2012/03/12/2392000.html</a></p>
-
-<p>iostat用于输出CPU和磁盘I/O相关的统计信息.</p>
-
-<p>命令格式:</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>iostat [ -c | -d ] [ -k | -m ] [ -t ] [ -V ] [ -x ] [ device [ ... ] | ALL ] [ -p [ device | ALL ]  ]
-</span><span class='line'>       [ interval [ count ] ]</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>1)iostat的 简单使用</h4>
-
-<p>iostat可以显示CPU和I/O系统的负载情况及分区状态信息. 直接执行iostat可以显示下面内容:</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'># iostat
-</span><span class='line'>Linux 2.6.9-8.11.EVAL (ts3-150.ts.cn.tlan)      08/08/2007
-</span><span class='line'>
-</span><span class='line'>avg-cpu:  %user   %nice    %sys %iowait   %idle
-</span><span class='line'>          12.01    0.00        2.15    2.30       83.54
-</span><span class='line'>
-</span><span class='line'>Device:            tps   Blk_read/s   Blk_wrtn/s   Blk_read   Blk_wrtn
-</span><span class='line'>hda               7.13       200.12        34.73     640119     111076</span></code></pre></td></tr></table></div></figure>
-
-
-<p>各个输出项目的含义如下:</p>
-
-<p>avg-cpu段:</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>%user: 在用户级别运行所使用的CPU的百分比.
-</span><span class='line'>%nice: nice操作所使用的CPU的百分比.
-</span><span class='line'>%sys: 在系统级别(kernel)运行所使用CPU的百分比.
-</span><span class='line'>%iowait: CPU等待硬件I/O时,所占用CPU百分比.
-</span><span class='line'>%idle: CPU空闲时间的百分比.</span></code></pre></td></tr></table></div></figure>
-
-
-<p>Device段:</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>tps: 每秒钟发送到的I/O请求数.
-</span><span class='line'>Blk_read /s: 每秒读取的block数.
-</span><span class='line'>Blk_wrtn/s: 每秒写入的block数.
-</span><span class='line'>Blk_read:   读入的block总数.
-</span><span class='line'>Blk_wrtn:  写入的block总数.</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>2)iostat参 数说明</h4>
-
-<p>iostat各个参数说明:</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>-c 仅显示CPU统计信息.与-d选项互斥.
-</span><span class='line'>-d 仅显示磁盘统计信息.与-c选项互斥.
-</span><span class='line'>-k 以K为单位显示每秒的磁盘请求数,默认单位块.
-</span><span class='line'>-p device | ALL
-</span><span class='line'> 与-x选项互斥,用于显示块设备及系统分区的统计信息.也可以在-p后指定一个设备名,如:
-</span><span class='line'> # iostat -p hda
-</span><span class='line'> 或显示所有设备
-</span><span class='line'> # iostat -p ALL
-</span><span class='line'>-t    在输出数据时,打印搜集数据的时间.
-</span><span class='line'>-V    打印版本号和帮助信息.
-</span><span class='line'>-x    输出扩展信息.</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>3)iostat输 出项目说明</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>rrqm/s: 每秒进行 merge 的读操作数目。即 delta(rmerge)/s
-</span><span class='line'>wrqm/s: 每秒进行 merge 的写操作数目。即 delta(wmerge)/s
-</span><span class='line'>r/s: 每秒完成的读 I/O 设备次数。即 delta(rio)/s
-</span><span class='line'>w/s: 每秒完成的写 I/O 设备次数。即 delta(wio)/s
-</span><span class='line'>rsec/s: 每秒读扇区数。即 delta(rsect)/s
-</span><span class='line'>wsec/s: 每秒写扇区数。即 delta(wsect)/s
-</span><span class='line'>rkB/s: 每秒读K字节数。是 rsect/s 的一半，因为每扇区大小为512字节。(需要计算)
-</span><span class='line'>wkB/s: 每秒写K字节数。是 wsect/s 的一半。(需要计算)
-</span><span class='line'>avgrq-sz: 平均每次设备I/O操作的数据大小 (扇区)。delta(rsect+wsect)/delta(rio+wio)
-</span><span class='line'>avgqu-sz: 平均I/O队列长度。即 delta(aveq)/s/1000 (因为aveq的单位为毫秒)。
-</span><span class='line'>await: 平均每次设备I/O操作的等待时间 (毫秒)。即 delta(ruse+wuse)/delta(rio+wio)
-</span><span class='line'>svctm: 平均每次设备I/O操作的服务时间 (毫秒)。即 delta(use)/delta(rio+wio)
-</span><span class='line'>%util: 一秒中有百分之多少的时间用于 I/O 操作，或者说一秒中有多少时间 I/O 队列是非空的。即 delta(use)/s/1000 (因为use的单位为毫秒)
-</span><span class='line'>如果 %util 接近 100%，说明产生的I/O请求太多，I/O系统已经满负荷，该磁盘可能存在瓶颈。
-</span><span class='line'>
-</span><span class='line'>Blk_read 读入块的当总数.
-</span><span class='line'>Blk_wrtn 写入块的总数.
-</span><span class='line'>kB_read/s 每秒从驱动器读入的数据量,单位为K.
-</span><span class='line'>kB_wrtn/s 每秒向驱动器写入的数据量,单位为K.
-</span><span class='line'>kB_read 读入的数据总量,单位为K.
-</span><span class='line'>kB_wrtn 写入的数据总量,单位为K.
-</span><span class='line'>rrqm/s 将读入请求合并后,每秒发送到设备的读入请求数.
-</span><span class='line'>wrqm/s 将写入请求合并后,每秒发送到设备的写入请求数.
-</span><span class='line'>r/s 每秒发送到设备的读入请求数.
-</span><span class='line'>w/s 每秒发送到设备的写入请求数.
-</span><span class='line'>rsec/s 每秒从设备读入的扇区数.
-</span><span class='line'>wsec/s 每秒向设备写入的扇区数.
-</span><span class='line'>rkB/s 每秒从设备读入的数据量,单位为K.
-</span><span class='line'>wkB/s 每秒向设备写入的数据量,单位为K.
-</span><span class='line'>avgrq-sz 发送到设备的请求的平均大小,单位是扇区.
-</span><span class='line'>avgqu-sz 发送到设备的请求的平均队列长度.
-</span><span class='line'>await I/O请求平均执行时间.包括发送请求和执行的时间.单位是毫秒.
-</span><span class='line'>svctm 发送到设备的I/O请求的平均执行时间.单位是毫秒.
-</span><span class='line'>%util 在I/O请求发送到设备期间,占用CPU时间的百分比.用于显示设备的带宽利用率.当这个值接近100%时,表示设备带宽已经占满.</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>4)iostat示 例</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'># iostat
-</span><span class='line'>显示一条统计记录,包括所有的CPU和设备.
-</span><span class='line'>
-</span><span class='line'># iostat -d 2
-</span><span class='line'>每隔2秒,显示一次设备统计信息.
-</span><span class='line'>
-</span><span class='line'># iostat -d 2 6
-</span><span class='line'>每隔2秒,显示一次设备统计信息.总共输出6次.
-</span><span class='line'>
-</span><span class='line'># iostat -x hda hdb 2 6
-</span><span class='line'>每隔2秒显示一次hda,hdb两个设备的扩展统计信息,共输出6次.
-</span><span class='line'>
-</span><span class='line'># iostat -p sda 2 6
-</span><span class='line'>每隔2秒显示一次sda及上面所有分区的统计信息,共输出6次.</span></code></pre></td></tr></table></div></figure>
-
-
-
-</div>
-  
-  
-
-
-    </article>
-  
   <div class="pagination">
     
       <a class="prev" href="/posts/45">&larr; Older</a>
@@ -3520,7 +3544,7 @@ raw_sendmsg() -> ip_route_output_flow() -> <strong>ip_route_output_key() -> ip_r
   
     <section>
 <h1>Categories
-<span class='right_span'>(639)</span>
+<span class='right_span'>(640)</span>
 
 </h1>
 <head>
@@ -3602,7 +3626,7 @@ if (!document.getElementById('assembly~base')) document.getElementById('aexp_ass
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~apache2')) document.getElementById('aexp_tools~apache2').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/tools~base/?opendiv=tools'>base</a><a href='##' onmousedown=showDiv('tools~base') id='aexp_tools~base'><span class='exp_style' id='exp_tools~base'>[+]</span></a><span class='right_span'>15</span></li>
+<li><a href='/blog/cats/tools~base/?opendiv=tools'>base</a><a href='##' onmousedown=showDiv('tools~base') id='aexp_tools~base'><span class='exp_style' id='exp_tools~base'>[+]</span></a><span class='right_span'>14</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~base')) document.getElementById('aexp_tools~base').style.visibility = 'hidden';
 </script>
@@ -3654,7 +3678,7 @@ if (!document.getElementById('tools~sqlservel')) document.getElementById('aexp_t
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~squid')) document.getElementById('aexp_tools~squid').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/tools~ssh/?opendiv=tools'>ssh</a><a href='##' onmousedown=showDiv('tools~ssh') id='aexp_tools~ssh'><span class='exp_style' id='exp_tools~ssh'>[+]</span></a><span class='right_span'>3</span></li>
+<li><a href='/blog/cats/tools~ssh/?opendiv=tools'>ssh</a><a href='##' onmousedown=showDiv('tools~ssh') id='aexp_tools~ssh'><span class='exp_style' id='exp_tools~ssh'>[+]</span></a><span class='right_span'>4</span></li>
 </div><script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools')) document.getElementById('aexp_tools').style.visibility = 'hidden';
 if (!document.getElementById('tools~ssh')) document.getElementById('aexp_tools~ssh').style.visibility = 'hidden';
@@ -3689,7 +3713,7 @@ if (!document.getElementById('system~namespace')) document.getElementById('aexp_
 if (!document.getElementById('system')) document.getElementById('aexp_system').style.visibility = 'hidden';
 if (!document.getElementById('system~ubuntu')) document.getElementById('aexp_system~ubuntu').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/kernel/'>kernel</a><a href='##' onmousedown=showDiv('kernel') id='aexp_kernel'><span class='exp_style' id='exp_kernel'>[+]</span></a><span class='right_span'>(249)</span></li>
+<li class='catclass'><a href='/blog/cats/kernel/'>kernel</a><a href='##' onmousedown=showDiv('kernel') id='aexp_kernel'><span class='exp_style' id='exp_kernel'>[+]</span></a><span class='right_span'>(250)</span></li>
 <div id='kernel' class='catsub'><li><a href='/blog/cats/kernel~10gb/?opendiv=kernel'>10gb</a><a href='##' onmousedown=showDiv('kernel~10gb') id='aexp_kernel~10gb'><span class='exp_style' id='exp_kernel~10gb'>[+]</span></a><span class='right_span'>5</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('kernel~10gb')) document.getElementById('aexp_kernel~10gb').style.visibility = 'hidden';
@@ -3758,7 +3782,7 @@ if (!document.getElementById('kernel~sound')) document.getElementById('aexp_kern
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('kernel~tcp')) document.getElementById('aexp_kernel~tcp').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/kernel~vpn/?opendiv=kernel'>vpn</a><a href='##' onmousedown=showDiv('kernel~vpn') id='aexp_kernel~vpn'><span class='exp_style' id='exp_kernel~vpn'>[+]</span></a><span class='right_span'>2</span></li>
+<li><a href='/blog/cats/kernel~vpn/?opendiv=kernel'>vpn</a><a href='##' onmousedown=showDiv('kernel~vpn') id='aexp_kernel~vpn'><span class='exp_style' id='exp_kernel~vpn'>[+]</span></a><span class='right_span'>3</span></li>
 </div><script language='javascript' type='text/javascript'>
 if (!document.getElementById('kernel')) document.getElementById('aexp_kernel').style.visibility = 'hidden';
 if (!document.getElementById('kernel~vpn')) document.getElementById('aexp_kernel~vpn').style.visibility = 'hidden';
@@ -3858,7 +3882,7 @@ if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algo
 
 <section>
 <h1>Date Categories
-<span class='right_span'>(639)</span>
+<span class='right_span'>(640)</span>
 
 </h1>
 <head>
@@ -3866,8 +3890,8 @@ if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algo
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2021/'>2021</a><a href='##' onmousedown=showDiv('2021')><span class='exp_style' id='exp_2021'>[+]</span></a><span class='right_span'>(5)</span></li>
-<div id='2021' class='catsub'><li><a href='/blog/cats/2021~04/?opendiv=2021'>2021-04</a><span class='right_span'>2</span></li>
+<li class='catclass'><a href='/blog/cats/2021/'>2021</a><a href='##' onmousedown=showDiv('2021')><span class='exp_style' id='exp_2021'>[+]</span></a><span class='right_span'>(6)</span></li>
+<div id='2021' class='catsub'><li><a href='/blog/cats/2021~04/?opendiv=2021'>2021-04</a><span class='right_span'>3</span></li>
 <li><a href='/blog/cats/2021~03/?opendiv=2021'>2021-03</a><span class='right_span'>2</span></li>
 <li><a href='/blog/cats/2021~01/?opendiv=2021'>2021-01</a><span class='right_span'>1</span></li>
 </div><li class='catclass'><a href='/blog/cats/2020/'>2020</a><a href='##' onmousedown=showDiv('2020')><span class='exp_style' id='exp_2020'>[+]</span></a><span class='right_span'>(70)</span></li>
@@ -3992,6 +4016,7 @@ if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algo
 <a style="font-size: 127%" href="/tags/mptcp/">mptcp(8)</a>
 <a style="font-size: 119%" href="/tags/nginx/">nginx(6)</a>
 <a style="font-size: 108%" href="/tags/squid/">squid(4)</a>
+<a style="font-size: 108%" href="/tags/vpn/">vpn(4)</a>
 <a style="font-size: 141%" href="/tags/hui-bian/">汇编(13)</a>
 
 </ul>
@@ -3999,6 +4024,10 @@ if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algo
 <section>
   <h1>Recent Posts</h1>
   <ul id="recent_posts">
+    
+      <li class="post">
+        <a href="/blog/2021/04/08/kernel-udp-vpn/">udp vpn, 代理dota2</a>
+      </li>
     
       <li class="post">
         <a href="/blog/2021/04/04/vim-args/">vim 查找多个文件, 替换</a>
@@ -4014,10 +4043,6 @@ if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algo
     
       <li class="post">
         <a href="/blog/2021/03/02/python-xlsx/">python读取xlsx</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2021/01/22/lang-php-month/">php获取月初和月尾时间</a>
       </li>
     
   </ul>
