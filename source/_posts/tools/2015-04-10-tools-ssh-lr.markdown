@@ -1,6 +1,6 @@
 ---
 layout: post
-title: "SSH端口转发 及 SSH代理"
+title: "SSH端口转发 及 SSH代理,socks vpn"
 date: 2015-04-09 23:06:00 +0800
 comments: false
 categories:
@@ -9,6 +9,7 @@ categories:
 - tools
 - tools~ssh
 tags:
+- vpn
 ---
 #### SSH端口转发
 假设A、B为内网机，C为可登录公网机。那么A连B过程为：

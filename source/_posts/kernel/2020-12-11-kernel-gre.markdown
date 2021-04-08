@@ -9,6 +9,7 @@ categories:
 - kernel
 - kernel~vpn
 tags:
+- vpn
 ---
 
 #### 1. GRE介绍

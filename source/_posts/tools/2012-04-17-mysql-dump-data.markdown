@@ -1,6 +1,6 @@
 ---
 layout: post
-title: "导入数据库、导出表"
+title: "mysql 导入、导出"
 date: 2012-04-17 18:40:00 +0800
 comments: false
 categories:
@@ -10,35 +10,36 @@ categories:
 - tools~mysql
 tags:
 ---
-#### 导入数据库
-##### 常用source 号令
-步入mysql数据库节制台，  
-如mysql -u root -p  
+
+#### source 导入
 mysql>use 数据库  
-然后施用source号令，后面参数为脚本文件（如这里用到的.sql）
+然后用source，后面参数为脚本文件（如这里用到的.sql）
 ```
-mysql>source /home/abcdxyzk/chai.sql
+	mysql>source /home/abcdxyzk/chai.sql
 ```
-#### MySQL 导出表
-```
-mysqldump -uroot -p123456 test > /home/my.sql
-```
-说下上面参数  
-数据库用户名：root  
-密码 ：123456  
-数据库名：test  
-/home/my.sql 为导出文件地址，
 
-这里 是linux系统 所以为/home/my.sql如果是windows替换 它为：e:/my.sql 注意空格奥。。
+#### 命令导入
 
-
-##### 导出单个数据表结构和数据
 ```
+	mysql -upx -ppx px < pxbak.sql
+```
+
+#### 导出表结构和数据
+
+配合git做数据库备份, 加 --skip-extended-insert 不要合并插入数据。
+```
+	mysqldump --skip-extended-insert -h localhost -uroot -p123456 database table > dump.sql
+```
+
+导出单个数据表结构（包含数据）
+```
+	mysqldump -h localhost -uroot -p123456 -d database > dump.sql
+
+	mysqldump -h localhost -uroot -p123456 -d database table > dump.sql
+```
+
 导出整个数据库结构（不包含数据）
-mysqldump -h localhost -uroot -p123456 database table > dump.sql
-
-导出单个数据表结构（不包含数据）
-mysqldump -h localhost -uroot -p123456 -d database > dump.sql
-
-mysqldump -h localhost -uroot -p123456 -d database table > dump.sql
 ```
+	mysqldump -d -h localhost -uroot -p123456 database table > dump.sql
+```
+

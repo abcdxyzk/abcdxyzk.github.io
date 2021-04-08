@@ -1,13 +1,13 @@
 ---
 layout: post
-title: "ssh反向连接"
+title: "autossh、ssh反向连接"
 date: 2019-12-12 11:04:00 +0800
 comments: false
 categories:
 - 2019
 - 2019~12
 - tools
-- tools~base
+- tools~ssh
 tags:
 ---
 

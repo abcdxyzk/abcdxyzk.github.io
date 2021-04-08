@@ -9,6 +9,7 @@ categories:
 - kernel
 - kernel~vpn
 tags:
+- vpn
 ---
 
 ### 方案一
