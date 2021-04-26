@@ -31,7 +31,12 @@ https://blog.csdn.net/u011323949/article/details/102937856
 	codes = ['000756', '601288', '601988', '601319', '600929']
 
 	while 1:
-		df = ts.get_realtime_quotes(codes);
+		try:
+			df = ts.get_realtime_quotes(codes);
+		except:
+			print "get err\n";
+			time.sleep(3);
+			continue;
 
 		os.system("clear")
 		print datetime.now()
