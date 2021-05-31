@@ -10,8 +10,11 @@ categories:
 - tools~openvpn
 tags:
 - vpn
-tags:
 ---
+
+[openvpn-2.4.11-1.el7.x86_64.rpm](/download/tools/openvpn-2.4.11-1.el7.x86_64.rpm)
+
+[pkcs11-helper-1.11-3.el7.x86_64.rpm](/download/tools/pkcs11-helper-1.11-3.el7.x86_64.rpm)
 
 [配置样例etc.openvpn.tar](/download/tools/etc.openvpn.tar)
 
@@ -113,7 +116,7 @@ https://my.oschina.net/randolphcyg/blog/4920516
 	cert keys/server.crt
 	key keys/server.key  # This file should be kept secret
 	dh keys/dh2048.pem
-	# 默认虚拟局域网网段，不要和实际的局域网冲突即可
+	# 默认虚拟局域网网段，不要和实际的局域网冲突即可。和gre类似，配置在tun0上的ip段
 	server 10.8.0.0 255.255.255.0 # 路由模式，桥接模式用server-bridge
 	ifconfig-pool-persist ipp.txt
 	# 10.0.0.0/8是我这台VPN服务器所在的内网的网段，读者应该根据自身实际情况进行修改
@@ -146,9 +149,13 @@ https://my.oschina.net/randolphcyg/blog/4920516
 
 	# 配置防火墙，别忘记保存
 	iptables -I INPUT -p tcp --dport 1194 -m comment --comment "openvpn" -j ACCEPT
+
+	# 客户端过来的包以NAT方式访问外网
 	iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -j MASQUERADE
+
 	mkdir /etc/iptables
 	iptables-save > /etc/iptables/iptables.conf
+
 	# 关闭ufw防火墙，改成iptables，这一步按需要设置，比较ufw在Ubuntu默认关闭的。iptables和ufw任选一个即可。
 	ufw disable
 
@@ -220,6 +227,11 @@ https://my.oschina.net/randolphcyg/blog/4920516
 启动客户端
 ```
 	openvpn --daemon --cd /etc/openvpn --config client.ovpn --log-append /var/log/openvpn.log &
+```
+
+增加需要走vpn的net
+```
+	route add -net 180.101.49.0/24 gw 10.8.0.5
 ```
 
 上面是以守护进程启动的，可以把上面脚本放在/etc/rc.local实现开机启动。或者使用以服务的形式启动，如果想清晰明了，建议放在启动脚本。
