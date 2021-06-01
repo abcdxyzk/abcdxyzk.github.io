@@ -7,7 +7,7 @@ categories:
 - 2012
 - 2012~03
 - tools
-- tools~base
+- tools~vim
 tags:
 ---
 #### 简单配置
