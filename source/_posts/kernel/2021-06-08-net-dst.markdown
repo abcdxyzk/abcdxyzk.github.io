@@ -1,0 +1,143 @@
+---
+layout: post
+title: "SKB路由缓存与SOCK路由缓存"
+date: 2021-06-08 22:04:00 +0800
+comments: false
+categories:
+- 2021
+- 2021~06
+- kernel
+- kernel~base
+tags:
+---
+
+https://www.2cto.com/kf/201805/745174.html
+
+
+skb结构体中的成员 `_skb_refdst` 与sock结构体中成员sk_rx_dst（缓存入口路由）和sk_dst_cache（缓存出口路由）成员之间的交互操作。
+
+### SOCK入口路由与SKB路由缓存
+
+内核在接收流程中，调用early_demux函数提前在IP层做established状态的sock查找，并负责将sock结构体成员sk_rx_dst的路由缓存赋值给skb成员`_skb_refdst`，对于UDP协议，先判断DST_NOCACHE标志，如果成立，增加dst引用计数，设置skb的dst；否则，调用skb_dst_set_noref直接进行设置。
+```
+	void udp_v4_early_demux(struct sk_buff *skb)
+	{
+		dst = READ_ONCE(sk->sk_rx_dst);
+	 
+		if (dst)
+			dst = dst_check(dst, 0);
+		if (dst) {
+			/* DST_NOCACHE can not be used without taking a reference */
+			if (dst->flags & DST_NOCACHE) {
+				if (likely(atomic_inc_not_zero(&dst->__refcnt)))
+					skb_dst_set(skb, dst);
+			} else {
+				skb_dst_set_noref(skb, dst);
+			}
+		}
+	}
+```
+
+对于TCP协议，直接调用skb_dst_set_noref函数，将sock结构体成员sk_rx_dst缓存到skb结构体中。
+
+```
+	void tcp_v4_early_demux(struct sk_buff *skb)
+	{
+		if (sk->sk_state != TCP_TIME_WAIT) {
+			struct dst_entry *dst = sk->sk_rx_dst;
+	 
+			if (dst)
+				dst = dst_check(dst, 0);
+			if (dst &&
+				inet_sk(sk)->rx_dst_ifindex == skb->skb_iif)
+				skb_dst_set_noref(skb, dst);
+		}
+	}
+```
+
+同样都为early_demux函数，都是从sk->sk_rx_dst获取路由缓存，tcp和udp的存在明显差别。TCP直接赋值，UDP需要先判断DST_NOCACHE标志。此情况是由UDP与TCP在sock中缓存dst时的处理不同造成的，TCP预先调用了dst_hold_safe函数，进行了DST_NOCACHE标志的判断处理，如未缓存则增加了引用计数。然而，UDP在缓存路由dst时，使用xchg函数，未判断也未增加引用计数，所以需要在后续判断处理。
+
+```
+	static inline bool dst_hold_safe(struct dst_entry *dst)
+	{
+		if (dst->flags & DST_NOCACHE)
+			return atomic_inc_not_zero(&dst->__refcnt);
+		dst_hold(dst);
+	}
+	 
+	void inet_sk_rx_dst_set(struct sock *sk, const struct sk_buff *skb)
+	{
+		struct dst_entry *dst = skb_dst(skb);
+	 
+		if (dst && dst_hold_safe(dst)) {
+			sk->sk_rx_dst = dst;
+			inet_sk(sk)->rx_dst_ifindex = skb->skb_iif;
+		}
+	}
+	 
+	static void udp_sk_rx_dst_set(struct sock *sk, struct dst_entry *dst)
+	{
+		struct dst_entry *old;
+	 
+		dst_hold(dst);
+		old = xchg(&sk->sk_rx_dst, dst);
+		dst_release(old);
+	}
+```
+
+### SOCK出口路由与SKB路由缓存
+
+对于UDP协议客户端，其在connect时（UDP客户端connect不同于TCP，仅绑定通信端地址），查询路由，缓存到sock结构体的sk_dst_cache中。
+
+```
+	int ip4_datagram_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)
+	{
+		rt = ip_route_connect(...);
+		sk_dst_set(sk, &rt->dst);
+	}
+```
+
+之后，发送UDP数据包时，检查sock结构体中的出口路由是否有效，有效的话可不用再次查询路由表，在函数ip_make_skb中直接使用rt，并且调用skb_dst_set赋值给skb的`_skb_refdst`结构体，以便在发送过程中使用。
+
+对于UDP服务端，在首次发包检测到rt为空时，查询路由表得到出口路由，缓存在sock结构中，之后发包时rt有效，省去再次查询。
+
+```
+	struct sk_buff *__ip_make_skb(...)
+	{
+		skb_dst_set(skb, &rt->dst);
+	}
+	 
+	int udp_sendmsg(...)
+	{
+		if (connected)
+			rt = (struct rtable *)sk_dst_check(sk, 0);
+		if (rt == NULL) {
+			rt = ip_route_output_flow(net, fl4, sk);
+			if (connected)
+				sk_dst_set(sk, dst_clone(&rt->dst));
+		}
+	 
+		skb = ip_make_skb(sk, fl4, getfrag, msg->msg_iov, ulen,
+				sizeof(struct udphdr), &ipc, &rt,
+				msg->msg_flags);
+	}
+```
+
+IP层发送数据包时(调用ip_queue_xmit），检测sock结构中出口路由缓存，如果有效，设置到skb结构体中。否则重新进行出口路由查找。
+
+```
+	int ip_queue_xmit(struct sk_buff *skb, struct flowi *fl)
+	{
+		rt = (struct rtable *)__sk_dst_check(sk, 0);
+		if (rt == NULL) {
+			rt = ip_route_output_ports(...);
+			sk_setup_caps(sk, &rt->dst);
+		}
+		skb_dst_set_noref(skb, &rt->dst);
+	}
+```
+
+内核版本
+
+linux-3.10.0
+
