@@ -7,7 +7,7 @@ categories:
 - 2012
 - 2012~08
 - language
-- language~web
+- language~php
 tags:
 ---
 #### php读取标准输入的方式
