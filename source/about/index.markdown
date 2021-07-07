@@ -9,5 +9,3 @@ footer: true
 
 email: 942655497@qq.com
 
-![](/images/kk.png)
-
