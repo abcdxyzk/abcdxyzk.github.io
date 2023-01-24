@@ -1,0 +1,1944 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+
+  <title><![CDATA[Category: 2015~09 | kk Blog —— 通用基础]]></title>
+  <link href="http://abcdxyzk.github.io/blog/cats/2015~09/atom.xml" rel="self"/>
+  <link href="http://abcdxyzk.github.io/"/>
+  <updated>2023-01-24T19:27:19+08:00</updated>
+  <id>http://abcdxyzk.github.io/</id>
+  <author>
+    <name><![CDATA[kk]]></name>
+    
+  </author>
+  <generator uri="http://octopress.org/">Octopress</generator>
+
+  
+  <entry>
+    <title type="html"><![CDATA[kernel 3.10内核源码分析--Out of Memory(OOM)处理流程]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/09/30/kernel-mm-oom/"/>
+    <updated>2015-09-30T15:56:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/09/30/kernel-mm-oom</id>
+    <content type="html"><![CDATA[<p><a href="http://blog.chinaunix.net/uid-20671208-id-4440249.html">http://blog.chinaunix.net/uid-20671208-id-4440249.html</a></p>
+
+<p>Out Of Memory(OOM)，即内存耗尽，当系统中内存耗尽时，如果不做处理，将处于崩溃的边缘，因为无内核资源可用，而系统运行时刻都可能需要申请内存。这时，内核需要采取一定的措施来防止系统崩溃，这就是我们熟知的OOM流程，其实就是要回收一些内存，而走到OOM流程，已经基本说明其它的回收内存的手段都已经尝试过了(比如回收cache)，这里通常只能通过kill进程来回收内存了，而选择被kill进程的标准就比较简单直接了，总体就是：谁用的多，就kill谁。</p>
+
+<p>OOM处理的基本流程简单描述如下：</p>
+
+<p>1、检查是否配置了/proc/sys/kernel/panic_on_oom，如果是则直接触发panic。</p>
+
+<p>2、检查是否配置了oom_kill_allocating_task，即是否需要kill current进程来回收内存，如果是，且current进程是killable的，则kill current进程。</p>
+
+<p>3、根据既定策略选择需要kill的process，基本策略为：通过进程的内存占用情况计算“点数”，点数最高者被选中。</p>
+
+<p>4、如果没有选出来可kill的进程，那么直接panic(通常不会走到这个流程，但也有例外，比如，当被选中的进程处于D状态，或者正在被kill)</p>
+
+<p>5、kill掉被选中的进程，以释放内存。</p>
+
+<p>代码注释如下：</p>
+
+<pre><code>    /*
+      * OOM处理的主流程，上面的注释应该比较清楚了。
+      */
+    void out_of_memory(struct zonelist *zonelist, gfp_t gfp_mask,
+            int order, nodemask_t *nodemask, bool force_kill)
+    {
+        const nodemask_t *mpol_mask;
+        struct task_struct *p;
+        unsigned long totalpages;
+        unsigned long freed = 0;
+        unsigned int uninitialized_var(points);
+        enum oom_constraint constraint = CONSTRAINT_NONE;
+        int killed = 0;
+
+        // 调用block通知链oom_nofify_list中的函数
+        blocking_notifier_call_chain(&amp;oom_notify_list, 0, &amp;freed);
+
+        if (freed &gt; 0)
+            /* Got some memory back in the last second. */
+            return;
+
+        /*
+         * If current has a pending SIGKILL or is exiting, then automatically
+         * select it. The goal is to allow it to allocate so that it may
+         * quickly exit and free its memory.
+         */
+        /*
+         * 如果当前进程有pending的SIGKILL(9)信号，或者正在退出，则选择当前进程来kill,
+         * 这样可以最快的达到释放内存的目的。
+         */
+        if (fatal_signal_pending(current) || current-&gt;flags &amp; PF_EXITING) {
+            set_thread_flag(TIF_MEMDIE);
+            return;
+        }
+
+        /*
+         * Check if there were limitations on the allocation (only relevant for
+         * NUMA) that may require different handling.
+         */
+        /*
+         * 检查是否有限制，有几种不同的限制策略，仅用于NUMA场景
+         */
+        constraint = constrained_alloc(zonelist, gfp_mask, nodemask,
+                            &amp;totalpages);
+        mpol_mask = (constraint == CONSTRAINT_MEMORY_POLICY) ? nodemask : NULL;
+        // 检查是否配置了/proc/sys/kernel/panic_on_oom，如果是则直接触发panic
+        check_panic_on_oom(constraint, gfp_mask, order, mpol_mask);
+
+        /*
+         * 检查是否配置了oom_kill_allocating_task，即是否需要kill current进程来
+         * 回收内存，如果是，且current进程是killable的，则kill current进程。
+         */
+        if (sysctl_oom_kill_allocating_task &amp;&amp; current-&gt;mm &amp;&amp;
+         !oom_unkillable_task(current, NULL, nodemask) &amp;&amp;
+         current-&gt;signal-&gt;oom_score_adj != OOM_SCORE_ADJ_MIN) {
+            get_task_struct(current);
+            // kill被选中的进程。
+            oom_kill_process(current, gfp_mask, order, 0, totalpages, NULL,
+                     nodemask,
+                     "Out of memory (oom_kill_allocating_task)");
+            goto out;
+        }
+
+        // 根据既定策略选择需要kill的process。
+        p = select_bad_process(&amp;points, totalpages, mpol_mask, force_kill);
+        /* Found nothing?!?! Either we hang forever, or we panic. */
+        /*
+         * 如果没有选出来，即没有可kill的进程，那么直接panic
+         * 通常不会走到这个流程，但也有例外，比如，当被选中的进程处于D状态，或者正在被kill
+         */
+        if (!p) {
+            dump_header(NULL, gfp_mask, order, NULL, mpol_mask);
+            panic("Out of memory and no killable processes...\n");
+        }
+        // kill掉被选中的进程，以释放内存。
+        if (PTR_ERR(p) != -1UL) {
+            oom_kill_process(p, gfp_mask, order, points, totalpages, NULL,
+                     nodemask, "Out of memory");
+            killed = 1;
+        }
+    out:
+        /*
+         * Give the killed threads a good chance of exiting before trying to
+         * allocate memory again.
+         */
+        /*
+         * 在重新分配内存之前，给被kill的进程1s的时间完成exit相关处理，通常情况
+         * 下，1s应该够了。
+         */
+        if (killed)
+            schedule_timeout_killable(1);
+    }
+</code></pre>
+
+<p>out_of_memory->select_bad_process</p>
+
+<p>通过select_bad_process函数选择被kill的进程，其基本流程为：</p>
+
+<p>1、遍历系统中的所有进程，进行"点数"计算</p>
+
+<p>2、进行一些特殊情况的处理，比如: 优先选择触发OOM的进程、不处理正在exit的进程等。</p>
+
+<p>3、计算"点数"，选择点数最大的进程。通过函数oom_badness()</p>
+
+<p>代码注释和分析如下：</p>
+
+<pre><code>    /*
+      * OOM流程中，用来选择被kill的进程的函数
+      * @ppoints:点数，用来计算每个进程被"选中"可能性，点数越高，越可能被"选中"
+      */
+    static struct task_struct *select_bad_process(unsigned int *ppoints,
+            unsigned long totalpages, const nodemask_t *nodemask,
+            bool force_kill)
+    {
+        struct task_struct *g, *p;
+        struct task_struct *chosen = NULL;
+        unsigned long chosen_points = 0;
+
+        rcu_read_lock();
+        // 遍历系统中的所有进程，进行"点数"计算
+        do_each_thread(g, p) {
+            unsigned int points;
+
+            /*
+             * 进行一些特殊情况的处理，比如: 优先选择触发OOM的进程、不处理
+             * 正在exit的进程等。
+             */        
+            switch (oom_scan_process_thread(p, totalpages, nodemask,
+                            force_kill)) {
+            case OOM_SCAN_SELECT:
+                chosen = p;
+                chosen_points = ULONG_MAX;
+                /* fall through */
+            case OOM_SCAN_CONTINUE:
+                continue;
+            case OOM_SCAN_ABORT:
+                rcu_read_unlock();
+                return ERR_PTR(-1UL);
+            case OOM_SCAN_OK:
+                break;
+            };
+            // 计算"点数"，选择点数最大的进程。
+            points = oom_badness(p, NULL, nodemask, totalpages);
+            if (points &gt; chosen_points) {
+                chosen = p;
+                chosen_points = points;
+            }
+        } while_each_thread(g, p);
+        if (chosen)
+            get_task_struct(chosen);
+        rcu_read_unlock();
+
+        *ppoints = chosen_points * 1000 / totalpages;
+        return chosen;
+    }
+</code></pre>
+
+<p>out_of_memory->select_bad_process->oom_scan_process_thread</p>
+
+<p>oom_scan_process_thread函数的分析和注释如下：</p>
+
+<pre><code>    enum oom_scan_t oom_scan_process_thread(struct task_struct *task,
+            unsigned long totalpages, const nodemask_t *nodemask,
+            bool force_kill)
+    {
+        // 如果进程正在exit
+        if (task-&gt;exit_state)
+            return OOM_SCAN_CONTINUE;
+        /*
+         * 如果进程不能被kill，比如: init进程或进程在nodemask对应的节点上，
+         * 没有可以释放的内存。
+         */
+        if (oom_unkillable_task(task, NULL, nodemask))
+            return OOM_SCAN_CONTINUE;
+
+        /*
+         * This task already has access to memory reserves and is being killed.
+         * Don't allow any other task to have access to the reserves.
+         */
+        /*
+         * 如果有进程正在被OOM流程kill，那么应该有内存可以释放了，就不需要再kill
+         * 其它进程了，此时返回abort，结束oom kill流程。
+         */
+        if (test_tsk_thread_flag(task, TIF_MEMDIE)) {
+            if (unlikely(frozen(task)))
+                __thaw_task(task);
+            if (!force_kill)
+                return OOM_SCAN_ABORT;
+        }
+        // 如果不存在mm了(可能进程刚退出了)
+        if (!task-&gt;mm)
+            return OOM_SCAN_CONTINUE;
+
+        /*
+         * If task is allocating a lot of memory and has been marked to be
+         * killed first if it triggers an oom, then select it.
+         */
+        // 优先选择触发OOM的进程。
+        if (oom_task_origin(task))
+            return OOM_SCAN_SELECT;
+
+        if (task-&gt;flags &amp; PF_EXITING &amp;&amp; !force_kill) {
+            /*
+             * If this task is not being ptraced on exit, then wait for it
+             * to finish before killing some other task unnecessarily.
+             */
+            if (!(task-&gt;group_leader-&gt;ptrace &amp; PT_TRACE_EXIT))
+                return OOM_SCAN_ABORT;
+        }
+        return OOM_SCAN_OK;
+    }
+</code></pre>
+
+<p>out_of_memory->select_bad_process->oom_badness</p>
+
+<p>oom_badness用于计算进程的“点数”，点数最高者被选中，代码注释和分析如下：</p>
+
+<pre><code>    /*
+     * 计算进程"点数"(代表进程被选中的可能性)的函数，点数根据进程占用的物理内存来计算
+     * 物理内存占用越多，被选中的可能性越大。root processes有3%的bonus。
+     */
+    unsigned long oom_badness(struct task_struct *p, struct mem_cgroup *memcg,
+                 const nodemask_t *nodemask, unsigned long totalpages)
+    {
+        long points;
+        long adj;
+
+        if (oom_unkillable_task(p, memcg, nodemask))
+            return 0;
+        // 确认进程是否还存在
+        p = find_lock_task_mm(p);
+        if (!p)
+            return 0;
+
+        adj = (long)p-&gt;signal-&gt;oom_score_adj;
+        if (adj == OOM_SCORE_ADJ_MIN) {
+            task_unlock(p);
+            return 0;
+        }
+
+        /*
+         * The baseline for the badness score is the proportion of RAM that each
+         * task's rss, pagetable and swap space use.
+         */
+        // 点数=rss(驻留内存/占用物理内存)+pte数+交换分区用量
+        points = get_mm_rss(p-&gt;mm) + p-&gt;mm-&gt;nr_ptes +
+             get_mm_counter(p-&gt;mm, MM_SWAPENTS);
+        task_unlock(p);
+
+        /*
+         * Root processes get 3% bonus, just like the __vm_enough_memory()
+         * implementation used by LSMs.
+         */
+        /*
+         * root用户启动的进程，有总 内存*3% 的bonus，就是说可以使用比其它进程多3%的内存
+         * 3%=30/1000
+         */
+        if (has_capability_noaudit(p, CAP_SYS_ADMIN))
+            adj -= 30;
+
+        /* Normalize to oom_score_adj units */
+        // 归一化"点数"单位
+        adj *= totalpages / 1000;
+        points += adj;
+
+        /*
+         * Never return 0 for an eligible task regardless of the root bonus and
+         * oom_score_adj (oom_score_adj can't be OOM_SCORE_ADJ_MIN here).
+         */
+        return points &gt; 0 ? points : 1;
+    }
+</code></pre>
+
+<p>out_of_memory->oom_kill_process</p>
+
+<p>oom_kill_process()函数用于：kill被选中的进程，其实就是给指定进程发送SIGKILL信号，待被选中进程返回用户态时，进行信号处理。</p>
+
+<p>相关代码注释和分析如下：</p>
+
+<pre><code>    /*
+      * kill被选中的进程，在OOM流程中被调用
+      */
+    void oom_kill_process(struct task_struct *p, gfp_t gfp_mask, int order,
+             unsigned int points, unsigned long totalpages,
+             struct mem_cgroup *memcg, nodemask_t *nodemask,
+             const char *message)
+    {
+        struct task_struct *victim = p;
+        struct task_struct *child;
+        struct task_struct *t = p;
+        struct mm_struct *mm;
+        unsigned int victim_points = 0;
+        static DEFINE_RATELIMIT_STATE(oom_rs, DEFAULT_RATELIMIT_INTERVAL,
+                         DEFAULT_RATELIMIT_BURST);
+
+        /*
+         * If the task is already exiting, don't alarm the sysadmin or kill
+         * its children or threads, just set TIF_MEMDIE so it can die quickly
+         */
+        /*
+         * 如果进程正在exiting，就没有必要再kill它了，直接设置TIF_MEMDIE，然后返回。
+        */
+        if (p-&gt;flags &amp; PF_EXITING) {
+            set_tsk_thread_flag(p, TIF_MEMDIE);
+            put_task_struct(p);
+            return;
+        }
+
+        if (__ratelimit(&amp;oom_rs))
+            dump_header(p, gfp_mask, order, memcg, nodemask);
+
+        task_lock(p);
+        pr_err("%s: Kill process %d (%s) score %d or sacrifice child\n",
+            message, task_pid_nr(p), p-&gt;comm, points);
+        task_unlock(p);
+
+        /*
+         * If any of p's children has a different mm and is eligible for kill,
+         * the one with the highest oom_badness() score is sacrificed for its
+         * parent. This attempts to lose the minimal amount of work done while
+         * still freeing memory.
+         */
+        /*
+         * 如果被选中的进程的子进程，不跟其共享mm(通常是这样)，且膐om_badness的
+         * 得分更高，那么重新选择该子进程为被kill的进程。
+         */
+        read_lock(&amp;tasklist_lock);
+        do {
+            // 遍历被选中进程的所有子进程
+            list_for_each_entry(child, &amp;t-&gt;children, sibling) {
+                unsigned int child_points;
+
+                // 如果不共享mm
+                if (child-&gt;mm == p-&gt;mm)
+                    continue;
+                /*
+                 * oom_badness() returns 0 if the thread is unkillable
+                 */
+                // 计算child?om_badness得分
+                child_points = oom_badness(child, memcg, nodemask,
+                                    totalpages);
+                // 如果child得分更高，则将被选中进程换成child
+                if (child_points &gt; victim_points) {
+                    put_task_struct(victim);
+                    victim = child;
+                    victim_points = child_points;
+                    get_task_struct(victim);
+                }
+            }
+        } while_each_thread(p, t);
+        read_unlock(&amp;tasklist_lock);
+
+        rcu_read_lock();
+        /*
+         * 遍历确认被选中进程的线程组，判断是否还存在task_struct-&gt;mm，如果不存在
+         * (有可能这个时候进程退出了，或释放了mm),就没必要再kill了。
+         * 如果存在则选择线程组中的进程。
+         */
+        p = find_lock_task_mm(victim);
+        if (!p) {
+            rcu_read_unlock();
+            put_task_struct(victim);
+            return;
+        // 如果新选择的进程跟之前的不是同一个，那么更新victim。
+        } else if (victim != p) {
+            get_task_struct(p);
+            put_task_struct(victim);
+            victim = p;
+        }
+
+        /* mm cannot safely be dereferenced after task_unlock(victim) */
+        mm = victim-&gt;mm;
+        pr_err("Killed process %d (%s) total-vm:%lukB, anon-rss:%lukB, file-rss:%lukB\n",
+            task_pid_nr(victim), victim-&gt;comm, K(victim-&gt;mm-&gt;total_vm),
+            K(get_mm_counter(victim-&gt;mm, MM_ANONPAGES)),
+            K(get_mm_counter(victim-&gt;mm, MM_FILEPAGES)));
+        task_unlock(victim);
+
+        /*
+         * Kill all user processes sharing victim-&gt;mm in other thread groups, if
+         * any. They don't get access to memory reserves, though, to avoid
+         * depletion of all memory. This prevents mm-&gt;mmap_sem livelock when an
+         * oom killed thread cannot exit because it requires the semaphore and
+         * its contended by another thread trying to allocate memory itself.
+         * That thread will now get access to memory reserves since it has a
+         * pending fatal signal.
+         */
+        /*
+         * 遍历系统中的所有进程，寻找在其它线程组中，跟被选中进程(victim)共享mm结构
+         * 的进程(内核线程除外)，共享mm结构即共享进程地址空间，比如fork后exec之前，
+         * 父子进程是共享mm的，回收内存必须要将共享mm的所有进程都kill掉。
+         */
+        for_each_process(p)
+            if (p-&gt;mm == mm &amp;&amp; !same_thread_group(p, victim) &amp;&amp;
+             !(p-&gt;flags &amp; PF_KTHREAD)) {
+                if (p-&gt;signal-&gt;oom_score_adj == OOM_SCORE_ADJ_MIN)
+                    continue;
+
+                // 进行task_struct相关操作时，通常需要获取该锁。
+                task_lock(p);    /* Protect -&gt;comm from prctl() */
+                pr_err("Kill process %d (%s) sharing same memory\n",
+                    task_pid_nr(p), p-&gt;comm);
+                task_unlock(p);
+                // 通过向被选中的进程发送kill信号，来kill进程。
+                do_send_sig_info(SIGKILL, SEND_SIG_FORCED, p, true);
+            }
+        rcu_read_unlock();
+
+        // 进程设置TIF_MEMDIE标记，表示进程正在被oom killer终止中。
+        set_tsk_thread_flag(victim, TIF_MEMDIE);
+        /*
+         * 最终通过向被选中的进程发送kill信号，来kill进程，被kill的进程在从内核态
+         * 返回用户态时，进行信号处理。
+         * 被选中的进程可以是自己(current)，则current进程会在oom流程执行完成后，返回
+         * 用户态时，处理信号。
+         */
+        do_send_sig_info(SIGKILL, SEND_SIG_FORCED, victim, true);
+        put_task_struct(victim);
+    }
+</code></pre>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[kernel 3.10内核源码分析--内核页表创建]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/09/30/kernel-mm-init/"/>
+    <updated>2015-09-30T15:53:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/09/30/kernel-mm-init</id>
+    <content type="html"><![CDATA[<p><a href="http://blog.chinaunix.net/uid-20671208-id-4440253.html">http://blog.chinaunix.net/uid-20671208-id-4440253.html</a></p>
+
+<p>内核页表创建基本流程：
+<code>
+    start_kernel
+        setup_arch
+            init_mem_mapping
+                init_range_memory_mapping
+                    init_memory_mapping
+                        kernel_physical_mapping_init  
+</code></p>
+
+<pre><code>    /*
+      * 创建内核页表，将内核页表中能线性映射的部分(0-896M，还要刨去ISA等区域)
+      * 进行映射，创建相应的页表项，在内核初始化的时候(setup_arch())完成。
+      */
+    unsigned long __init
+    kernel_physical_mapping_init(unsigned long start,
+                 unsigned long end,
+                 unsigned long page_size_mask)
+    {
+        int use_pse = page_size_mask == (1&lt;&lt;PG_LEVEL_2M);
+        unsigned long last_map_addr = end;
+        unsigned long start_pfn, end_pfn;
+         /*内核页表页目录所在的位置，其所占的内存是在head_32.S中预先分配好的*/
+        pgd_t *pgd_base = swapper_pg_dir;
+        int pgd_idx, pmd_idx, pte_ofs;
+        unsigned long pfn;
+        pgd_t *pgd;
+        pmd_t *pmd;
+        pte_t *pte;
+        unsigned pages_2m, pages_4k;
+        int mapping_iter;
+        /*计算欲映射区域的起始和结束pfn*/
+        start_pfn = start &gt;&gt; PAGE_SHIFT;
+        end_pfn = end &gt;&gt; PAGE_SHIFT;
+
+        /*
+         * First iteration will setup identity mapping using large/small pages
+         * based on use_pse, with other attributes same as set by
+         * the early code in head_32.S
+         *
+         * Second iteration will setup the appropriate attributes (NX, GLOBAL..)
+         * as desired for the kernel identity mapping.
+         *
+         * This two pass mechanism conforms to the TLB app note which says:
+         *
+         * "Software should not write to a paging-structure entry in a way
+         * that would change, for any linear address, both the page size
+         * and either the page frame or attributes."
+         */
+        mapping_iter = 1;
+
+        if (!cpu_has_pse)
+            use_pse = 0;
+
+    repeat:
+        pages_2m = pages_4k = 0;
+        pfn = start_pfn;
+        pgd_idx = pgd_index((pfn&lt;&lt;PAGE_SHIFT) + PAGE_OFFSET);
+        /*
+         * pgd、pmd等存放的是本级页表中对应index项的虚拟地址，页表项的内容中存放的是
+         * 下一级页表的起始物理地址
+         */
+        pgd = pgd_base + pgd_idx;
+        for (; pgd_idx &lt; PTRS_PER_PGD; pgd++, pgd_idx++) {
+            //创建pmd，如果没有pmd，则返回pgd。实际通过get_free_page接口分配，此时buddy系统已经可用?
+            pmd = one_md_table_init(pgd);
+
+            if (pfn &gt;= end_pfn)
+                continue;
+    #ifdef CONFIG_X86_PAE
+            pmd_idx = pmd_index((pfn&lt;&lt;PAGE_SHIFT) + PAGE_OFFSET);
+            pmd += pmd_idx;
+    #else
+            pmd_idx = 0;
+    #endif
+            for (; pmd_idx &lt; PTRS_PER_PMD &amp;&amp; pfn &lt; end_pfn;
+             pmd++, pmd_idx++) {
+                /*
+                 * 页框虚拟地址，就是物理地址(pfn * PAGE_SIZE)+固定偏移
+                 * 这就是线性映射的实质。
+                */
+                unsigned int addr = pfn * PAGE_SIZE + PAGE_OFFSET;
+
+                /*
+                 * Map with big pages if possible, otherwise
+                 * create normal page tables:
+                 */
+                if (use_pse) {
+                    unsigned int addr2;
+                    pgprot_t prot = PAGE_KERNEL_LARGE;
+                    /*
+                     * first pass will use the same initial
+                     * identity mapping attribute + _PAGE_PSE.
+                     */
+                    pgprot_t init_prot =
+                        __pgprot(PTE_IDENT_ATTR |
+                            _PAGE_PSE);
+
+                    pfn &amp;= PMD_MASK &gt;&gt; PAGE_SHIFT;
+                    addr2 = (pfn + PTRS_PER_PTE-1) * PAGE_SIZE +
+                        PAGE_OFFSET + PAGE_SIZE-1;
+
+                    if (is_kernel_text(addr) ||
+                     is_kernel_text(addr2))
+                        prot = PAGE_KERNEL_LARGE_EXEC;
+
+                    pages_2m++;
+                    if (mapping_iter == 1)
+                        set_pmd(pmd, pfn_pmd(pfn, init_prot));
+                    else
+                        set_pmd(pmd, pfn_pmd(pfn, prot));
+
+                    pfn += PTRS_PER_PTE;
+                    continue;
+                }
+                // 创建页表
+                pte = one_page_table_init(pmd);
+
+                pte_ofs = pte_index((pfn&lt;&lt;PAGE_SHIFT) + PAGE_OFFSET);
+                pte += pte_ofs;
+                // 填写每项页表的内容。
+                for (; pte_ofs &lt; PTRS_PER_PTE &amp;&amp; pfn &lt; end_pfn;
+                 pte++, pfn++, pte_ofs++, addr += PAGE_SIZE) {
+                    pgprot_t prot = PAGE_KERNEL;
+                    /*
+                     * first pass will use the same initial
+                     * identity mapping attribute.
+                     */
+                    pgprot_t init_prot = __pgprot(PTE_IDENT_ATTR);
+
+                    if (is_kernel_text(addr))
+                        prot = PAGE_KERNEL_EXEC;
+
+                    pages_4k++;
+                    if (mapping_iter == 1) {
+                        // 将pfn(页框号)和相关属性转换为物理地址，然后写入pte中
+                        set_pte(pte, pfn_pte(pfn, init_prot));
+                        last_map_addr = (pfn &lt;&lt; PAGE_SHIFT) + PAGE_SIZE;
+                    } else
+                        set_pte(pte, pfn_pte(pfn, prot));
+                }
+            }
+        }
+        if (mapping_iter == 1) {
+            /*
+             * update direct mapping page count only in the first
+             * iteration.
+             */
+            update_page_count(PG_LEVEL_2M, pages_2m);
+            update_page_count(PG_LEVEL_4K, pages_4k);
+
+            /*
+             * local global flush tlb, which will flush the previous
+             * mappings present in both small and large page TLB's.
+             */
+            __flush_tlb_all();
+
+            /*
+             * Second iteration will set the actual desired PTE attributes.
+             */
+            mapping_iter = 2;
+            goto repeat;
+        }
+        return last_map_addr;
+</code></pre>
+
+<p>swapper_pg_dir为内核页表页目录所在的位置，其所占的内存是在head_32.S中预先分配好的，从下面的汇编代码看，预先分配了1024*4=4k的空间，可以容纳1024个entry。</p>
+
+<pre><code>    ENTRY(swapper_pg_dir)
+        .fill 1024,4,0
+</code></pre>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[TCP的定时器系列 — 保活定时器]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/09/30/kernel-net-keepalive/"/>
+    <updated>2015-09-30T15:32:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/09/30/kernel-net-keepalive</id>
+    <content type="html"><![CDATA[<p><a href="http://blog.csdn.net/zhangskd/article/details/44177475">http://blog.csdn.net/zhangskd/article/details/44177475</a></p>
+
+<p>主要内容：保活定时器的实现，TCP_USER_TIMEOUT选项的实现。<br/>
+内核版本：3.15.2</p>
+
+<h4>原理</h4>
+
+<p>HTTP有Keepalive功能，TCP也有Keepalive功能，虽然都叫Keepalive，但是它们的目的却是不一样的。为了说明这一点，先来看下长连接和短连接的定义。</p>
+
+<p>连接的“长短”是什么？<br/>
+短连接：建立一条连接，传输一个请求，马上关闭连接。<br/>
+长连接：建立一条连接，传输一个请求，过会儿，又传输若干个请求，最后再关闭连接。</p>
+
+<p>长连接的好处是显而易见的，多个请求可以复用一条连接，省去连接建立和释放的时间开销和系统调用，但也意味着服务器的一部分资源会被长时间占用着。</p>
+
+<p>HTTP的Keepalive，顾名思义，目的在于延长连接的时间，以便在同一条连接中传输多个HTTP请求。</p>
+
+<p>HTTP服务器一般会提供Keepalive Timeout参数，用来决定连接保持多久，什么时候关闭连接。</p>
+
+<p>当连接使用了Keepalive功能时，对于客户端发送过来的一个请求，服务器端会发送一个响应，然后开始计时，如果经过Timeout时间后，客户端没有再发送请求过来，服务器端就把连接关了，不再保持连接了。</p>
+
+<p>TCP的Keepalive，是挂羊头卖狗肉的，目的在于看看对方有没有发生异常，如果有异常就及时关闭连接。</p>
+
+<p>当传输双方不主动关闭连接时，就算双方没有交换任何数据，连接也是一直有效的。</p>
+
+<p>如果这个时候对端、中间网络出现异常而导致连接不可用，本端如何得知这一信息呢？</p>
+
+<p>答案就是保活定时器。它每隔一段时间会超时，超时后会检查连接是否空闲太久了，如果空闲的时间超过了设置时间，就会发送探测报文。然后通过对端是否响应、响应是否符合预期，来判断对端是否正常，如果不正常，就主动关闭连接，而不用等待HTTP层的关闭了。</p>
+
+<p>当服务器发送探测报文时，客户端可能处于4种不同的情况：仍然正常运行、已经崩溃、已经崩溃并重启了、由于中间链路问题不可达。在不同的情况下，服务器会得到不一样的反馈。</p>
+
+<p>(1) 客户主机依然正常运行，并且从服务器端可达</p>
+
+<p>客户端的TCP响应正常，从而服务器端知道对方是正常的。保活定时器会在两小时以后继续触发。</p>
+
+<p>(2) 客户主机已经崩溃，并且关闭或者正在重新启动</p>
+
+<p>客户端的TCP没有响应，服务器没有收到对探测包的响应，此后每隔75s发送探测报文，一共发送9次。</p>
+
+<p>socket函数会返回-1，errno设置为ETIMEDOUT，表示连接超时。</p>
+
+<p>(3) 客户主机已经崩溃，并且重新启动了</p>
+
+<p>客户端的TCP发送RST，服务器端收到后关闭此连接。</p>
+
+<p>socket函数会返回-1，errno设置为ECONNRESET，表示连接被对端复位了。</p>
+
+<p>(4) 客户主机依然正常运行，但是从服务器不可达</p>
+
+<p>双方的反应和第二种是一样的，因为服务器不能区分对端异常与中间链路异常。</p>
+
+<p>socket函数会返回-1，errno设置为EHOSTUNREACH，表示对端不可达。</p>
+
+<h4>选项</h4>
+
+<p>内核默认并不使用TCP Keepalive功能，除非用户设置了SO_KEEPALIVE选项。</p>
+
+<p>有两种方式可以自行调整保活定时器的参数：一种是修改TCP参数，一种是使用TCP层选项。</p>
+
+<p>(1) TCP参数</p>
+
+<p>tcp_keepalive_time</p>
+
+<p>最后一次数据交换到TCP发送第一个保活探测报文的时间，即允许连接空闲的时间，默认为7200s。</p>
+
+<p>tcp_keepalive_intvl</p>
+
+<p>保活探测报文的重传时间，默认为75s。</p>
+
+<p>tcp_keepalive_probes</p>
+
+<p>保活探测报文的发送次数，默认为9次。</p>
+
+<p>Q：一次完整的保活探测需要花费多长时间？</p>
+
+<p>A：tcp_keepalive_time + tcp_keepalive_intvl * tcp_keepalive_probes，默认值为7875s。如果觉得两个多小时太长了，可以自行调整上述参数。</p>
+
+<p>(2) TCP层选项</p>
+
+<p>TCP_KEEPIDLE：含义同tcp_keepalive_time。</p>
+
+<p>TCP_KEEPINTVL：含义同tcp_keepalive_intvl。</p>
+
+<p>TCP_KEEPCNT：含义同tcp_keepalive_probes。</p>
+
+<p>Q：既然有了TCP参数可供调整，为什么还增加了上述的TCP层选项？</p>
+
+<p>A：TCP参数是面向本机的所有TCP连接，一旦调整了，对所有的连接都有效。而TCP层选项是面向一条连接的，一旦调整了，只对本条连接有效。</p>
+
+<h4>激活</h4>
+
+<p>在连接建立后，可以通过设置SO_KEEPALIVE选项，来激活保活定时器。</p>
+
+<pre><code>    int keepalive = 1;
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &amp;keepalive, sizeof(keepalive));
+</code></pre>
+
+<pre><code>    int sock_setsockopt(struct socket *sock, int level, int optname, char __user *optval,   
+        unsigned int optlen)  
+    {  
+        ...  
+        case SO_KEEPALIVE:  
+    #ifdef CONFIG_INET  
+            if (sk-&gt;sk_protocol == IPPROTO_TCP &amp;&amp; sk-&gt;sk_type == SOCK_STREAM)  
+                tcp_set_keepalive(sk, valbool); /* 激活或删除保活定时器 */  
+    #endif  
+            sock_valbool_flag(sk, SOCK_KEEPOPEN, valbool); /* 设置或取消SOCK_KEEPOPEN标志位 */  
+            break;  
+        ...  
+    }  
+
+    static inline void sock_valbool_flag (struct sock *sk, int bit, int valbool)  
+    {  
+        if (valbool)  
+            sock_set_flag(sk, bit);  
+        else  
+            sock_reset_flag(sk, bit);  
+    }  
+</code></pre>
+
+<pre><code>    void tcp_set_keepalive(struct sock *sk, int val)  
+    {  
+        /* 不在以下两个状态设置保活定时器： 
+         * TCP_CLOSE：sk_timer用作FIN_WAIT2定时器 
+         * TCP_LISTEN：sk_timer用作SYNACK重传定时器 
+         */  
+        if ((1 &lt;&lt; sk-&gt;sk_state) &amp; (TCPF_CLOSE | TCPF_LISTEN))  
+            return;  
+
+        /* 如果SO_KEEPALIVE选项值为1，且此前没有设置SOCK_KEEPOPEN标志， 
+         * 则激活sk_timer，用作保活定时器。 
+         */  
+        if (val &amp;&amp; !sock_flag(sk, SOCK_KEEPOPEN))  
+            inet_csk_reset_keepalive_timer(sk, keepalive_time_when(tcp_sk(sk)));  
+        else if (!val)  
+            /* 如果SO_KEEPALIVE选项值为0，则删除保活定时器 */  
+            inet_csk_delete_keepalive_timer(sk);  
+    }  
+
+    /* 保活定时器的超时时间 */  
+    static inline int keepalive_time_when(const struct tcp_sock *tp)  
+    {  
+        return tp-&gt;keepalive_time ? : sysctl_tcp_keepalive_time;  
+    }  
+
+    void inet_csk_reset_keepalive_timer (struc sock *sk, unsigned long len)  
+    {  
+        sk_reset_timer(sk, &amp;sk-&gt;sk_timer, jiffies + len);  
+    }  
+</code></pre>
+
+<p>可以使用TCP层选项来动态调整保活定时器的参数。</p>
+
+<pre><code>    int keepidle = 600;
+    int keepintvl = 10;
+    int keepcnt = 6;
+
+    setsockopt(fd, SOL_TCP, TCP_KEEPIDLE, &amp;keepidle, sizeof(keepidle));
+    setsockopt(fd, SOL_TCP, TCP_KEEPINTVL, &amp;keepintvl, sizeof(keepintvl));
+    setsockopt(fd, SOL_TCP, TCP_KEEPCNT, &amp;keepcnt, sizeof(keepcnt));
+</code></pre>
+
+<pre><code>    struct tcp_sock {  
+        ...  
+        /* 最后一次接收到ACK的时间 */  
+        u32 rcv_tstamp; /* timestamp of last received ACK (for keepalives) */  
+        ...  
+        /* time before keep alive takes place, 空闲多久后才发送探测报文 */  
+        unsigned int keepalive_time;  
+        /* time iterval between keep alive probes */  
+        unsigned int keepalive_intvl; /* 探测报文之间的时间间隔 */  
+        /* num of allowed keep alive probes */  
+        u8 keepalive_probes; /* 探测报文的发送次数 */  
+        ...  
+        struct {  
+            ...  
+            /* 最后一次接收到带负荷的报文的时间 */  
+            __u32 lrcvtime; /* timestamp of last received data packet */  
+            ...  
+        } icsk_ack;  
+        ...  
+    };  
+
+    #define TCP_KEEPIDLE 4 /* Start Keepalives after this period */  
+    #define TCP_KEEPINTVL 5 /* Interval between keepalives */  
+    #define TCP_KEEPCNT 6 /* Number of keepalives before death */  
+
+    #define MAX_TCP_KEEPIDLE 32767  
+    #define MAX_TCP_KEEPINTVL 32767  
+    #define MAX_TCP_KEEPCNT 127  
+</code></pre>
+
+<pre><code>    static int do_tcp_setsockopt(struct sock *sk, int level, int optname, char __user *optval,  
+        unsigned int optlen)  
+    {  
+        ...  
+        case TCP_KEEPIDLE:  
+           if (val &lt; 1 || val &gt; MAX_TCP_KEEPIDLE)  
+               err = -EINVAL;  
+            else {  
+                tp-&gt;keepalive_time = val * HZ; /* 设置新的空闲时间 */  
+
+                /* 如果有使用SO_KEEPALIVE选项，连接处于非监听非结束的状态。 
+                 * 这个时候保活定时器已经在计时了，这里设置新的超时时间。 
+                 */  
+                if (sock_flag(sk, SOCK_KEEPOPEN) &amp;&amp;   
+                    !((1 &lt;&lt; sk-&gt;sk_state) &amp; (TCPF_CLOSE | TCPF_LISTEN))) {  
+                    u32 elapsed = keepalive_time_elapsed(tp); /* 连接已经经历的空闲时间 */  
+
+                    if (tp-&gt;keepalive_time &gt; elapsed)  
+                        elapsed = tp-&gt;keepalive_time - elapsed; /* 接着等待的时间，然后超时 */  
+                    else  
+                        elapsed = 0; /* 会导致马上超时 */  
+                    inet_csk_reset_keepalive_timer(sk, elapsed);  
+                }  
+            }  
+            break;  
+
+        case TCP_KEEPINTVL:  
+            if (val &lt; 1 || val &gt; MAX_TCP_KEEPINTVL)  
+                err = -EINVAL;  
+            else  
+                tp-&gt;keepalive_intvl = val * HZ; /* 设置新的探测报文间隔 */  
+            break;  
+
+        case TCP_KEEPCNT:  
+            if (val &lt; 1 || val &gt; MAX_TCP_KEEPCNT)  
+                err = -EINVAL;  
+            else  
+                tp-&gt;keepalive_probes = val; /* 设置新的探测次数 */  
+            break;  
+        ...  
+    }  
+</code></pre>
+
+<p>到目前为止，连接已经经历的空闲时间，即最后一次接收到报文至今的时间。</p>
+
+<pre><code>    static inline u32 keepalive_time_elapsed (const struct tcp_sock *tp)  
+    {  
+        const struct inet_connection_sock *icsk = &amp;tp-&gt;inet_conn;  
+
+        /* lrcvtime是最后一次接收到数据报的时间 
+         * rcv_tstamp是最后一次接收到ACK的时间 
+         * 返回值就是最后一次接收到报文，到现在的时间，即经历的空闲时间。 
+         */  
+        return min_t(u32, tcp_time_stamp - icsk-&gt;icsk_ack.lrcvtime,  
+            tcp_time_stamp - tp-&gt;rcv_tstamp);  
+    }  
+</code></pre>
+
+<h4>超时处理函数</h4>
+
+<p>我们知道保活定时器、SYNACK重传定时器、FIN_WAIT2定时器是共用一个定时器实例sk->sk_timer，所以它们的超时处理函数也是一样的，都为tcp_keepalive_timer()。而在函数内部，可以根据此时连接所处的状态，来判断是哪个定时器触发了超时。</p>
+
+<p>Q：什么时候判断对端为异常并关闭连接？</p>
+
+<p>A：分两种情况。</p>
+
+<ol>
+<li><p>用户使用了TCP_USER_TIMEOUT选项。当连接的空闲时间超过了用户设置的时间，且有发送过探测报文。</p></li>
+<li><p>用户没有使用TCP_USER_TIMEOUT选项。当发送保活探测包的次数达到了保活探测的最大次数时。</p></li>
+</ol>
+
+
+<pre><code>    static void tcp_keepalive_timer (unsigned long data)  
+    {  
+        struct sock *sk = (struct sock *) data;  
+        struct inet_connection_sock *icsk = inet_csk(sk);  
+        struct tcp_sock *tp = tcp_sk(sk);  
+        u32 elapsed;  
+
+        /* Only process if socket is not in use. */  
+        bh_lock_sock(sk);  
+
+        /* 加锁以保证在此期间，连接状态不会被用户进程修改。 
+         * 如果用户进程正在使用此sock，那么过50ms再来看看。 
+         */  
+        if (sock_owned_by_user(sk)) {  
+            /* Try again later. */  
+            inet_csk_reset_keepalive_timer(sk, HZ/20);  
+            goto out;  
+        }  
+
+        /* 三次握手期间，用作SYNACK定时器 */  
+        if (sk-&gt;sk_state == TCP_LISTEN) {  
+            tcp_synack_timer(sk);  
+            goto out;  
+        }      
+
+        /* 连接释放期间，用作FIN_WAIT2定时器 */  
+        if (sk-&gt;sk_state == TCP_FIN_WAIT2 &amp;&amp; sock_flag(sk, SOCK_DEAD)) {  
+            ...  
+        }  
+
+        /* 接下来就是用作保活定时器了 */  
+        if (!sock_flag(sk, SOCK_KEEPOPEN) || sk-&gt;sk_state == TCP_CLOSE)  
+            goto out;  
+
+        elapsed = keepalive_time_when(tp); /* 连接的空闲时间超过此值，就发送保活探测报文 */  
+
+        /* It is alive without keepalive. 
+         * 如果网络中有发送且未确认的数据包，或者发送队列不为空，说明连接不是idle的？ 
+         * 既然连接不是idle的，就没有必要探测对端是否正常。 
+         * 保活定时器重新开始计时即可。 
+         *  
+         * 而实际上当网络中有发送且未确认的数据包时，对端也可能会发生异常而没有响应。 
+         * 这个时候会导致数据包的不断重传，只能依靠重传超过了允许的最大时间，来判断连接超时。 
+         * 为了解决这一问题，引入了TCP_USER_TIMEOUT，允许用户指定超时时间，可见下文：） 
+         */  
+        if (tp-&gt;packets_out || tcp_send_head(sk))  
+            goto resched; /* 保活定时器重新开始计时 */  
+
+        /* 连接经历的空闲时间，即上次收到报文至今的时间 */  
+        elapsed = keepalive_time_elapsed(tp);  
+
+        /* 如果连接空闲的时间超过了设置的时间值 */  
+        if (elapsed &gt;= keepalive_time_when(tp)) {  
+
+            /* 什么时候关闭连接？ 
+             * 1. 使用了TCP_USER_TIMEOUT选项。当连接空闲时间超过了用户设置的时间，且有发送过探测报文。 
+             * 2. 用户没有使用选项。当发送的保活探测包达到了保活探测的最大次数。 
+             */  
+            if (icsk-&gt;icsk_user_timeout != 0 &amp;&amp; elapsed &gt;= icsk-&gt;icsk_user_timeout &amp;&amp;  
+                icsk-&gt;icsk_probes_out &gt; 0) || (icsk-&gt;icsk_user_timeout == 0 &amp;&amp;  
+                icsk-&gt;icsk_probes_out &gt;= keepalive_probes(tp))) {  
+                tcp_send_active_reset(sk, GFP_ATOMIC); /* 构造一个RST包并发送 */  
+                tcp_write_err(sk); /* 报告错误，关闭连接 */  
+                goto out;  
+            }  
+
+            /* 如果还不到关闭连接的时候，就继续发送保活探测包 */  
+            if (tcp_write_wakeup(sk) &lt;= 0) {  
+                icsk-&gt;icsk_probes_out++; /* 已发送的保活探测包个数 */  
+                elapsed = keepalive_intvl_when(tp); /* 下次超时的时间，默认为75s */  
+            } else {  
+                /* If keepalive was lost due to local congestion, try harder. */  
+                elapsd = TCP_RESOURCE_PROBE_INTERVAL; /* 默认为500ms，会使超时更加频繁 */  
+            }  
+
+        } else {  
+            /* 如果连接的空闲时间，还没有超过设定值，则接着等待 */  
+            elapsed = keepalive_time_when(tp) - elapsed;  
+        }   
+
+        sk_mem_reclaim(sk);  
+
+    resched: /* 重设保活定时器 */  
+        inet_csk_reset_keepalive_timer(sk, elapsed);  
+        goto out;   
+
+    out:  
+        bh_unlock_sock(sk);  
+        sock_put(sk);  
+    }  
+</code></pre>
+
+<p>Q：TCP是如何发送Keepalive探测报文的？</p>
+
+<p>A：分两种情况。</p>
+
+<ol>
+<li><p>有新的数据段可供发送，且对端接收窗口还没被塞满。发送新的数据段，来作为探测包。</p></li>
+<li><p>没有新的数据段可供发送，或者对端的接收窗口满了。发送序号为snd_una - 1、长度为0的ACK包作为探测包。</p></li>
+</ol>
+
+
+<pre><code>    /* Initiate keepalive or window probe from timer. */  
+
+    int tcp_write_wakeup (struct sock *sk)  
+    {  
+        struct tcp_sock *tp = tcp_sk(sk);  
+        struct sk_buff *skb;  
+
+        if (sk-&gt;sk_state == TCP_CLOSE)  
+            return -1;  
+
+        /* 如果还有未发送过的数据包，并且对端的接收窗口还没有满 */  
+        if ((skb = tcp_send_head(sk)) != NULL &amp;&amp; before(TCP_SKB_CB(skb)-&gt;seq, tcp_wnd_end(tp))) {  
+            int err;  
+            unsigned int mss = tcp_current_mss(sk); /* 当前的MSS */  
+            /* 对端接收窗口所允许的最大报文长度 */  
+            unsigned int seg_size = tcp_wnd_end(tp) - TCP_SKB_CB(skb)-&gt;seq;  
+
+            /* pushed_seq记录发送出去的最后一个字节的序号 */  
+            if (before(tp-&gt;pushed_seq, TCP_SKB_CB(skb)-&gt;end_seq))  
+                tp-&gt;pushed_seq = TCP_SKB_CB(skb)-&gt;end_seq;  
+
+            /* 如果对端接收窗口小于此数据段的长度，或者此数据段的长度超过了MSS，那么就要进行分段 */  
+            if (seg_size &lt; TCP_SKB_CB(skb)-&gt;end_seq - TCP_SKB_CB(skb)-&gt;seq || skb-&gt;len &gt; mss) {  
+                seg_size = min(seg_size, mss);  
+                TCP_SKB_CB(skb)-&gt;tcp_flags |= TCPHDR_PSH; /* 设置PSH标志，让对端马上把数据提交给程序 */  
+                if (tcp_fragment(sk, skb, seg_size, mss)) /* 进行分段 */  
+                    return -1;  
+            } else if (! tcp_skb_pcount(skb)) /* 进行TSO分片 */  
+                tcp_set_skb_tso_segs(sk, skb, mss); /* 初始化分片相关变量 */  
+
+            TCP_SKB_CB(skb)-&gt;tcp_flags |= TCPHDR_PSH;  
+            TCP_SKB_CB(skb)-&gt;when = tcp_time_stamp;  
+            err = tcp_transmit_skb(sk, skb, 1, GFP_ATOMIC); /* 发送此数据段 */  
+            if (!err)  
+                tcp_event_new_data_sent(sk, skb); /* 发送了新的数据，更新相关参数 */  
+
+        } else { /* 如果没有新的数据段可用作探测报文发送，或者对端的接收窗口为0 */  
+
+           /* 处于紧急模式时，额外发送一个序号为snd_una的ACK包，告诉对端紧急指针 */  
+           if (between(tp-&gt;snd_up, tp-&gt;snd_una + 1, tp-&gt;snd_una + 0xFFFF))  
+               tcp_xmit_probe_skb(sk, 1);  
+
+            /* 发送一个序号为snd_una -1的ACK包，长度为0，这是一个序号过时的报文。 
+             * snd_una: first byte we want an ack for，所以snd_una - 1序号的字节已经被确认过了。 
+             * 对端会响应一个ACK。 
+             */  
+            return tcp_xmit_probe_skb(sk, 0);  
+        }  
+    }  
+</code></pre>
+
+<p>Q：当没有新的数据可以用作探测包、或者对端的接收窗口为0时，怎么办呢？</p>
+
+<p>A：发送一个序号为snd_una - 1、长度为0的ACK包，对端收到此包后会发送一个ACK响应。如此一来本端就能够知道对端是否还活着、接收窗口是否打开了。</p>
+
+<pre><code>    /* This routine sends a packet with an out of date sequence number. 
+     * It assumes the other end will try to ack it. 
+     *  
+     * Question: what should we make while urgent mode? 
+     * 4.4BSD forces sending single byte of data. We cannot send out of window 
+     * data, because we have SND.NXT == SND.MAX... 
+     *  
+     * Current solution: to send TWO zero-length segments in urgent mode: 
+     * one is with SEG.SEG=SND.UNA to deliver urgent pointer, another is out-of-date with 
+     * SND.UNA - 1 to probe window. 
+     */  
+
+    static int tcp_xmit_probe_skb (struct sock *sk, int urgent)  
+    {  
+        struct tcp_sock *tp = tcp_sk(sk);  
+        struct sk_buff *skb;  
+
+        /* We don't queue it, tcp_transmit_skb() sets ownership. */  
+        skb = alloc_skb(MAX_TCP_HEADER, sk_gfp_atomic(sk, GFP_ATOMIC));  
+        if (skb == NULL)  
+            return -1;  
+
+        /* Reserve space for headers and set control bits. */  
+        skb_reserve(skb, MAX_TCP_HEADER);  
+
+        /* Use a previous sequence. This should cause the other end to send an ack. 
+         * Don't queue or clone SKB, just send it. 
+         */  
+        /* 如果没有设置紧急指针，那么发送的序号为snd_una - 1，否则发送的序号为snd_una */  
+        tcp_init_nondata_skb(skb, tp-&gt;snd_una - !urgent, TCPHDR_ACK);  
+        TCP_SKB_CB(skb)-&gt;when = tcp_time_stamp;  
+        return tcp_transmit_skb(sk, skb, 0, GFP_ATOMIC); /* 发送探测包 */  
+    }  
+</code></pre>
+
+<p>发送RST包。</p>
+
+<pre><code>    /* We get here when a process closes a file descriptor (either due to an explicit close() 
+     * or as a byproduct of exit()'ing) and there was unread data in the receive queue. 
+     * This behavior is recommended by RFC 2525, section 2.17. -DaveM 
+     */  
+
+    void tcp_send_active_reset (struct sock *sk, gfp_t priority)  
+    {  
+        struct sk_buff *skb;  
+        /* NOTE: No TCP options attached and we never retransmit this. */  
+        skb = alloc_skb(MAX_TCP_HEADER, priority);  
+        if (!skb) {  
+            NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPABORTFAILED);  
+            return;  
+        }  
+
+        /* Reserve space for headers and prepare control bits. */  
+        skb_reserve(skb, MAX_TCP_HEADER); /* 为报文头部预留空间 */  
+        /* 初始化不携带数据的skb的一些控制字段 */  
+        tcp_init_nondata_skb(skb, tcp_acceptable_seq(sk), TCPHDR_ACK | TCPHDR_RST);  
+
+        /* Send if off，发送此RST包*/  
+        TCP_SKB_CB(skb)-&gt;when = tcp_time_stamp;  
+        if (tcp_transmit_skb(sk, skb, 0, priority))  
+            NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPABORTFAILED);  
+        TCP_INC_STATS(sock_net(sk), TCP_MIB_OUTRSTS);  
+    }  
+
+    static inline __u32 tcp_acceptable_seq (const struct sock *sk)  
+    {  
+        const struct tcp_sock *tp = tcp_sk(sk);  
+
+        /* 如果snd_nxt在对端接收窗口范围内 */  
+        if (! before(tcp_wnd_end(tp), tp-&gt;snd_nxt))  
+            return tp-&gt;snd_nxt;  
+        else  
+            return tcp_wnd_end(tp);  
+    }  
+</code></pre>
+
+<h4>TCP_USER_TIMEOUT选项</h4>
+
+<p>从上文可知同时符合以下条件时，保活定时器才会发送探测报文：</p>
+
+<ol>
+<li><p>网络中没有发送且未确认的数据包。</p></li>
+<li><p>发送队列为空。</p></li>
+<li><p>连接的空闲时间超过了设定的时间。</p></li>
+</ol>
+
+
+<p>Q：如果网络中有发送且未确认的数据包、或者发送队列不为空时，保活定时器不起作用了，岂不是不能够检测到对端的异常了？</p>
+
+<p>A：可以使用TCP_USER_TIMEOUT，显式的指定当发送数据多久后还没有得到响应，就判定连接超时，从而主动关闭连接。</p>
+
+<p>TCP_USER_TIMEOUT选项会影响到超时重传定时器和保活定时器。</p>
+
+<p>(1) 超时重传定时器</p>
+
+<p>判断连接是否超时，分3种情况：</p>
+
+<ol>
+<li><p>SYN包：当SYN包的重传次数达到上限时，判定连接超时。(默认允许重传5次，初始超时时间为1s，总共历时31s)</p></li>
+<li><p>非SYN包，用户使用TCP_USER_TIMEOUT：当数据包发出去后的等待时间超过用户设置的时间时，判定连接超时。</p></li>
+<li><p>非SYN包，用户没有使用TCP_USER_TIMEOUT：当数据包发出去后的等待时间超过以TCP_RTO_MIN为初始超时时间，重传boundary次所花费的时间后，判定连接超时。(boundary的最大值为tcp_retries2，默认值为15)</p></li>
+</ol>
+
+
+<p>(2) 保活定时器</p>
+
+<p>判断连接是否异常，分2种情况：</p>
+
+<ol>
+<li><p>用户使用了TCP_USER_TIMEOUT选项。当连接的空闲时间超过了用户设置的时间，且有发送过探测报文。</p></li>
+<li><p>用户没有使用TCP_USER_TIMEOUT选项。当发送保活探测包的次数达到了保活探测的最大次数时。</p></li>
+</ol>
+
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[ack loop]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/09/30/debug-loop_ack/"/>
+    <updated>2015-09-30T15:32:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/09/30/debug-loop_ack</id>
+    <content type="html"><![CDATA[<h4>patch</h4>
+
+<pre><code>    commit 4fb17a6091674f469e8ac85dc770fbf9a9ba7cc8
+    Author: Neal Cardwell &lt;ncardwell@google.com&gt;
+    Date:   Fri Feb 6 16:04:41 2015 -0500
+
+        tcp: mitigate ACK loops for connections as tcp_timewait_sock
+
+        Ensure that in state FIN_WAIT2 or TIME_WAIT, where the connection is
+        represented by a tcp_timewait_sock, we rate limit dupacks in response
+        to incoming packets (a) with TCP timestamps that fail PAWS checks, or
+        (b) with sequence numbers that are out of the acceptable window.
+
+        We do not send a dupack in response to out-of-window packets if it has
+        been less than sysctl_tcp_invalid_ratelimit (default 500ms) since we
+        last sent a dupack in response to an out-of-window packet.
+
+        Reported-by: Avery Fay &lt;avery@mixpanel.com&gt;
+        Signed-off-by: Neal Cardwell &lt;ncardwell@google.com&gt;
+        Signed-off-by: Yuchung Cheng &lt;ycheng@google.com&gt;
+        Signed-off-by: Eric Dumazet &lt;edumazet@google.com&gt;
+        Signed-off-by: David S. Miller &lt;davem@davemloft.net&gt;
+
+    diff --git a/include/linux/tcp.h b/include/linux/tcp.h
+    index 66d85a8..1a7adb4 100644
+    --- a/include/linux/tcp.h
+    +++ b/include/linux/tcp.h
+    @@ -342,6 +342,10 @@ struct tcp_timewait_sock {
+        u32           tw_rcv_wnd;
+        u32           tw_ts_offset;
+        u32           tw_ts_recent;
+    +
+    +   /* The time we sent the last out-of-window ACK: */
+    +   u32           tw_last_oow_ack_time;
+    +
+        long              tw_ts_recent_stamp;
+     #ifdef CONFIG_TCP_MD5SIG
+        struct tcp_md5sig_key     *tw_md5_key;
+    diff --git a/net/ipv4/tcp_minisocks.c b/net/ipv4/tcp_minisocks.c
+    index 98a8405..dd11ac7 100644
+    --- a/net/ipv4/tcp_minisocks.c
+    +++ b/net/ipv4/tcp_minisocks.c
+    @@ -58,6 +58,25 @@ static bool tcp_in_window(u32 seq, u32 end_seq, u32 s_win, u32 e_win)
+        return seq == e_win &amp;&amp; seq == end_seq;
+     }
+
+    +static enum tcp_tw_status
+    +tcp_timewait_check_oow_rate_limit(struct inet_timewait_sock *tw,
+    +                 const struct sk_buff *skb, int mib_idx)
+    +{
+    +   struct tcp_timewait_sock *tcptw = tcp_twsk((struct sock *)tw);
+    +
+    +   if (!tcp_oow_rate_limited(twsk_net(tw), skb, mib_idx,
+    +                 &amp;tcptw-&gt;tw_last_oow_ack_time)) {
+    +       /* Send ACK. Note, we do not put the bucket,
+    +        * it will be released by caller.
+    +        */
+    +       return TCP_TW_ACK;
+    +   }
+    +
+    +   /* We are rate-limiting, so just release the tw sock and drop skb. */
+    +   inet_twsk_put(tw);
+    +   return TCP_TW_SUCCESS;
+    +}
+    +
+     /*
+      * * Main purpose of TIME-WAIT state is to close connection gracefully,
+      *   when one of ends sits in LAST-ACK or CLOSING retransmitting FIN
+    @@ -116,7 +135,8 @@ tcp_timewait_state_process(struct inet_timewait_sock *tw, struct sk_buff *skb,
+                !tcp_in_window(TCP_SKB_CB(skb)-&gt;seq, TCP_SKB_CB(skb)-&gt;end_seq,
+                       tcptw-&gt;tw_rcv_nxt,
+                       tcptw-&gt;tw_rcv_nxt + tcptw-&gt;tw_rcv_wnd))
+    -           return TCP_TW_ACK;
+    +           return tcp_timewait_check_oow_rate_limit(
+    +               tw, skb, LINUX_MIB_TCPACKSKIPPEDFINWAIT2);
+
+            if (th-&gt;rst)
+                goto kill;
+    @@ -250,10 +270,8 @@ kill:
+                inet_twsk_schedule(tw, &amp;tcp_death_row, TCP_TIMEWAIT_LEN,
+                           TCP_TIMEWAIT_LEN);
+
+    -       /* Send ACK. Note, we do not put the bucket,
+    -        * it will be released by caller.
+    -        */
+    -       return TCP_TW_ACK;
+    +       return tcp_timewait_check_oow_rate_limit(
+    +           tw, skb, LINUX_MIB_TCPACKSKIPPEDTIMEWAIT);
+        }
+        inet_twsk_put(tw);
+        return TCP_TW_SUCCESS;
+    @@ -289,6 +307,7 @@ void tcp_time_wait(struct sock *sk, int state, int timeo)
+            tcptw-&gt;tw_ts_recent = tp-&gt;rx_opt.ts_recent;
+            tcptw-&gt;tw_ts_recent_stamp = tp-&gt;rx_opt.ts_recent_stamp;
+            tcptw-&gt;tw_ts_offset = tp-&gt;tsoffset;
+    +       tcptw-&gt;tw_last_oow_ack_time = 0;
+
+     #if IS_ENABLED(CONFIG_IPV6)
+            if (tw-&gt;tw_family == PF_INET6) {
+
+    commit f2b2c582e82429270d5818fbabe653f4359d7024
+    Author: Neal Cardwell &lt;ncardwell@google.com&gt;
+    Date:   Fri Feb 6 16:04:40 2015 -0500
+
+        tcp: mitigate ACK loops for connections as tcp_sock
+
+        Ensure that in state ESTABLISHED, where the connection is represented
+        by a tcp_sock, we rate limit dupacks in response to incoming packets
+        (a) with TCP timestamps that fail PAWS checks, or (b) with sequence
+        numbers or ACK numbers that are out of the acceptable window.
+
+        We do not send a dupack in response to out-of-window packets if it has
+        been less than sysctl_tcp_invalid_ratelimit (default 500ms) since we
+        last sent a dupack in response to an out-of-window packet.
+
+        There is already a similar (although global) rate-limiting mechanism
+        for "challenge ACKs". When deciding whether to send a challence ACK,
+        we first consult the new per-connection rate limit, and then the
+        global rate limit.
+
+        Reported-by: Avery Fay &lt;avery@mixpanel.com&gt;
+        Signed-off-by: Neal Cardwell &lt;ncardwell@google.com&gt;
+        Signed-off-by: Yuchung Cheng &lt;ycheng@google.com&gt;
+        Signed-off-by: Eric Dumazet &lt;edumazet@google.com&gt;
+        Signed-off-by: David S. Miller &lt;davem@davemloft.net&gt;
+
+    diff --git a/include/linux/tcp.h b/include/linux/tcp.h
+    index bcc828d..66d85a8 100644
+    --- a/include/linux/tcp.h
+    +++ b/include/linux/tcp.h
+    @@ -153,6 +153,7 @@ struct tcp_sock {
+        u32 snd_sml;    /* Last byte of the most recently transmitted small packet */
+        u32 rcv_tstamp; /* timestamp of last received ACK (for keepalives) */
+        u32 lsndtime;   /* timestamp of last sent data packet (for restart window) */
+    +   u32 last_oow_ack_time;  /* timestamp of last out-of-window ACK */
+
+        u32 tsoffset;   /* timestamp offset */
+
+    diff --git a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
+    index 9401aa43..8fdd27b 100644
+    --- a/net/ipv4/tcp_input.c
+    +++ b/net/ipv4/tcp_input.c
+    @@ -3322,13 +3322,22 @@ static int tcp_ack_update_window(struct sock *sk, const struct sk_buff *skb, u32
+     }
+
+     /* RFC 5961 7 [ACK Throttling] */
+    -static void tcp_send_challenge_ack(struct sock *sk)
+    +static void tcp_send_challenge_ack(struct sock *sk, const struct sk_buff *skb)
+     {
+        /* unprotected vars, we dont care of overwrites */
+        static u32 challenge_timestamp;
+        static unsigned int challenge_count;
+    -   u32 now = jiffies / HZ;
+    +   struct tcp_sock *tp = tcp_sk(sk);
+    +   u32 now;
+    +
+    +   /* First check our per-socket dupack rate limit. */
+    +   if (tcp_oow_rate_limited(sock_net(sk), skb,
+    +                LINUX_MIB_TCPACKSKIPPEDCHALLENGE,
+    +                &amp;tp-&gt;last_oow_ack_time))
+    +       return;
+
+    +   /* Then check the check host-wide RFC 5961 rate limit. */
+    +   now = jiffies / HZ;
+        if (now != challenge_timestamp) {
+            challenge_timestamp = now;
+            challenge_count = 0;
+    @@ -3424,7 +3433,7 @@ static int tcp_ack(struct sock *sk, const struct sk_buff *skb, int flag)
+        if (before(ack, prior_snd_una)) {
+            /* RFC 5961 5.2 [Blind Data Injection Attack].[Mitigation] */
+            if (before(ack, prior_snd_una - tp-&gt;max_window)) {
+    -           tcp_send_challenge_ack(sk);
+    +           tcp_send_challenge_ack(sk, skb);
+                return -1;
+            }
+            goto old_ack;
+    @@ -4993,7 +5002,10 @@ static bool tcp_validate_incoming(struct sock *sk, struct sk_buff *skb,
+            tcp_paws_discard(sk, skb)) {
+            if (!th-&gt;rst) {
+                NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_PAWSESTABREJECTED);
+    -           tcp_send_dupack(sk, skb);
+    +           if (!tcp_oow_rate_limited(sock_net(sk), skb,
+    +                         LINUX_MIB_TCPACKSKIPPEDPAWS,
+    +                         &amp;tp-&gt;last_oow_ack_time))
+    +               tcp_send_dupack(sk, skb);
+                goto discard;
+            }
+            /* Reset is accepted even if it did not pass PAWS. */
+    @@ -5010,7 +5022,10 @@ static bool tcp_validate_incoming(struct sock *sk, struct sk_buff *skb,
+            if (!th-&gt;rst) {
+                if (th-&gt;syn)
+                    goto syn_challenge;
+    -           tcp_send_dupack(sk, skb);
+    +           if (!tcp_oow_rate_limited(sock_net(sk), skb,
+    +                         LINUX_MIB_TCPACKSKIPPEDSEQ,
+    +                         &amp;tp-&gt;last_oow_ack_time))
+    +               tcp_send_dupack(sk, skb);
+            }
+            goto discard;
+        }
+    @@ -5026,7 +5041,7 @@ static bool tcp_validate_incoming(struct sock *sk, struct sk_buff *skb,
+            if (TCP_SKB_CB(skb)-&gt;seq == tp-&gt;rcv_nxt)
+                tcp_reset(sk);
+            else
+    -           tcp_send_challenge_ack(sk);
+    +           tcp_send_challenge_ack(sk, skb);
+            goto discard;
+        }
+
+    @@ -5040,7 +5055,7 @@ syn_challenge:
+            if (syn_inerr)
+                TCP_INC_STATS_BH(sock_net(sk), TCP_MIB_INERRS);
+            NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_TCPSYNCHALLENGE);
+    -       tcp_send_challenge_ack(sk);
+    +       tcp_send_challenge_ack(sk, skb);
+            goto discard;
+        }
+
+    diff --git a/net/ipv4/tcp_minisocks.c b/net/ipv4/tcp_minisocks.c
+    index 131aa49..98a8405 100644
+    --- a/net/ipv4/tcp_minisocks.c
+    +++ b/net/ipv4/tcp_minisocks.c
+    @@ -467,6 +467,7 @@ struct sock *tcp_create_openreq_child(struct sock *sk, struct request_sock *req,
+            tcp_enable_early_retrans(newtp);
+            newtp-&gt;tlp_high_seq = 0;
+            newtp-&gt;lsndtime = treq-&gt;snt_synack;
+    +       newtp-&gt;last_oow_ack_time = 0;
+            newtp-&gt;total_retrans = req-&gt;num_retrans;
+
+            /* So many TCP implementations out there (incorrectly) count the
+
+    commit a9b2c06dbef48ed31cff1764c5ce824829106f4f
+    Author: Neal Cardwell &lt;ncardwell@google.com&gt;
+    Date:   Fri Feb 6 16:04:39 2015 -0500
+
+        tcp: mitigate ACK loops for connections as tcp_request_sock
+
+        In the SYN_RECV state, where the TCP connection is represented by
+        tcp_request_sock, we now rate-limit SYNACKs in response to a client's
+        retransmitted SYNs: we do not send a SYNACK in response to client SYN
+        if it has been less than sysctl_tcp_invalid_ratelimit (default 500ms)
+        since we last sent a SYNACK in response to a client's retransmitted
+        SYN.
+
+        This allows the vast majority of legitimate client connections to
+        proceed unimpeded, even for the most aggressive platforms, iOS and
+        MacOS, which actually retransmit SYNs 1-second intervals for several
+        times in a row. They use SYN RTO timeouts following the progression:
+        1,1,1,1,1,2,4,8,16,32.
+
+        Reported-by: Avery Fay &lt;avery@mixpanel.com&gt;
+        Signed-off-by: Neal Cardwell &lt;ncardwell@google.com&gt;
+        Signed-off-by: Yuchung Cheng &lt;ycheng@google.com&gt;
+        Signed-off-by: Eric Dumazet &lt;edumazet@google.com&gt;
+        Signed-off-by: David S. Miller &lt;davem@davemloft.net&gt;
+
+    diff --git a/include/linux/tcp.h b/include/linux/tcp.h
+    index 67309ec..bcc828d 100644
+    --- a/include/linux/tcp.h
+    +++ b/include/linux/tcp.h
+    @@ -115,6 +115,7 @@ struct tcp_request_sock {
+        u32             rcv_isn;
+        u32             snt_isn;
+        u32             snt_synack; /* synack sent time */
+    +   u32             last_oow_ack_time; /* last SYNACK */
+        u32             rcv_nxt; /* the ack # by SYNACK. For
+                              * FastOpen it's the seq#
+                              * after data-in-SYN.
+    diff --git a/include/net/tcp.h b/include/net/tcp.h
+    index b81f45c..da4196fb 100644
+    --- a/include/net/tcp.h
+    +++ b/include/net/tcp.h
+    @@ -1145,6 +1145,7 @@ static inline void tcp_openreq_init(struct request_sock *req,
+        tcp_rsk(req)-&gt;rcv_isn = TCP_SKB_CB(skb)-&gt;seq;
+        tcp_rsk(req)-&gt;rcv_nxt = TCP_SKB_CB(skb)-&gt;seq + 1;
+        tcp_rsk(req)-&gt;snt_synack = tcp_time_stamp;
+    +   tcp_rsk(req)-&gt;last_oow_ack_time = 0;
+        req-&gt;mss = rx_opt-&gt;mss_clamp;
+        req-&gt;ts_recent = rx_opt-&gt;saw_tstamp ? rx_opt-&gt;rcv_tsval : 0;
+        ireq-&gt;tstamp_ok = rx_opt-&gt;tstamp_ok;
+    diff --git a/net/ipv4/tcp_minisocks.c b/net/ipv4/tcp_minisocks.c
+    index bc9216d..131aa49 100644
+    --- a/net/ipv4/tcp_minisocks.c
+    +++ b/net/ipv4/tcp_minisocks.c
+    @@ -605,7 +605,11 @@ struct sock *tcp_check_req(struct sock *sk, struct sk_buff *skb,
+             * Reset timer after retransmitting SYNACK, similar to
+             * the idea of fast retransmit in recovery.
+             */
+    -       if (!inet_rtx_syn_ack(sk, req))
+    +       if (!tcp_oow_rate_limited(sock_net(sk), skb,
+    +                     LINUX_MIB_TCPACKSKIPPEDSYNRECV,
+    +                     &amp;tcp_rsk(req)-&gt;last_oow_ack_time) &amp;&amp;
+    +
+    +           !inet_rtx_syn_ack(sk, req))
+                req-&gt;expires = min(TCP_TIMEOUT_INIT &lt;&lt; req-&gt;num_timeout,
+                           TCP_RTO_MAX) + jiffies;
+            return NULL;
+
+    commit 032ee4236954eb214651cb9bfc1b38ffa8fd7a01
+    Author: Neal Cardwell &lt;ncardwell@google.com&gt;
+    Date:   Fri Feb 6 16:04:38 2015 -0500
+
+        tcp: helpers to mitigate ACK loops by rate-limiting out-of-window dupacks
+
+        Helpers for mitigating ACK loops by rate-limiting dupacks sent in
+        response to incoming out-of-window packets.
+
+        This patch includes:
+
+        - rate-limiting logic
+        - sysctl to control how often we allow dupacks to out-of-window packets
+        - SNMP counter for cases where we rate-limited our dupack sending
+
+        The rate-limiting logic in this patch decides to not send dupacks in
+        response to out-of-window segments if (a) they are SYNs or pure ACKs
+        and (b) the remote endpoint is sending them faster than the configured
+        rate limit.
+
+        We rate-limit our responses rather than blocking them entirely or
+        resetting the connection, because legitimate connections can rely on
+        dupacks in response to some out-of-window segments. For example, zero
+        window probes are typically sent with a sequence number that is below
+        the current window, and ZWPs thus expect to thus elicit a dupack in
+        response.
+
+        We allow dupacks in response to TCP segments with data, because these
+        may be spurious retransmissions for which the remote endpoint wants to
+        receive DSACKs. This is safe because segments with data can't
+        realistically be part of ACK loops, which by their nature consist of
+        each side sending pure/data-less ACKs to each other.
+
+        The dupack interval is controlled by a new sysctl knob,
+        tcp_invalid_ratelimit, given in milliseconds, in case an administrator
+        needs to dial this upward in the face of a high-rate DoS attack. The
+        name and units are chosen to be analogous to the existing analogous
+        knob for ICMP, icmp_ratelimit.
+
+        The default value for tcp_invalid_ratelimit is 500ms, which allows at
+        most one such dupack per 500ms. This is chosen to be 2x faster than
+        the 1-second minimum RTO interval allowed by RFC 6298 (section 2, rule
+        2.4). We allow the extra 2x factor because network delay variations
+        can cause packets sent at 1 second intervals to be compressed and
+        arrive much closer.
+
+        Reported-by: Avery Fay &lt;avery@mixpanel.com&gt;
+        Signed-off-by: Neal Cardwell &lt;ncardwell@google.com&gt;
+        Signed-off-by: Yuchung Cheng &lt;ycheng@google.com&gt;
+        Signed-off-by: Eric Dumazet &lt;edumazet@google.com&gt;
+        Signed-off-by: David S. Miller &lt;davem@davemloft.net&gt;
+
+    diff --git a/Documentation/networking/ip-sysctl.txt b/Documentation/networking/ip-sysctl.txt
+    index a5e4c81..1b8c964 100644
+    --- a/Documentation/networking/ip-sysctl.txt
+    +++ b/Documentation/networking/ip-sysctl.txt
+    @@ -290,6 +290,28 @@ tcp_frto - INTEGER
+
+        By default it's enabled with a non-zero value. 0 disables F-RTO.
+
+    +tcp_invalid_ratelimit - INTEGER
+    +   Limit the maximal rate for sending duplicate acknowledgments
+    +   in response to incoming TCP packets that are for an existing
+    +   connection but that are invalid due to any of these reasons:
+    +
+    +     (a) out-of-window sequence number,
+    +     (b) out-of-window acknowledgment number, or
+    +     (c) PAWS (Protection Against Wrapped Sequence numbers) check failure
+    +
+    +   This can help mitigate simple "ack loop" DoS attacks, wherein
+    +   a buggy or malicious middlebox or man-in-the-middle can
+    +   rewrite TCP header fields in manner that causes each endpoint
+    +   to think that the other is sending invalid TCP segments, thus
+    +   causing each side to send an unterminating stream of duplicate
+    +   acknowledgments for invalid segments.
+    +
+    +   Using 0 disables rate-limiting of dupacks in response to
+    +   invalid segments; otherwise this value specifies the minimal
+    +   space between sending such dupacks, in milliseconds.
+    +
+    +   Default: 500 (milliseconds).
+    +
+     tcp_keepalive_time - INTEGER
+        How often TCP sends out keepalive messages when keepalive is enabled.
+        Default: 2hours.
+    diff --git a/include/net/tcp.h b/include/net/tcp.h
+    index 28e9bd3..b81f45c 100644
+    --- a/include/net/tcp.h
+    +++ b/include/net/tcp.h
+    @@ -274,6 +274,7 @@ extern int sysctl_tcp_challenge_ack_limit;
+     extern unsigned int sysctl_tcp_notsent_lowat;
+     extern int sysctl_tcp_min_tso_segs;
+     extern int sysctl_tcp_autocorking;
+    +extern int sysctl_tcp_invalid_ratelimit;
+
+     extern atomic_long_t tcp_memory_allocated;
+     extern struct percpu_counter tcp_sockets_allocated;
+    @@ -1236,6 +1237,37 @@ static inline bool tcp_paws_reject(const struct tcp_options_received *rx_opt,
+        return true;
+     }
+
+    +/* Return true if we're currently rate-limiting out-of-window ACKs and
+    + * thus shouldn't send a dupack right now. We rate-limit dupacks in
+    + * response to out-of-window SYNs or ACKs to mitigate ACK loops or DoS
+    + * attacks that send repeated SYNs or ACKs for the same connection. To
+    + * do this, we do not send a duplicate SYNACK or ACK if the remote
+    + * endpoint is sending out-of-window SYNs or pure ACKs at a high rate.
+    + */
+    +static inline bool tcp_oow_rate_limited(struct net *net,
+    +                   const struct sk_buff *skb,
+    +                   int mib_idx, u32 *last_oow_ack_time)
+    +{
+    +   /* Data packets without SYNs are not likely part of an ACK loop. */
+    +   if ((TCP_SKB_CB(skb)-&gt;seq != TCP_SKB_CB(skb)-&gt;end_seq) &amp;&amp;
+    +       !tcp_hdr(skb)-&gt;syn)
+    +       goto not_rate_limited;
+    +
+    +   if (*last_oow_ack_time) {
+    +       s32 elapsed = (s32)(tcp_time_stamp - *last_oow_ack_time);
+    +
+    +       if (0 &lt;= elapsed &amp;&amp; elapsed &lt; sysctl_tcp_invalid_ratelimit) {
+    +           NET_INC_STATS_BH(net, mib_idx);
+    +           return true;    /* rate-limited: don't send yet! */
+    +       }
+    +   }
+    +
+    +   *last_oow_ack_time = tcp_time_stamp;
+    +
+    +not_rate_limited:
+    +   return false;   /* not rate-limited: go ahead, send dupack now! */
+    +}
+    +
+     static inline void tcp_mib_init(struct net *net)
+     {
+        /* See RFC 2012 */
+    diff --git a/include/uapi/linux/snmp.h b/include/uapi/linux/snmp.h
+    index b222241..6a6fb74 100644
+    --- a/include/uapi/linux/snmp.h
+    +++ b/include/uapi/linux/snmp.h
+    @@ -270,6 +270,12 @@ enum
+        LINUX_MIB_TCPHYSTARTTRAINCWND,      /* TCPHystartTrainCwnd */
+        LINUX_MIB_TCPHYSTARTDELAYDETECT,    /* TCPHystartDelayDetect */
+        LINUX_MIB_TCPHYSTARTDELAYCWND,      /* TCPHystartDelayCwnd */
+    +   LINUX_MIB_TCPACKSKIPPEDSYNRECV,     /* TCPACKSkippedSynRecv */
+    +   LINUX_MIB_TCPACKSKIPPEDPAWS,        /* TCPACKSkippedPAWS */
+    +   LINUX_MIB_TCPACKSKIPPEDSEQ,     /* TCPACKSkippedSeq */
+    +   LINUX_MIB_TCPACKSKIPPEDFINWAIT2,    /* TCPACKSkippedFinWait2 */
+    +   LINUX_MIB_TCPACKSKIPPEDTIMEWAIT,    /* TCPACKSkippedTimeWait */
+    +   LINUX_MIB_TCPACKSKIPPEDCHALLENGE,   /* TCPACKSkippedChallenge */
+        __LINUX_MIB_MAX
+     };
+
+    diff --git a/net/ipv4/proc.c b/net/ipv4/proc.c
+    index 8f9cd20..d8953ef 100644
+    --- a/net/ipv4/proc.c
+    +++ b/net/ipv4/proc.c
+    @@ -292,6 +292,12 @@ static const struct snmp_mib snmp4_net_list[] = {
+        SNMP_MIB_ITEM("TCPHystartTrainCwnd", LINUX_MIB_TCPHYSTARTTRAINCWND),
+        SNMP_MIB_ITEM("TCPHystartDelayDetect", LINUX_MIB_TCPHYSTARTDELAYDETECT),
+        SNMP_MIB_ITEM("TCPHystartDelayCwnd", LINUX_MIB_TCPHYSTARTDELAYCWND),
+    +   SNMP_MIB_ITEM("TCPACKSkippedSynRecv", LINUX_MIB_TCPACKSKIPPEDSYNRECV),
+    +   SNMP_MIB_ITEM("TCPACKSkippedPAWS", LINUX_MIB_TCPACKSKIPPEDPAWS),
+    +   SNMP_MIB_ITEM("TCPACKSkippedSeq", LINUX_MIB_TCPACKSKIPPEDSEQ),
+    +   SNMP_MIB_ITEM("TCPACKSkippedFinWait2", LINUX_MIB_TCPACKSKIPPEDFINWAIT2),
+    +   SNMP_MIB_ITEM("TCPACKSkippedTimeWait", LINUX_MIB_TCPACKSKIPPEDTIMEWAIT),
+    +   SNMP_MIB_ITEM("TCPACKSkippedChallenge", LINUX_MIB_TCPACKSKIPPEDCHALLENGE),
+        SNMP_MIB_SENTINEL
+     };
+
+    diff --git a/net/ipv4/sysctl_net_ipv4.c b/net/ipv4/sysctl_net_ipv4.c
+    index e0ee384..82601a6 100644
+    --- a/net/ipv4/sysctl_net_ipv4.c
+    +++ b/net/ipv4/sysctl_net_ipv4.c
+    @@ -729,6 +729,13 @@ static struct ctl_table ipv4_table[] = {
+            .extra2     = &amp;one,
+        },
+        {
+    +       .procname   = "tcp_invalid_ratelimit",
+    +       .data       = &amp;sysctl_tcp_invalid_ratelimit,
+    +       .maxlen     = sizeof(int),
+    +       .mode       = 0644,
+    +       .proc_handler   = proc_dointvec_ms_jiffies,
+    +   },
+    +   {
+            .procname   = "icmp_msgs_per_sec",
+            .data       = &amp;sysctl_icmp_msgs_per_sec,
+            .maxlen     = sizeof(int),
+    diff --git a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
+    index d3dfff7..9401aa43 100644
+    --- a/net/ipv4/tcp_input.c
+    +++ b/net/ipv4/tcp_input.c
+    @@ -100,6 +100,7 @@ int sysctl_tcp_thin_dupack __read_mostly;
+
+     int sysctl_tcp_moderate_rcvbuf __read_mostly = 1;
+     int sysctl_tcp_early_retrans __read_mostly = 3;
+    +int sysctl_tcp_invalid_ratelimit __read_mostly = HZ/2;
+
+     #define FLAG_DATA      0x01 /* Incoming frame contained data.      */
+     #define FLAG_WIN_UPDATE        0x02 /* Incoming ACK was a window update.   */
+</code></pre>
+
+<hr />
+
+<h4>sample</h4>
+
+<pre><code>    #define KMSG_COMPONENT "synflood"
+    #define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
+
+    #include &lt;linux/module.h&gt;
+    #include &lt;linux/kernel.h&gt;
+    #include &lt;linux/ip.h&gt;
+    #include &lt;linux/tcp.h&gt;
+    #include &lt;linux/icmp.h&gt;
+    #include &lt;linux/netfilter.h&gt;
+    #include &lt;linux/netfilter_ipv4.h&gt;
+    #include &lt;linux/netdevice.h&gt;
+
+    #include &lt;net/ip.h&gt;
+    #include &lt;net/tcp.h&gt;
+    #include &lt;net/udp.h&gt;
+    #include &lt;net/icmp.h&gt;
+
+    __be16 cport = 80;
+    char *selfip = NULL;
+
+    module_param(cport, short, S_IRUGO);
+    module_param(selfip, charp, S_IRUGO);
+
+    void skbcsum(struct sk_buff *skb)
+    {
+        struct tcphdr *tcph;
+        struct iphdr *iph;
+        int iphl;
+        int tcphl;
+        int tcplen;
+
+        iph = (struct iphdr *)skb-&gt;data;
+        iphl = iph-&gt;ihl &lt;&lt; 2;
+        tcph = (struct tcphdr *)(skb-&gt;data + iphl);
+        tcphl = tcph-&gt;doff &lt;&lt; 2;
+
+        iph-&gt;check = 0;
+        iph-&gt;check = ip_fast_csum((unsigned char *)iph, iph-&gt;ihl);
+
+        tcph-&gt;check    = 0;
+        tcplen        = skb-&gt;len - (iph-&gt;ihl &lt;&lt; 2);
+        if (skb-&gt;ip_summed == CHECKSUM_PARTIAL) {
+            tcph-&gt;check = ~csum_tcpudp_magic(iph-&gt;saddr, iph-&gt;daddr,
+                    tcplen, IPPROTO_TCP, 0);
+            skb-&gt;csum_start    = skb_transport_header(skb) - skb-&gt;head;
+            skb-&gt;csum_offset = offsetof(struct tcphdr, check);
+        }
+        else {
+            skb-&gt;csum = 0;
+            skb-&gt;csum = skb_checksum(skb, iph-&gt;ihl &lt;&lt; 2, tcplen, 0);
+            tcph-&gt;check = csum_tcpudp_magic(iph-&gt;saddr, iph-&gt;daddr,
+                    tcplen, IPPROTO_TCP, skb-&gt;csum);
+
+        }
+    }
+
+    int pktcome = 0;
+    int fincome = 0;
+    static int check(__be32 ip, __be16 port, int syn, int fin)
+    {
+        if ((selfip == NULL || ip == in_aton(selfip)) &amp;&amp; ntohs(port) == cport) {
+            if (syn) {
+                pktcome = 0;
+                fincome = 0;
+            }
+            pktcome ++;
+            if (pktcome &gt; 30 || fincome == 3)
+                return 1;
+            fincome |= fin;
+        }
+        return 0;
+    }
+
+    static unsigned int local_in(unsigned int hooknum, 
+        struct sk_buff *skb, const struct net_device *in, 
+        const struct net_device *out, int (*okfn) (struct sk_buff *))
+    {
+        struct iphdr *iph;
+        struct tcphdr *th;
+
+        if (unlikely(skb-&gt;pkt_type != PACKET_HOST))
+            goto exit;
+        if (unlikely(skb-&gt;protocol != __constant_htons(ETH_P_IP)))
+            goto exit;
+        iph = (struct iphdr *)skb_network_header(skb);
+        if (iph-&gt;protocol != IPPROTO_TCP)
+            goto exit;
+        if (unlikely(!pskb_may_pull(skb, iph-&gt;ihl * 4 + sizeof(struct tcphdr))))
+            goto drop_out;
+        skb_set_transport_header(skb, iph-&gt;ihl * 4);
+        th = tcp_hdr(skb);
+        if (check(iph-&gt;daddr, th-&gt;dest, th-&gt;syn, th-&gt;fin)) {
+            skb-&gt;ip_summed = CHECKSUM_UNNECESSARY;
+            th-&gt;seq = htonl(ntohl(th-&gt;seq) + 10000000);
+        }
+    exit:
+        return NF_ACCEPT;
+    drop_out:
+        return NF_DROP;
+    }
+
+    static unsigned int local_out(unsigned int hooknum, 
+        struct sk_buff *skb, const struct net_device *in, 
+        const struct net_device *out, int (*okfn) (struct sk_buff *))
+    {
+        struct iphdr *iph;
+        struct tcphdr *th;
+
+        iph = (struct iphdr *)skb_network_header(skb);
+        if (iph-&gt;protocol != IPPROTO_TCP)
+            goto exit;
+        if (unlikely(!pskb_may_pull(skb, iph-&gt;ihl * 4 + sizeof(struct tcphdr))))
+            goto drop_out;
+        skb_set_transport_header(skb, iph-&gt;ihl * 4);
+        th = tcp_hdr(skb);
+        if (check(iph-&gt;saddr, th-&gt;source, 0, (th-&gt;fin) &lt;&lt; 1)) {
+            th-&gt;seq = htonl(ntohl(th-&gt;seq) + 10000000);
+            skbcsum(skb);
+        }
+    exit:
+        return NF_ACCEPT;
+    drop_out:
+        return NF_DROP;
+    }
+
+    static struct nf_hook_ops syndef_ops[] __read_mostly = {
+        {
+            .hook = local_in,
+            .owner = THIS_MODULE,
+            .pf = PF_INET,
+            .hooknum = NF_INET_LOCAL_IN,
+            .priority = 100,
+        },
+        {
+            .hook = local_out,
+            .owner = THIS_MODULE,
+            .pf = PF_INET,
+            .hooknum = NF_INET_LOCAL_OUT,
+            .priority = 100,
+        },
+
+    };
+
+    int __init loopack_init(void)
+    {
+        int ret;
+
+        ret = nf_register_hooks(syndef_ops, ARRAY_SIZE(syndef_ops));
+        if (ret &lt; 0) {
+            pr_err("can't register hooks.\n");
+            goto hooks_err;
+        }
+
+        pr_err("init success.\n");
+
+    hooks_err:
+        return ret;
+    }
+
+    void __exit loopack_exit(void)
+    {
+        nf_unregister_hooks(syndef_ops, ARRAY_SIZE(syndef_ops));
+
+        pr_err("unload success.\n");
+    }
+
+    module_init(loopack_init);
+    module_exit(loopack_exit);
+    MODULE_AUTHOR("kk");
+    MODULE_VERSION("1.0.0");
+    MODULE_LICENSE("GPL");
+</code></pre>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[linux c libcurl的简单使用]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2015/09/30/lang-c-libcurl/"/>
+    <updated>2015-09-30T15:25:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2015/09/30/lang-c-libcurl</id>
+    <content type="html"><![CDATA[<p><a href="http://blog.chinaunix.net/uid-23095063-id-163160.html">http://blog.chinaunix.net/uid-23095063-id-163160.html</a></p>
+
+<pre><code>    yum install libcurl libcurl-devel
+</code></pre>
+
+<pre><code>    #include &lt;curl/curl.h&gt;
+    #include &lt;stdio.h&gt;
+    #include &lt;string.h&gt;
+
+    CURL *curl;
+    CURLcode res;
+
+    size_t write_data(void *ptr, size_t size, size_t nmemb, void *stream)
+    {
+        if (strlen((char *)stream) + strlen((char *)ptr) &gt; 999999) return 0;
+        strcat(stream, (char *)ptr);
+    //  printf("%s\n", ptr);
+        return nmemb;
+    }
+
+    char *down_file(char *url)
+    {
+        static char str[1000000];
+        int ret;
+
+        struct curl_slist *slist = NULL;
+        slist = curl_slist_append(slist, "Connection: Keep-Alive"); //http长连接
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, slist);
+
+        strcpy(str, "");
+
+        curl_easy_setopt(curl, CURLOPT_VERBOSE, 1); // 显示详细信息
+
+        curl_easy_setopt(curl, CURLOPT_URL, url); //设置下载地址
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 3); //设置超时时间
+
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_data); //设置写数据的函数
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, str); //设置写数据的变量
+
+        res = curl_easy_perform(curl); //执行下载
+
+        str[999999] = '\0';
+        if (CURLE_OK != res) //判断是否下载成功
+            return NULL;
+
+        return str;
+    }
+
+    int main()
+    {
+        char url[200];
+        curl = curl_easy_init(); //对curl进行初始化
+
+        char *result;
+        printf("Please Input a url: ");
+        while (scanf("%s", url) != EOF) {
+            result = down_file(url);
+            if (result)
+                puts(result);
+            else
+                puts("Get Error!");
+            printf("\nPlease Input a url: ");
+        }
+        curl_easy_cleanup(curl); //释放curl资源
+
+        return 0;
+    }
+</code></pre>
+]]></content>
+  </entry>
+  
+</feed>

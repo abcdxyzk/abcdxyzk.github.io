@@ -1,0 +1,3726 @@
+
+<!DOCTYPE html>
+<!--[if IEMobile 7 ]><html class="no-js iem7"><![endif]-->
+<!--[if lt IE 9]><html class="no-js lte-ie8"><![endif]-->
+<!--[if (gt IE 8)|(gt IEMobile 7)|!(IEMobile)|!(IE)]><!--><html class="no-js" lang="en"><!--<![endif]-->
+<head>
+  <meta charset="utf-8">
+  <title>Linux slab 分配器，注意RCU - kk Blog —— 通用基础</title>
+
+  <link href="/favicon.png" rel="icon">
+  <link href="/stylesheets/screen.css" media="screen, projection" rel="stylesheet" type="text/css">
+  <link href="/atom.xml" rel="alternate" title="kk Blog —— 通用基础" type="application/atom+xml">
+  <script src="/javascripts/modernizr-2.0.js"></script>
+  <script src="/javascripts/libs/jquery.min.js"></script>
+<!--  <script>!window.jQuery && document.write(unescape('%3Cscript src="/javascripts/libs/jquery.min.js"%3E%3C/script%3E'))</script> -->
+  <script src="/javascripts/octopress.js" type="text/javascript"></script>
+  <script src="/javascripts/category.js" type="text/javascript"></script>
+
+</head>
+
+<body   >
+  <header role="banner"><hgroup>
+  <h1><a href="/">kk Blog —— 通用基础</a></h1>
+  
+    <h2><br>date [-d @int|str] [+%s|"+%F %T"]<br>netstat -ltunp</h2>
+  
+  <div class="hwx" style='text-align: left; position: absolute; margin-top: -115px; white-space: nowrap;'>
+	  <img src="/images/wx_ok.png" width=130px; height=130px;>
+	  <img src="/images/ali_ok.png" width=130px; height=130px; style="margin-left:30px;">
+  </div>
+</hgroup>
+
+</header>
+  <nav role="navigation" style='white-space: nowrap; min-width=1120px;'><form action="/search" method="get" target="_blank">
+    <input class="search" name="query" id="query" type="text" placeholder="search...">
+    <input id="btnSubmit" value="search" type="submit">
+</form>
+<script type="text/javascript">
+var query = GetRequest("query");
+if (query != null) {
+	document.getElementById("query").value = query;
+}
+</script>
+
+<!-- Start of Site Search 360 Scripts -->
+<!-- Search 360 达到次数后要收费，换成静态索引
+<script type="text/javascript">
+var ss360Config = {
+    siteId: "abcdxyzk.github.io",
+    searchBox: {
+        selector: "input#query",
+        searchButton: "input#query+input[type='submit']"
+    }
+}
+</script>
+<script src="https://cdn.sitesearch360.com/v13/sitesearch360-v13.min.js" async></script>
+-->
+<!-- End of Site Search 360 Scripts -->
+
+<ul class="subscription" data-subscription="rss">
+<li>
+</li>
+  <li><a href="/atom.xml" rel="subscribe-rss">RSS</a></li>
+  
+</ul>
+  
+  
+<ul class="main-navigation">
+  <li><a href="/">Blog</a></li>
+  <li><a href="/blog/archives">Archives</a></li>
+  <li><a href="/search">Search</a></li>
+  <li><a href="/download">Download</a></li>
+  <li><a href="/about">About</a></li>
+</ul>
+
+</nav>
+  <div id="main">
+    <div id="content">
+      <div>
+<article class="hentry" role="article">
+  
+  <header>
+    
+      <h2 class="entry-title">Linux slab 分配器，注意RCU</h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-03-03T17:32:00+08:00'><span class='date'>2015-03-03</span> <span class='time'>17:32:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+<div class="entry-content"><p><a href="http://www.linuxidc.com/Linux/2012-06/62965.htm">Linux Slab分配器(一)-概述</a><br/>
+<a href="http://www.linuxidc.com/Linux/2012-06/62966.htm">Linux Slab分配器(二)-初始化</a><br/>
+<a href="http://www.linuxidc.com/Linux/2012-06/63109.htm">Linux Slab分配器(三)-创建缓存</a><br/>
+<a href="http://www.linuxidc.com/Linux/2012-06/63138.htm">Linux Slab分配器(四)-分配对象</a><br/>
+<a href="https://www.linuxidc.com/Linux/2012-06/63167p3.htm">Linux Slab分配器(五)&ndash;释放对象</a><br/>
+<a href="https://www.linuxidc.com/Linux/2012-06/63167.htm">Linux Slab分配器(六)&ndash;创建slab和销毁slab</a><br/>
+<a href="https://www.linuxidc.com/Linux/2012-06/63257.htm">Linux Slab分配器(七)&ndash;销毁缓存</a></p>
+
+<h2>一、概述</h2>
+
+<p>  slab分配器是Linux内存管理中非常重要和复杂的一部分，其工作是针对一些经常分配并释放的对象，如进程描述符等，这些对象的大小一般比较小，如果直接采用伙伴系统来进行分配和释放，不仅会造成大量的内碎片，而且处理速度也太慢。而slab分配器是基于对象进行管理的，相同类型的对象归为一类(如进程描述符就是一类)，每当要申请这样一个对象，slab分配器就从一个slab列表中分配一个这样大小的单元出去，而当要释放时，将其重新保存在该列表中，而不是直接返回给伙伴系统。slab分配对象时，会使用最近释放的对象内存块，因此其驻留在CPU高速缓存的概率较高。</p>
+
+<h5>用于描述和管理cache的数据结构是struct kmem_cache</h5>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct kmem_cache {
+</span><span class='line'>/* 1) per-cpu data, touched during every alloc/free */
+</span><span class='line'>&#9;/*per-CPU数据，记录了本地高速缓存的信息，也用于跟踪最近释放的对象，每次分配和释放都要直接访问它*/
+</span><span class='line'>&#9;struct array_cache *array[NR_CPUS];
+</span><span class='line'>/* 2) Cache tunables. Protected by cache_chain_mutex */
+</span><span class='line'>&#9;unsigned int batchcount;  /*本地高速缓存转入或转出的大批对象数量*/
+</span><span class='line'>&#9;unsigned int limit;       /*本地高速缓存中空闲对象的最大数目*/
+</span><span class='line'>&#9;unsigned int shared;
+</span><span class='line'>
+</span><span class='line'>&#9;unsigned int buffer_size;/*管理对象的大小*/
+</span><span class='line'>&#9;u32 reciprocal_buffer_size;/*buffer_size的倒数值*/
+</span><span class='line'>/* 3) touched by every alloc & free from the backend */
+</span><span class='line'>
+</span><span class='line'>&#9;unsigned int flags;          /* 高速缓存的永久标识*/
+</span><span class='line'>&#9;unsigned int num;         /* 一个slab所包含的对象数目 */
+</span><span class='line'>
+</span><span class='line'>/* 4) cache_grow/shrink */
+</span><span class='line'>&#9;/* order of pgs per slab (2^n) */
+</span><span class='line'>&#9;unsigned int gfporder;   /*一个slab包含的连续页框数的对数*/
+</span><span class='line'>
+</span><span class='line'>&#9;/* force GFP flags, e.g. GFP_DMA */
+</span><span class='line'>&#9;gfp_t gfpflags;          /*与伙伴系统交互时所提供的分配标识*/
+</span><span class='line'>
+</span><span class='line'>&#9;size_t colour;         /* 颜色的个数*/
+</span><span class='line'>&#9;unsigned int colour_off; /* 着色的偏移量 */
+</span><span class='line'>
+</span><span class='line'>&#9;/*如果将slab描述符存储在外部，该指针指向存储slab描述符的cache,
+</span><span class='line'>&#9;  否则为NULL*/
+</span><span class='line'>&#9;struct kmem_cache *slabp_cache;
+</span><span class='line'>&#9;unsigned int slab_size;  /*slab管理区的大小*/
+</span><span class='line'>&#9;unsigned int dflags;     /*动态标识*/
+</span><span class='line'>
+</span><span class='line'>&#9;/* constructor func */
+</span><span class='line'>&#9;void (*ctor)(void *obj); /*创建高速缓存时的构造函数指针*/
+</span><span class='line'>
+</span><span class='line'>/* 5) cache creation/removal */
+</span><span class='line'>&#9;const char *name;         /*高速缓存名*/
+</span><span class='line'>&#9;struct list_head next;    /*用于将高速缓存链入cache chain*/
+</span><span class='line'>
+</span><span class='line'>/* 6) statistics */
+</span><span class='line'>#ifdef CONFIG_DEBUG_SLAB /*一些用于调试用的变量*/
+</span><span class='line'>&#9;unsigned long num_active;
+</span><span class='line'>&#9;unsigned long num_allocations;
+</span><span class='line'>&#9;unsigned long high_mark;
+</span><span class='line'>&#9;unsigned long grown;
+</span><span class='line'>&#9;unsigned long reaped;
+</span><span class='line'>&#9;unsigned long errors;
+</span><span class='line'>&#9;unsigned long max_freeable;
+</span><span class='line'>&#9;unsigned long node_allocs;
+</span><span class='line'>&#9;unsigned long node_frees;
+</span><span class='line'>&#9;unsigned long node_overflow;
+</span><span class='line'>&#9;atomic_t allochit;
+</span><span class='line'>&#9;atomic_t allocmiss;
+</span><span class='line'>&#9;atomic_t freehit;
+</span><span class='line'>&#9;atomic_t freemiss;
+</span><span class='line'>
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * If debugging is enabled, then the allocator can add additional
+</span><span class='line'>&#9; * fields and/or padding to every object. buffer_size contains the total
+</span><span class='line'>&#9; * object size including these internal fields, the following two
+</span><span class='line'>&#9; * variables contain the offset to the user object and its size.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;int obj_offset;
+</span><span class='line'>&#9;int obj_size;
+</span><span class='line'>#endif /* CONFIG_DEBUG_SLAB */
+</span><span class='line'>
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * We put nodelists[] at the end of kmem_cache, because we want to size
+</span><span class='line'>&#9; * this array to nr_node_ids slots instead of MAX_NUMNODES
+</span><span class='line'>&#9; * (see kmem_cache_init())
+</span><span class='line'>&#9; * We still use [MAX_NUMNODES] and not [1] or [0] because cache_cache
+</span><span class='line'>&#9; * is statically defined, so we reserve the max number of nodes.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9; /*struct kmem_list3用于组织该高速缓存中的slab*/
+</span><span class='line'>&#9;struct kmem_list3 *nodelists[MAX_NUMNODES];
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * Do not add fields after nodelists[]
+</span><span class='line'>&#9; */
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct kmem_list3 {
+</span><span class='line'>&#9;struct list_head slabs_partial;/*slab链表，包含空闲对象和已分配对象的slab描述符*/
+</span><span class='line'>&#9;struct list_head slabs_full;   /*slab链表，只包含非空闲的slab描述符*/
+</span><span class='line'>&#9;struct list_head slabs_free;   /*slab链表，只包含空闲的slab描述符*/
+</span><span class='line'>&#9;unsigned long free_objects;    /*高速缓存中空闲对象的个数*/
+</span><span class='line'>&#9;unsigned int free_limit;       /*空闲对象的上限*/
+</span><span class='line'>&#9;unsigned int colour_next;       /*下一个slab使用的颜色*/
+</span><span class='line'>&#9;spinlock_t list_lock;
+</span><span class='line'>&#9;struct array_cache *shared; /* shared per node */
+</span><span class='line'>&#9;struct array_cache **alien; /* on other nodes */
+</span><span class='line'>&#9;unsigned long next_reap;    /* updated without locking */
+</span><span class='line'>&#9;int free_touched;       /* updated without locking */
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>描述和管理单个slab的结构是struct slab</h5>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct slab {
+</span><span class='line'>&#9;struct list_head list;  /*用于将slab链入kmem_list3的链表*/
+</span><span class='line'>&#9;unsigned long colouroff;/*该slab的着色偏移*/
+</span><span class='line'>&#9;void *s_mem;            /*指向slab中的第一个对象*/
+</span><span class='line'>&#9;unsigned int inuse;     /*已分配出去的对象*/
+</span><span class='line'>&#9;kmem_bufctl_t free;     /*下一个空闲对象的下标*/
+</span><span class='line'>&#9;unsigned short nodeid;  /*节点标识号*/
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<!-- more -->
+
+
+<p>  还要介绍的一个数据结构就是struct array_cache。struct kmem_cache中定义了一个struct array_cache指针数组，数组的元素个数对应了系统的CPU数，和伙伴系统中的每CPU页框高速缓存类似，该结构用来描述每个CPU的本地高速缓存，它可以减少SMP系统中对于自旋锁的竞争。在每个array_cache的末端都用一个指针数组记录了slab中的空闲对象，分配对象时，采用LIFO方式，也就是将该数组中的最后一个索引对应的对象分配出去，以保证该对象还驻留在高速缓存中的可能性。实际上，每次分配内存都是直接与本地CPU高速缓存进行交互，只有当其空闲内存不足时，才会从kmem_list中的slab中引入一部分对象到本地高速缓存中，而kmem_list中的空闲对象也不足了，那么就要从伙伴系统中引入新的页来建立新的slab了，这一点也和伙伴系统的每CPU页框高速缓存很类似。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct array_cache {
+</span><span class='line'>&#9;unsigned int avail;/*本地高速缓存中可用的空闲对象数*/
+</span><span class='line'>&#9;unsigned int limit;/*空闲对象的上限*/
+</span><span class='line'>&#9;unsigned int batchcount;/*一次转入和转出的对象数量*/
+</span><span class='line'>&#9;unsigned int touched;   /*标识本地CPU最近是否被使用*/
+</span><span class='line'>&#9;spinlock_t lock;
+</span><span class='line'>&#9;void *entry[];  /*这是一个伪数组，便于对后面用于跟踪空闲对象的指针数组的访问
+</span><span class='line'>&#9;&#9;&#9; * Must have this definition in here for the proper
+</span><span class='line'>&#9;&#9;&#9; * alignment of array_cache. Also simplifies accessing
+</span><span class='line'>&#9;&#9;&#9; * the entries.
+</span><span class='line'>&#9;&#9;&#9; */
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>slab分配器涉及到了一些繁杂的概念，这些在后面再逐一结合代码进行讲解，在理解slab分配器的工作之前，必须先理解上述这些数据结构之间的联系，下图给出了一个清晰的描述</p>
+
+<p><img src="/images/kernel/2015-03-03-11.png" alt="" /></p>
+
+<h2>二、初始化</h2>
+
+<p>在前文中介绍了slab所涉及到的数据结构， slab分配器的初始化工作都是围绕这些数据结构来展开的，主要是针对以下两个问题:<br/>
+1. 创建kmem_cache高速缓存用来存储所有的cache描述符<br/>
+2. 创建array_cache和kmem_list3高速缓存用来存储slab数据结构中的这两个关键结构</p>
+
+<p>这里明显有点自相矛盾，那就是slab管理器尚未建立起来，又如何靠slab分配高速缓存来给这些结构分配空间呢？</p>
+
+<p>  解决第一个问题的方法是直接静态定义一个名为cache_cache的kmem_cache结构，来管理所有的kmem_cache描述符，对于array_cache和kmem_list3，内核也是先静态定义，然后建立起普通高速缓存(general cache)，再使用kmalloc分配普通高速缓存空间来替代之前静态定义的部分。</p>
+
+<h5>普通高速缓存是一组大小按几何倍数增长的高速缓存的合集，一个普通高速缓存用如下结构描述</h5>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* Size description struct for general caches. */
+</span><span class='line'>struct cache_sizes {
+</span><span class='line'>&#9;size_t          cs_size;   /*general cache的大小*/
+</span><span class='line'>&#9;struct kmem_cache   *cs_cachep;         /*general cache的cache描述符指针*/
+</span><span class='line'>#ifdef CONFIG_ZONE_DMA
+</span><span class='line'>&#9;struct kmem_cache   *cs_dmacachep;
+</span><span class='line'>#endif
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>普通高速缓存的大小由malloc_sizes表来确定</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/*
+</span><span class='line'> * These are the default caches for kmalloc. Custom caches can have other sizes.
+</span><span class='line'> */
+</span><span class='line'>struct cache_sizes malloc_sizes[] = {
+</span><span class='line'>#define CACHE(x) { .cs_size = (x) },
+</span><span class='line'>#include &lt;linux/kmalloc_sizes.h&gt;
+</span><span class='line'>&#9;CACHE(ULONG_MAX)
+</span><span class='line'>#undef CACHE
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>其中&lt;linux/kmalloc_sizes.h>中的内容为</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#if (PAGE_SIZE == 4096)
+</span><span class='line'>&#9;CACHE(32)
+</span><span class='line'>#endif
+</span><span class='line'>&#9;CACHE(64)
+</span><span class='line'>#if L1_CACHE_BYTES &lt; 64
+</span><span class='line'>&#9;CACHE(96)
+</span><span class='line'>#endif
+</span><span class='line'>&#9;CACHE(128)
+</span><span class='line'>#if L1_CACHE_BYTES &lt; 128
+</span><span class='line'>&#9;CACHE(192)
+</span><span class='line'>#endif
+</span><span class='line'>&#9;CACHE(256)
+</span><span class='line'>&#9;CACHE(512)
+</span><span class='line'>&#9;CACHE(1024)
+</span><span class='line'>&#9;CACHE(2048)
+</span><span class='line'>&#9;CACHE(4096)
+</span><span class='line'>&#9;CACHE(8192)
+</span><span class='line'>&#9;CACHE(16384)
+</span><span class='line'>&#9;CACHE(32768)
+</span><span class='line'>&#9;CACHE(65536)
+</span><span class='line'>&#9;CACHE(131072)
+</span><span class='line'>#if KMALLOC_MAX_SIZE &gt;= 262144
+</span><span class='line'>&#9;CACHE(262144)
+</span><span class='line'>#endif
+</span><span class='line'>#if KMALLOC_MAX_SIZE &gt;= 524288
+</span><span class='line'>&#9;CACHE(524288)
+</span><span class='line'>#endif
+</span><span class='line'>#if KMALLOC_MAX_SIZE &gt;= 1048576
+</span><span class='line'>&#9;CACHE(1048576)
+</span><span class='line'>#endif
+</span><span class='line'>#if KMALLOC_MAX_SIZE &gt;= 2097152
+</span><span class='line'>&#9;CACHE(2097152)
+</span><span class='line'>#endif
+</span><span class='line'>#if KMALLOC_MAX_SIZE &gt;= 4194304
+</span><span class='line'>&#9;CACHE(4194304)
+</span><span class='line'>#endif
+</span><span class='line'>#if KMALLOC_MAX_SIZE &gt;= 8388608
+</span><span class='line'>&#9;CACHE(8388608)
+</span><span class='line'>#endif
+</span><span class='line'>#if KMALLOC_MAX_SIZE &gt;= 16777216
+</span><span class='line'>&#9;CACHE(16777216)
+</span><span class='line'>#endif
+</span><span class='line'>#if KMALLOC_MAX_SIZE &gt;= 33554432
+</span><span class='line'>&#9;CACHE(33554432)
+</span><span class='line'>#endif</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>cache_cache的初始化和普通高速缓存的建立</h5>
+
+<p>由<code>start_kernel()--&gt;mm_init()--&gt;kmem_cache_init()</code>函数来完成，下面就来看具体的初始化代码</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+<span class='line-number'>82</span>
+<span class='line-number'>83</span>
+<span class='line-number'>84</span>
+<span class='line-number'>85</span>
+<span class='line-number'>86</span>
+<span class='line-number'>87</span>
+<span class='line-number'>88</span>
+<span class='line-number'>89</span>
+<span class='line-number'>90</span>
+<span class='line-number'>91</span>
+<span class='line-number'>92</span>
+<span class='line-number'>93</span>
+<span class='line-number'>94</span>
+<span class='line-number'>95</span>
+<span class='line-number'>96</span>
+<span class='line-number'>97</span>
+<span class='line-number'>98</span>
+<span class='line-number'>99</span>
+<span class='line-number'>100</span>
+<span class='line-number'>101</span>
+<span class='line-number'>102</span>
+<span class='line-number'>103</span>
+<span class='line-number'>104</span>
+<span class='line-number'>105</span>
+<span class='line-number'>106</span>
+<span class='line-number'>107</span>
+<span class='line-number'>108</span>
+<span class='line-number'>109</span>
+<span class='line-number'>110</span>
+<span class='line-number'>111</span>
+<span class='line-number'>112</span>
+<span class='line-number'>113</span>
+<span class='line-number'>114</span>
+<span class='line-number'>115</span>
+<span class='line-number'>116</span>
+<span class='line-number'>117</span>
+<span class='line-number'>118</span>
+<span class='line-number'>119</span>
+<span class='line-number'>120</span>
+<span class='line-number'>121</span>
+<span class='line-number'>122</span>
+<span class='line-number'>123</span>
+<span class='line-number'>124</span>
+<span class='line-number'>125</span>
+<span class='line-number'>126</span>
+<span class='line-number'>127</span>
+<span class='line-number'>128</span>
+<span class='line-number'>129</span>
+<span class='line-number'>130</span>
+<span class='line-number'>131</span>
+<span class='line-number'>132</span>
+<span class='line-number'>133</span>
+<span class='line-number'>134</span>
+<span class='line-number'>135</span>
+<span class='line-number'>136</span>
+<span class='line-number'>137</span>
+<span class='line-number'>138</span>
+<span class='line-number'>139</span>
+<span class='line-number'>140</span>
+<span class='line-number'>141</span>
+<span class='line-number'>142</span>
+<span class='line-number'>143</span>
+<span class='line-number'>144</span>
+<span class='line-number'>145</span>
+<span class='line-number'>146</span>
+<span class='line-number'>147</span>
+<span class='line-number'>148</span>
+<span class='line-number'>149</span>
+<span class='line-number'>150</span>
+<span class='line-number'>151</span>
+<span class='line-number'>152</span>
+<span class='line-number'>153</span>
+<span class='line-number'>154</span>
+<span class='line-number'>155</span>
+<span class='line-number'>156</span>
+<span class='line-number'>157</span>
+<span class='line-number'>158</span>
+<span class='line-number'>159</span>
+<span class='line-number'>160</span>
+<span class='line-number'>161</span>
+<span class='line-number'>162</span>
+<span class='line-number'>163</span>
+<span class='line-number'>164</span>
+<span class='line-number'>165</span>
+<span class='line-number'>166</span>
+<span class='line-number'>167</span>
+<span class='line-number'>168</span>
+<span class='line-number'>169</span>
+<span class='line-number'>170</span>
+<span class='line-number'>171</span>
+<span class='line-number'>172</span>
+<span class='line-number'>173</span>
+<span class='line-number'>174</span>
+<span class='line-number'>175</span>
+<span class='line-number'>176</span>
+<span class='line-number'>177</span>
+<span class='line-number'>178</span>
+<span class='line-number'>179</span>
+<span class='line-number'>180</span>
+<span class='line-number'>181</span>
+<span class='line-number'>182</span>
+<span class='line-number'>183</span>
+<span class='line-number'>184</span>
+<span class='line-number'>185</span>
+<span class='line-number'>186</span>
+<span class='line-number'>187</span>
+<span class='line-number'>188</span>
+<span class='line-number'>189</span>
+<span class='line-number'>190</span>
+<span class='line-number'>191</span>
+<span class='line-number'>192</span>
+<span class='line-number'>193</span>
+<span class='line-number'>194</span>
+<span class='line-number'>195</span>
+<span class='line-number'>196</span>
+<span class='line-number'>197</span>
+<span class='line-number'>198</span>
+<span class='line-number'>199</span>
+<span class='line-number'>200</span>
+<span class='line-number'>201</span>
+<span class='line-number'>202</span>
+<span class='line-number'>203</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void __init kmem_cache_init(void)
+</span><span class='line'>{
+</span><span class='line'>&#9;size_t left_over;
+</span><span class='line'>&#9;struct cache_sizes *sizes;
+</span><span class='line'>&#9;struct cache_names *names;
+</span><span class='line'>&#9;int i;
+</span><span class='line'>&#9;int order;
+</span><span class='line'>&#9;int node;
+</span><span class='line'>
+</span><span class='line'>&#9;if (num_possible_nodes() == 1)
+</span><span class='line'>&#9;&#9;use_alien_caches = 0;
+</span><span class='line'>
+</span><span class='line'>&#9;/*初始化静态L3变量initkmem_list3*/
+</span><span class='line'>&#9;for (i = 0; i &lt; NUM_INIT_LISTS; i++) {
+</span><span class='line'>&#9;&#9;kmem_list3_init(&initkmem_list3[i]);
+</span><span class='line'>&#9;&#9;if (i &lt; MAX_NUMNODES)
+</span><span class='line'>&#9;&#9;&#9;cache_cache.nodelists[i] = NULL;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;/*将cache_cache和initkmem_list3相关联*/
+</span><span class='line'>&#9;set_up_list3s(&cache_cache, CACHE_CACHE);
+</span><span class='line'>
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * Fragmentation resistance on low memory - only use bigger
+</span><span class='line'>&#9; * page orders on machines with more than 32MB of memory.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;if (totalram_pages &gt; (32 &lt;&lt; 20) &gt;&gt; PAGE_SHIFT)
+</span><span class='line'>&#9;&#9;slab_break_gfp_order = BREAK_GFP_ORDER_HI;
+</span><span class='line'>
+</span><span class='line'>&#9;/* Bootstrap is tricky, because several objects are allocated
+</span><span class='line'>&#9; * from caches that do not exist yet:
+</span><span class='line'>&#9; * 1) initialize the cache_cache cache: it contains the struct
+</span><span class='line'>&#9; *    kmem_cache structures of all caches, except cache_cache itself:
+</span><span class='line'>&#9; *    cache_cache is statically allocated.
+</span><span class='line'>&#9; *    Initially an __init data area is used for the head array and the
+</span><span class='line'>&#9; *    kmem_list3 structures, it's replaced with a kmalloc allocated
+</span><span class='line'>&#9; *    array at the end of the bootstrap.
+</span><span class='line'>&#9; * 2) Create the first kmalloc cache.
+</span><span class='line'>&#9; *    The struct kmem_cache for the new cache is allocated normally.
+</span><span class='line'>&#9; *    An __init data area is used for the head array.
+</span><span class='line'>&#9; * 3) Create the remaining kmalloc caches, with minimally sized
+</span><span class='line'>&#9; *    head arrays.
+</span><span class='line'>&#9; * 4) Replace the __init data head arrays for cache_cache and the first
+</span><span class='line'>&#9; *    kmalloc cache with kmalloc allocated arrays.
+</span><span class='line'>&#9; * 5) Replace the __init data for kmem_list3 for cache_cache and
+</span><span class='line'>&#9; *    the other cache's with kmalloc allocated memory.
+</span><span class='line'>&#9; * 6) Resize the head arrays of the kmalloc caches to their final sizes.
+</span><span class='line'>&#9; */
+</span><span class='line'>
+</span><span class='line'>&#9;node = numa_node_id();
+</span><span class='line'>
+</span><span class='line'>&#9;/*初始化cache_cache的其余部分*/
+</span><span class='line'>
+</span><span class='line'>&#9;/* 1) create the cache_cache */
+</span><span class='line'>&#9;INIT_LIST_HEAD(&cache_chain);
+</span><span class='line'>&#9;list_add(&cache_cache.next, &cache_chain);
+</span><span class='line'>&#9;cache_cache.colour_off = cache_line_size();
+</span><span class='line'>&#9;cache_cache.array[smp_processor_id()] = &initarray_cache.cache;
+</span><span class='line'>&#9;cache_cache.nodelists[node] = &initkmem_list3[CACHE_CACHE + node];
+</span><span class='line'>
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * struct kmem_cache size depends on nr_node_ids, which
+</span><span class='line'>&#9; * can be less than MAX_NUMNODES.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;cache_cache.buffer_size = offsetof(struct kmem_cache, nodelists) +
+</span><span class='line'>&#9;&#9;&#9;&#9; nr_node_ids * sizeof(struct kmem_list3 *);
+</span><span class='line'>#if DEBUG
+</span><span class='line'>&#9;cache_cache.obj_size = cache_cache.buffer_size;
+</span><span class='line'>#endif
+</span><span class='line'>&#9;cache_cache.buffer_size = ALIGN(cache_cache.buffer_size,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;cache_line_size());
+</span><span class='line'>&#9;cache_cache.reciprocal_buffer_size =
+</span><span class='line'>&#9;&#9;reciprocal_value(cache_cache.buffer_size);
+</span><span class='line'>
+</span><span class='line'>&#9;/*计算cache_cache的剩余空间以及slab中对象的数目，order决定了slab的大小(PAGE_SIZE&lt;&lt;order)*/
+</span><span class='line'>&#9;for (order = 0; order &lt; MAX_ORDER; order++) {
+</span><span class='line'>&#9;&#9;cache_estimate(order, cache_cache.buffer_size,
+</span><span class='line'>&#9;&#9;&#9;cache_line_size(), 0, &left_over, &cache_cache.num);
+</span><span class='line'>&#9;&#9;/*当该order计算出来的num,即slab中对象的数目不为0时，则跳出循环*/
+</span><span class='line'>&#9;&#9;if (cache_cache.num)
+</span><span class='line'>&#9;&#9;&#9;break;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;BUG_ON(!cache_cache.num);
+</span><span class='line'>&#9;cache_cache.gfporder = order;/*确定分配给每个slab的页数的对数*/
+</span><span class='line'>&#9;cache_cache.colour = left_over / cache_cache.colour_off;/*确定可用颜色的数目*/
+</span><span class='line'>&#9;/*确定slab管理区的大小，即slab描述符以及kmem_bufctl_t数组*/
+</span><span class='line'>&#9;cache_cache.slab_size = ALIGN(cache_cache.num * sizeof(kmem_bufctl_t) +
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;  sizeof(struct slab), cache_line_size());
+</span><span class='line'>
+</span><span class='line'>&#9;/* 2+3) create the kmalloc caches */
+</span><span class='line'>&#9;sizes = malloc_sizes;
+</span><span class='line'>&#9;names = cache_names;
+</span><span class='line'>
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * Initialize the caches that provide memory for the array cache and the
+</span><span class='line'>&#9; * kmem_list3 structures first.  Without this, further allocations will
+</span><span class='line'>&#9; * bug.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;/*为了后面能够调用kmalloc()创建per-CPU高速缓存和kmem_list3高速缓存，
+</span><span class='line'>&#9;   这里必须先创建大小相应的general cache*/
+</span><span class='line'>&#9;sizes[INDEX_AC].cs_cachep = kmem_cache_create(names[INDEX_AC].name,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;sizes[INDEX_AC].cs_size,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;ARCH_KMALLOC_MINALIGN,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;ARCH_KMALLOC_FLAGS|SLAB_PANIC,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;NULL);
+</span><span class='line'>
+</span><span class='line'>&#9;/*如果AC和L3在malloc_sizes中的偏移不一样，也就是说它们的大小不属于同一级别，
+</span><span class='line'>&#9; 则创建AC的gerneral cache，否则两者共用一个gerneral cache*/
+</span><span class='line'>&#9;if (INDEX_AC != INDEX_L3) {
+</span><span class='line'>&#9;&#9;sizes[INDEX_L3].cs_cachep =
+</span><span class='line'>&#9;&#9;&#9;kmem_cache_create(names[INDEX_L3].name,
+</span><span class='line'>&#9;&#9;&#9;&#9;sizes[INDEX_L3].cs_size,
+</span><span class='line'>&#9;&#9;&#9;&#9;ARCH_KMALLOC_MINALIGN,
+</span><span class='line'>&#9;&#9;&#9;&#9;ARCH_KMALLOC_FLAGS|SLAB_PANIC,
+</span><span class='line'>&#9;&#9;&#9;&#9;NULL);
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;slab_early_init = 0;
+</span><span class='line'>
+</span><span class='line'>&#9;/*创建各级的gerneral cache*/
+</span><span class='line'>&#9;while (sizes-&gt;cs_size != ULONG_MAX) {
+</span><span class='line'>&#9;&#9;/*
+</span><span class='line'>&#9;&#9; * For performance, all the general caches are L1 aligned.
+</span><span class='line'>&#9;&#9; * This should be particularly beneficial on SMP boxes, as it
+</span><span class='line'>&#9;&#9; * eliminates "false sharing".
+</span><span class='line'>&#9;&#9; * Note for systems short on memory removing the alignment will
+</span><span class='line'>&#9;&#9; * allow tighter packing of the smaller caches.
+</span><span class='line'>&#9;&#9; */
+</span><span class='line'>&#9;&#9;if (!sizes-&gt;cs_cachep) {
+</span><span class='line'>&#9;&#9;&#9;sizes-&gt;cs_cachep = kmem_cache_create(names-&gt;name,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;sizes-&gt;cs_size,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;ARCH_KMALLOC_MINALIGN,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;ARCH_KMALLOC_FLAGS|SLAB_PANIC,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;NULL);
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>#ifdef CONFIG_ZONE_DMA
+</span><span class='line'>&#9;&#9;sizes-&gt;cs_dmacachep = kmem_cache_create(
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;names-&gt;name_dma,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;sizes-&gt;cs_size,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;ARCH_KMALLOC_MINALIGN,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;ARCH_KMALLOC_FLAGS|SLAB_CACHE_DMA|
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;SLAB_PANIC,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;NULL);
+</span><span class='line'>#endif
+</span><span class='line'>&#9;&#9;sizes++;
+</span><span class='line'>&#9;&#9;names++;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;/* 4) Replace the bootstrap head arrays */
+</span><span class='line'>&#9;{
+</span><span class='line'>&#9;&#9;struct array_cache *ptr;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;/*这里调用kmalloc()为cache_cache创建per-CPU高速缓存*/
+</span><span class='line'>&#9;&#9;ptr = kmalloc(sizeof(struct arraycache_init), GFP_NOWAIT);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;BUG_ON(cpu_cache_get(&cache_cache) != &initarray_cache.cache);
+</span><span class='line'>&#9;&#9;/*将静态定义的initarray_cache中的array_cache拷贝到malloc申请到的空间中*/
+</span><span class='line'>&#9;&#9;memcpy(ptr, cpu_cache_get(&cache_cache),
+</span><span class='line'>&#9;&#9;&#9;   sizeof(struct arraycache_init));
+</span><span class='line'>&#9;&#9;/*
+</span><span class='line'>&#9;&#9; * Do not assume that spinlocks can be initialized via memcpy:
+</span><span class='line'>&#9;&#9; */
+</span><span class='line'>&#9;&#9;spin_lock_init(&ptr-&gt;lock);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;/*将cache_cache与保存per-CPU高速缓存的空间关联*/
+</span><span class='line'>&#9;&#9;cache_cache.array[smp_processor_id()] = ptr;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;/*为之前创建的AC gerneral cache创建per-CPU高速缓存，替换静态定义的initarray_generic.cache*/
+</span><span class='line'>&#9;&#9;ptr = kmalloc(sizeof(struct arraycache_init), GFP_NOWAIT);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;BUG_ON(cpu_cache_get(malloc_sizes[INDEX_AC].cs_cachep)
+</span><span class='line'>&#9;&#9;&#9;   != &initarray_generic.cache);
+</span><span class='line'>&#9;&#9;memcpy(ptr, cpu_cache_get(malloc_sizes[INDEX_AC].cs_cachep),
+</span><span class='line'>&#9;&#9;&#9;   sizeof(struct arraycache_init));
+</span><span class='line'>&#9;&#9;/*
+</span><span class='line'>&#9;&#9; * Do not assume that spinlocks can be initialized via memcpy:
+</span><span class='line'>&#9;&#9; */
+</span><span class='line'>&#9;&#9;spin_lock_init(&ptr-&gt;lock);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;malloc_sizes[INDEX_AC].cs_cachep-&gt;array[smp_processor_id()] =
+</span><span class='line'>&#9;&#9;&#9;ptr;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;/* 5) Replace the bootstrap kmem_list3's */
+</span><span class='line'>&#9;{
+</span><span class='line'>&#9;&#9;int nid;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;for_each_online_node(nid) {
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;/*为cache_cache的kmem_list3申请高速缓存空间，并替换静态定义的initkmem_list3*/
+</span><span class='line'>&#9;&#9;&#9;init_list(&cache_cache, &initkmem_list3[CACHE_CACHE + nid], nid);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;/*为AC的kmem_list3申请高速缓存空间，并替换静态定义的initkmem_list3*/
+</span><span class='line'>&#9;&#9;&#9;init_list(malloc_sizes[INDEX_AC].cs_cachep,
+</span><span class='line'>&#9;&#9;&#9;&#9;  &initkmem_list3[SIZE_AC + nid], nid);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;if (INDEX_AC != INDEX_L3) {
+</span><span class='line'>&#9;&#9;&#9;/*为L3的kmem_list3申请高速缓存空间，并替换静态定义的initkmem_list3*/
+</span><span class='line'>&#9;&#9;&#9;&#9;init_list(malloc_sizes[INDEX_L3].cs_cachep,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;  &initkmem_list3[SIZE_L3 + nid], nid);
+</span><span class='line'>&#9;&#9;&#9;}
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;g_cpucache_up = EARLY;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<ul>
+<li>前面大部分的代码都是围绕cache_cache展开的，主要是将cache_cache同静态kmem_list3进行关联，将cache_cache添加到cache_chain链表中，并且计算初始化内部的一些数据项</li>
+<li>现在还没有高速缓存来存储cache_cache中的kmem_list3描述符和array_cache描述符，因此下面就要调用kmem_cache_create()建立高速缓存来存储这两种描述符</li>
+<li>内核使用g_cpucache_up这个枚举量来表示slab分配器的初始化进度</li>
+</ul>
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static enum {
+</span><span class='line'>&#9;NONE,
+</span><span class='line'>&#9;PARTIAL_AC,
+</span><span class='line'>&#9;PARTIAL_L3,
+</span><span class='line'>&#9;EARLY,
+</span><span class='line'>&#9;FULL
+</span><span class='line'>} g_cpucache_up;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  这个值的更新是在<code>kmem_cache_create()--&gt;setup_cpu_cache()</code>函数中进行更新的，每调用一次kmem_cache_create(),g_cpucache_up的值就加1，直到它等于EARLY，比如说第一次调用kmem_cache_create()创建了AC(array_cache)的高速缓存，那么g_cpucache_up由NONE变为PARTIAL_AC，那么下次调用kmem_cache_create()创建L3高速缓存时，内核就知道AC高速缓存已经准备好了，也就是说可以在array_cache高速缓存中为L3高速缓存描述符的array_cache描述符分配高速缓存空间了。</p>
+
+<ul>
+<li>创建了AC和L3高速缓存后就循环创建各级普通高速缓存，此时创建的高速缓存都是完整的了！也就是说里面的结构变量都已经是存储在相应的高速缓存中</li>
+<li>由于AC高速缓存已经创建，因此kmalloc()动态创建一个array_cache对象替换cache_cache的静态array_cache</li>
+<li>由于AC高速缓存描述符本身的array_cache描述符还未动态创建，因此同样kmalloc()动态创建一个array_cache替换AC高速缓存的静态array_cache</li>
+<li>为cache_cache,AC,L3高速缓存分别动态创建kmem_list描述符对象，替换静态的initkmem_list3</li>
+<li>将g_cpucache_up置为EARLY,表示slab分配器的初始化已初步完成</li>
+</ul>
+
+
+<h5>slab分配器初始化工作的最后一步由kmem_cache_init_late()函数完成</h5>
+
+<p>这个函数就不做详细分析了，它的工作就是设置cache_cache和各级普通高速缓存中的array_cache本地高速缓存的相关属性</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void __init kmem_cache_init_late(void)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct kmem_cache *cachep;
+</span><span class='line'>
+</span><span class='line'>&#9;/* 6) resize the head arrays to their final sizes */
+</span><span class='line'>&#9;mutex_lock(&cache_chain_mutex);
+</span><span class='line'>&#9;list_for_each_entry(cachep, &cache_chain, next)
+</span><span class='line'>&#9;&#9;if (enable_cpucache(cachep, GFP_NOWAIT))
+</span><span class='line'>&#9;&#9;&#9;BUG();
+</span><span class='line'>&#9;mutex_unlock(&cache_chain_mutex);
+</span><span class='line'>
+</span><span class='line'>&#9;/* Done! */
+</span><span class='line'>&#9;g_cpucache_up = FULL;   /*slab初始化完成*/
+</span><span class='line'>
+</span><span class='line'>&#9;/* Annotate slab for lockdep -- annotate the malloc caches */
+</span><span class='line'>&#9;init_lock_keys();
+</span><span class='line'>
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * Register a cpu startup notifier callback that initializes
+</span><span class='line'>&#9; * cpu_cache_get for all new cpus
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;register_cpu_notifier(&cpucache_notifier);
+</span><span class='line'>
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * The reap timers are started later, with a module init call: That part
+</span><span class='line'>&#9; * of the kernel is not yet operational.
+</span><span class='line'>&#9; */
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h2>三、创建缓存</h2>
+
+<h5>创建新的缓存必须通过kmem_cache_create()函数来完成，原型如下</h5>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct kmem_cache *
+</span><span class='line'>kmem_cache_create (const char *name, size_t size, size_t align,
+</span><span class='line'>&#9;unsigned long flags, void (*ctor)(void *))</span></code></pre></td></tr></table></div></figure>
+
+
+<ul>
+<li>name:所创建的新缓存的名字</li>
+<li>size :缓存所分配对象的大小</li>
+<li>align:对象的对齐值</li>
+<li>flags:创建用的标识</li>
+<li>ctor:创建对象时的构造函数</li>
+</ul>
+
+
+<p>kmem_cache_create()的实际工作就是为新的缓存申请缓存描述符，array_cache描述符和kmem_list3描述符，并根据接收的参数对这三个结构中的变量进行相应的初始化。新创建的缓存是空的，不包含slab。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+<span class='line-number'>82</span>
+<span class='line-number'>83</span>
+<span class='line-number'>84</span>
+<span class='line-number'>85</span>
+<span class='line-number'>86</span>
+<span class='line-number'>87</span>
+<span class='line-number'>88</span>
+<span class='line-number'>89</span>
+<span class='line-number'>90</span>
+<span class='line-number'>91</span>
+<span class='line-number'>92</span>
+<span class='line-number'>93</span>
+<span class='line-number'>94</span>
+<span class='line-number'>95</span>
+<span class='line-number'>96</span>
+<span class='line-number'>97</span>
+<span class='line-number'>98</span>
+<span class='line-number'>99</span>
+<span class='line-number'>100</span>
+<span class='line-number'>101</span>
+<span class='line-number'>102</span>
+<span class='line-number'>103</span>
+<span class='line-number'>104</span>
+<span class='line-number'>105</span>
+<span class='line-number'>106</span>
+<span class='line-number'>107</span>
+<span class='line-number'>108</span>
+<span class='line-number'>109</span>
+<span class='line-number'>110</span>
+<span class='line-number'>111</span>
+<span class='line-number'>112</span>
+<span class='line-number'>113</span>
+<span class='line-number'>114</span>
+<span class='line-number'>115</span>
+<span class='line-number'>116</span>
+<span class='line-number'>117</span>
+<span class='line-number'>118</span>
+<span class='line-number'>119</span>
+<span class='line-number'>120</span>
+<span class='line-number'>121</span>
+<span class='line-number'>122</span>
+<span class='line-number'>123</span>
+<span class='line-number'>124</span>
+<span class='line-number'>125</span>
+<span class='line-number'>126</span>
+<span class='line-number'>127</span>
+<span class='line-number'>128</span>
+<span class='line-number'>129</span>
+<span class='line-number'>130</span>
+<span class='line-number'>131</span>
+<span class='line-number'>132</span>
+<span class='line-number'>133</span>
+<span class='line-number'>134</span>
+<span class='line-number'>135</span>
+<span class='line-number'>136</span>
+<span class='line-number'>137</span>
+<span class='line-number'>138</span>
+<span class='line-number'>139</span>
+<span class='line-number'>140</span>
+<span class='line-number'>141</span>
+<span class='line-number'>142</span>
+<span class='line-number'>143</span>
+<span class='line-number'>144</span>
+<span class='line-number'>145</span>
+<span class='line-number'>146</span>
+<span class='line-number'>147</span>
+<span class='line-number'>148</span>
+<span class='line-number'>149</span>
+<span class='line-number'>150</span>
+<span class='line-number'>151</span>
+<span class='line-number'>152</span>
+<span class='line-number'>153</span>
+<span class='line-number'>154</span>
+<span class='line-number'>155</span>
+<span class='line-number'>156</span>
+<span class='line-number'>157</span>
+<span class='line-number'>158</span>
+<span class='line-number'>159</span>
+<span class='line-number'>160</span>
+<span class='line-number'>161</span>
+<span class='line-number'>162</span>
+<span class='line-number'>163</span>
+<span class='line-number'>164</span>
+<span class='line-number'>165</span>
+<span class='line-number'>166</span>
+<span class='line-number'>167</span>
+<span class='line-number'>168</span>
+<span class='line-number'>169</span>
+<span class='line-number'>170</span>
+<span class='line-number'>171</span>
+<span class='line-number'>172</span>
+<span class='line-number'>173</span>
+<span class='line-number'>174</span>
+<span class='line-number'>175</span>
+<span class='line-number'>176</span>
+<span class='line-number'>177</span>
+<span class='line-number'>178</span>
+<span class='line-number'>179</span>
+<span class='line-number'>180</span>
+<span class='line-number'>181</span>
+<span class='line-number'>182</span>
+<span class='line-number'>183</span>
+<span class='line-number'>184</span>
+<span class='line-number'>185</span>
+<span class='line-number'>186</span>
+<span class='line-number'>187</span>
+<span class='line-number'>188</span>
+<span class='line-number'>189</span>
+<span class='line-number'>190</span>
+<span class='line-number'>191</span>
+<span class='line-number'>192</span>
+<span class='line-number'>193</span>
+<span class='line-number'>194</span>
+<span class='line-number'>195</span>
+<span class='line-number'>196</span>
+<span class='line-number'>197</span>
+<span class='line-number'>198</span>
+<span class='line-number'>199</span>
+<span class='line-number'>200</span>
+<span class='line-number'>201</span>
+<span class='line-number'>202</span>
+<span class='line-number'>203</span>
+<span class='line-number'>204</span>
+<span class='line-number'>205</span>
+<span class='line-number'>206</span>
+<span class='line-number'>207</span>
+<span class='line-number'>208</span>
+<span class='line-number'>209</span>
+<span class='line-number'>210</span>
+<span class='line-number'>211</span>
+<span class='line-number'>212</span>
+<span class='line-number'>213</span>
+<span class='line-number'>214</span>
+<span class='line-number'>215</span>
+<span class='line-number'>216</span>
+<span class='line-number'>217</span>
+<span class='line-number'>218</span>
+<span class='line-number'>219</span>
+<span class='line-number'>220</span>
+<span class='line-number'>221</span>
+<span class='line-number'>222</span>
+<span class='line-number'>223</span>
+<span class='line-number'>224</span>
+<span class='line-number'>225</span>
+<span class='line-number'>226</span>
+<span class='line-number'>227</span>
+<span class='line-number'>228</span>
+<span class='line-number'>229</span>
+<span class='line-number'>230</span>
+<span class='line-number'>231</span>
+<span class='line-number'>232</span>
+<span class='line-number'>233</span>
+<span class='line-number'>234</span>
+<span class='line-number'>235</span>
+<span class='line-number'>236</span>
+<span class='line-number'>237</span>
+<span class='line-number'>238</span>
+<span class='line-number'>239</span>
+<span class='line-number'>240</span>
+<span class='line-number'>241</span>
+<span class='line-number'>242</span>
+<span class='line-number'>243</span>
+<span class='line-number'>244</span>
+<span class='line-number'>245</span>
+<span class='line-number'>246</span>
+<span class='line-number'>247</span>
+<span class='line-number'>248</span>
+<span class='line-number'>249</span>
+<span class='line-number'>250</span>
+<span class='line-number'>251</span>
+<span class='line-number'>252</span>
+<span class='line-number'>253</span>
+<span class='line-number'>254</span>
+<span class='line-number'>255</span>
+<span class='line-number'>256</span>
+<span class='line-number'>257</span>
+<span class='line-number'>258</span>
+<span class='line-number'>259</span>
+<span class='line-number'>260</span>
+<span class='line-number'>261</span>
+<span class='line-number'>262</span>
+<span class='line-number'>263</span>
+<span class='line-number'>264</span>
+<span class='line-number'>265</span>
+<span class='line-number'>266</span>
+<span class='line-number'>267</span>
+<span class='line-number'>268</span>
+<span class='line-number'>269</span>
+<span class='line-number'>270</span>
+<span class='line-number'>271</span>
+<span class='line-number'>272</span>
+<span class='line-number'>273</span>
+<span class='line-number'>274</span>
+<span class='line-number'>275</span>
+<span class='line-number'>276</span>
+<span class='line-number'>277</span>
+<span class='line-number'>278</span>
+<span class='line-number'>279</span>
+<span class='line-number'>280</span>
+<span class='line-number'>281</span>
+<span class='line-number'>282</span>
+<span class='line-number'>283</span>
+<span class='line-number'>284</span>
+<span class='line-number'>285</span>
+<span class='line-number'>286</span>
+<span class='line-number'>287</span>
+<span class='line-number'>288</span>
+<span class='line-number'>289</span>
+<span class='line-number'>290</span>
+<span class='line-number'>291</span>
+<span class='line-number'>292</span>
+<span class='line-number'>293</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct kmem_cache *
+</span><span class='line'>kmem_cache_create (const char *name, size_t size, size_t align,
+</span><span class='line'>&#9;unsigned long flags, void (*ctor)(void *))
+</span><span class='line'>{
+</span><span class='line'>&#9;size_t left_over, slab_size, ralign;
+</span><span class='line'>&#9;struct kmem_cache *cachep = NULL, *pc;
+</span><span class='line'>&#9;gfp_t gfp;
+</span><span class='line'>
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * Sanity checks... these are all serious usage bugs.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9; /*做一些必要的检查，以下情况都是不合法的:
+</span><span class='line'>&#9;   1.缓存名为空
+</span><span class='line'>&#9;   2.处于中断环境中
+</span><span class='line'>&#9;   3.缓存中的对象大小小于处理器的字长
+</span><span class='line'>&#9;   4.缓存中的对象大小大于普通缓存的最大长度*/
+</span><span class='line'>&#9;if (!name || in_interrupt() || (size &lt; BYTES_PER_WORD) ||
+</span><span class='line'>&#9;&#9;size &gt; KMALLOC_MAX_SIZE) {
+</span><span class='line'>&#9;&#9;printk(KERN_ERR "%s: Early error in slab %s\n", __func__,
+</span><span class='line'>&#9;&#9;&#9;&#9;name);
+</span><span class='line'>&#9;&#9;BUG();
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * We use cache_chain_mutex to ensure a consistent view of
+</span><span class='line'>&#9; * cpu_online_mask as well.  Please see cpuup_callback
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;if (slab_is_available()) {
+</span><span class='line'>&#9;&#9;get_online_cpus();
+</span><span class='line'>&#9;&#9;mutex_lock(&cache_chain_mutex);
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;list_for_each_entry(pc, &cache_chain, next) {
+</span><span class='line'>&#9;&#9;char tmp;
+</span><span class='line'>&#9;&#9;int res;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;/*
+</span><span class='line'>&#9;&#9; * This happens when the module gets unloaded and doesn't
+</span><span class='line'>&#9;&#9; * destroy its slab cache and no-one else reuses the vmalloc
+</span><span class='line'>&#9;&#9; * area of the module.  Print a warning.
+</span><span class='line'>&#9;&#9; */
+</span><span class='line'>&#9;&#9;res = probe_kernel_address(pc-&gt;name, tmp);
+</span><span class='line'>&#9;&#9;if (res) {
+</span><span class='line'>&#9;&#9;&#9;printk(KERN_ERR
+</span><span class='line'>&#9;&#9;&#9;&#9;   "SLAB: cache with size %d has lost its name\n",
+</span><span class='line'>&#9;&#9;&#9;&#9;   pc-&gt;buffer_size);
+</span><span class='line'>&#9;&#9;&#9;continue;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (!strcmp(pc-&gt;name, name)) {
+</span><span class='line'>&#9;&#9;&#9;printk(KERN_ERR
+</span><span class='line'>&#9;&#9;&#9;&#9;   "kmem_cache_create: duplicate cache %s\n", name);
+</span><span class='line'>&#9;&#9;&#9;dump_stack();
+</span><span class='line'>&#9;&#9;&#9;goto oops;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>#if DEBUG
+</span><span class='line'>&#9;WARN_ON(strchr(name, ' ')); /* It confuses parsers */
+</span><span class='line'>#if FORCED_DEBUG
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * Enable redzoning and last user accounting, except for caches with
+</span><span class='line'>&#9; * large objects, if the increased size would increase the object size
+</span><span class='line'>&#9; * above the next power of two: caches with object sizes just above a
+</span><span class='line'>&#9; * power of two have a significant amount of internal fragmentation.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;if (size &lt; 4096 || fls(size - 1) == fls(size-1 + REDZONE_ALIGN +
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;2 * sizeof(unsigned long long)))
+</span><span class='line'>&#9;&#9;flags |= SLAB_RED_ZONE | SLAB_STORE_USER;
+</span><span class='line'>&#9;if (!(flags & SLAB_DESTROY_BY_RCU))
+</span><span class='line'>&#9;&#9;flags |= SLAB_POISON;
+</span><span class='line'>#endif
+</span><span class='line'>&#9;if (flags & SLAB_DESTROY_BY_RCU)
+</span><span class='line'>&#9;&#9;BUG_ON(flags & SLAB_POISON);
+</span><span class='line'>#endif
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * Always checks flags, a caller might be expecting debug support which
+</span><span class='line'>&#9; * isn't available.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;BUG_ON(flags & ~CREATE_MASK);
+</span><span class='line'>
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * Check that size is in terms of words.  This is needed to avoid
+</span><span class='line'>&#9; * unaligned accesses for some archs when redzoning is used, and makes
+</span><span class='line'>&#9; * sure any on-slab bufctl's are also correctly aligned.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9; /*如果缓存对象大小没有对齐到处理器字长，则对齐之*/
+</span><span class='line'>&#9;if (size & (BYTES_PER_WORD - 1)) {
+</span><span class='line'>&#9;&#9;size += (BYTES_PER_WORD - 1);
+</span><span class='line'>&#9;&#9;size &= ~(BYTES_PER_WORD - 1);
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;/* calculate the final buffer alignment: */
+</span><span class='line'>
+</span><span class='line'>&#9;/* 1) arch recommendation: can be overridden for debug */
+</span><span class='line'>&#9;/*要求按照体系结构对齐*/
+</span><span class='line'>&#9;if (flags & SLAB_HWCACHE_ALIGN) {
+</span><span class='line'>&#9;&#9;/*
+</span><span class='line'>&#9;&#9; * Default alignment: as specified by the arch code.  Except if
+</span><span class='line'>&#9;&#9; * an object is really small, then squeeze multiple objects into
+</span><span class='line'>&#9;&#9; * one cacheline.
+</span><span class='line'>&#9;&#9; */
+</span><span class='line'>&#9;&#9;ralign = cache_line_size();/*对齐值取L1缓存行的大小*/
+</span><span class='line'>&#9;&#9;/*如果对象大小足够小，则不断压缩对齐值以保证能将足够多的对象装入一个缓存行*/
+</span><span class='line'>&#9;&#9;while (size &lt;= ralign / 2)
+</span><span class='line'>&#9;&#9;&#9;ralign /= 2;
+</span><span class='line'>&#9;} else {
+</span><span class='line'>&#9;&#9;ralign = BYTES_PER_WORD; /*对齐值取处理器字长*/
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * Redzoning and user store require word alignment or possibly larger.
+</span><span class='line'>&#9; * Note this will be overridden by architecture or caller mandated
+</span><span class='line'>&#9; * alignment if either is greater than BYTES_PER_WORD.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9; /*如果开启了DEBUG，则按需要进行相应的对齐*/
+</span><span class='line'>&#9;if (flags & SLAB_STORE_USER)
+</span><span class='line'>&#9;&#9;ralign = BYTES_PER_WORD;
+</span><span class='line'>
+</span><span class='line'>&#9;if (flags & SLAB_RED_ZONE) {
+</span><span class='line'>&#9;&#9;ralign = REDZONE_ALIGN;
+</span><span class='line'>&#9;&#9;/* If redzoning, ensure that the second redzone is suitably
+</span><span class='line'>&#9;&#9; * aligned, by adjusting the object size accordingly. */
+</span><span class='line'>&#9;&#9;size += REDZONE_ALIGN - 1;
+</span><span class='line'>&#9;&#9;size &= ~(REDZONE_ALIGN - 1);
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;/* 2) arch mandated alignment */
+</span><span class='line'>&#9;if (ralign &lt; ARCH_SLAB_MINALIGN) {
+</span><span class='line'>&#9;&#9;ralign = ARCH_SLAB_MINALIGN;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;/* 3) caller mandated alignment */
+</span><span class='line'>&#9;if (ralign &lt; align) {
+</span><span class='line'>&#9;&#9;ralign = align;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;/* disable debug if necessary */
+</span><span class='line'>&#9;if (ralign &gt; __alignof__(unsigned long long))
+</span><span class='line'>&#9;&#9;flags &= ~(SLAB_RED_ZONE | SLAB_STORE_USER);
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * 4) Store it.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;align = ralign;
+</span><span class='line'>
+</span><span class='line'>&#9;if (slab_is_available())
+</span><span class='line'>&#9;&#9;gfp = GFP_KERNEL;
+</span><span class='line'>&#9;else
+</span><span class='line'>&#9;&#9;gfp = GFP_NOWAIT;
+</span><span class='line'>
+</span><span class='line'>&#9;/* Get cache's description obj. */
+</span><span class='line'>&#9;/*从cache_cache中分配一个高速缓存描述符*/
+</span><span class='line'>&#9;cachep = kmem_cache_zalloc(&cache_cache, gfp);
+</span><span class='line'>&#9;if (!cachep)
+</span><span class='line'>&#9;&#9;goto oops;
+</span><span class='line'>
+</span><span class='line'>#if DEBUG
+</span><span class='line'>&#9;cachep-&gt;obj_size = size;
+</span><span class='line'>
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * Both debugging options require word-alignment which is calculated
+</span><span class='line'>&#9; * into align above.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;if (flags & SLAB_RED_ZONE) {
+</span><span class='line'>&#9;&#9;/* add space for red zone words */
+</span><span class='line'>&#9;&#9;cachep-&gt;obj_offset += sizeof(unsigned long long);
+</span><span class='line'>&#9;&#9;size += 2 * sizeof(unsigned long long);
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;if (flags & SLAB_STORE_USER) {
+</span><span class='line'>&#9;&#9;/* user store requires one word storage behind the end of
+</span><span class='line'>&#9;&#9; * the real object. But if the second red zone needs to be
+</span><span class='line'>&#9;&#9; * aligned to 64 bits, we must allow that much space.
+</span><span class='line'>&#9;&#9; */
+</span><span class='line'>&#9;&#9;if (flags & SLAB_RED_ZONE)
+</span><span class='line'>&#9;&#9;&#9;size += REDZONE_ALIGN;
+</span><span class='line'>&#9;&#9;else
+</span><span class='line'>&#9;&#9;&#9;size += BYTES_PER_WORD;
+</span><span class='line'>&#9;}
+</span><span class='line'>#if FORCED_DEBUG && defined(CONFIG_DEBUG_PAGEALLOC)
+</span><span class='line'>&#9;if (size &gt;= malloc_sizes[INDEX_L3 + 1].cs_size
+</span><span class='line'>&#9;&#9;&& cachep-&gt;obj_size &gt; cache_line_size() && ALIGN(size, align) &lt; PAGE_SIZE) {
+</span><span class='line'>&#9;&#9;cachep-&gt;obj_offset += PAGE_SIZE - ALIGN(size, align);
+</span><span class='line'>&#9;&#9;size = PAGE_SIZE;
+</span><span class='line'>&#9;}
+</span><span class='line'>#endif
+</span><span class='line'>#endif
+</span><span class='line'>
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * Determine if the slab management is 'on' or 'off' slab.
+</span><span class='line'>&#9; * (bootstrapping cannot cope with offslab caches so don't do
+</span><span class='line'>&#9; * it too early on.)
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9; /*如果缓存对象的大小不小于页面大小的1/8并且不处于slab初始化阶段，
+</span><span class='line'>&#9;   则选择将slab描述符放在slab外部以腾出更多的空间给对象*/
+</span><span class='line'>&#9;if ((size &gt;= (PAGE_SIZE &gt;&gt; 3)) && !slab_early_init)
+</span><span class='line'>&#9;&#9;/*
+</span><span class='line'>&#9;&#9; * Size is large, assume best to place the slab management obj
+</span><span class='line'>&#9;&#9; * off-slab (should allow better packing of objs).
+</span><span class='line'>&#9;&#9; */
+</span><span class='line'>&#9;&#9;flags |= CFLGS_OFF_SLAB;
+</span><span class='line'>
+</span><span class='line'>&#9;/*将对象大小按之前确定的align对齐*/
+</span><span class='line'>&#9;size = ALIGN(size, align);
+</span><span class='line'>
+</span><span class='line'>&#9;/*计算slab的对象数，分配给slab的页框阶数并返回slab的剩余空间，即碎片大小*/
+</span><span class='line'>&#9;left_over = calculate_slab_order(cachep, size, align, flags);
+</span><span class='line'>
+</span><span class='line'>&#9;if (!cachep-&gt;num) {
+</span><span class='line'>&#9;&#9;printk(KERN_ERR
+</span><span class='line'>&#9;&#9;&#9;   "kmem_cache_create: couldn't create cache %s.\n", name);
+</span><span class='line'>&#9;&#9;kmem_cache_free(&cache_cache, cachep);
+</span><span class='line'>&#9;&#9;cachep = NULL;
+</span><span class='line'>&#9;&#9;goto oops;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;/*将slab管理区的大小按align进行对齐*/
+</span><span class='line'>&#9;slab_size = ALIGN(cachep-&gt;num * sizeof(kmem_bufctl_t)
+</span><span class='line'>&#9;&#9;&#9;  + sizeof(struct slab), align);
+</span><span class='line'>
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * If the slab has been placed off-slab, and we have enough space then
+</span><span class='line'>&#9; * move it on-slab. This is at the expense of any extra colouring.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9; /*如果之前确定将slab管理区放在slab外部，但是碎片空间大于slab管理区大小，
+</span><span class='line'>&#9;   这时改变策略将slab管理区放在slab内部，这样可以节省外部空间，但是会牺牲
+</span><span class='line'>&#9;   着色的颜色个数*/
+</span><span class='line'>&#9;if (flags & CFLGS_OFF_SLAB && left_over &gt;= slab_size) {
+</span><span class='line'>&#9;&#9;flags &= ~CFLGS_OFF_SLAB;
+</span><span class='line'>&#9;&#9;left_over -= slab_size;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;/*如果的确要将slab管理区放在外部，则不需按照该slab的对齐方式进行对齐了，
+</span><span class='line'>&#9; 重新计算slab_size*/
+</span><span class='line'>&#9;if (flags & CFLGS_OFF_SLAB) {
+</span><span class='line'>&#9;&#9;/* really off slab. No need for manual alignment */
+</span><span class='line'>&#9;&#9;slab_size =
+</span><span class='line'>&#9;&#9;&#9;cachep-&gt;num * sizeof(kmem_bufctl_t) + sizeof(struct slab);
+</span><span class='line'>
+</span><span class='line'>#ifdef CONFIG_PAGE_POISONING
+</span><span class='line'>&#9;&#9;/* If we're going to use the generic kernel_map_pages()
+</span><span class='line'>&#9;&#9; * poisoning, then it's going to smash the contents of
+</span><span class='line'>&#9;&#9; * the redzone and userword anyhow, so switch them off.
+</span><span class='line'>&#9;&#9; */
+</span><span class='line'>&#9;&#9;if (size % PAGE_SIZE == 0 && flags & SLAB_POISON)
+</span><span class='line'>&#9;&#9;&#9;flags &= ~(SLAB_RED_ZONE | SLAB_STORE_USER);
+</span><span class='line'>#endif
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;/*着色偏移区L1缓存行的大小*/
+</span><span class='line'>&#9;cachep-&gt;colour_off = cache_line_size();
+</span><span class='line'>&#9;/* Offset must be a multiple of the alignment. */
+</span><span class='line'>&#9;if (cachep-&gt;colour_off &lt; align)/*着色偏移小于align的话则要取对齐值*/
+</span><span class='line'>&#9;&#9;cachep-&gt;colour_off = align;
+</span><span class='line'>&#9;/*计算着色的颜色数目*/
+</span><span class='line'>&#9;cachep-&gt;colour = left_over / cachep-&gt;colour_off;
+</span><span class='line'>&#9;cachep-&gt;slab_size = slab_size;
+</span><span class='line'>&#9;cachep-&gt;flags = flags;
+</span><span class='line'>&#9;cachep-&gt;gfpflags = 0;
+</span><span class='line'>&#9;if (CONFIG_ZONE_DMA_FLAG && (flags & SLAB_CACHE_DMA))
+</span><span class='line'>&#9;&#9;cachep-&gt;gfpflags |= GFP_DMA;
+</span><span class='line'>&#9;cachep-&gt;buffer_size = size;
+</span><span class='line'>&#9;cachep-&gt;reciprocal_buffer_size = reciprocal_value(size);
+</span><span class='line'>
+</span><span class='line'>&#9;if (flags & CFLGS_OFF_SLAB) {
+</span><span class='line'>&#9;&#9;cachep-&gt;slabp_cache = kmem_find_general_cachep(slab_size, 0u);
+</span><span class='line'>&#9;&#9;/*
+</span><span class='line'>&#9;&#9; * This is a possibility for one of the malloc_sizes caches.
+</span><span class='line'>&#9;&#9; * But since we go off slab only for object size greater than
+</span><span class='line'>&#9;&#9; * PAGE_SIZE/8, and malloc_sizes gets created in ascending order,
+</span><span class='line'>&#9;&#9; * this should not happen at all.
+</span><span class='line'>&#9;&#9; * But leave a BUG_ON for some lucky dude.
+</span><span class='line'>&#9;&#9; */
+</span><span class='line'>&#9;&#9;BUG_ON(ZERO_OR_NULL_PTR(cachep-&gt;slabp_cache));
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;cachep-&gt;ctor = ctor;
+</span><span class='line'>&#9;cachep-&gt;name = name;
+</span><span class='line'>
+</span><span class='line'>&#9;if (setup_cpu_cache(cachep, gfp)) {
+</span><span class='line'>&#9;&#9;__kmem_cache_destroy(cachep);
+</span><span class='line'>&#9;&#9;cachep = NULL;
+</span><span class='line'>&#9;&#9;goto oops;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;/* cache setup completed, link it into the list */
+</span><span class='line'>&#9;/*将该高速缓存描述符添加进cache_chain*/
+</span><span class='line'>&#9;list_add(&cachep-&gt;next, &cache_chain);
+</span><span class='line'>oops:
+</span><span class='line'>&#9;if (!cachep && (flags & SLAB_PANIC))
+</span><span class='line'>&#9;&#9;panic("kmem_cache_create(): failed to create slab `%s'\n",
+</span><span class='line'>&#9;&#9;&#9;  name);
+</span><span class='line'>&#9;if (slab_is_available()) {
+</span><span class='line'>&#9;&#9;mutex_unlock(&cache_chain_mutex);
+</span><span class='line'>&#9;&#9;put_online_cpus();
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;return cachep;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<ul>
+<li>首先做参数有效性的检查</li>
+<li>计算对齐值</li>
+<li>分配一个缓存描述符</li>
+<li>确定slab管理区(slab描述符+kmem_bufctl_t数组)的存储位置</li>
+<li>调用calculate_slab_order()进行相关项的计算，包括分配给slab的页阶数，碎片大小，slab的对象数</li>
+<li>计算着色偏移和可用的颜色数量</li>
+<li>调用setup_cpu_cache()分配array_cache描述符和kmem_list3描述符并初始化相关变量</li>
+<li>最后将缓存描述符插入cache_chain中</li>
+</ul>
+
+
+<h5>再来看看两个辅助函数calculate_slab_order()和setup_cpu_cache()</h5>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static size_t calculate_slab_order(struct kmem_cache *cachep,
+</span><span class='line'>&#9;&#9;&#9;size_t size, size_t align, unsigned long flags)
+</span><span class='line'>{
+</span><span class='line'>&#9;unsigned long offslab_limit;
+</span><span class='line'>&#9;size_t left_over = 0;
+</span><span class='line'>&#9;int gfporder;
+</span><span class='line'>
+</span><span class='line'>
+</span><span class='line'>&#9;for (gfporder = 0; gfporder &lt;= KMALLOC_MAX_ORDER; gfporder++) {
+</span><span class='line'>&#9;&#9;unsigned int num;
+</span><span class='line'>&#9;&#9;size_t remainder;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;/*根据gfporder计算对象数和剩余空间*/
+</span><span class='line'>&#9;&#9;cache_estimate(gfporder, size, align, flags, &remainder, &num);
+</span><span class='line'>&#9;&#9;if (!num)/*如果计算出来的对象数为0则要增大分配给slab的页框阶数再进行计算*/
+</span><span class='line'>&#9;&#9;&#9;continue;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (flags & CFLGS_OFF_SLAB) {
+</span><span class='line'>&#9;&#9;&#9;/*
+</span><span class='line'>&#9;&#9;&#9; * Max number of objs-per-slab for caches which
+</span><span class='line'>&#9;&#9;&#9; * use off-slab slabs. Needed to avoid a possible
+</span><span class='line'>&#9;&#9;&#9; * looping condition in cache_grow().
+</span><span class='line'>&#9;&#9;&#9; */
+</span><span class='line'>&#9;&#9;&#9; /*offslab_limit记录了在外部存储slab描述符时所允许的slab最大对象数*/
+</span><span class='line'>&#9;&#9;&#9;offslab_limit = size - sizeof(struct slab);
+</span><span class='line'>&#9;&#9;&#9;offslab_limit /= sizeof(kmem_bufctl_t);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;/*如果前面计算出的对象数num要大于允许的最大对象数，则不合法*/
+</span><span class='line'>&#9;&#9;&#9;if (num &gt; offslab_limit)
+</span><span class='line'>&#9;&#9;&#9;&#9;break;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;/* Found something acceptable - save it away */
+</span><span class='line'>&#9;&#9;cachep-&gt;num = num;
+</span><span class='line'>&#9;&#9;cachep-&gt;gfporder = gfporder;
+</span><span class='line'>&#9;&#9;left_over = remainder;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;/*
+</span><span class='line'>&#9;&#9; * A VFS-reclaimable slab tends to have most allocations
+</span><span class='line'>&#9;&#9; * as GFP_NOFS and we really don't want to have to be allocating
+</span><span class='line'>&#9;&#9; * higher-order pages when we are unable to shrink dcache.
+</span><span class='line'>&#9;&#9; */
+</span><span class='line'>&#9;&#9;if (flags & SLAB_RECLAIM_ACCOUNT)
+</span><span class='line'>&#9;&#9;&#9;break;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;/*
+</span><span class='line'>&#9;&#9; * Large number of objects is good, but very large slabs are
+</span><span class='line'>&#9;&#9; * currently bad for the gfp()s.
+</span><span class='line'>&#9;&#9; */
+</span><span class='line'>&#9;&#9;if (gfporder &gt;= slab_break_gfp_order)
+</span><span class='line'>&#9;&#9;&#9;break;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;/*
+</span><span class='line'>&#9;&#9; * Acceptable internal fragmentation?
+</span><span class='line'>&#9;&#9; */
+</span><span class='line'>&#9;&#9;if (left_over * 8 &lt;= (PAGE_SIZE &lt;&lt; gfporder))
+</span><span class='line'>&#9;&#9;&#9;break;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;return left_over;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void cache_estimate(unsigned long gfporder, size_t buffer_size,
+</span><span class='line'>&#9;&#9;&#9;   size_t align, int flags, size_t *left_over,
+</span><span class='line'>&#9;&#9;&#9;   unsigned int *num)
+</span><span class='line'>{
+</span><span class='line'>&#9;int nr_objs;
+</span><span class='line'>&#9;size_t mgmt_size;
+</span><span class='line'>&#9;size_t slab_size = PAGE_SIZE &lt;&lt; gfporder;
+</span><span class='line'>
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * The slab management structure can be either off the slab or
+</span><span class='line'>&#9; * on it. For the latter case, the memory allocated for a
+</span><span class='line'>&#9; * slab is used for:
+</span><span class='line'>&#9; *
+</span><span class='line'>&#9; * - The struct slab
+</span><span class='line'>&#9; * - One kmem_bufctl_t for each object
+</span><span class='line'>&#9; * - Padding to respect alignment of @align
+</span><span class='line'>&#9; * - @buffer_size bytes for each object
+</span><span class='line'>&#9; *
+</span><span class='line'>&#9; * If the slab management structure is off the slab, then the
+</span><span class='line'>&#9; * alignment will already be calculated into the size. Because
+</span><span class='line'>&#9; * the slabs are all pages aligned, the objects will be at the
+</span><span class='line'>&#9; * correct alignment when allocated.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9; /*如果slab描述符存储在slab外部，则slab的对象数即为slab_size/buffer_size*/
+</span><span class='line'>&#9;if (flags & CFLGS_OFF_SLAB) {
+</span><span class='line'>&#9;&#9;mgmt_size = 0;
+</span><span class='line'>&#9;&#9;nr_objs = slab_size / buffer_size;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (nr_objs &gt; SLAB_LIMIT)
+</span><span class='line'>&#9;&#9;&#9;nr_objs = SLAB_LIMIT;
+</span><span class='line'>&#9;} else {/*否则先减去slab管理区的大小再进行计算*/
+</span><span class='line'>&#9;&#9;/*
+</span><span class='line'>&#9;&#9; * Ignore padding for the initial guess. The padding
+</span><span class='line'>&#9;&#9; * is at most @align-1 bytes, and @buffer_size is at
+</span><span class='line'>&#9;&#9; * least @align. In the worst case, this result will
+</span><span class='line'>&#9;&#9; * be one greater than the number of objects that fit
+</span><span class='line'>&#9;&#9; * into the memory allocation when taking the padding
+</span><span class='line'>&#9;&#9; * into account.
+</span><span class='line'>&#9;&#9; */
+</span><span class='line'>&#9;&#9;nr_objs = (slab_size - sizeof(struct slab)) /
+</span><span class='line'>&#9;&#9;&#9;  (buffer_size + sizeof(kmem_bufctl_t));
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;/*
+</span><span class='line'>&#9;&#9; * This calculated number will be either the right
+</span><span class='line'>&#9;&#9; * amount, or one greater than what we want.
+</span><span class='line'>&#9;&#9; */
+</span><span class='line'>&#9;&#9;if (slab_mgmt_size(nr_objs, align) + nr_objs*buffer_size
+</span><span class='line'>&#9;&#9;&#9;   &gt; slab_size)
+</span><span class='line'>&#9;&#9;&#9;nr_objs--;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (nr_objs &gt; SLAB_LIMIT)
+</span><span class='line'>&#9;&#9;&#9;nr_objs = SLAB_LIMIT;
+</span><span class='line'>&#9;&#9;&#9;&#9;  /*计算slab管理区的大小*/
+</span><span class='line'>&#9;&#9;mgmt_size = slab_mgmt_size(nr_objs, align);
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;/*保存slab对象数*/
+</span><span class='line'>&#9;*num = nr_objs;
+</span><span class='line'>&#9;/*计算并保存slab的剩余空间*/
+</span><span class='line'>&#9;*left_over = slab_size - nr_objs*buffer_size - mgmt_size;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>在slab初始化完成后，也就是g_cpucache_up变量的值为FULL后</h5>
+
+<p>setup_cpu_cache()函数等价于<code>setup_cpu_cache()--&gt;enable_cpucache()</code></p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int enable_cpucache(struct kmem_cache *cachep, gfp_t gfp)
+</span><span class='line'>{
+</span><span class='line'>&#9;int err;
+</span><span class='line'>&#9;int limit, shared;
+</span><span class='line'>
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * The head array serves three purposes:
+</span><span class='line'>&#9; * - create a LIFO ordering, i.e. return objects that are cache-warm
+</span><span class='line'>&#9; * - reduce the number of spinlock operations.
+</span><span class='line'>&#9; * - reduce the number of linked list operations on the slab and
+</span><span class='line'>&#9; *   bufctl chains: array operations are cheaper.
+</span><span class='line'>&#9; * The numbers are guessed, we should auto-tune as described by
+</span><span class='line'>&#9; * Bonwick.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9; /*根据对象的大小来确定本地高速缓存中的空闲对象上限*/
+</span><span class='line'>&#9;if (cachep-&gt;buffer_size &gt; 131072)
+</span><span class='line'>&#9;&#9;limit = 1;
+</span><span class='line'>&#9;else if (cachep-&gt;buffer_size &gt; PAGE_SIZE)
+</span><span class='line'>&#9;&#9;limit = 8;
+</span><span class='line'>&#9;else if (cachep-&gt;buffer_size &gt; 1024)
+</span><span class='line'>&#9;&#9;limit = 24;
+</span><span class='line'>&#9;else if (cachep-&gt;buffer_size &gt; 256)
+</span><span class='line'>&#9;&#9;limit = 54;
+</span><span class='line'>&#9;else
+</span><span class='line'>&#9;&#9;limit = 120;
+</span><span class='line'>
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * CPU bound tasks (e.g. network routing) can exhibit cpu bound
+</span><span class='line'>&#9; * allocation behaviour: Most allocs on one cpu, most free operations
+</span><span class='line'>&#9; * on another cpu. For these cases, an efficient object passing between
+</span><span class='line'>&#9; * cpus is necessary. This is provided by a shared array. The array
+</span><span class='line'>&#9; * replaces Bonwick's magazine layer.
+</span><span class='line'>&#9; * On uniprocessor, it's functionally equivalent (but less efficient)
+</span><span class='line'>&#9; * to a larger limit. Thus disabled by default.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;shared = 0;
+</span><span class='line'>&#9;if (cachep-&gt;buffer_size &lt;= PAGE_SIZE && num_possible_cpus() &gt; 1)
+</span><span class='line'>&#9;&#9;shared = 8;
+</span><span class='line'>
+</span><span class='line'>#if DEBUG
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * With debugging enabled, large batchcount lead to excessively long
+</span><span class='line'>&#9; * periods with disabled local interrupts. Limit the batchcount
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;if (limit &gt; 32)
+</span><span class='line'>&#9;&#9;limit = 32;
+</span><span class='line'>#endif
+</span><span class='line'>&#9;err = do_tune_cpucache(cachep, limit, (limit + 1) / 2, shared, gfp);
+</span><span class='line'>&#9;if (err)
+</span><span class='line'>&#9;&#9;printk(KERN_ERR "enable_cpucache failed for %s, error %d.\n",
+</span><span class='line'>&#9;&#9;&#9;   cachep-&gt;name, -err);
+</span><span class='line'>&#9;return err;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int do_tune_cpucache(struct kmem_cache *cachep, int limit,
+</span><span class='line'>&#9;&#9;&#9;&#9;int batchcount, int shared, gfp_t gfp)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct ccupdate_struct *new;
+</span><span class='line'>&#9;int i;
+</span><span class='line'>
+</span><span class='line'>&#9;/*申请一个ccupdate_struct*/
+</span><span class='line'>&#9;new = kzalloc(sizeof(*new), gfp);
+</span><span class='line'>&#9;if (!new)
+</span><span class='line'>&#9;&#9;return -ENOMEM;
+</span><span class='line'>
+</span><span class='line'>&#9;/*为每个CPU申请array_cache和用来跟踪本地CPU空闲对象的指针数组*/
+</span><span class='line'>&#9;for_each_online_cpu(i) {
+</span><span class='line'>&#9;&#9;new-&gt;new[i] = alloc_arraycache(cpu_to_node(i), limit,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;batchcount, gfp);
+</span><span class='line'>&#9;&#9;if (!new-&gt;new[i]) {
+</span><span class='line'>&#9;&#9;&#9;for (i--; i &gt;= 0; i--)
+</span><span class='line'>&#9;&#9;&#9;&#9;kfree(new-&gt;new[i]);
+</span><span class='line'>&#9;&#9;&#9;kfree(new);
+</span><span class='line'>&#9;&#9;&#9;return -ENOMEM;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;new-&gt;cachep = cachep;
+</span><span class='line'>
+</span><span class='line'>&#9;/*将cachep和array_cache进关联*/
+</span><span class='line'>&#9;on_each_cpu(do_ccupdate_local, (void *)new, 1);
+</span><span class='line'>
+</span><span class='line'>&#9;check_irq_on();
+</span><span class='line'>&#9;cachep-&gt;batchcount = batchcount;
+</span><span class='line'>&#9;cachep-&gt;limit = limit;
+</span><span class='line'>&#9;cachep-&gt;shared = shared;
+</span><span class='line'>
+</span><span class='line'>&#9;for_each_online_cpu(i) {
+</span><span class='line'>&#9;&#9;struct array_cache *ccold = new-&gt;new[i];
+</span><span class='line'>&#9;&#9;if (!ccold)
+</span><span class='line'>&#9;&#9;&#9;continue;
+</span><span class='line'>&#9;&#9;spin_lock_irq(&cachep-&gt;nodelists[cpu_to_node(i)]-&gt;list_lock);
+</span><span class='line'>&#9;&#9;free_block(cachep, ccold-&gt;entry, ccold-&gt;avail, cpu_to_node(i));
+</span><span class='line'>&#9;&#9;spin_unlock_irq(&cachep-&gt;nodelists[cpu_to_node(i)]-&gt;list_lock);
+</span><span class='line'>&#9;&#9;kfree(ccold);
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;kfree(new);
+</span><span class='line'>&#9;/*申请kmem_list3*/
+</span><span class='line'>&#9;return alloc_kmemlist(cachep, gfp);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h2>四、分配对象</h2>
+
+<p>从一个缓存中分配对象总是遵循下面的原则：<br/>
+1. 本地高速缓存中是否有空闲对象，如果有的话则从其中获取对象，这时分配的对象是最“热”的；<br/>
+2. 如果本地高速缓存中没有对象，则从kmem_list3中的slab链表中寻找空闲对象并填充到本地高速缓存再分配；<br/>
+3. 如果所有的slab中都没有空闲对象了，那么就要创建新的slab,再分配 。</p>
+
+<p>函数kmem_cache_alloc用于从特定的缓存获取对象，kmalloc用于从普通缓存中获取对象，它们的执行流程如下图所示</p>
+
+<p><img src="/images/kernel/2015-03-03-12.png" alt="" /></p>
+
+<p>实质性的工作是从<code>____cache_alloc()</code>开始的，因此从这个函数作为入口来分析</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static inline void *____cache_alloc(struct kmem_cache *cachep, gfp_t flags)
+</span><span class='line'>{
+</span><span class='line'>&#9;void *objp;
+</span><span class='line'>&#9;struct array_cache *ac;
+</span><span class='line'>
+</span><span class='line'>&#9;check_irq_off();
+</span><span class='line'>
+</span><span class='line'>&#9;/*获取缓存的本地高速缓存的描述符array_cache*/
+</span><span class='line'>&#9;ac = cpu_cache_get(cachep);
+</span><span class='line'>
+</span><span class='line'>&#9;/*如果本地高速缓存中还有空闲对象可以分配则从本地高速缓存中分配*/
+</span><span class='line'>&#9;if (likely(ac-&gt;avail)) {
+</span><span class='line'>&#9;&#9;STATS_INC_ALLOCHIT(cachep);
+</span><span class='line'>&#9;&#9;ac-&gt;touched = 1;
+</span><span class='line'>&#9;&#9;/*先将avail的值减1，这样avail对应的空闲对象是最热的，即最近释放出来的，
+</span><span class='line'>&#9;&#9;  更有可能驻留在CPU高速缓存中*/
+</span><span class='line'>&#9;&#9;objp = ac-&gt;entry[--ac-&gt;avail];
+</span><span class='line'>&#9;} else {/*否则需要填充本地高速缓存*/
+</span><span class='line'>&#9;&#9;STATS_INC_ALLOCMISS(cachep);
+</span><span class='line'>&#9;&#9;objp = cache_alloc_refill(cachep, flags);
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * To avoid a false negative, if an object that is in one of the
+</span><span class='line'>&#9; * per-CPU caches is leaked, we need to make sure kmemleak doesn't
+</span><span class='line'>&#9; * treat the array pointers as a reference to the object.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;kmemleak_erase(&ac-&gt;entry[ac-&gt;avail]);
+</span><span class='line'>&#9;return objp;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+<span class='line-number'>82</span>
+<span class='line-number'>83</span>
+<span class='line-number'>84</span>
+<span class='line-number'>85</span>
+<span class='line-number'>86</span>
+<span class='line-number'>87</span>
+<span class='line-number'>88</span>
+<span class='line-number'>89</span>
+<span class='line-number'>90</span>
+<span class='line-number'>91</span>
+<span class='line-number'>92</span>
+<span class='line-number'>93</span>
+<span class='line-number'>94</span>
+<span class='line-number'>95</span>
+<span class='line-number'>96</span>
+<span class='line-number'>97</span>
+<span class='line-number'>98</span>
+<span class='line-number'>99</span>
+<span class='line-number'>100</span>
+<span class='line-number'>101</span>
+<span class='line-number'>102</span>
+<span class='line-number'>103</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void *cache_alloc_refill(struct kmem_cache *cachep, gfp_t flags)
+</span><span class='line'>{
+</span><span class='line'>&#9;int batchcount;
+</span><span class='line'>&#9;struct kmem_list3 *l3;
+</span><span class='line'>&#9;struct array_cache *ac;
+</span><span class='line'>&#9;int node;
+</span><span class='line'>
+</span><span class='line'>retry:
+</span><span class='line'>&#9;check_irq_off();
+</span><span class='line'>&#9;node = numa_node_id();
+</span><span class='line'>&#9;ac = cpu_cache_get(cachep);
+</span><span class='line'>&#9;batchcount = ac-&gt;batchcount;  /*获取批量转移的数目*/
+</span><span class='line'>&#9;if (!ac-&gt;touched && batchcount &gt; BATCHREFILL_LIMIT) {
+</span><span class='line'>&#9;&#9;/*
+</span><span class='line'>&#9;&#9; * If there was little recent activity on this cache, then
+</span><span class='line'>&#9;&#9; * perform only a partial refill.  Otherwise we could generate
+</span><span class='line'>&#9;&#9; * refill bouncing.
+</span><span class='line'>&#9;&#9; */
+</span><span class='line'>&#9;&#9;batchcount = BATCHREFILL_LIMIT;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;/*获取kmem_list3*/
+</span><span class='line'>&#9;l3 = cachep-&gt;nodelists[node];
+</span><span class='line'>
+</span><span class='line'>&#9;BUG_ON(ac-&gt;avail &gt; 0 || !l3);
+</span><span class='line'>&#9;spin_lock(&l3-&gt;list_lock);
+</span><span class='line'>
+</span><span class='line'>&#9;/* See if we can refill from the shared array */
+</span><span class='line'>&#9;/*如果有共享本地高速缓存，则从共享本地高速缓存填充*/
+</span><span class='line'>&#9;if (l3-&gt;shared && transfer_objects(ac, l3-&gt;shared, batchcount))
+</span><span class='line'>&#9;&#9;goto alloc_done;
+</span><span class='line'>
+</span><span class='line'>&#9;while (batchcount &gt; 0) {
+</span><span class='line'>&#9;&#9;struct list_head *entry;
+</span><span class='line'>&#9;&#9;struct slab *slabp;
+</span><span class='line'>&#9;&#9;/* Get slab alloc is to come from. */
+</span><span class='line'>&#9;&#9;/*扫描slab链表，先从partial链表开始，如果整个partial链表都无法找到batchcount个空闲对象，
+</span><span class='line'>&#9;&#9;再扫描free链表*/
+</span><span class='line'>&#9;&#9;entry = l3-&gt;slabs_partial.next;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;/*entry回到表头说明partial链表已经扫描完毕，开始扫描free链表*/
+</span><span class='line'>&#9;&#9;if (entry == &l3-&gt;slabs_partial) {
+</span><span class='line'>&#9;&#9;&#9;l3-&gt;free_touched = 1;
+</span><span class='line'>&#9;&#9;&#9;entry = l3-&gt;slabs_free.next;
+</span><span class='line'>&#9;&#9;&#9;if (entry == &l3-&gt;slabs_free)
+</span><span class='line'>&#9;&#9;&#9;&#9;goto must_grow;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;/*由链表项得到slab描述符*/
+</span><span class='line'>&#9;&#9;slabp = list_entry(entry, struct slab, list);
+</span><span class='line'>&#9;&#9;check_slabp(cachep, slabp);
+</span><span class='line'>&#9;&#9;check_spinlock_acquired(cachep);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;/*
+</span><span class='line'>&#9;&#9; * The slab was either on partial or free list so
+</span><span class='line'>&#9;&#9; * there must be at least one object available for
+</span><span class='line'>&#9;&#9; * allocation.
+</span><span class='line'>&#9;&#9; */
+</span><span class='line'>&#9;&#9;BUG_ON(slabp-&gt;inuse &gt;= cachep-&gt;num);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;/*如果slabp中还存在空闲对象并且还需要继续填充对象到本地高速缓存*/
+</span><span class='line'>&#9;&#9;while (slabp-&gt;inuse &lt; cachep-&gt;num && batchcount--) {
+</span><span class='line'>&#9;&#9;&#9;STATS_INC_ALLOCED(cachep);
+</span><span class='line'>&#9;&#9;&#9;STATS_INC_ACTIVE(cachep);
+</span><span class='line'>&#9;&#9;&#9;STATS_SET_HIGH(cachep);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;/*填充的本质就是用ac后面的void*数组元素指向一个空闲对象*/
+</span><span class='line'>&#9;&#9;&#9;ac-&gt;entry[ac-&gt;avail++] = slab_get_obj(cachep, slabp,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9;&#9;node);
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;check_slabp(cachep, slabp);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;/* move slabp to correct slabp list: */
+</span><span class='line'>&#9;&#9;/*由于从slab中分配出去了对象，因此有可能需要将slab移到其他链表中去*/
+</span><span class='line'>&#9;&#9;list_del(&slabp-&gt;list);
+</span><span class='line'>&#9;&#9;/*free等于BUFCTL_END表示空闲对象已耗尽，将slab插入full链表*/
+</span><span class='line'>&#9;&#9;if (slabp-&gt;free == BUFCTL_END)
+</span><span class='line'>&#9;&#9;&#9;list_add(&slabp-&gt;list, &l3-&gt;slabs_full);
+</span><span class='line'>&#9;&#9;else/*否则肯定是插入partial链表*/
+</span><span class='line'>&#9;&#9;&#9;list_add(&slabp-&gt;list, &l3-&gt;slabs_partial);
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>must_grow:
+</span><span class='line'>&#9;l3-&gt;free_objects -= ac-&gt;avail;/*刷新kmem_list3中的空闲对象*/
+</span><span class='line'>alloc_done:
+</span><span class='line'>&#9;spin_unlock(&l3-&gt;list_lock);
+</span><span class='line'>
+</span><span class='line'>&#9;/*avail为0表示kmem_list3中的slab全部处于full状态或者没有slab,则要为缓存分配slab*/
+</span><span class='line'>&#9;if (unlikely(!ac-&gt;avail)) {
+</span><span class='line'>&#9;&#9;int x;
+</span><span class='line'>&#9;&#9;x = cache_grow(cachep, flags | GFP_THISNODE, node, NULL);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;/* cache_grow can reenable interrupts, then ac could change. */
+</span><span class='line'>&#9;&#9;ac = cpu_cache_get(cachep);
+</span><span class='line'>&#9;&#9;if (!x && ac-&gt;avail == 0)    /* no objects in sight? abort */
+</span><span class='line'>&#9;&#9;&#9;return NULL;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (!ac-&gt;avail)      /* objects refilled by interrupt? */
+</span><span class='line'>&#9;&#9;&#9;goto retry;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;ac-&gt;touched = 1;
+</span><span class='line'>&#9;/*返回最后一个末端的对象*/
+</span><span class='line'>&#9;return ac-&gt;entry[--ac-&gt;avail];
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>对于所有slab都空闲对象的情况，需要调用cache_grow()来增加cache的容量，这个函数在后面分析slab的分配时再做介绍。</p>
+
+<h2>Linux Slab分配器(五)&ndash;释放对象</h2>
+
+<p>缓存回收对象基于以下原则</p>
+
+<p>1.本地高速缓存的空间还可以容纳空闲对象，则直接将对象放回本地高速缓存</p>
+
+<p>2.本地高速缓存的空间已满，则按batchcount的值将对象从本地高速缓存转移到slab中，转移是基于先进先出的原则的，也就是转移entry数组最前面的batchcount个空闲对象，因为这些对象在数组中存在的时间相对较长，不太可能仍然驻留在CPU高速缓存中</p>
+
+<p>释放对象通过函数kmem_cache_free()来完成，下图给出了主要的工作流程</p>
+
+<p><img src="/images/kernel/2018-08-08-1.png" alt="" /></p>
+
+<p>我们以<code>__cache_free</code>函数作为入口进行分析</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+<span class='line-number'>82</span>
+<span class='line-number'>83</span>
+<span class='line-number'>84</span>
+<span class='line-number'>85</span>
+<span class='line-number'>86</span>
+<span class='line-number'>87</span>
+<span class='line-number'>88</span>
+<span class='line-number'>89</span>
+<span class='line-number'>90</span>
+<span class='line-number'>91</span>
+<span class='line-number'>92</span>
+<span class='line-number'>93</span>
+<span class='line-number'>94</span>
+<span class='line-number'>95</span>
+<span class='line-number'>96</span>
+<span class='line-number'>97</span>
+<span class='line-number'>98</span>
+<span class='line-number'>99</span>
+<span class='line-number'>100</span>
+<span class='line-number'>101</span>
+<span class='line-number'>102</span>
+<span class='line-number'>103</span>
+<span class='line-number'>104</span>
+<span class='line-number'>105</span>
+<span class='line-number'>106</span>
+<span class='line-number'>107</span>
+<span class='line-number'>108</span>
+<span class='line-number'>109</span>
+<span class='line-number'>110</span>
+<span class='line-number'>111</span>
+<span class='line-number'>112</span>
+<span class='line-number'>113</span>
+<span class='line-number'>114</span>
+<span class='line-number'>115</span>
+<span class='line-number'>116</span>
+<span class='line-number'>117</span>
+<span class='line-number'>118</span>
+<span class='line-number'>119</span>
+<span class='line-number'>120</span>
+<span class='line-number'>121</span>
+<span class='line-number'>122</span>
+<span class='line-number'>123</span>
+<span class='line-number'>124</span>
+<span class='line-number'>125</span>
+<span class='line-number'>126</span>
+<span class='line-number'>127</span>
+<span class='line-number'>128</span>
+<span class='line-number'>129</span>
+<span class='line-number'>130</span>
+<span class='line-number'>131</span>
+<span class='line-number'>132</span>
+<span class='line-number'>133</span>
+<span class='line-number'>134</span>
+<span class='line-number'>135</span>
+<span class='line-number'>136</span>
+<span class='line-number'>137</span>
+<span class='line-number'>138</span>
+<span class='line-number'>139</span>
+<span class='line-number'>140</span>
+<span class='line-number'>141</span>
+<span class='line-number'>142</span>
+<span class='line-number'>143</span>
+<span class='line-number'>144</span>
+<span class='line-number'>145</span>
+<span class='line-number'>146</span>
+<span class='line-number'>147</span>
+<span class='line-number'>148</span>
+<span class='line-number'>149</span>
+<span class='line-number'>150</span>
+<span class='line-number'>151</span>
+<span class='line-number'>152</span>
+<span class='line-number'>153</span>
+<span class='line-number'>154</span>
+<span class='line-number'>155</span>
+<span class='line-number'>156</span>
+<span class='line-number'>157</span>
+<span class='line-number'>158</span>
+<span class='line-number'>159</span>
+<span class='line-number'>160</span>
+<span class='line-number'>161</span>
+<span class='line-number'>162</span>
+<span class='line-number'>163</span>
+<span class='line-number'>164</span>
+<span class='line-number'>165</span>
+<span class='line-number'>166</span>
+<span class='line-number'>167</span>
+<span class='line-number'>168</span>
+<span class='line-number'>169</span>
+<span class='line-number'>170</span>
+<span class='line-number'>171</span>
+<span class='line-number'>172</span>
+<span class='line-number'>173</span>
+<span class='line-number'>174</span>
+<span class='line-number'>175</span>
+<span class='line-number'>176</span>
+<span class='line-number'>177</span>
+<span class='line-number'>178</span>
+<span class='line-number'>179</span>
+<span class='line-number'>180</span>
+<span class='line-number'>181</span>
+<span class='line-number'>182</span>
+<span class='line-number'>183</span>
+<span class='line-number'>184</span>
+<span class='line-number'>185</span>
+<span class='line-number'>186</span>
+<span class='line-number'>187</span>
+<span class='line-number'>188</span>
+<span class='line-number'>189</span>
+<span class='line-number'>190</span>
+<span class='line-number'>191</span>
+<span class='line-number'>192</span>
+<span class='line-number'>193</span>
+<span class='line-number'>194</span>
+<span class='line-number'>195</span>
+<span class='line-number'>196</span>
+<span class='line-number'>197</span>
+<span class='line-number'>198</span>
+<span class='line-number'>199</span>
+<span class='line-number'>200</span>
+<span class='line-number'>201</span>
+<span class='line-number'>202</span>
+<span class='line-number'>203</span>
+<span class='line-number'>204</span>
+<span class='line-number'>205</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static inline void __cache_free(struct kmem_cache *cachep, void *objp)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct array_cache *ac = cpu_cache_get(cachep);
+</span><span class='line'>
+</span><span class='line'>&#9;check_irq_off();
+</span><span class='line'>&#9;kmemleak_free_recursive(objp, cachep-&gt;flags);
+</span><span class='line'>&#9;objp = cache_free_debugcheck(cachep, objp, __builtin_return_address(0));
+</span><span class='line'>
+</span><span class='line'>&#9;kmemcheck_slab_free(cachep, objp, obj_size(cachep));
+</span><span class='line'>
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * Skip calling cache_free_alien() when the platform is not numa.
+</span><span class='line'>&#9; * This will avoid cache misses that happen while accessing slabp (which
+</span><span class='line'>&#9; * is per page memory  reference) to get nodeid. Instead use a global
+</span><span class='line'>&#9; * variable to skip the call, which is mostly likely to be present in
+</span><span class='line'>&#9; * the cache.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;if (nr_online_nodes &gt; 1 && cache_free_alien(cachep, objp))
+</span><span class='line'>&#9;&#9;return;
+</span><span class='line'>
+</span><span class='line'>&#9;/*如果本地高速缓存中的空闲对象小于空闲对象上限，则直接用entry中的元素记录对象的地址*/
+</span><span class='line'>&#9;if (likely(ac-&gt;avail &lt; ac-&gt;limit)) {
+</span><span class='line'>&#9;&#9;STATS_INC_FREEHIT(cachep);
+</span><span class='line'>&#9;&#9;ac-&gt;entry[ac-&gt;avail++] = objp;
+</span><span class='line'>&#9;&#9;return;
+</span><span class='line'>&#9;} else {/*否则将本地高速缓存中的空闲对象批量转移到slab中*/
+</span><span class='line'>&#9;&#9;STATS_INC_FREEMISS(cachep);
+</span><span class='line'>&#9;&#9;cache_flusharray(cachep, ac);
+</span><span class='line'>&#9;&#9;ac-&gt;entry[ac-&gt;avail++] = objp;
+</span><span class='line'>&#9;}
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>static void cache_flusharray(struct kmem_cache *cachep, struct array_cache *ac)
+</span><span class='line'>{
+</span><span class='line'>&#9;int batchcount;
+</span><span class='line'>&#9;struct kmem_list3 *l3;
+</span><span class='line'>&#9;int node = numa_node_id();
+</span><span class='line'>
+</span><span class='line'>&#9;batchcount = ac-&gt;batchcount;
+</span><span class='line'>#if DEBUG
+</span><span class='line'>&#9;BUG_ON(!batchcount || batchcount &gt; ac-&gt;avail);
+</span><span class='line'>#endif
+</span><span class='line'>&#9;check_irq_off();
+</span><span class='line'>&#9;l3 = cachep-&gt;nodelists[node];
+</span><span class='line'>&#9;spin_lock(&l3-&gt;list_lock);
+</span><span class='line'>&#9;if (l3-&gt;shared) {/*如果开启了共享本地高速缓存*/
+</span><span class='line'>&#9;&#9;/*获取共享的array_cache*/
+</span><span class='line'>&#9;&#9;struct array_cache *shared_array = l3-&gt;shared;
+</span><span class='line'>&#9;&#9;/*计算共享本地高速缓存还可容纳的空闲对象数*/
+</span><span class='line'>&#9;&#9;int max = shared_array-&gt;limit - shared_array-&gt;avail;
+</span><span class='line'>&#9;&#9;if (max) {
+</span><span class='line'>&#9;&#9;&#9;if (batchcount &gt; max)
+</span><span class='line'>&#9;&#9;&#9;&#9;batchcount = max;
+</span><span class='line'>&#9;&#9;&#9;/*将batchcount个对象移到共享本地高速缓存中*/
+</span><span class='line'>&#9;&#9;&#9;memcpy(&(shared_array-&gt;entry[shared_array-&gt;avail]),
+</span><span class='line'>&#9;&#9;&#9;&#9;   ac-&gt;entry, sizeof(void *) * batchcount);
+</span><span class='line'>&#9;&#9;&#9;shared_array-&gt;avail += batchcount;
+</span><span class='line'>&#9;&#9;&#9;goto free_done;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;/*将本地高速缓存的前batchcount个对象放回slab*/
+</span><span class='line'>&#9;free_block(cachep, ac-&gt;entry, batchcount, node);
+</span><span class='line'>free_done:
+</span><span class='line'>#if STATS
+</span><span class='line'>&#9;{
+</span><span class='line'>&#9;&#9;int i = 0;
+</span><span class='line'>&#9;&#9;struct list_head *p;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;p = l3-&gt;slabs_free.next;
+</span><span class='line'>&#9;&#9;while (p != &(l3-&gt;slabs_free)) {
+</span><span class='line'>&#9;&#9;&#9;struct slab *slabp;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;slabp = list_entry(p, struct slab, list);
+</span><span class='line'>&#9;&#9;&#9;BUG_ON(slabp-&gt;inuse);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;i++;
+</span><span class='line'>&#9;&#9;&#9;p = p-&gt;next;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;STATS_SET_FREEABLE(cachep, i);
+</span><span class='line'>&#9;}
+</span><span class='line'>#endif
+</span><span class='line'>&#9;spin_unlock(&l3-&gt;list_lock);
+</span><span class='line'>&#9;ac-&gt;avail -= batchcount;/*刷新本地高速缓存的avail值*/
+</span><span class='line'>&#9;/*将从batchcount开始的元素搬到前面去*/
+</span><span class='line'>&#9;memmove(ac-&gt;entry, &(ac-&gt;entry[batchcount]), sizeof(void *)*ac-&gt;avail);
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>/*
+</span><span class='line'> * Release an obj back to its cache. If the obj has a constructed state, it must
+</span><span class='line'> * be in this state _before_ it is released.  Called with disabled ints.
+</span><span class='line'> */
+</span><span class='line'>static inline void __cache_free(struct kmem_cache *cachep, void *objp)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct array_cache *ac = cpu_cache_get(cachep);
+</span><span class='line'>
+</span><span class='line'>&#9;check_irq_off();
+</span><span class='line'>&#9;kmemleak_free_recursive(objp, cachep-&gt;flags);
+</span><span class='line'>&#9;objp = cache_free_debugcheck(cachep, objp, __builtin_return_address(0));
+</span><span class='line'>
+</span><span class='line'>&#9;kmemcheck_slab_free(cachep, objp, obj_size(cachep));
+</span><span class='line'>
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * Skip calling cache_free_alien() when the platform is not numa.
+</span><span class='line'>&#9; * This will avoid cache misses that happen while accessing slabp (which
+</span><span class='line'>&#9; * is per page memory  reference) to get nodeid. Instead use a global
+</span><span class='line'>&#9; * variable to skip the call, which is mostly likely to be present in
+</span><span class='line'>&#9; * the cache.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;if (nr_online_nodes &gt; 1 && cache_free_alien(cachep, objp))
+</span><span class='line'>&#9;&#9;return;
+</span><span class='line'>
+</span><span class='line'>&#9;/*如果本地高速缓存中的空闲对象小于空闲对象上限，则直接用entry中的元素记录对象的地址*/
+</span><span class='line'>&#9;if (likely(ac-&gt;avail &lt; ac-&gt;limit)) {
+</span><span class='line'>&#9;&#9;STATS_INC_FREEHIT(cachep);
+</span><span class='line'>&#9;&#9;ac-&gt;entry[ac-&gt;avail++] = objp;
+</span><span class='line'>&#9;&#9;return;
+</span><span class='line'>&#9;} else {/*否则将本地高速缓存中的空闲对象批量转移到slab中*/
+</span><span class='line'>&#9;&#9;STATS_INC_FREEMISS(cachep);
+</span><span class='line'>&#9;&#9;cache_flusharray(cachep, ac);
+</span><span class='line'>&#9;&#9;ac-&gt;entry[ac-&gt;avail++] = objp;
+</span><span class='line'>&#9;}
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>static void free_block(struct kmem_cache *cachep, void **objpp, int nr_objects,
+</span><span class='line'>&#9;&#9;&#9;   int node)
+</span><span class='line'>{
+</span><span class='line'>&#9;int i;
+</span><span class='line'>&#9;struct kmem_list3 *l3;
+</span><span class='line'>
+</span><span class='line'>&#9;for (i = 0; i &lt; nr_objects; i++) {
+</span><span class='line'>&#9;&#9;void *objp = objpp[i];
+</span><span class='line'>&#9;&#9;struct slab *slabp;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;/*通过对象的虚拟地址得到slab描述符*/
+</span><span class='line'>&#9;&#9;slabp = virt_to_slab(objp);
+</span><span class='line'>&#9;&#9;
+</span><span class='line'>&#9;&#9;/*获取kmem_list3*/
+</span><span class='line'>&#9;&#9;l3 = cachep-&gt;nodelists[node];
+</span><span class='line'>&#9;&#9;
+</span><span class='line'>&#9;&#9;/*先将slab从所在链表中删除*/
+</span><span class='line'>&#9;&#9;list_del(&slabp-&gt;list);
+</span><span class='line'>&#9;&#9;check_spinlock_acquired_node(cachep, node);
+</span><span class='line'>&#9;&#9;check_slabp(cachep, slabp);
+</span><span class='line'>&#9;&#9;
+</span><span class='line'>&#9;&#9;/*将一个对象放回slab上*/
+</span><span class='line'>&#9;&#9;slab_put_obj(cachep, slabp, objp, node);
+</span><span class='line'>&#9;&#9;STATS_DEC_ACTIVE(cachep);
+</span><span class='line'>&#9;&#9;
+</span><span class='line'>&#9;&#9;/*kmem_list3中的空闲对象数加1*/
+</span><span class='line'>&#9;&#9;l3-&gt;free_objects++;
+</span><span class='line'>&#9;&#9;check_slabp(cachep, slabp);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;/* fixup slab chains */
+</span><span class='line'>&#9;&#9;/*slab的对象全部空闲*/
+</span><span class='line'>&#9;&#9;if (slabp-&gt;inuse == 0) {
+</span><span class='line'>&#9;&#9;&#9;/*如果空闲对象数大于了空闲对象上限*/
+</span><span class='line'>&#9;&#9;&#9;if (l3-&gt;free_objects &gt; l3-&gt;free_limit) {
+</span><span class='line'>&#9;&#9;&#9;&#9;/*总空闲对象数减去一个slab的对象数*/
+</span><span class='line'>&#9;&#9;&#9;&#9;l3-&gt;free_objects -= cachep-&gt;num;
+</span><span class='line'>&#9;&#9;&#9;&#9;/* No need to drop any previously held
+</span><span class='line'>&#9;&#9;&#9;&#9; * lock here, even if we have a off-slab slab
+</span><span class='line'>&#9;&#9;&#9;&#9; * descriptor it is guaranteed to come from
+</span><span class='line'>&#9;&#9;&#9;&#9; * a different cache, refer to comments before
+</span><span class='line'>&#9;&#9;&#9;&#9; * alloc_slabmgmt.
+</span><span class='line'>&#9;&#9;&#9;&#9; */
+</span><span class='line'>&#9;&#9;&#9;&#9; /*销毁该slab*/
+</span><span class='line'>&#9;&#9;&#9;&#9;slab_destroy(cachep, slabp);
+</span><span class='line'>&#9;&#9;&#9;} else {
+</span><span class='line'>&#9;&#9;&#9;&#9;/*将该slab添加到free链表*/
+</span><span class='line'>&#9;&#9;&#9;&#9;list_add(&slabp-&gt;list, &l3-&gt;slabs_free);
+</span><span class='line'>&#9;&#9;&#9;}
+</span><span class='line'>&#9;&#9;} else {/*否则添加到partial链表*/
+</span><span class='line'>&#9;&#9;&#9;/* Unconditionally move a slab to the end of the
+</span><span class='line'>&#9;&#9;&#9; * partial list on free - maximum time for the
+</span><span class='line'>&#9;&#9;&#9; * other objects to be freed, too.
+</span><span class='line'>&#9;&#9;&#9; */
+</span><span class='line'>&#9;&#9;&#9;list_add_tail(&slabp-&gt;list, &l3-&gt;slabs_partial);
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;}
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>static void slab_put_obj(struct kmem_cache *cachep, struct slab *slabp,
+</span><span class='line'>&#9;&#9;&#9;&#9;void *objp, int nodeid)
+</span><span class='line'>{
+</span><span class='line'>&#9;/*得到对象的偏移*/
+</span><span class='line'>&#9;unsigned int objnr = obj_to_index(cachep, slabp, objp);
+</span><span class='line'>
+</span><span class='line'>#if DEBUG
+</span><span class='line'>&#9;/* Verify that the slab belongs to the intended node */
+</span><span class='line'>&#9;WARN_ON(slabp-&gt;nodeid != nodeid);
+</span><span class='line'>
+</span><span class='line'>&#9;if (slab_bufctl(slabp)[objnr] + 1 &lt;= SLAB_LIMIT + 1) {
+</span><span class='line'>&#9;&#9;printk(KERN_ERR "slab: double free detected in cache "
+</span><span class='line'>&#9;&#9;&#9;&#9;"'%s', objp %p\n", cachep-&gt;name, objp);
+</span><span class='line'>&#9;&#9;BUG();
+</span><span class='line'>&#9;}
+</span><span class='line'>#endif
+</span><span class='line'>&#9;/*bufctl数组的相应元素更新为free*/
+</span><span class='line'>&#9;slab_bufctl(slabp)[objnr] = slabp-&gt;free;
+</span><span class='line'>&#9;/*free更新为objnr*/
+</span><span class='line'>&#9;slabp-&gt;free = objnr;
+</span><span class='line'>&#9;/*非空闲数减1*/
+</span><span class='line'>&#9;slabp-&gt;inuse--;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h2>Linux Slab分配器(六)&ndash;创建slab和销毁slab</h2>
+
+<p>在满足以下两个条件时，slab分配器将为高速缓存创建新的slab</p>
+
+<p>1.请求分配对象，但本地高速缓存没有空闲对象可以分配，需要填充</p>
+
+<p>2.kmem_list3维护的链表中没有slab或者所有的slab都处于FULL链表中</p>
+
+<p>这时，调用cache_grow()创建slab增大缓存容量</p>
+
+<p>下图给出了cache_grow()的代码流程</p>
+
+<p><img src="/images/kernel/2018-08-08-2.png" alt="" /></p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+<span class='line-number'>82</span>
+<span class='line-number'>83</span>
+<span class='line-number'>84</span>
+<span class='line-number'>85</span>
+<span class='line-number'>86</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int cache_grow(struct kmem_cache *cachep,
+</span><span class='line'>&#9;&#9;gfp_t flags, int nodeid, void *objp)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct slab *slabp;
+</span><span class='line'>&#9;size_t offset;
+</span><span class='line'>&#9;gfp_t local_flags;
+</span><span class='line'>&#9;struct kmem_list3 *l3;
+</span><span class='line'>
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * Be lazy and only check for valid flags here,  keeping it out of the
+</span><span class='line'>&#9; * critical path in kmem_cache_alloc().
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;BUG_ON(flags & GFP_SLAB_BUG_MASK);
+</span><span class='line'>&#9;local_flags = flags & (GFP_CONSTRAINT_MASK|GFP_RECLAIM_MASK);
+</span><span class='line'>
+</span><span class='line'>&#9;/* Take the l3 list lock to change the colour_next on this node */
+</span><span class='line'>&#9;check_irq_off();
+</span><span class='line'>&#9;l3 = cachep-&gt;nodelists[nodeid];
+</span><span class='line'>&#9;spin_lock(&l3-&gt;list_lock);
+</span><span class='line'>
+</span><span class='line'>&#9;/* Get colour for the slab, and cal the next value. */
+</span><span class='line'>&#9;/*确定待创建的slab的颜色编号*/
+</span><span class='line'>&#9;offset = l3-&gt;colour_next;
+</span><span class='line'>&#9;/*更新下一个slab的颜色编号*/
+</span><span class='line'>&#9;l3-&gt;colour_next++;
+</span><span class='line'>&#9;/*颜色编号必须小于颜色数*/
+</span><span class='line'>&#9;if (l3-&gt;colour_next &gt;= cachep-&gt;colour)
+</span><span class='line'>&#9;&#9;l3-&gt;colour_next = 0;
+</span><span class='line'>&#9;spin_unlock(&l3-&gt;list_lock);
+</span><span class='line'>
+</span><span class='line'>&#9;/*确定待创建的slab的颜色*/
+</span><span class='line'>&#9;offset *= cachep-&gt;colour_off;
+</span><span class='line'>
+</span><span class='line'>&#9;if (local_flags & __GFP_WAIT)
+</span><span class='line'>&#9;&#9;local_irq_enable();
+</span><span class='line'>
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * The test for missing atomic flag is performed here, rather than
+</span><span class='line'>&#9; * the more obvious place, simply to reduce the critical path length
+</span><span class='line'>&#9; * in kmem_cache_alloc(). If a caller is seriously mis-behaving they
+</span><span class='line'>&#9; * will eventually be caught here (where it matters).
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;kmem_flagcheck(cachep, flags);
+</span><span class='line'>
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * Get mem for the objs.  Attempt to allocate a physical page from
+</span><span class='line'>&#9; * 'nodeid'.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;if (!objp)
+</span><span class='line'>&#9;&#9;/*从伙伴系统分配页框，这是slab分配器与伙伴系统的接口*/
+</span><span class='line'>&#9;&#9;objp = kmem_getpages(cachep, local_flags, nodeid);
+</span><span class='line'>&#9;if (!objp)
+</span><span class='line'>&#9;&#9;goto failed;
+</span><span class='line'>
+</span><span class='line'>&#9;/* Get slab management. */
+</span><span class='line'>&#9;/*分配slab管理区*/
+</span><span class='line'>&#9;slabp = alloc_slabmgmt(cachep, objp, offset,
+</span><span class='line'>&#9;&#9;&#9;local_flags & ~GFP_CONSTRAINT_MASK, nodeid);
+</span><span class='line'>&#9;if (!slabp)
+</span><span class='line'>&#9;&#9;goto opps1;
+</span><span class='line'>
+</span><span class='line'>&#9;/*建立页面到slab和cache的映射，以便于根据obj迅速定位slab描述符和cache描述符*/
+</span><span class='line'>&#9;slab_map_pages(cachep, slabp, objp);
+</span><span class='line'>
+</span><span class='line'>&#9;/*初始化对象*/
+</span><span class='line'>&#9;cache_init_objs(cachep, slabp);
+</span><span class='line'>
+</span><span class='line'>&#9;if (local_flags & __GFP_WAIT)
+</span><span class='line'>&#9;&#9;local_irq_disable();
+</span><span class='line'>&#9;check_irq_off();
+</span><span class='line'>&#9;spin_lock(&l3-&gt;list_lock);
+</span><span class='line'>
+</span><span class='line'>&#9;/* Make slab active. */
+</span><span class='line'>&#9;/*将新创建的slab添加到free链表*/
+</span><span class='line'>&#9;list_add_tail(&slabp-&gt;list, &(l3-&gt;slabs_free));
+</span><span class='line'>&#9;STATS_INC_GROWN(cachep);
+</span><span class='line'>&#9;l3-&gt;free_objects += cachep-&gt;num;
+</span><span class='line'>&#9;spin_unlock(&l3-&gt;list_lock);
+</span><span class='line'>&#9;return 1;
+</span><span class='line'>opps1:
+</span><span class='line'>&#9;kmem_freepages(cachep, objp);
+</span><span class='line'>failed:
+</span><span class='line'>&#9;if (local_flags & __GFP_WAIT)
+</span><span class='line'>&#9;&#9;local_irq_disable();
+</span><span class='line'>&#9;return 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>辅助函数：</p>
+
+<p>为slab分配页框</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void *kmem_getpages(struct kmem_cache *cachep, gfp_t flags, int nodeid)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct page *page;
+</span><span class='line'>&#9;int nr_pages;
+</span><span class='line'>&#9;int i;
+</span><span class='line'>
+</span><span class='line'>#ifndef CONFIG_MMU
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * Nommu uses slab's for process anonymous memory allocations, and thus
+</span><span class='line'>&#9; * requires __GFP_COMP to properly refcount higher order allocations
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;flags |= __GFP_COMP;
+</span><span class='line'>#endif
+</span><span class='line'>
+</span><span class='line'>&#9;flags |= cachep-&gt;gfpflags;
+</span><span class='line'>&#9;if (cachep-&gt;flags & SLAB_RECLAIM_ACCOUNT)
+</span><span class='line'>&#9;&#9;flags |= __GFP_RECLAIMABLE;
+</span><span class='line'>
+</span><span class='line'>&#9;/*从特定的节点分配2^gfporder个连续页*/
+</span><span class='line'>&#9;page = alloc_pages_exact_node(nodeid, flags | __GFP_NOTRACK, cachep-&gt;gfporder);
+</span><span class='line'>&#9;if (!page)
+</span><span class='line'>&#9;&#9;return NULL;
+</span><span class='line'>
+</span><span class='line'>&#9;nr_pages = (1 &lt;&lt; cachep-&gt;gfporder);
+</span><span class='line'>&#9;if (cachep-&gt;flags & SLAB_RECLAIM_ACCOUNT)
+</span><span class='line'>&#9;&#9;add_zone_page_state(page_zone(page),
+</span><span class='line'>&#9;&#9;&#9;NR_SLAB_RECLAIMABLE, nr_pages);
+</span><span class='line'>&#9;else
+</span><span class='line'>&#9;&#9;add_zone_page_state(page_zone(page),
+</span><span class='line'>&#9;&#9;&#9;NR_SLAB_UNRECLAIMABLE, nr_pages);
+</span><span class='line'>&#9;for (i = 0; i &lt; nr_pages; i++)
+</span><span class='line'>&#9;&#9;__SetPageSlab(page + i);
+</span><span class='line'>
+</span><span class='line'>&#9;if (kmemcheck_enabled && !(cachep-&gt;flags & SLAB_NOTRACK)) {
+</span><span class='line'>&#9;&#9;kmemcheck_alloc_shadow(page, cachep-&gt;gfporder, flags, nodeid);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (cachep-&gt;ctor)
+</span><span class='line'>&#9;&#9;&#9;kmemcheck_mark_uninitialized_pages(page, nr_pages);
+</span><span class='line'>&#9;&#9;else
+</span><span class='line'>&#9;&#9;&#9;kmemcheck_mark_unallocated_pages(page, nr_pages);
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;/*返回首页的虚拟地址*/
+</span><span class='line'>&#9;return page_address(page);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>为slab管理区分配空间:</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static struct slab *alloc_slabmgmt(struct kmem_cache *cachep, void *objp,
+</span><span class='line'>&#9;&#9;&#9;&#9;   int colour_off, gfp_t local_flags,
+</span><span class='line'>&#9;&#9;&#9;&#9;   int nodeid)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct slab *slabp;
+</span><span class='line'>
+</span><span class='line'>&#9;/*如果slab管理区位于slab外，则在指定的slabp_cache中分配空间*/
+</span><span class='line'>&#9;if (OFF_SLAB(cachep)) {
+</span><span class='line'>&#9;&#9;/* Slab management obj is off-slab. */
+</span><span class='line'>&#9;&#9;slabp = kmem_cache_alloc_node(cachep-&gt;slabp_cache,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;  local_flags, nodeid);
+</span><span class='line'>&#9;&#9;/*
+</span><span class='line'>&#9;&#9; * If the first object in the slab is leaked (it's allocated
+</span><span class='line'>&#9;&#9; * but no one has a reference to it), we want to make sure
+</span><span class='line'>&#9;&#9; * kmemleak does not treat the -&gt;s_mem pointer as a reference
+</span><span class='line'>&#9;&#9; * to the object. Otherwise we will not report the leak.
+</span><span class='line'>&#9;&#9; */
+</span><span class='line'>&#9;&#9;kmemleak_scan_area(slabp, offsetof(struct slab, list),
+</span><span class='line'>&#9;&#9;&#9;&#9;   sizeof(struct list_head), local_flags);
+</span><span class='line'>&#9;&#9;if (!slabp)
+</span><span class='line'>&#9;&#9;&#9;return NULL;
+</span><span class='line'>&#9;} else {/*slab管理区处于slab中*/
+</span><span class='line'>&#9;&#9;/*slab管理区从slab首部偏移颜色值的地方开始*/
+</span><span class='line'>&#9;&#9;slabp = objp + colour_off;
+</span><span class='line'>&#9;&#9;colour_off += cachep-&gt;slab_size;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;slabp-&gt;inuse = 0;/*对象全为空闲*/
+</span><span class='line'>&#9;slabp-&gt;colouroff = colour_off;   /*刷新第一个对象的偏移*/
+</span><span class='line'>&#9;slabp-&gt;s_mem = objp + colour_off;/*确定第一个对象的位置*/
+</span><span class='line'>&#9;slabp-&gt;nodeid = nodeid;/*标识节点*/
+</span><span class='line'>&#9;slabp-&gt;free = 0; /*下一个空闲对象位于s_mem起始处*/
+</span><span class='line'>&#9;return slabp;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>利用页描述结构的lru域建立页框到slab描述符和cache描述符的映射，实际就是使lru.next指向cache描述符，lru.prev指向slab描述符</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void slab_map_pages(struct kmem_cache *cache, struct slab *slab,
+</span><span class='line'>&#9;&#9;&#9;   void *addr)
+</span><span class='line'>{
+</span><span class='line'>&#9;int nr_pages;
+</span><span class='line'>&#9;struct page *page;
+</span><span class='line'>
+</span><span class='line'>&#9;page = virt_to_page(addr);
+</span><span class='line'>
+</span><span class='line'>&#9;nr_pages = 1;
+</span><span class='line'>&#9;if (likely(!PageCompound(page)))
+</span><span class='line'>&#9;&#9;nr_pages &lt;&lt;= cache-&gt;gfporder;/*分配给slab的页框数*/
+</span><span class='line'>
+</span><span class='line'>&#9;do {
+</span><span class='line'>&#9;&#9;page_set_cache(page, cache);/*建立到cache的映射*/
+</span><span class='line'>&#9;&#9;page_set_slab(page, slab);  /*建立到slab的映射*/
+</span><span class='line'>&#9;&#9;page++;
+</span><span class='line'>&#9;} while (--nr_pages);
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>static inline void page_set_cache(struct page *page, struct kmem_cache *cache)
+</span><span class='line'>{
+</span><span class='line'>&#9;page-&gt;lru.next = (struct list_head *)cache;
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>static inline void page_set_slab(struct page *page, struct slab *slab)
+</span><span class='line'>{
+</span><span class='line'>&#9;page-&gt;lru.prev = (struct list_head *)slab;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>初始化对象</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void cache_init_objs(struct kmem_cache *cachep,
+</span><span class='line'>&#9;&#9;&#9;&#9;struct slab *slabp)
+</span><span class='line'>{
+</span><span class='line'>&#9;int i;
+</span><span class='line'>
+</span><span class='line'>&#9;for (i = 0; i &lt; cachep-&gt;num; i++) {
+</span><span class='line'>&#9;&#9;/*得到第i个对象*/
+</span><span class='line'>&#9;&#9;void *objp = index_to_obj(cachep, slabp, i);
+</span><span class='line'>#if DEBUG /*Debug相关操作*/
+</span><span class='line'>&#9;&#9;/* need to poison the objs? */
+</span><span class='line'>&#9;&#9;if (cachep-&gt;flags & SLAB_POISON)
+</span><span class='line'>&#9;&#9;&#9;poison_obj(cachep, objp, POISON_FREE);
+</span><span class='line'>&#9;&#9;if (cachep-&gt;flags & SLAB_STORE_USER)
+</span><span class='line'>&#9;&#9;&#9;*dbg_userword(cachep, objp) = NULL;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (cachep-&gt;flags & SLAB_RED_ZONE) {
+</span><span class='line'>&#9;&#9;&#9;*dbg_redzone1(cachep, objp) = RED_INACTIVE;
+</span><span class='line'>&#9;&#9;&#9;*dbg_redzone2(cachep, objp) = RED_INACTIVE;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;/*
+</span><span class='line'>&#9;&#9; * Constructors are not allowed to allocate memory from the same
+</span><span class='line'>&#9;&#9; * cache which they are a constructor for.  Otherwise, deadlock.
+</span><span class='line'>&#9;&#9; * They must also be threaded.
+</span><span class='line'>&#9;&#9; */
+</span><span class='line'>&#9;&#9;if (cachep-&gt;ctor && !(cachep-&gt;flags & SLAB_POISON))
+</span><span class='line'>&#9;&#9;&#9;cachep-&gt;ctor(objp + obj_offset(cachep));
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (cachep-&gt;flags & SLAB_RED_ZONE) {
+</span><span class='line'>&#9;&#9;&#9;if (*dbg_redzone2(cachep, objp) != RED_INACTIVE)
+</span><span class='line'>&#9;&#9;&#9;&#9;slab_error(cachep, "constructor overwrote the"
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;   " end of an object");
+</span><span class='line'>&#9;&#9;&#9;if (*dbg_redzone1(cachep, objp) != RED_INACTIVE)
+</span><span class='line'>&#9;&#9;&#9;&#9;slab_error(cachep, "constructor overwrote the"
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;   " start of an object");
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;if ((cachep-&gt;buffer_size % PAGE_SIZE) == 0 &&
+</span><span class='line'>&#9;&#9;&#9;&#9;OFF_SLAB(cachep) && cachep-&gt;flags & SLAB_POISON)
+</span><span class='line'>&#9;&#9;&#9;kernel_map_pages(virt_to_page(objp),
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9; cachep-&gt;buffer_size / PAGE_SIZE, 0);
+</span><span class='line'>#else
+</span><span class='line'>&#9;&#9;if (cachep-&gt;ctor)/*根据构造函数初始化对象*/
+</span><span class='line'>&#9;&#9;&#9;cachep-&gt;ctor(objp);
+</span><span class='line'>#endif
+</span><span class='line'>&#9;&#9;slab_bufctl(slabp)[i] = i + 1;/*确定下一个空闲对象为后面相邻的对象*/
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;slab_bufctl(slabp)[i - 1] = BUFCTL_END;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>销毁slab就是释放slab管理区和对象占用的空间</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void slab_destroy(struct kmem_cache *cachep, struct slab *slabp)
+</span><span class='line'>{
+</span><span class='line'>&#9;/*用第一个对象的地址减去着色偏移量得到slab的起始地址*/
+</span><span class='line'>&#9;void *addr = slabp-&gt;s_mem - slabp-&gt;colouroff;
+</span><span class='line'>
+</span><span class='line'>&#9;slab_destroy_debugcheck(cachep, slabp);
+</span><span class='line'>
+</span><span class='line'>&#9;/*如果选择了RCU方式来销毁slab,则通过RCU进行销毁，这个表示还不太明白*/
+</span><span class='line'>&#9;if (unlikely(cachep-&gt;flags & SLAB_DESTROY_BY_RCU)) {
+</span><span class='line'>&#9;&#9;struct slab_rcu *slab_rcu;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;slab_rcu = (struct slab_rcu *)slabp;
+</span><span class='line'>&#9;&#9;slab_rcu-&gt;cachep = cachep;
+</span><span class='line'>&#9;&#9;slab_rcu-&gt;addr = addr;
+</span><span class='line'>&#9;&#9;call_rcu(&slab_rcu-&gt;head, kmem_rcu_free);
+</span><span class='line'>&#9;} else {
+</span><span class='line'>&#9;&#9;/*将slab占用的页框释放回伙伴系统*/
+</span><span class='line'>&#9;&#9;kmem_freepages(cachep, addr);
+</span><span class='line'>&#9;&#9;/*如果slab的管理区位于外部，则需要从对应的缓存中释放管理区对象*/
+</span><span class='line'>&#9;&#9;if (OFF_SLAB(cachep))
+</span><span class='line'>&#9;&#9;&#9;kmem_cache_free(cachep-&gt;slabp_cache, slabp);
+</span><span class='line'>&#9;}
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h2>Linux Slab分配器(七)&ndash;销毁缓存</h2>
+
+<p>销毁缓存首先要保证的一点就是缓存当中所有的对象都是空闲的，也就是之前分配出去的对象都已经释放回来了，其主要的步骤如下</p>
+
+<p>1.将缓存从cache_chain链表中删除</p>
+
+<p>2.将本地高速缓存、alien高速缓存和共享本地高速缓存中的对象都释放回slab并释放所有的free链表，然后判断full链表以及partial链表是否都为空，如果有一个不为空说明存在非空闲slab,也就是说有对象还未释放，此时无法销毁缓存，重新将缓存添加到cache_chain链表中</p>
+
+<p>3.确定所有的slab都为空闲状态后，将缓存涉及到的所有描述符都释放(这些描述符都是保存在普通高速缓存中的)</p>
+
+<p>负责销毁缓存的函数为kmem_cache_destroy()</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void kmem_cache_destroy(struct kmem_cache *cachep)
+</span><span class='line'>{
+</span><span class='line'>&#9;BUG_ON(!cachep || in_interrupt());
+</span><span class='line'>
+</span><span class='line'>&#9;/* Find the cache in the chain of caches. */
+</span><span class='line'>&#9;get_online_cpus();
+</span><span class='line'>&#9;mutex_lock(&cache_chain_mutex);
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * the chain is never empty, cache_cache is never destroyed
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;/*将cache从cache_chain中删除*/
+</span><span class='line'>&#9;list_del(&cachep-&gt;next);
+</span><span class='line'>&#9;
+</span><span class='line'>&#9;/*释放完free链表,如果FULL链表或partial链表中还有slab,说明还有对象处于分配状态
+</span><span class='line'>&#9;因此不能销毁该缓存!*/
+</span><span class='line'>&#9;if (__cache_shrink(cachep)) {
+</span><span class='line'>&#9;&#9;slab_error(cachep, "Can't free all objects");
+</span><span class='line'>&#9;&#9;/*重新将缓存添加到cache_chain链表中*/
+</span><span class='line'>&#9;&#9;list_add(&cachep-&gt;next, &cache_chain);
+</span><span class='line'>&#9;&#9;mutex_unlock(&cache_chain_mutex);
+</span><span class='line'>&#9;&#9;put_online_cpus();
+</span><span class='line'>&#9;&#9;return;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;if (unlikely(cachep-&gt;flags & SLAB_DESTROY_BY_RCU))
+</span><span class='line'>&#9;&#9;rcu_barrier();
+</span><span class='line'>
+</span><span class='line'>&#9;/*释放cache所涉及到的各个描述符的存储对象*/
+</span><span class='line'>&#9;__kmem_cache_destroy(cachep);
+</span><span class='line'>&#9;mutex_unlock(&cache_chain_mutex);
+</span><span class='line'>&#9;put_online_cpus();
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>static int __cache_shrink(struct kmem_cache *cachep)
+</span><span class='line'>{
+</span><span class='line'>&#9;int ret = 0, i = 0;
+</span><span class='line'>&#9;struct kmem_list3 *l3;
+</span><span class='line'>
+</span><span class='line'>&#9;/*将本地高速缓存，share本地高速缓存以及alien高速缓存的空闲对象释放slab*/
+</span><span class='line'>&#9;drain_cpu_caches(cachep);
+</span><span class='line'>
+</span><span class='line'>&#9;check_irq_on();
+</span><span class='line'>&#9;for_each_online_node(i) {
+</span><span class='line'>&#9;&#9;l3 = cachep-&gt;nodelists[i];
+</span><span class='line'>&#9;&#9;if (!l3)
+</span><span class='line'>&#9;&#9;&#9;continue;
+</span><span class='line'>&#9;&#9;&#9;&#9;  /*销毁空闲链表中的slab*/
+</span><span class='line'>&#9;&#9;drain_freelist(cachep, l3, l3-&gt;free_objects);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;/*判断full和partial是否为空，有一个不为空则ret就为1*/
+</span><span class='line'>&#9;&#9;ret += !list_empty(&l3-&gt;slabs_full) ||
+</span><span class='line'>&#9;&#9;&#9;!list_empty(&l3-&gt;slabs_partial);
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;return (ret ? 1 : 0);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>drain_cpu_caches()的最终落脚在free_block()函数上，该函数在前面已做过分析，在此不再列出</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int drain_freelist(struct kmem_cache *cache,
+</span><span class='line'>&#9;&#9;&#9;struct kmem_list3 *l3, int tofree)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct list_head *p;
+</span><span class='line'>&#9;int nr_freed;
+</span><span class='line'>&#9;struct slab *slabp;
+</span><span class='line'>
+</span><span class='line'>&#9;nr_freed = 0;
+</span><span class='line'>&#9;/*slab中的对象还未释放完并且free链表不为空*/
+</span><span class='line'>&#9;while (nr_freed &lt; tofree && !list_empty(&l3-&gt;slabs_free)) {
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;spin_lock_irq(&l3-&gt;list_lock);
+</span><span class='line'>&#9;&#9;p = l3-&gt;slabs_free.prev;
+</span><span class='line'>&#9;&#9;if (p == &l3-&gt;slabs_free) {/*链表中已无元素*/
+</span><span class='line'>&#9;&#9;&#9;spin_unlock_irq(&l3-&gt;list_lock);
+</span><span class='line'>&#9;&#9;&#9;goto out;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;/*从free链表中取出一个slab*/
+</span><span class='line'>&#9;&#9;slabp = list_entry(p, struct slab, list);
+</span><span class='line'>#if DEBUG
+</span><span class='line'>&#9;&#9;BUG_ON(slabp-&gt;inuse);
+</span><span class='line'>#endif
+</span><span class='line'>&#9;&#9;/*从链表中删除*/
+</span><span class='line'>&#9;&#9;list_del(&slabp-&gt;list);
+</span><span class='line'>&#9;&#9;/*
+</span><span class='line'>&#9;&#9; * Safe to drop the lock. The slab is no longer linked
+</span><span class='line'>&#9;&#9; * to the cache.
+</span><span class='line'>&#9;&#9; */
+</span><span class='line'>&#9;&#9; /*空闲对象数量总数减去num*/
+</span><span class='line'>&#9;&#9;l3-&gt;free_objects -= cache-&gt;num;
+</span><span class='line'>&#9;&#9;spin_unlock_irq(&l3-&gt;list_lock);
+</span><span class='line'>&#9;&#9;/*销毁slab*/
+</span><span class='line'>&#9;&#9;slab_destroy(cache, slabp);
+</span><span class='line'>&#9;&#9;nr_freed++;
+</span><span class='line'>&#9;}
+</span><span class='line'>out:
+</span><span class='line'>&#9;return nr_freed;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>slab_destroy()函数已在前文中分析</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void __kmem_cache_destroy(struct kmem_cache *cachep)
+</span><span class='line'>{
+</span><span class='line'>&#9;int i;
+</span><span class='line'>&#9;struct kmem_list3 *l3;
+</span><span class='line'>
+</span><span class='line'>&#9;/*释放存储本地高速缓存描述符的对象*/
+</span><span class='line'>&#9;for_each_online_cpu(i)
+</span><span class='line'>&#9;&#9;kfree(cachep-&gt;array[i]);
+</span><span class='line'>
+</span><span class='line'>&#9;/* NUMA: free the list3 structures */
+</span><span class='line'>&#9;for_each_online_node(i) {
+</span><span class='line'>&#9;&#9;l3 = cachep-&gt;nodelists[i];
+</span><span class='line'>&#9;&#9;if (l3) {
+</span><span class='line'>&#9;&#9;&#9;/*释放存储共享本地高速缓存描述符的对象*/
+</span><span class='line'>&#9;&#9;&#9;kfree(l3-&gt;shared);
+</span><span class='line'>&#9;&#9;&#9;/*释放存储alien本地高速缓存描述符的对象*/
+</span><span class='line'>&#9;&#9;&#9;free_alien_cache(l3-&gt;alien);
+</span><span class='line'>&#9;&#9;&#9;/*释放存储kmem_list3描述符的对象*/
+</span><span class='line'>&#9;&#9;&#9;kfree(l3);
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;/*释放存储缓存描述符的对象*/
+</span><span class='line'>&#9;kmem_cache_free(&cache_cache, cachep);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
+</div>
+
+
+  <footer>
+    <p class="meta">
+      
+  
+
+<span class="byline author vcard">Posted by <span class="fn">kk</span></span>
+
+      
+
+
+
+
+<time class='entry-date' datetime='2015-03-03T17:32:00+08:00'><span class='date'>2015-03-03</span> <span class='time'>17:32:00</span></time>
+      
+
+<span class="categories">
+  
+    <a class='category' href='/blog/cats/kernel/'>kernel</a>, <a class='category' href='/blog/cats/kernel~mm/'>mm</a>
+  
+</span>
+
+
+    </p>
+    
+      
+    
+    <p class="meta">
+      
+        <a class="basic-alignment left" href="/blog/2015/03/03/kernel-mm-slab1/" title="Previous Post: Linux slab 分配器剖析">&laquo; Linux slab 分配器剖析</a>
+      
+      
+        <a class="basic-alignment right" href="/blog/2015/03/04/kernel-net-ip/" title="Next Post: linux TCP/IP协议栈-IP层">linux TCP/IP协议栈-IP层 &raquo;</a>
+      
+    </p>
+    <p class="meta">
+	<div style='white-space: nowrap;'>
+	<img src="/images/wx_ok.png" width=150px; height=150px; style="margin-left:100px;">
+	<img src="/images/ali_ok.png" width=150px; height=150px; style="margin-left:100px;">
+	</div>
+    </p>
+  </footer>
+</article>
+
+</div>
+<aside class="sidebar" id='load_sidebar'>
+</aside>
+<script type="text/javascript">
+  $('#load_sidebar').load('/sidebar.html');
+</script>
+
+    </div>
+  </div>
+  <footer role="contentinfo">  Copyright &copy; 2023 - kk -
+  <span class="credit">Powered by <a href="http://octopress.org">Octopress</a></span>
+  <a title="Top" href="#" id="scroll2top" style="position: fixed; height: 50px; bottom: 30px; right: 25px; cursor: pointer; z-index: 9999; display: block; opacity: 1;"><img src="/images/scrollup.png"></a>
+  <script src="/javascripts/scroll2top.js"></script>
+
+<!-- Matomo -->
+<script>
+  var _paq = window._paq = window._paq || [];
+  /* tracker methods like "setCustomDimension" should be called before "trackPageView" */
+  _paq.push(['trackPageView']);
+  _paq.push(['enableLinkTracking']);
+  (function() {
+    var u="//www.abcxyzkk.xyz/matomo/";
+    _paq.push(['setTrackerUrl', u+'matomo.php']);
+    _paq.push(['setSiteId', '1']);
+    var d=document, g=d.createElement('script'), s=d.getElementsByTagName('script')[0];
+    g.async=true; g.src=u+'matomo.js'; s.parentNode.insertBefore(g,s);
+  })();
+</script>
+<!-- End Matomo Code -->
+
+
+<!-- Histats.com  (div with counter) --><div id="histats_counter"></div>
+<!-- Histats.com  START  (aync)-->
+<!--
+<script type="text/javascript">var _Hasync= _Hasync|| [];
+_Hasync.push(['Histats.start', '1,4673876,4,107,170,20,00010000']);
+_Hasync.push(['Histats.fasi', '1']);
+_Hasync.push(['Histats.track_hits', '']);
+(function() {
+var hs = document.createElement('script'); hs.type = 'text/javascript'; hs.async = true;
+hs.src = ('//s10.histats.com/js15_as.js');
+(document.getElementsByTagName('head')[0] || document.getElementsByTagName('body')[0]).appendChild(hs);
+})();</script>
+<noscript><a href="/" target="_blank"><img  src="//sstatic1.histats.com/0.gif?4673876&101" alt="simple hit counter" border="0"></a></noscript>
+-->
+<!-- Histats.com  END  -->
+
+<!--  <script type="text/javascript">var cnzz_protocol = (("https:" == document.location.protocol) ? " https://" : " http://");document.write(unescape("%3Cspan id='cnzz_stat_icon_1253604690'%3E%3C/span%3E%3Cscript src='" + cnzz_protocol + "s95.cnzz.com/z_stat.php%3Fid%3D1253604690' type='text/javascript'%3E%3C/script%3E"));</script>
+-->
+
+</footer>
+  
+
+
+
+
+
+</body>
+</html>

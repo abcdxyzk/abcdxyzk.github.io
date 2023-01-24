@@ -1,0 +1,1351 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+
+  <title><![CDATA[Category: 2018~01 | kk Blog —— 通用基础]]></title>
+  <link href="http://abcdxyzk.github.io/blog/cats/2018~01/atom.xml" rel="self"/>
+  <link href="http://abcdxyzk.github.io/"/>
+  <updated>2023-01-24T19:27:19+08:00</updated>
+  <id>http://abcdxyzk.github.io/</id>
+  <author>
+    <name><![CDATA[kk]]></name>
+    
+  </author>
+  <generator uri="http://octopress.org/">Octopress</generator>
+
+  
+  <entry>
+    <title type="html"><![CDATA[TCP Fast Open(TFO), tcp_fastopen]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2018/01/25/kernel-net-fastopen/"/>
+    <updated>2018-01-25T03:25:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2018/01/25/kernel-net-fastopen</id>
+    <content type="html"><![CDATA[<p><a href="https://www.2cto.com/kf/201701/586043.html">https://www.2cto.com/kf/201701/586043.html</a></p>
+
+<p><a href="http://blog.csdn.net/u011130578/article/details/44515165">http://blog.csdn.net/u011130578/article/details/44515165</a></p>
+
+<p><a href="http://blog.sina.com.cn/s/blog_583f42f101011veh.html">http://blog.sina.com.cn/s/blog_583f42f101011veh.html</a></p>
+
+<pre><code>    #define TFO_CLIENT_ENABLE       1
+    #define TFO_SERVER_ENABLE       2
+    #define TFO_CLIENT_NO_COOKIE    4       /* Data in SYN w/o cookie option */
+
+    /* Process SYN data but skip cookie validation */
+    #define TFO_SERVER_COOKIE_NOT_CHKED     0x100   // 收到cookie也不检查
+    /* Accept SYN data w/o any cookie option */
+    #define TFO_SERVER_COOKIE_NOT_REQD      0x200   // 不需要cookie需要data就能创建fastopen child，默认情况下syn的data会被忽略
+
+    /* Force enable TFO on all listeners, i.e., not requiring the
+     * TCP_FASTOPEN socket option. SOCKOPT1/2 determine how to set max_qlen.
+     */
+    #define TFO_SERVER_WO_SOCKOPT1  0x400       // 调listen后不需要再调setsockopt就开启fastopen
+    #define TFO_SERVER_WO_SOCKOPT2  0x800       // 调listen后不需要再调setsockopt就开启fastopen，backlog=TFO_SERVER_WO_SOCKOPT2&gt;&gt;16
+    /* Always create TFO child sockets on a TFO listener even when
+     * cookie/data not present. (For testing purpose!)
+     */
+    #define TFO_SERVER_ALWAYS       0x1000      // 不需要cookie也不需要data就创建fastopen child, 容易被攻击，不开启
+</code></pre>
+
+<h3>测试</h3>
+
+<h4>开启</h4>
+
+<pre><code>    echo 3 &gt; /proc/sys/net/ipv4/tcp_fastopen   # 1 开启客户端，2 开启服务端，3 都开启
+
+    tc qdisc add dev lo root netem delay 300ms # 设置延迟才能看出效果
+    ifconfig lo mtu 1500
+</code></pre>
+
+<h4>client</h4>
+
+<pre><code>    #include &lt;stdio.h&gt;
+    #include &lt;unistd.h&gt;
+    #include &lt;string.h&gt;
+    #include &lt;errno.h&gt;
+    #include &lt;sys/types.h&gt;
+    #include &lt;sys/socket.h&gt;
+    #include &lt;netinet/in.h&gt;
+
+    #include &lt;netinet/tcp.h&gt;
+
+    #ifndef MSG_FASTOPEN
+    #define MSG_FASTOPEN   0x20000000
+    #endif
+
+    int main(int argc, char *argv[])
+    {
+        int sockfd, n;
+        struct sockaddr_in servaddr;
+        char buf[50000] = "aaabbbccc";
+        int ret = 0, tot;
+
+        if ((sockfd = socket(AF_INET, SOCK_STREAM, 0)) &lt; 0) {
+            printf ("create socket error: %s(errno: %d)\n", strerror (errno), errno);
+            return -1;
+        }
+
+        memset (&amp;servaddr, 0, sizeof (servaddr));
+        servaddr.sin_family = AF_INET;
+        servaddr.sin_port = htons (1935);
+        servaddr.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+    #define FASTOPEN_TEST
+    #ifndef FASTOPEN_TEST
+        if (connect(sockfd, (struct sockaddr *)&amp;servaddr, sizeof(servaddr))) {
+            printf("connect error\n");
+            return -2;
+        }
+        ret = send(sockfd, buf, 1005, 0);
+    #else
+        ret = sendto(sockfd, buf, 1005, MSG_FASTOPEN, (struct sockaddr *)&amp;servaddr, sizeof(servaddr));
+    #endif
+        if (ret &lt; 0) {
+            printf ("send msg error: %s(errno: %d)\n", strerror (errno), errno);
+            // 如果是连接失败会打印：Connection refused(errno: 111)
+            return -2;
+        }
+        printf("client fastopen sendto len=%d\n", ret);
+        if ((ret = send(sockfd, buf, 20000, 0)) &lt; 0) {
+            printf("send error ret = %d\n", ret);
+        }
+        printf("client send len = %d\n", ret);
+        shutdown(sockfd, 1);
+
+        tot = 0;
+        while ((n = recv(sockfd, buf, 1024, 0)) &gt; 0)
+            tot += n;
+        printf("client recv len = %d\n", tot);
+        close (sockfd);
+        return 0;
+    }
+</code></pre>
+
+<h4>server</h4>
+
+<pre><code>    #include &lt;unistd.h&gt;
+    #include &lt;string.h&gt;
+    #include &lt;sys/types.h&gt;
+    #include &lt;sys/socket.h&gt;
+    #include &lt;netinet/in.h&gt;
+    #include &lt;netinet/tcp.h&gt;
+    #include &lt;stdio.h&gt;
+
+    int main()
+    {
+        int serverSock, clientSock;
+        struct sockaddr_in addr, clientAddr;
+        int addrLen;
+
+        char buf[10240];
+        int n, tot;
+
+        serverSock = socket(AF_INET, SOCK_STREAM, 0);
+        if (serverSock == -1) {
+            printf("socket failed!\n");
+            return -1;
+        }
+
+        memset(&amp;addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(1935);
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+        if (bind(serverSock, (struct sockaddr*)&amp;addr, sizeof(addr)) &lt; 0) {
+            printf("bind failed!\n");
+            return -2;
+        }
+
+        int qlen = 5;
+        setsockopt(serverSock, SOL_TCP, TCP_FASTOPEN, &amp;qlen, sizeof(qlen));
+
+        if (listen(serverSock, 511) &lt; 0) {
+            printf("listen failed!\n");
+            return -3;
+        }
+
+        while (1) {
+            addrLen = sizeof(clientAddr);
+            clientSock = accept(serverSock, (struct sockaddr*)&amp;clientAddr, &amp;addrLen);
+            if (clientSock &lt; 0) {
+                printf("accept failed!\n");
+                return -4;
+            }
+
+            if ((n = send(clientSock, buf, 10000, 0)) &lt; 0) {
+                printf("send error ret = %d\n", n);
+                return -5;
+            }
+            printf("server send len = %d\n", n);
+            shutdown(clientSock, 1);
+
+            sleep(1);
+
+            tot = 0;
+            while ((n = recv(clientSock, buf, 1024, 0)) &gt; 0)
+                tot += n;
+            printf("server recv len = %d\n", tot);
+            close(clientSock);
+        }
+
+        return 0;
+    }
+</code></pre>
+
+<h3>原理</h3>
+
+<p>1.客户端发送一个SYN包到服务器，这个包中携带了Fast Open Cookie Request;</p>
+
+<p>2.服务器生成一个cookie，这个cookie是加密客户端的IP地址生成的。服务器给客户端发送SYN+ACK响应，在响应包的选项中包含了这个cookie;</p>
+
+<p>3.客户端存储这个cookie以便将来再次与这个服务器的IP建立TFO连接时使用;</p>
+
+<p>也就是说，第一次TCP连接只是交换cookie信息，无法在SYN包中携带数据。在第一次交换之后，接下来的TCP连接就可以在SYN中携带数据了。流程如下：</p>
+
+<p>4.客户端发送一个SYN包，这个包比较特殊，因为它携带应用数据和cookie;</p>
+
+<p>5.服务器验证这个cookie，如果合法，服务器发送一个SYN+ACK，这个ACK同时确认SYN和数据。然后数据被传递到应用进程;</p>
+
+<p>如果不合法，服务器丢弃数据，发送一个SYN+ACK，这个ACK只确认SYN，接下来走三次握手的普通流程;</p>
+
+<p>6.如果验证合法(接收了SYN包中的数据)，服务器在接收到客户端的第一个ACK前可以发送其它响应数据;</p>
+
+<p>7.如果验证不合法(客户端在SYN中带的数据没被确认)，客户端发送ACK确认服务器的SYN;并且，数据会在ACK包中重传;</p>
+
+<p>8.下面的流程与普通的TCP交互流程无异。</p>
+
+<p><img src="/images/kernel/2018-01-25.jpeg" alt="" /></p>
+
+<h3>源码分析</h3>
+
+<p>TFO功能在Linux 2.6.34内核中开始集成。</p>
+
+<p>下面通过分析内核代码来了解TFO的运行机制。开启TFO功能后，server端进程在调用listen系统调用时会初始化TFO队列：</p>
+
+<pre><code>    int inet_listen(struct socket *sock, int backlog)
+    {
+        struct sock *sk = sock-&gt;sk;
+        unsigned char old_state;
+        int err;
+        ...
+        if (old_state != TCP_LISTEN) {
+        ...
+            if ((sysctl_tcp_fastopen &amp; TFO_SERVER_ENABLE) != 0 &amp;&amp;
+                inet_csk(sk)-&gt;icsk_accept_queue.fastopenq == NULL) {
+                if ((sysctl_tcp_fastopen &amp; TFO_SERVER_WO_SOCKOPT1) != 0)
+                    err = fastopen_init_queue(sk, backlog);
+                else if ((sysctl_tcp_fastopen &amp;
+                      TFO_SERVER_WO_SOCKOPT2) != 0)
+                    err = fastopen_init_queue(sk,
+                        ((uint)sysctl_tcp_fastopen) &gt;&gt; 16);
+                else
+                    err = 0;
+                if (err)
+                    goto out;
+            }
+            err = inet_csk_listen_start(sk, backlog);
+...
+</code></pre>
+
+<p>fastopen_init_queue函数
+```
+    static inline int fastopen_init_queue(struct sock <em>sk, int backlog)
+    {
+        struct request_sock_queue </em>queue =
+            &amp;inet_csk(sk)->icsk_accept_queue;</p>
+
+<pre><code>    if (queue-&gt;fastopenq == NULL) {
+        queue-&gt;fastopenq = kzalloc(
+            sizeof(struct fastopen_queue),
+            sk-&gt;sk_allocation);
+        if (queue-&gt;fastopenq == NULL)
+            return -ENOMEM;
+
+        sk-&gt;sk_destruct = tcp_sock_destruct;
+        spin_lock_init(&amp;queue-&gt;fastopenq-&gt;lock);
+    }
+    queue-&gt;fastopenq-&gt;max_qlen = backlog;
+    return 0;
+}
+</code></pre>
+
+<pre><code>
+如果net.ipv4.tcp_fastopen &amp;&amp; (TFO_SERVER_WO_SOCKOPT1|TFO_SERVER_WO_SOCKOPT2)为假，则TFO队列不会被初始化。但setsockopt函数也可以初始化TFO队列：
+</code></pre>
+
+<pre><code>static int do_tcp_setsockopt(struct sock *sk, int level,
+        int optname, char __user *optval, unsigned int optlen)
+{
+    struct tcp_sock *tp = tcp_sk(sk);
+    struct inet_connection_sock *icsk = inet_csk(sk);
+    int val;
+    int err = 0;
+    ...
+    case TCP_FASTOPEN:
+        if (val &gt;= 0 &amp;&amp; ((1 &lt;&lt; sk-&gt;sk_state) &amp; (TCPF_CLOSE |
+            TCPF_LISTEN)))
+            err = fastopen_init_queue(sk, val);
+        else
+            err = -EINVAL;
+        break;
+    ...
+</code></pre>
+
+<pre><code>
+如果inet_csk(sk)-&gt;icsk_accept_queue.fastopenq为NULL的话意味着TFO功能未开启。
+
+轮到client端出场了！client端的sendto系统调用在内核中对应的TCP函数是tcp_sendmsg：
+</code></pre>
+
+<pre><code>int tcp_sendmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
+        size_t size)
+{
+    struct iovec *iov;
+    struct tcp_sock *tp = tcp_sk(sk);
+    struct sk_buff *skb;
+    int iovlen, flags, err, copied = 0;
+    int mss_now = 0, size_goal, copied_syn = 0, offset = 0;
+    bool sg;
+    long timeo;
+
+    lock_sock(sk);
+
+    flags = msg-&gt;msg_flags;
+    if (flags &amp; MSG_FASTOPEN) {//要使用TFO功能
+        err = tcp_sendmsg_fastopen(sk, msg, &amp;copied_syn);//发送TFO数据
+        if (err == -EINPROGRESS &amp;&amp; copied_syn &gt; 0)
+            goto out;
+        else if (err)
+            goto out_err;
+        offset = copied_syn;
+    }
+</code></pre>
+
+<pre><code>
+tcp_sendmsg_fastopen函数用于发送带TFO请求的SYN或携带数据的SYN：
+</code></pre>
+
+<pre><code>static int tcp_sendmsg_fastopen(struct sock *sk, struct msghdr *msg, int *size)
+{
+    struct tcp_sock *tp = tcp_sk(sk);
+    int err, flags;
+
+    if (!(sysctl_tcp_fastopen &amp; TFO_CLIENT_ENABLE))
+        return -EOPNOTSUPP;
+    if (tp-&gt;fastopen_req != NULL)
+        return -EALREADY; /* Another Fast Open is in progress */
+
+    tp-&gt;fastopen_req = kzalloc(sizeof(struct tcp_fastopen_request),
+                   sk-&gt;sk_allocation);
+    if (unlikely(tp-&gt;fastopen_req == NULL))
+        return -ENOBUFS;
+    tp-&gt;fastopen_req-&gt;data = msg;
+
+    flags = (msg-&gt;msg_flags &amp; MSG_DONTWAIT) ? O_NONBLOCK : 0;
+    err = __inet_stream_connect(sk-&gt;sk_socket, msg-&gt;msg_name,
+                    msg-&gt;msg_namelen, flags);      //发送连接请求
+    *size = tp-&gt;fastopen_req-&gt;copied;　//记录发送了多少数据，如果发送的是TFO请求则*size为0
+    tcp_free_fastopen_req(tp);
+    return err;
+}
+</code></pre>
+
+<pre><code>
+　　`__inet_stream_connect`函数会调用tcp_connect函数发送SYN：
+</code></pre>
+
+<pre><code>int tcp_connect(struct sock *sk)
+{
+    struct tcp_sock *tp = tcp_sk(sk);
+    struct sk_buff *buff;
+    int err;
+    ...
+    /* Send off SYN; include data in Fast Open. */
+    err = tp-&gt;fastopen_req ? tcp_send_syn_data(sk, buff) :
+          tcp_transmit_skb(sk, buff, 1, sk-&gt;sk_allocation); //如果使用TFO，则会调用tcp_send_syn_data发送SYN
+</code></pre>
+
+<pre><code>tcp_send_syn_data函数：
+</code></pre>
+
+<pre><code>static int tcp_send_syn_data(struct sock *sk, struct sk_buff *syn)
+{
+    struct tcp_sock *tp = tcp_sk(sk);
+    struct tcp_fastopen_request *fo = tp-&gt;fastopen_req;
+    int syn_loss = 0, space, i, err = 0, iovlen = fo-&gt;data-&gt;msg_iovlen;
+    struct sk_buff *syn_data = NULL, *data;
+    unsigned long last_syn_loss = 0;
+
+    tp-&gt;rx_opt.mss_clamp = tp-&gt;advmss;  /* If MSS is not cached */
+    tcp_fastopen_cache_get(sk, &amp;tp-&gt;rx_opt.mss_clamp, &amp;fo-&gt;cookie,
+                   &amp;syn_loss, &amp;last_syn_loss);//查询缓存的TFO cookie信息
+    /* Recurring FO SYN losses: revert to regular handshake temporarily */
+    if (syn_loss &gt; 1 &amp;&amp;
+        time_before(jiffies, last_syn_loss + (60*HZ &lt;&lt; syn_loss))) {
+        fo-&gt;cookie.len = -1;
+        goto fallback;
+    }
+
+    if (sysctl_tcp_fastopen &amp; TFO_CLIENT_NO_COOKIE)//无论有没有cookie,都发送携带数据的SYN
+        fo-&gt;cookie.len = -1;
+    else if (fo-&gt;cookie.len &lt;= 0)      //没有cookie,发送携带TFO请求选项的SYN
+        goto fallback;
+
+    /* MSS for SYN-data is based on cached MSS and bounded by PMTU and
+     * user-MSS. Reserve maximum option space for middleboxes that add
+     * private TCP options. The cost is reduced data space in SYN :(
+     */
+    if (tp-&gt;rx_opt.user_mss &amp;&amp; tp-&gt;rx_opt.user_mss &lt; tp-&gt;rx_opt.mss_clamp)
+        tp-&gt;rx_opt.mss_clamp = tp-&gt;rx_opt.user_mss;
+    space = __tcp_mtu_to_mss(sk, inet_csk(sk)-&gt;icsk_pmtu_cookie) -
+        MAX_TCP_OPTION_SPACE;//计算SYN包中的能够携带的数据的最大大小
+
+    syn_data = skb_copy_expand(syn, skb_headroom(syn), space,
+                   sk-&gt;sk_allocation);//复制SYN包中的内容，并扩展SKB中的空间
+    if (syn_data == NULL)
+        goto fallback;
+
+    for (i = 0; i &lt; iovlen &amp;&amp; syn_data-&gt;len &lt; space; ++i) {//将用户态中缓存的数据copy到内核
+        struct iovec *iov = &amp;fo-&gt;data-&gt;msg_iov[i];
+        unsigned char __user *from = iov-&gt;iov_base;
+        int len = iov-&gt;iov_len;
+
+        if (syn_data-&gt;len + len &gt; space)//数据总长度大于SKB中空间的总大小
+            len = space - syn_data-&gt;len;
+        else if (i + 1 == iovlen)
+            /* No more data pending in inet_wait_for_connect() */
+            fo-&gt;data = NULL;//数据全部发送完毕，不需要在inet_wait_for_connect中等待时发送
+
+        if (skb_add_data(syn_data, from, len))//将用户数据copy到SKB中
+            goto fallback;
+    }
+
+    /* Queue a data-only packet after the regular SYN for retransmission */
+    data = pskb_copy(syn_data, sk-&gt;sk_allocation);
+    if (data == NULL)
+        goto fallback;
+    TCP_SKB_CB(data)-&gt;seq++;
+    TCP_SKB_CB(data)-&gt;tcp_flags &amp;= ~TCPHDR_SYN;
+    TCP_SKB_CB(data)-&gt;tcp_flags = (TCPHDR_ACK|TCPHDR_PSH);
+    tcp_connect_queue_skb(sk, data);
+    fo-&gt;copied = data-&gt;len;
+
+    if (tcp_transmit_skb(sk, syn_data, 0, sk-&gt;sk_allocation) == 0) {//发送携带数据的SYN
+        tp-&gt;syn_data = (fo-&gt;copied &gt; 0);
+        NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPFASTOPENACTIVE);
+        goto done;
+    }
+    syn_data = NULL;
+
+fallback:
+    /* Send a regular SYN with Fast Open cookie request option */
+    if (fo-&gt;cookie.len &gt; 0)
+        fo-&gt;cookie.len = 0;
+    err = tcp_transmit_skb(sk, syn, 1, sk-&gt;sk_allocation);
+    if (err)
+        tp-&gt;syn_fastopen = 0;
+    kfree_skb(syn_data);
+done:
+    fo-&gt;cookie.len = -1;  /* Exclude Fast Open option for SYN retries */
+    return err;
+}
+</code></pre>
+
+<pre><code>
+如果client是发送TFO请求，则tcp_send_syn_data函数会发送一个不带数据的SYN包，数据部分则会由tcp_sendmsg函数放入发送队列中，等待三次握手完成后再发送。
+
+tcp_transmit_skb函数会调用tcp_syn_options函数构建选项信息，tcp_options_write函数负责将选项写入TCP报头中：
+</code></pre>
+
+<pre><code>static unsigned int tcp_syn_options(struct sock *sk, struct sk_buff *skb,
+                struct tcp_out_options *opts,
+                struct tcp_md5sig_key **md5)
+{
+    struct tcp_sock *tp = tcp_sk(sk);
+    unsigned int remaining = MAX_TCP_OPTION_SPACE;
+    struct tcp_fastopen_request *fastopen = tp-&gt;fastopen_req;
+    ...
+    if (fastopen &amp;&amp; fastopen-&gt;cookie.len &gt;= 0) {
+        u32 need = TCPOLEN_EXP_FASTOPEN_BASE + fastopen-&gt;cookie.len;
+        need = (need + 3) &amp; ~3U;  /* Align to 32 bits */
+        if (remaining &gt;= need) {
+            opts-&gt;options |= OPTION_FAST_OPEN_COOKIE;
+            opts-&gt;fastopen_cookie = &amp;fastopen-&gt;cookie;
+            remaining -= need;
+            tp-&gt;syn_fastopen = 1;
+        }
+    }
+</code></pre>
+
+<pre><code></code></pre>
+
+<pre><code>static void tcp_options_write(__be32 *ptr, struct tcp_sock *tp,
+                  struct tcp_out_options *opts)
+{
+    u16 options = opts-&gt;options;    /* mungable copy */
+    ...
+    if (unlikely(OPTION_FAST_OPEN_COOKIE &amp; options)) {
+        struct tcp_fastopen_cookie *foc = opts-&gt;fastopen_cookie;
+
+        *ptr++ = htonl((TCPOPT_EXP &lt;&lt; 24) |
+                   ((TCPOLEN_EXP_FASTOPEN_BASE + foc-&gt;len) &lt;&lt; 16) |
+                   TCPOPT_FASTOPEN_MAGIC);
+
+        memcpy(ptr, foc-&gt;val, foc-&gt;len);  //如果找到了TFO cookie，则写入；没有RFO cookie则仅仅是一个TFO请求
+        if ((foc-&gt;len &amp; 3) == 2) {
+            u8 *align = ((u8 *)ptr) + foc-&gt;len;
+            align[0] = align[1] = TCPOPT_NOP;
+        }
+        ptr += (foc-&gt;len + 3) &gt;&gt; 2;
+    }
+</code></pre>
+
+<pre><code>
+client端在每次使用TFO功能时都会在TCP的选项中添加一个TFO选项，与server端进行第一次TFO交互时TFO选项只有4字节长，其值是一个“MAGIC”，这种TFO被称为“TFO请求”；后续的TFO选项长度会增加一个从服务器端获得的TFO cookie的长度值，并且在这个SYN中会携带数据。
+
+server收到SYN后，会在tcp_v4_conn_request中进行处理：
+</code></pre>
+
+<pre><code>int tcp_v4_conn_request(struct sock *sk, struct sk_buff *skb)
+{
+    struct tcp_options_received tmp_opt;
+    struct request_sock *req;
+    struct inet_request_sock *ireq;
+    struct tcp_sock *tp = tcp_sk(sk);
+    struct dst_entry *dst = NULL;
+    __be32 saddr = ip_hdr(skb)-&gt;saddr;
+    __be32 daddr = ip_hdr(skb)-&gt;daddr;
+    __u32 isn = TCP_SKB_CB(skb)-&gt;when;
+    bool want_cookie = false;
+    struct flowi4 fl4;
+    struct tcp_fastopen_cookie foc = { .len = -1 };
+    struct tcp_fastopen_cookie valid_foc = { .len = -1 };
+    struct sk_buff *skb_synack;
+    int do_fastopen;
+    ...
+    tcp_parse_options(skb, &amp;tmp_opt, 0, want_cookie ? NULL : &amp;foc);//解析TFO选项
+    ...
+    do_fastopen = tcp_fastopen_check(sk, skb, req, &amp;foc, &amp;valid_foc);//检查TFO选项的合法性
+    ...
+    skb_synack = tcp_make_synack(sk, dst, req,
+        fastopen_cookie_present(&amp;valid_foc) ? &amp;valid_foc : NULL);//如果客户端发送的是TFO请求则发送TFO cookie，否则不发送
+    ...
+    if (likely(!do_fastopen)) {
+    ...
+    } else if (tcp_v4_conn_req_fastopen(sk, skb, skb_synack, req))//创建子sock，将SYN中的数据放入socekt中的接收队列中
+        goto drop_and_free;
+
+    return 0;
+</code></pre>
+
+<pre><code>
+tcp_fastopen_check函数用于检查SYN中TFO请求的合法性以及生成TFO cookie：
+</code></pre>
+
+<pre><code>static bool tcp_fastopen_check(struct sock *sk, struct sk_buff *skb,
+                   struct request_sock *req,
+                   struct tcp_fastopen_cookie *foc,
+                   struct tcp_fastopen_cookie *valid_foc)
+{
+    bool skip_cookie = false;
+    struct fastopen_queue *fastopenq;
+
+    if (likely(!fastopen_cookie_present(foc))) {//SYN中没有携带TFO选项
+        /* See include/net/tcp.h for the meaning of these knobs */
+        if ((sysctl_tcp_fastopen &amp; TFO_SERVER_ALWAYS) ||
+            ((sysctl_tcp_fastopen &amp; TFO_SERVER_COOKIE_NOT_REQD) &amp;&amp;
+            (TCP_SKB_CB(skb)-&gt;end_seq != TCP_SKB_CB(skb)-&gt;seq + 1)))
+            skip_cookie = true; /* no cookie to validate */  //无需校验cookie，直接允许SYN中携带数据
+        else
+            return false;
+    }
+    fastopenq = inet_csk(sk)-&gt;icsk_accept_queue.fastopenq;
+    ...
+    if ((sysctl_tcp_fastopen &amp; TFO_SERVER_ENABLE) == 0 ||
+        fastopenq == NULL || fastopenq-&gt;max_qlen == 0)//未开启Server端TFO功能
+        return false;
+
+    if (fastopenq-&gt;qlen &gt;= fastopenq-&gt;max_qlen) {//TFO队列已满
+        struct request_sock *req1;
+        spin_lock(&amp;fastopenq-&gt;lock);
+        req1 = fastopenq-&gt;rskq_rst_head;
+        if ((req1 == NULL) || time_after(req1-&gt;expires, jiffies)) {
+            spin_unlock(&amp;fastopenq-&gt;lock);
+            NET_INC_STATS_BH(sock_net(sk),
+                LINUX_MIB_TCPFASTOPENLISTENOVERFLOW);
+            /* Avoid bumping LINUX_MIB_TCPFASTOPENPASSIVEFAIL*/
+            foc-&gt;len = -1;
+            return false;
+        }
+        fastopenq-&gt;rskq_rst_head = req1-&gt;dl_next;//替换队列中最老的一个
+        fastopenq-&gt;qlen--;
+        spin_unlock(&amp;fastopenq-&gt;lock);
+        reqsk_free(req1);
+    }
+    if (skip_cookie) {//不使用cookie，直接接收数据
+        tcp_rsk(req)-&gt;rcv_nxt = TCP_SKB_CB(skb)-&gt;end_seq;
+        return true;
+    }
+    if (foc-&gt;len == TCP_FASTOPEN_COOKIE_SIZE) {//SYN中携带了TFO cookie
+        if ((sysctl_tcp_fastopen &amp; TFO_SERVER_COOKIE_NOT_CHKED) == 0) {
+            tcp_fastopen_cookie_gen(ip_hdr(skb)-&gt;saddr, valid_foc);//生成TFO cookie
+            if ((valid_foc-&gt;len != TCP_FASTOPEN_COOKIE_SIZE) ||　//TFO初始化不成功
+                memcmp(&amp;foc-&gt;val[0], &amp;valid_foc-&gt;val[0],　//TFO cookie不合法
+                TCP_FASTOPEN_COOKIE_SIZE) != 0)
+                return false;
+            valid_foc-&gt;len = -1;
+        }
+        /* Acknowledge the data received from the peer. */
+        tcp_rsk(req)-&gt;rcv_nxt = TCP_SKB_CB(skb)-&gt;end_seq;
+        return true;
+    } else if (foc-&gt;len == 0) { /* Client requesting a cookie */
+        tcp_fastopen_cookie_gen(ip_hdr(skb)-&gt;saddr, valid_foc);//生成一个TFO cookie保存在valid_foc中
+        NET_INC_STATS_BH(sock_net(sk),
+            LINUX_MIB_TCPFASTOPENCOOKIEREQD);
+    } else {
+        /* Client sent a cookie with wrong size. Treat it
+         * the same as invalid and return a valid one.
+         */
+        tcp_fastopen_cookie_gen(ip_hdr(skb)-&gt;saddr, valid_foc);
+    }
+    return false;
+}
+</code></pre>
+
+<pre><code>
+1327：rskq_rst_head为NULL的场景为有很多带TFO的SYN到来但SYN|ACK发送后并没有收到RST包，这意味着之前收到的那些带数据的TFO SYN可能是合法的；如果不为NULL但对立中最老的一个仍然没有超时的话，也不能将其替换
+
+1344-1351：如果clienet端的TFO不是请求，而是cookie，则不设置valid_foc；另外如果server端被设置为不检查cookie的合法性，则生成一个cookie再检查SYN中的TFO cookie的合法性，如果不合法则不使用TFO功能。
+
+tcp_make_synack函数会将tcp_fastopen_check中生成的TFO cookie写入TCP首部中，tcp_synack_options函数用来构建SYN|ACK报文的选项信息：
+</code></pre>
+
+<pre><code>static unsigned int tcp_synack_options(struct sock *sk,
+                   struct request_sock *req,
+                   unsigned int mss, struct sk_buff *skb,
+                   struct tcp_out_options *opts,
+                   struct tcp_md5sig_key **md5,
+                   struct tcp_fastopen_cookie *foc)
+{
+    ...
+    if (foc != NULL) {
+        u32 need = TCPOLEN_EXP_FASTOPEN_BASE + foc-&gt;len;
+        need = (need + 3) &amp; ~3U;  /* Align to 32 bits */
+        if (remaining &gt;= need) {
+            opts-&gt;options |= OPTION_FAST_OPEN_COOKIE;
+            opts-&gt;fastopen_cookie = foc;
+            remaining -= need;
+        }
+    }
+    ...
+</code></pre>
+
+<pre><code>
+将选项信息写入SYN|ACK的方法与client发送SYN时一样，都是调用tcp_options_write函数。可以看出，TCP server端会返回给发送TFO请求的client端一个TFO cookie。client发送的下一个带数据的SYN必须携带这个cookie，而TCP server对这样的SYN回复的SYN|ACK中不会携带TFO选项。
+
+在SYN携带TFO cookie的情况下TCP server会在收到SYN时就创建sock，这个功能由cp_v4_conn_req_fastopen函数完成：
+</code></pre>
+
+<pre><code>static int tcp_v4_conn_req_fastopen(struct sock *sk,
+                    struct sk_buff *skb,
+                    struct sk_buff *skb_synack,
+                    struct request_sock *req)
+{
+    struct tcp_sock *tp = tcp_sk(sk);
+    struct request_sock_queue *queue = &amp;inet_csk(sk)-&gt;icsk_accept_queue;
+    const struct inet_request_sock *ireq = inet_rsk(req);
+    struct sock *child;
+    ...
+
+    child = inet_csk(sk)-&gt;icsk_af_ops-&gt;syn_recv_sock(sk, skb, req, NULL);//生成子socket，其状态为TCP_SYN_RECV
+    ...
+    err = ip_build_and_send_pkt(skb_synack, sk, ireq-&gt;loc_addr,
+                    ireq-&gt;rmt_addr, ireq-&gt;opt);//构建SYN|ACK的IP头并将其发送出去
+    err = net_xmit_eval(err);
+    if (!err)
+        tcp_rsk(req)-&gt;snt_synack = tcp_time_stamp;
+    /* XXX (TFO) - is it ok to ignore error and continue? */
+
+    spin_lock(&amp;queue-&gt;fastopenq-&gt;lock);
+    queue-&gt;fastopenq-&gt;qlen++;//将这个连接计入TFO queue
+    spin_unlock(&amp;queue-&gt;fastopenq-&gt;lock);
+    ...
+    tp = tcp_sk(child);
+
+    tp-&gt;fastopen_rsk = req;
+    /* Do a hold on the listner sk so that if the listener is being
+     * closed, the child that has been accepted can live on and still
+     * access listen_lock.
+     */
+    sock_hold(sk);
+    tcp_rsk(req)-&gt;listener = sk;
+
+    /* RFC1323: The window in SYN &amp; SYN/ACK segments is never
+     * scaled. So correct it appropriately.
+     */
+    tp-&gt;snd_wnd = ntohs(tcp_hdr(skb)-&gt;window);
+
+    /* Activate the retrans timer so that SYNACK can be retransmitted.
+     * The request socket is not added to the SYN table of the parent
+     * because it's been added to the accept queue directly.
+     */
+    inet_csk_reset_xmit_timer(child, ICSK_TIME_RETRANS,
+        TCP_TIMEOUT_INIT, TCP_RTO_MAX);
+
+    /* Add the child socket directly into the accept queue */
+    inet_csk_reqsk_queue_add(sk, req, child);
+
+    /* Now finish processing the fastopen child socket. */
+    inet_csk(child)-&gt;icsk_af_ops-&gt;rebuild_header(child);
+    tcp_init_congestion_control(child);
+    tcp_mtup_init(child);
+    tcp_init_buffer_space(child);
+    tcp_init_metrics(child);
+
+    /* Queue the data carried in the SYN packet. We need to first
+     * bump skb's refcnt because the caller will attempt to free it.
+     *
+     * XXX (TFO) - we honor a zero-payload TFO request for now.
+     * (Any reason not to?)
+     */
+    if (TCP_SKB_CB(skb)-&gt;end_seq == TCP_SKB_CB(skb)-&gt;seq + 1) {//SYN包中没有数据
+        /* Don't queue the skb if there is no payload in SYN.
+         * XXX (TFO) - How about SYN+FIN?
+         */
+        tp-&gt;rcv_nxt = TCP_SKB_CB(skb)-&gt;end_seq;
+    } else {
+        skb = skb_get(skb);
+        skb_dst_drop(skb);
+        __skb_pull(skb, tcp_hdr(skb)-&gt;doff * 4);
+        skb_set_owner_r(skb, child);
+        __skb_queue_tail(&amp;child-&gt;sk_receive_queue, skb);//将数据放入child的接收队列中
+        tp-&gt;rcv_nxt = TCP_SKB_CB(skb)-&gt;end_seq;
+        tp-&gt;syn_data_acked = 1;
+    }
+    sk-&gt;sk_data_ready(sk, 0);//通知持有listening socket的进程调用accept系统调用创建新连接
+    bh_unlock_sock(child);
+    sock_put(child);
+    WARN_ON(req-&gt;sk == NULL);
+    return 0;
+}
+</code></pre>
+
+<pre><code>
+应用进程收到listening socket的可读通告后，使用accept系统调用建立socket，就可以立即从这个新的socket中读到数据，并开始与客户端进行数据交互。
+
+如果client的TFO是cookie，则SYN|ACK的处理过程与不使用TFO的情况是一样的；如果client发送的TFO是请求，则在收到SYN|ACK时需要将包中的TFO cookie保存下来：
+</code></pre>
+
+<pre><code>static int tcp_rcv_synsent_state_process(struct sock *sk, struct sk_buff *skb,
+                     const struct tcphdr *th, unsigned int len)
+{
+    struct inet_connection_sock *icsk = inet_csk(sk);
+    struct tcp_sock *tp = tcp_sk(sk);
+    struct tcp_fastopen_cookie foc = { .len = -1 };
+    int saved_clamp = tp-&gt;rx_opt.mss_clamp;
+
+    tcp_parse_options(skb, &amp;tp-&gt;rx_opt, 0, &amp;foc);//解析TFO选项
+    ...
+        if ((tp-&gt;syn_fastopen || tp-&gt;syn_data) &amp;&amp; //如果发送过TFO选项或在SYN中发送过数据
+            tcp_rcv_fastopen_synack(sk, skb, &amp;foc))//记录SYN｜ACK中的FTO cookie
+            return -1;
+</code></pre>
+
+<pre><code>
+tcp_rcv_fastopen_synack函数检查并保存server端发送的TFO cookie：
+</code></pre>
+
+<pre><code>static bool tcp_rcv_fastopen_synack(struct sock *sk, struct sk_buff *synack,
+                    struct tcp_fastopen_cookie *cookie)
+{
+    struct tcp_sock *tp = tcp_sk(sk);
+    struct sk_buff *data = tp-&gt;syn_data ? tcp_write_queue_head(sk) : NULL;
+    u16 mss = tp-&gt;rx_opt.mss_clamp;
+    bool syn_drop;
+
+    if (mss == tp-&gt;rx_opt.user_mss) {
+        struct tcp_options_received opt;
+
+        /* Get original SYNACK MSS value if user MSS sets mss_clamp */
+        tcp_clear_options(&amp;opt);
+        opt.user_mss = opt.mss_clamp = 0;
+        tcp_parse_options(synack, &amp;opt, 0, NULL);
+        mss = opt.mss_clamp;
+    }
+
+    if (!tp-&gt;syn_fastopen)  /* Ignore an unsolicited cookie */
+        cookie-&gt;len = -1;//如果客户端没有发送TFO请求但服务器给出了TFO cookie，忽略之
+
+    /* The SYN-ACK neither has cookie nor acknowledges the data. Presumably
+     * the remote receives only the retransmitted (regular) SYNs: either
+     * the original SYN-data or the corresponding SYN-ACK is lost.
+     */
+    syn_drop = (cookie-&gt;len &lt;= 0 &amp;&amp; data &amp;&amp; tp-&gt;total_retrans); //客户端认为发生了SYN丢失事件
+
+    tcp_fastopen_cache_set(sk, mss, cookie, syn_drop);//存储SYN｜ACK包中的TFO cookie，并记录发现SYN丢失事件的时间
+
+    if (data) { /* Retransmit unacked data in SYN */
+        tcp_for_write_queue_from(data, sk) {
+            if (data == tcp_send_head(sk) ||
+                __tcp_retransmit_skb(sk, data))
+                break;
+        }
+        tcp_rearm_rto(sk);
+        return true;
+    }
+    tp-&gt;syn_data_acked = tp-&gt;syn_data;
+    return false;
+}
+</code></pre>
+
+<pre><code>
+在保存了TFO cookie后，client在向相同IP地址的server发送SYN时都可以携带数据（这时必须发送TFO cookie）。client在收到SYN|ACK后需要回复ACK报文，服务器端在接收ACK时对TFO的处理如下：
+</code></pre>
+
+<pre><code>int tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb,
+              const struct tcphdr *th, unsigned int len)
+{
+    struct tcp_sock *tp = tcp_sk(sk);
+    struct inet_connection_sock *icsk = inet_csk(sk);
+    struct request_sock *req;
+    ...
+    req = tp-&gt;fastopen_rsk;//找到在SYN请求到来后创建子socket时使用的request sock
+    if (req != NULL) {
+        WARN_ON_ONCE(sk-&gt;sk_state != TCP_SYN_RECV &amp;&amp;
+            sk-&gt;sk_state != TCP_FIN_WAIT1);
+
+        if (tcp_check_req(sk, skb, req, NULL, true) == NULL)//检查包的合法性
+            goto discard;
+    }
+    ...
+        switch (sk-&gt;sk_state) {
+        case TCP_SYN_RECV:
+            if (acceptable) {
+                /* Once we leave TCP_SYN_RECV, we no longer
+                 * need req so release it.
+                 */
+                if (req) {//使用了TFO cookie
+                    tcp_synack_rtt_meas(sk, req);
+                    tp-&gt;total_retrans = req-&gt;num_retrans;
+
+                    reqsk_fastopen_remove(sk, req, false);//将request sock从TFO queue中删除，TFO流程全部结束
+                } else {
+    ...
+</code></pre>
+
+<p>```</p>
+
+<p>综上，TFO在收到SYN的时候就创建socket并将数据提交给应用进程，这样就比普通模式节省了SYN|ACK与ACK的交互时间，减小了通信延迟。</p>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[Linux 内核线程及普通进程总结]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2018/01/10/kernel-task-thread/"/>
+    <updated>2018-01-10T02:35:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2018/01/10/kernel-task-thread</id>
+    <content type="html"><![CDATA[<p><a href="http://cuckootan.me/2016/04/27/Linux/Linux%20%E5%86%85%E6%A0%B8%E7%BA%BF%E7%A8%8B%E5%8F%8A%E6%99%AE%E9%80%9A%E8%BF%9B%E7%A8%8B%E6%80%BB%E7%BB%93/">http://cuckootan.me/2016/04/27/Linux/Linux%20%E5%86%85%E6%A0%B8%E7%BA%BF%E7%A8%8B%E5%8F%8A%E6%99%AE%E9%80%9A%E8%BF%9B%E7%A8%8B%E6%80%BB%E7%BB%93/</a></p>
+
+<h3>1 Linux 中的进程与线程</h3>
+
+<p>对于 Linux 来讲，所有的线程都当作进程来实现，因为没有单独为线程定义特定的调度算法，也没有单独为线程定义特定的数据结构（所有的线程或进程的核心数据结构都是 task_struct）。</p>
+
+<blockquote><p> 对于一个进程，相当于是它含有一个线程，就是它自身。对于多线程来说，原本的进程称为主线程，它们在一起组成一个线程组。</p></blockquote>
+
+<p>进程拥有自己的地址空间，所以每个进程都有自己的页表。而线程却没有，只能和其它线程共享某一个地址空间和同一份页表。</p>
+
+<p>这个区别的 根本原因 是，在进程/线程创建时，因是否拷贝当前进程的地址空间还是共享当前进程的地址空间，而使得指定的参数不同而导致的。</p>
+
+<p>具体地说，进程和线程的创建都是执行 clone 系统调用进行的。而 clone 系统调用会执行 do_fork 内核函数，而它则又会调用 copy_process 内核函数来完成。主要包括如下操作：</p>
+
+<p>  在调用 copy_process 的过程中，会创建并拷贝当前进程的 task_stuct，同时还会创建属于子进程的 thread_info 结构以及内核栈。<br/>
+  此后，会为创建好的 task_stuct 指定一个新的 pid（在 task_struct 结构体中）。<br/>
+  然后根据传递给 clone 的参数标志，来选择拷贝还是共享打开的文件，文件系统信息，信号处理函数，进程地址空间等。这就是进程和线程不一样地方的本质所在。</p>
+
+<h3>2 三个数据结构</h3>
+
+<p>每个进程或线程都有三个数据结构，分别是 struct thread_info, struct task_struct 和 内核栈。</p>
+
+<blockquote><p> 注意，虽然线程与主线程共享地址空间，但是线程也是有自己独立的内核栈的。</p></blockquote>
+
+<p>thread_info 对象中存放的进程/线程的基本信息，它和这个进程/线程的内核栈存放在内核空间里的一段 2 倍页长的空间中。其中 thread_info 结构存放在低地址段的末尾，其余空间用作内核栈。内核使用 伙伴系统 为每个进程/线程分配这块空间。</p>
+
+<p>thread_info 结构体中有一个 struct task_struct *task，task 指向的就是这个进程或线程相关的 task_struct 对象（也在内核空间中），这个对象叫做进程描述符（叫做任务描述符更为贴切，因为每个线程也都有自己的 task_struct）。内核使用 slab 分配器为每个进程/线程分配这块空间。</p>
+
+<p>如下图所示：
+<img src="/images/kernel/2018-01-10-1.png" alt="" /></p>
+
+<h3>3 task_struct 结构体</h3>
+
+<p>每个进程或线程都有只属于自己的 task_struct 对象，是它们各自最为核心的数据结构。</p>
+
+<h4>3.1 task_struct 结构体中的主要元素</h4>
+
+<pre><code>    struct thread_info *thread_info。thread_info 指向该进程/线程的基本信息。
+    struct mm_struct *mm。mm_struct 对象用来管理该进程/线程的页表以及虚拟内存区。
+    struct mm_struct *active_mm。主要用于内核线程访问主内核页全局目录。
+    struct fs_struct *fs。fs_struct 是关于文件系统的对象。
+    struct files_struct *files。files_struct 是关于打开的文件的对象。
+    struct signal_struct *signal。signal_struct 是关于信号的对象。
+</code></pre>
+
+<h4>3.2 task_struct 结构体中的三个 ID 与一个指针</h4>
+
+<pre><code>    pid
+    每个 task_struct 都会有一个不同的 ID，就是这个 PID。
+    tid
+    线程 ID，用来标识每个线程的。
+
+    tgid
+    线程组领头线程的 PID，事实上就是主线程的 PID。
+    当创建一个子进程时，它的 tgid 与 pid 相等；
+    当创建一个线程时，它的 tgid 等于主线程的 pid。
+
+        getpid() 函数事实上返回的是当前进程或线程的 tgid。
+
+    pgid
+    进程组领头进程的 PID。
+    sid
+    会话领头进程的 PID。
+    group_leader
+    是一个 task_struct 类型的指针，指向的是进程组的组长对应的 task_struct 对象。
+</code></pre>
+
+<h3>4 虚拟内存地址空间</h3>
+
+<h4>4.1 内存管理</h4>
+
+<p>内存是由内核来管理的。</p>
+
+<p>内存被分为 n 个页框，然后进一步组织为多个区。而装入页框中的内容称为页。</p>
+
+<p>当内核函数申请内存时，内核总是立即满足（因为内核完全信任它们，所以优先级最高）。在分配适当内存空间后，将其映射到内核地址空间中（3-4GB 中的某部分空间），然后将地址映射写入页表。</p>
+
+<p>申请内存空间的内核函数有 vmalloc, kmalloc, alloc_pages, __get_free_pages 等。</p>
+
+<h4>4.2 内核常驻内存</h4>
+
+<p>就是说，内核地址空间（3-4GB）中的页面所映射的页框始终在物理内存中存在，不会被换出。即使是 vmalloc 动态申请的页面也会一直在物理内存中，直至通过相关内核函数释放掉。</p>
+
+<p>其原因在于，一方面内核文件不是太大，完全可以一次性装入物理内存；另一方面在于即使是动态申请内存空间，也能立即得到满足。</p>
+
+<p>因此，处于内核态的普通进程或内核线程（后面会提到）不会因为页面没有在内存中而产生缺页异常（不过处于内核态的普通进程会因为页表项没有同步的原因而产生缺页异常）。</p>
+
+<h4>4.3 为什么要有虚拟地址空间</h4>
+
+<p>普通进程在申请内存空间时会被内核认为是不紧要的，优先级较低。因而总是延迟处理，在之后的某个时候才会真正为其分配物理内存空间。</p>
+
+<p>比如，普通进程中的 malloc 函数在申请物理内存空间时，内核不会直接为其分配页框。</p>
+
+<p>另一方面，普通进程对应的可执行程序文件较大，不能够立即装入内存，而是采取运行时按需装入。</p>
+
+<p>要实现这种延迟分配策略，就需要引入一种新的地址空间，即 虚拟地址空间。可执行文件在装入时或者进程在执行 malloc 时，内核只会为其分配适当大小的虚拟地址空间。</p>
+
+<blockquote><p> 虚拟地址空间并不单纯地指线性地址空间。准确地说，指的是页面不能因为立即装入物理内存而采取折衷处理后拥有的线性地址空间。
+ 因此，虽然普通进程的虚拟地址空间为 4GB，但是从内核的角度来说，内核地址空间（也是线性空间）不能称为虚拟地址空间，内核线程不拥有也不需要虚拟地址空间。
+ 因此，虚拟地址空间只针对普通进程。</p></blockquote>
+
+<p>当然，这样的话就会产生所要访问的页面不在物理内存中而发生缺页异常。</p>
+
+<h4>4.4 虚拟地址空间的划分</h4>
+
+<p>每一个普通进程都拥有 4GB 的虚拟地址空间（对于 32 位的 CPU 来说，即 2<sup>32</sup> B）。</p>
+
+<p>主要分为两部分，一部分是用户空间（0-3GB），一部分是内核空间（3-4GB）。每个普通进程都有自己的用户空间，但是内核空间被所有普通进程所共享。</p>
+
+<p>如下图所示：</p>
+
+<p><img src="/images/kernel/2018-01-10-2.png" alt="" /></p>
+
+<blockquote><p> 之所以能够使用 3-4GB 的虚拟地址空间（对于普通进程来说），是因为每个进程的页全局目录（后面会提到）中的后面部分存放的是内核页全局目录的所有表项。当通过系统调用或者发生异常而陷入内核时，不会切换进程的页表。此时，处于内核态的普通进程将会直接使用进程页表中前面的页表项即可。这也是为什么在执行系统调用或者处理异常时没有发生进程的上下文切换的真实原因。
+ 同样，正因为每个进程的也全局目录中的后面部分存放的是内核页全局目录中的所有表项，所以所有普通进程共享内核空间。</p></blockquote>
+
+<p>另外，</p>
+
+<blockquote><p> 用户态下的普通进程只能访问 0-3GB 的用户空间；
+ 内核态下的普通进程既能访问 0-3GB 的用户空间，也能访问 3-4GB 的内核空间（内核态下的普通进程有时也会需要访问用户空间）。</p></blockquote>
+
+<h4>4.5 普通线程的用户堆栈与寄存器</h4>
+
+<p>对于多线程环境，虽然所有线程都共享同一片虚拟地址空间，但是每个线程都有自己的用户栈空间和寄存器，而用户堆仍然是所有线程共享的。</p>
+
+<p>栈空间的使用是有明确限制的，栈中相邻的任意两条数据在地址上都是连续的。试想，假设多个普通线程函数都在执行递归操作。如果多个线程共有用户栈空间，由于线程是异步执行的，那么某个线程从栈中取出数据时，这条数据就很有可能是其它线程之前压入的，这就导致了冲突。所以，每个线程都应该有自己的用户栈空间。</p>
+
+<p>寄存器也是如此，如果共用寄存器，很可能出现使用混乱的现象。</p>
+
+<p>而堆空间的使用则并没有这样明确的限制，某个线程在申请堆空间时，内核只要从堆空间中分配一块大小合适的空间给线程就行了。所以，多个线程同时执行时不会出现向栈那样产生冲突的情况，因而线程组中的所有线程共享用户堆。</p>
+
+<p>那么在创建线程时，内核是怎样为每个线程分配栈空间的呢？</p>
+
+<p>由之前所讲解可知，进程/线程的创建主要是由 clone 系统调用完成的。而 clone 系统调用的参数中有一个 void *child_stack，它就是用来指向所创建的进程/线程的堆栈指针。</p>
+
+<p>而在该进程/线程在用户态下是通过调用 pthread_create 库函数而陷入内核的。对于 pthread_create 函数，它则会调用一个名为 pthread_allocate_stack 的函数，专门用来为所创建的线程分配的栈空间（通过 mmap 系统调用）。然后再将这个栈空间的地址传递给 clone 系统调用。这也是为什么线程组中的每个线程都有自己的栈空间。</p>
+
+<h4>4.6 普通进程的页表</h4>
+
+<p>有两种页表，一种是内核页表（会在后面说明），另一种是进程页表。</p>
+
+<p>普通进程使用的则是进程页表，而且每个普通进程都有自己的进程页表。如果是多线程，则这些线程共享的是主线程的进程页表。</p>
+
+<h5>4.6.1 四级页表</h5>
+
+<p>现在的 Linux 内核中采用四级页表，分别为：
+<code>
+    页全局目录 (Page Global Directory, pgd)；
+    页上级目录 (Page Upper Directory, pud)；
+    页中间目录 (Page Middle Directory, pmd)；
+    页表 (Page Table, pt)。
+</code></p>
+
+<p>task_struct 中的 mm_struct 对象用于管理该进程（或者线程共享的）页表。准确地说，mm_struct 中的 pgd 指针指向着该进程的页全局目录。</p>
+
+<h5>4.6.2 普通进程的页全局目录</h5>
+
+<p>普通进程的页全局目录中，第一部分表项映射的线性地址为 0-3GB 部分，剩余部分存放的是主内核页全局目录（后面会提到）中的所有表项。</p>
+
+<h3>5 内核线程</h3>
+
+<p>内核线程是一种只运行在内核地址空间的线程。所有的内核线程共享内核地址空间（对于 32 位系统来说，就是 3-4GB 的虚拟地址空间），所以也共享同一份内核页表。这也是为什么叫内核线程，而不叫内核进程的原因。</p>
+
+<p>由于内核线程只运行在内核地址空间中，只会访问 3-4GB 的内核地址空间，不存在虚拟地址空间，因此每个内核线程的 task_struct 对象中的 mm 为 NULL。</p>
+
+<blockquote><p> 普通线程虽然也是同主线程共享地址空间，但是它的 task_struct 对象中的 mm 不为空，指向的是主线程的 mm_struct 对象。</p></blockquote>
+
+<h4>普通进程与内核线程有如下区别：</h4>
+
+<p>  内核线程只运行在内核态，而普通进程既可以运行在内核态，也可以运行在用户态；<br/>
+  内核线程只使用 3-4GB (假设为 32 位系统) 的内核地址空间（共享的），但普通进程由于既可以运行在用户态，又可以运行在内核态，因此可以使用 4GB 的虚拟地址空间。</p>
+
+<p>系统在正式启动内核时，会执行 start_kernel 函数。在这个函数中，会自动创建一个进程，名为 init_task。其 PID 为 0，运行在内核态中。然后开始执行一系列初始化。</p>
+
+<h4>5.1 init 内核线程</h4>
+
+<p>init_task 在执行 rest_init 函数时，会执行 kernel_thread 创建 init 内核线程。它的 PID 为 1，用来完成内核空间初始化。</p>
+
+<p>在内核空间完成初始化后，会调用 exceve 执行 init 可执行程序 (/sbin/init)。之后，init 内核线程变成了一个普通的进程，运行在用户空间中。</p>
+
+<blockquote><p> init 内核线程没有地址空间，且它的 task_struct 对象中的 mm 为 NULL。因此，执行 exceve 会使这个 mm 指向一个 mm_struct，而不会影响到 init_task 进程的地址空间。
+ 也正因为此，init 在转变为进程后，其 PID 没变，仍为 1。</p></blockquote>
+
+<p>创建完 init 内核线程后，init_task 进程演变为 idle 进程（PID 仍为 0）。</p>
+
+<p>之后，init 进程再根据再启动其它系统进程 (/etc/init.d 目录下的各个可执行文件)。</p>
+
+<h4>5.2 kthreadd 内核线程</h4>
+
+<p>init_task 进程演变为 idle 进程后，idle 进程会执行 kernel_thread 来创建 kthreadd 内核线程（仍然在 rest_init 函数中）。它的 PID 为 2，用来创建并管理其它内核线程（用 kthread_create, kthread_run, kthread_stop 等内核函数）。</p>
+
+<p>系统中有很多内核守护进程 (线程)，可以通过：
+<code>
+    ps -efj
+</code></p>
+
+<p>进行查看，其中带有 [] 号的就属于内核守护进程。它们的祖先都是这个 kthreadd 内核线程。</p>
+
+<h4>5.3 主内核页全局目录</h4>
+
+<p>内核维持着一组自己使用的页表，也即主内核页全局目录。当内核在初始化完成后，其存放在 swapper_pg_dir 中，而且所有的普通进程和内核线程就不再使用它了。</p>
+
+<h4>5.4 内核线程如何访问页表</h4>
+
+<h5>5.4.1 active_mm</h5>
+
+<p>对于内核线程，虽然它的 task_struct 中的 mm 为 NULL，但是它仍然需要访问内核空间，因此需要知道关于内核空间映射到物理内存的页表。然而不再使用 swapper_pg_dir，因此只能另外想法解决。</p>
+
+<p>由于所有的普通进程的页全局目录中的后面部分为主内核页全局目录，因此内核线程只需要使用某个普通进程的页全局目录就可以了。</p>
+
+<p>在 Linux 中，task_struct 中还有一个很重要的元素为 active_mm，它主要就是用于内核线程访问主内核页全局目录。</p>
+
+<p>  对于普通进程来说，task_struct 中的 mm 和 active_mm 指向的是同一片区域；
+  然而对内核线程来说，task_struct 中的 mm 为 NULL，active_mm 指向的是前一个普通进程的 mm_struct 对象。</p>
+
+<h5>5.4.2 mm_users 和 mm_count</h5>
+
+<p>但是这样还是不行，因为如果因为前一个普通进程退出了而导致它的 mm_struct 对象也被释放了，则内核线程就访问不到了。</p>
+
+<p>为此，mm_struct 对象维护了一个计数器 mm_count，专门用来对引用这个 mm_struct 对象的自身及内核线程进行计数。初始时为 1，表示普通进程本身引用了它自己的 mm_struct 对象。只有当这个引用计数为 0 时，才会真正释放这个 mm_struct 对象。</p>
+
+<p>另外，mm_struct 中还定义了一个 mm_users 计数器，它主要是用来对共享地址空间的线程计数。事实上，就是这个主线程所在线程组中线程的总个数。初始时为 1。</p>
+
+<blockquote><p> 注意，两者在实质上都是针对引用 mm_struct 对象而设置的计数器。
+ 不同的是，mm_count 是专门针对自身及内核线程或引用 mm_struct 而进行计数；而 mm_users 是专门针对该普通线程所在线程组的所有普通线程而进行计数。
+ 另外，只有当 mm_count 为 0 时，才会释放 mm_struct 对象，并不会因为 mm_users 为 0 就进行释放。</p></blockquote>
+
+<h3>Reference</h3>
+
+<ul>
+<li><a href="http://blog.csdn.net/hongchangfirst/article/details/7075026" target="_blank" rel="external">linux进程描述符task_struct详解</a></li>
+<li><a href="http://www.cnblogs.com/Anker/p/3269106.html" target="_blank" rel="external">用户空间与内核空间，进程上下文与中断上下文</a></li>
+<li><a href="http://blog.csdn.net/dyllove98/article/details/8917197" target="_blank" rel="external">Linux进程地址管理之mm_struct</a></li>
+<li><a href="http://blog.chinaunix.net/uid-20543672-id-2996319.html" target="_blank" rel="external">对Linux的进程内核栈的认识</a></li>
+<li><a href="https://yq.aliyun.com/articles/5865" target="_blank" rel="external">Linux内核内存管理-内存访问与缺页中断</a></li>
+<li><a href="http://blog.csdn.net/embedded_hunter/article/details/6897027?spm=5176.100239.blogcont5883.3.QKk6IF" target="_blank" rel="external">Linux下C程序进程地址空间布局</a></li>
+<li><a href="http://unicornx.github.io/2016/05/13/20160513-start_kernel_init/" target="_blank" rel="external">内核初始化－从start_kernel到init</a></li>
+<li><a href="http://www.cnblogs.com/kkshaq/p/4540040.html" target="_blank" rel="external">linux内核线程，进程，线程</a></li>
+<li><a href="http://lib.csdn.net/article/operatingsystem/22996" target="_blank" rel="external">Linux下0号进程的前世(init_task进程)今生(idle进程)—-Linux进程的管理与调度（五）</a></li>
+<li><a href="http://bbs.chinaunix.net/thread-2018590-1-1.html" target="_blank" rel="external">分享一个关于pthread线程栈在mm_struct里面的分布问题</a></li>
+<li><a href="http://www.cnblogs.com/clover-toeic/p/3754433.html" target="_blank" rel="external">Linux虚拟地址空间布局</a></li>
+</ul>
+
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[Linux模式设计4-数据对齐]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2018/01/08/kernel-align/"/>
+    <updated>2018-01-08T01:33:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2018/01/08/kernel-align</id>
+    <content type="html"><![CDATA[<p><a href="http://blog.chinaunix.net/uid-20608849-id-3027967.html">http://blog.chinaunix.net/uid-20608849-id-3027967.html</a></p>
+
+<p>内核在某些应用中，为了实现某种机制，比如分页，或者提高访问效率需要保证数据或者指针地址对齐到某个特定的整数值，比如连接代码脚本。这个值必须是2N。数据对齐，可以看做向上圆整的一种运算。</p>
+
+<pre><code>    include/linux/kernel.h
+    #define ALIGN(x, a) __ALIGN_MASK(x, (typeof(x))(a) - 1)
+    #define __ALIGN_MASK(x, mask) (((x) + (mask))&amp;~(mask))
+    #define PTR_ALIGN(p, a) ((typeof(p))ALIGN((unsigned long)(p), (a)))
+    #define IS_ALIGNED(x, a) (((x) &amp; ((typeof(x))(a) - 1)) == 0)
+</code></pre>
+
+<p>内核提供了两个用来对齐的宏ALIGN和PTR_ALIGN，一个实现数据对齐，而另一个实现指针的对齐。它们实现的核心都是<code>__ALIGN_MASK</code>，其中mask参数为低N位全为1，其余位全为0的掩码，它从圆整目标值2N - 1得到。<code>__ALIGN_MASK</code>得到对齐值，对于数据来说直接返回即可，而对于指针则需要进行强制转换。IS_ALIGNED宏用来判断当前值是否对齐与指定的值。内核中的分页对齐宏定义如下：</p>
+
+<pre><code>    arch/arm/include/asm/page.h
+    /* PAGE_SHIFT determines the page size */
+    #define PAGE_SHIFT 12
+    #define PAGE_SIZE (1UL &lt;&lt; PAGE_SHIFT)
+
+    include/linux/mm.h
+    /* to align the pointer to the (next) page boundary */
+    #define PAGE_ALIGN(addr) ALIGN(addr, PAGE_SIZE)
+</code></pre>
+
+<p>PAGE_SIZE定义在体系架构相关的代码中，通常为4K。内核中提供的特性功能的对齐宏均是对ALIGN的扩展。下面提供一个代码示例，并给出结果：</p>
+
+<pre><code>    #include &lt;stdio.h&gt;
+    ......
+    int main()
+    {
+        int a = 0 ,i = 0;
+        int *p = &amp;a;
+
+        for(; i &lt; 6; i++)
+         printf("ALIGN(%d, 4): %x\n", i, ALIGN(i, 4));
+
+        printf("p:%p, PTR_ALIGN(p, 8): %p\n", p, PTR_ALIGN(p, 8));
+        printf("IS_ALIGNED(7, 8): %d, IS_ALIGNED(16, 8): %d\n", IS_ALIGNED(7, 8), IS_ALIGNED(16, 8));
+
+        return 0;
+    }
+</code></pre>
+
+<p>对齐宏测试结果：</p>
+
+<pre><code>    ALIGN(0, 4): 0
+    ALIGN(1, 4): 4
+    ......
+    ALIGN(4, 4): 4
+    ALIGN(5, 4): 8
+    p:0xbf96c01c, PTR_ALIGN(p, 8): 0xbf96c020
+    IS_ALIGNED(7, 8): 0, IS_ALIGNED(16, 8): 1
+</code></pre>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[内核态使用FPU、MMX和XMM寄存器]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2018/01/08/kernel-fpu-2/"/>
+    <updated>2018-01-08T01:09:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2018/01/08/kernel-fpu-2</id>
+    <content type="html"><![CDATA[<p><a href="https://www.cnblogs.com/wz19860913/archive/2010/05/25/1742583.html">https://www.cnblogs.com/wz19860913/archive/2010/05/25/1742583.html</a></p>
+
+<h4>保存和加载FPU、MMX和XMM寄存器</h4>
+
+<p>  从Intel 80486DX开始，FPU（算术浮点单元）被集成到了CPU中，浮点算术功能用ESCAPE指令来执行，操纵CPU中的浮点寄存器集。显然，当一个进程正在使用ESCAPE指令，那么浮点寄存器的内容就属于它的硬件上下文。</p>
+
+<p>  为了加速多媒体程序的执行，Intel在微处理器中引入了新的指令集——MMX，MMX指令也作用于FPU的浮点寄存器。这样，MMX就不能和FPU指令混用，但是OS内核就可以忽略新的MMX指令集，因为保存浮点寄存器的功能代码也能够应用于MMX的状态。</p>
+
+<p>  MMX使用SIMD（单指令多数据）流水线，Pentium III增强了这种SIMD能力，引入SSE（Streaming SIMD Extensions）扩展。该功能增强了8个128位寄存器（XMM寄存器）的功能，这些寄存器不和FPU/MMX寄存器重叠，因此能够与FPU/MMX指令混用。</p>
+
+<p>  Pentium IV还引入了SSE2扩展，支持高精度浮点值，SSE2和SSE使用同一个XMM寄存器组。</p>
+
+<p>  80x86微处理器不在TSS中保存FPU、MMX和XMM寄存器的值，不过还是提供了一些支持，能够在需要时保存它们。cr0寄存器有一个TS（Task-Switching）标志位，每当执行硬件上下文切换时，TS置位，每当TS被置位后进程执行ESCAPE、MMX、SSE或SSE2指令，控制器就产生一个“Device not available”异常。这样，TS标志位就能够让OS内核只有在真正需要时才保存或恢复FPU、MMX和XMM寄存器。</p>
+
+<p>  假设进程A使用了数学协处理器，那么当进程A被切换出去的时候，内核设置TS并将浮点寄存器的内容保存到进程A的TSS中（原著这么写，但是应该是保存到进程A描述符的一个字段中，TSS是与CPU关联的，进程没有TSS）。</p>
+
+<p>  如果新进程B不使用数学协处理器，那么内核就不需要恢复浮点寄存器的内容，但是，一旦进程B执行FPU、MMX等指令，CPU就产生一个“Device not available”异常，相应的异常处理程序就会用保存在进程B中的相关值来恢复浮点寄存器。</p>
+
+<p>  处理FPU、MMX和XMM寄存器的数据结构存放在进程描述符的thread字段的i387子字段中（即thread.i387），由i387_union联合体描述，其格式如下：</p>
+
+<pre><code>    union i387_union {
+        struct i387_fsave_struct    fsave; /* 保存FPU、MMX寄存器的内容 */
+        struct i387_fxsave_struct   fxsave;/* 保存SSE和SSE2寄存器内容 */
+        struct i387_soft_struct     soft;  /* 由无数学协处理器的老式CPU模型使用 */
+    };
+</code></pre>
+
+<p>  此外，进程描述符中还包含了两个附加的标志：</p>
+
+<p>  thread_info结构中status字段的TS_USEDFPU标志，表示进程当前执行过程中是否使用过FPU、MMX和XMM寄存器。
+  task_struct结构的flags字段的PF_USED_MATH标志，表示thread.i387的内容是否有意义。</p>
+
+<p>  保存和加载FPU、MMX和XMM寄存器主要用到<strong>unlazy_fpu宏，该宏在</strong>switch_to函数中使用，下一篇会对其进行分析。</p>
+
+<h4>内核态使用FPU、MMX和XMM寄存器</h4>
+
+<p>  OS内核也可以使用FPU、MMX和XMM寄存器，当然，这么做的时候应该避免干扰用户态进程。因此，Linux使用如下方法来解决：</p>
+
+<p>  在内核使用协处理器之前，如果用户态进程使用了FPU（TS_USEDFPU标志为1），内核就要调用kernel_fpu_begin()函数，该函数里又调用save_init_fpu()来保存寄存器内容，然后重新设置cr0寄存器的TS标志。
+  使用完协处理器之后，内核调用kernel_fpu_end宏设置cr0寄存器的TS标志。
+  当用户态进程恢复执行时，math_state_restore()函数将恢复FPU、MMX和XMM寄存器的内容。</p>
+
+<p>  需要注意的是，如果当前用户态进程有在用数学协处理器时，kernel_fpu_begin()函数的执行时间比较长，甚至无法通过FPU、MMX或XMM达到加速的目的。因此，内核只在有限的场合使用FPU、MMX或XMM指令，比如移动或清除大内存区字段、计算校验和等。</p>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[linux 下的浮点运算]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2018/01/08/kernel-fpu-1/"/>
+    <updated>2018-01-08T00:54:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2018/01/08/kernel-fpu-1</id>
+    <content type="html"><![CDATA[<p><a href="http://blog.sina.com.cn/s/blog_6e32babb0101o9kf.html">linux 下的浮点运算</a></p>
+
+<ol>
+<li><p>intel 平台下，如果有浮点计算，都会用专门的浮点指令来执行。但是double/float 类型的加减乘除，gcc 是用的一般指令来做的，没有用浮点指令来做。</p></li>
+<li><p>还是intel 平台下，一个进程在被cpu调度到之后，运行的第一条浮点指令会触发“no deveice avaible”异常，从而导致执行相应的中断处理程序。后续的不再触发。这个中断处理程序中，一般会做的是，恢复/保存浮点运行相关的环境。如果该时间段内没有浮点操作，那么就不用恢复/保存浮点运行环境，从而减少开销。这也是为什么要设计成这样的原因。</p></li>
+<li><p>内核也可以执行浮点操作，只需要调用前后用 kernel_fpu_begin() and kernel_fpu_end() 括起来。但是有可能这个的开销已经超过了用浮点指令带来的便捷。所以内核应该尽量少用浮点操作。</p></li>
+</ol>
+
+
+<hr />
+
+<p><a href="http://www.lenky.info/archives/2012/10/2001/comment-page-1">Linux内核与浮点计算</a></p>
+
+<p>在Linux内核里无法直接进行浮点计算，这是从性能上的考虑，因为这样做可以省去在用户态与内核态之间进行切换时保存/恢复浮点寄存器 FPU的操作，当然，这到底可以提升多少性能我还不得而知，不过就目前而言，Linux内核的确就是这样做的。</p>
+
+<p>比如下面这个测试模块：
+<code>``
+    # Makefile
+    MDIR = $(shell pwd)
+    ifeq (, $(KSRC))
+        KSRC := /usr/src/linux-</code>uname -r`
+    endif</p>
+
+<pre><code>ifeq (, $(PROJECT_DIR))
+    PROJECT_DIR := $(PWD)/../
+endif
+
+module := float_test
+
+obj-m := $(module).o
+
+srcs =  $(wildcard, *.c)
+
+$(module)-objs := $(addsuffix .o, $(basename $(srcs)))
+
+EXTRA_CFLAGS += -g $(FLAG) -I$(PROJECT_DIR)/inc -I${SHAREDHDR} -I$(KERNELHDR) -O2 -D__KERNEL__ -DMODULE $(INCLUDE) -DEXPORT_SYMTAB
+
+TARGET = $(module).ko
+
+all:
+    make -C $(KSRC) M=$(MDIR) modules
+
+debug:
+    make EXTRA_FLAGS="${EXTRA_CFLAGS} -DDEBUG" -C $(KSRC) M=$(MDIR) modules
+
+clean:
+    make -C $(KSRC) M=$(MDIR) clean
+
+install: all
+    cp -f $(TARGET) $(INSTALL_DIR)
+</code></pre>
+
+<pre><code></code></pre>
+
+<pre><code>/**
+ * float_test.c
+ */
+#include &lt;linux/kernel.h&gt;
+#include &lt;linux/types.h&gt;
+#include &lt;linux/stddef.h&gt;
+#include &lt;linux/module.h&gt;
+#include &lt;linux/fs.h&gt;
+#include &lt;asm/desc.h&gt;
+
+static float float_test(float a, float b)
+{
+    return a/b;
+}
+
+static int __init test_module_init(void)
+{
+    float_test(1.0, 1.0);
+    return 0;
+}
+
+static void __exit test_module_fini(void)
+{
+
+    //Do Nothing
+    return;
+}
+
+module_init(test_module_init);
+module_exit(test_module_fini);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("lenky0401 at gmail dot com");
+</code></pre>
+
+<pre><code>
+编译它将得到如下错误提示：
+</code></pre>
+
+<pre><code>[root@localhost t]# make
+make -C /usr/src/linux-`uname -r` M=/home/gqk/t modules
+make[1]: Entering directory `/usr/src/linux-2.6.38.8'
+  CC [M]  /home/gqk/t/float_test.o
+/home/gqk/t/float_test.c: In function ‘float_test’:
+/home/gqk/t/float_test.c:12: error: SSE register return with SSE disabled
+make[2]: *** [/home/gqk/t/float_test.o] Error 1
+make[1]: *** [_module_/home/gqk/t] Error 2
+make[1]: Leaving directory `/usr/src/linux-2.6.38.8'
+make: *** [all] Error 2
+[root@localhost t]#
+
+[root@localhost t]# make V=1
+make -C /usr/src/linux-`uname -r` M=/home/gqk/t modules
+make[1]: Entering directory `/usr/src/linux-2.6.38.8'
+test -e include/generated/autoconf.h -a -e include/config/auto.conf || (        \
+    echo;                               \
+    echo "  ERROR: Kernel configuration is invalid.";       \
+    echo "         include/generated/autoconf.h or include/config/auto.conf are missing.";\
+    echo "         Run 'make oldconfig &amp;&amp; make prepare' on kernel src to fix it.";  \
+    echo;                               \
+    /bin/false)
+mkdir -p /home/gqk/t/.tmp_versions ; rm -f /home/gqk/t/.tmp_versions/*
+make -f scripts/Makefile.build obj=/home/gqk/t
+  gcc -Wp,-MD,/home/gqk/t/.float_test.o.d  -nostdinc -isystem /usr/lib/gcc/x86_64-redhat-linux/4.4.4/include -I/usr/src/linux-2.6.38.8/arch/x86/include -Iinclude  -include include/generated/autoconf.h -D__KERNEL__ -Wall -Wundef -Wstrict-prototypes -Wno-trigraphs -fno-strict-aliasing -fno-common -Werror-implicit-function-declaration -Wno-format-security -fno-delete-null-pointer-checks -O1 -m64 -mtune=generic -mno-red-zone -mcmodel=kernel -funit-at-a-time -maccumulate-outgoing-args -fstack-protector -DCONFIG_AS_CFI=1 -DCONFIG_AS_CFI_SIGNAL_FRAME=1 -DCONFIG_AS_CFI_SECTIONS=1 -DCONFIG_AS_FXSAVEQ=1 -pipe -Wno-sign-compare -fno-asynchronous-unwind-tables -mno-sse -mno-mmx -mno-sse2 -mno-3dnow -Wframe-larger-than=2048 -fno-omit-frame-pointer -fno-optimize-sibling-calls -g -Wdeclaration-after-statement -Wno-pointer-sign -fno-strict-overflow -fconserve-stack -DCC_HAVE_ASM_GOTO -g -I/home/gqk/t/..//inc -I -I -O2 -D__KERNEL__ -DMODULE -DEXPORT_SYMTAB  -DMODULE  -D"KBUILD_STR(s)=#s" -D"KBUILD_BASENAME=KBUILD_STR(float_test)"  -D"KBUILD_MODNAME=KBUILD_STR(float_test)" -c -o /home/gqk/t/.tmp_float_test.o /home/gqk/t/float_test.c
+/home/gqk/t/float_test.c: In function ‘float_test’:
+/home/gqk/t/float_test.c:12: error: SSE register return with SSE disabled
+make[2]: *** [/home/gqk/t/float_test.o] Error 1
+make[1]: *** [_module_/home/gqk/t] Error 2
+make[1]: Leaving directory `/usr/src/linux-2.6.38.8'
+make: *** [all] Error 2
+[root@localhost t]#
+</code></pre>
+
+<p>```</p>
+
+<p>注意到其中的gcc编译选项：-mno-sse -mno-mmx -mno-sse2，这几个选项是Linux内核编译模块时自动带上的，就是它们（具体就是-mno-sse）明确禁止了Linux内核无法使用浮点数。</p>
+
+<p>在Linux内核里很少会有使用浮点数的需求，即便是有也大多是通过变通的办法解决，在下面链接里有一些很好的扩展介绍，感兴趣的可以看看：</p>
+
+<p><a href="http://stackoverflow.com/questions/6397430/overhead-of-supporting-floating-point-arithmetic-inside-the-linux-kernel">http://stackoverflow.com/questions/6397430/overhead-of-supporting-floating-point-arithmetic-inside-the-linux-kernel</a></p>
+
+<p><a href="http://stackoverflow.com/questions/10212892/how-to-avoid-fpu-when-given-float-numbers">http://stackoverflow.com/questions/10212892/how-to-avoid-fpu-when-given-float-numbers</a></p>
+
+<p><a href="http://www.linuxsmiths.com/blog/?p=253">http://www.linuxsmiths.com/blog/?p=253</a></p>
+
+<hr />
+
+<p><a href="http://blog.csdn.net/vbskj/article/details/38408467">http://blog.csdn.net/vbskj/article/details/38408467</a></p>
+]]></content>
+  </entry>
+  
+</feed>

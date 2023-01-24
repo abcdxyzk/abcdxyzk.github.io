@@ -1,0 +1,153 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+
+  <title><![CDATA[Category: 2020~01 | kk Blog —— 通用基础]]></title>
+  <link href="http://abcdxyzk.github.io/blog/cats/2020~01/atom.xml" rel="self"/>
+  <link href="http://abcdxyzk.github.io/"/>
+  <updated>2023-01-24T19:27:19+08:00</updated>
+  <id>http://abcdxyzk.github.io/</id>
+  <author>
+    <name><![CDATA[kk]]></name>
+    
+  </author>
+  <generator uri="http://octopress.org/">Octopress</generator>
+
+  
+  <entry>
+    <title type="html"><![CDATA[KASLR 内核动态地址]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2020/01/07/KASLR/"/>
+    <updated>2020-01-07T11:23:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2020/01/07/KASLR</id>
+    <content type="html"><![CDATA[<p>/proc/kallsyms 和 /boot/System.map-xxx 一致需要修改 .config
+<code>
+    &lt; # CONFIG_RANDOMIZE_BASE is not set
+    ---
+    &gt; CONFIG_RANDOMIZE_BASE=y
+    &gt; CONFIG_X86_NEED_RELOCS=y
+    &gt; CONFIG_RANDOMIZE_MEMORY=y
+    &gt; CONFIG_RANDOMIZE_MEMORY_PHYSICAL_PADDING=0xa
+</code></p>
+
+<hr />
+
+<p><a href="http://www.wowotech.net/memory_management/441.html">http://www.wowotech.net/memory_management/441.html</a></p>
+
+<h3>引言</h3>
+
+<p>什么是KASLR？KASLR是kernel address space layout randomization的缩写，直译过来就是内核地址空间布局随机化。KASLR技术允许kernel image加载到VMALLOC区域的任何位置。当KASLR关闭的时候，kernel image都会映射到一个固定的链接地址。对于黑客来说是透明的，因此安全性得不到保证。KASLR技术可以让kernel image映射的地址相对于链接地址有个偏移。偏移地址可以通过dts设置。如果bootloader支持每次开机随机生成偏移数值，那么可以做到每次开机kernel image映射的虚拟地址都不一样。因此，对于开启KASLR的kernel来说，不同的产品的kernel image映射的地址几乎都不一样。因此在安全性上有一定的提升。</p>
+
+<p>注：文章代码分析基于linux-4.15，架构基于aarch64（ARM64）。</p>
+
+<h3>如何使用</h3>
+
+<p>打开KASLR功能非常简单，在支持KASLR的内核配置选项添加选项CONFIG_RANDOMIZE_BASE=y。同时还需要告知kernel映射的偏移地址，通过dts传递。在chosen节点下添加kaslr-seed属性。属性值就是偏移地址。另外command line不要带nokaslr，否则KASLR还是关闭。dts信息举例如下。顺便说一下，在dts中&lt;>符号中是一个32 bit的值。但是在ARM64平台，这里的kaslr-seed属性是一个特例，他就是一个64 bit的值。</p>
+
+<pre><code>    / {
+        chosen {
+            kaslr-seed = &lt;0x10000000&gt;;
+        };
+    }; 
+</code></pre>
+
+<h3>如何获取偏移</h3>
+
+<p>kaslr-seed属性的解析在kaslr_early_init函数完成。该函数根据输入参数dtb首地址（物理地址）解析dtb，找到偏移地址，最后返回。kaslr_early_init实现如下。</p>
+
+<pre><code>    u64 __init kaslr_early_init(u64 dt_phys)
+    {
+        void *fdt;
+        u64 seed, offset, mask, module_range;
+        const u8 *cmdline, *str;
+        int size;
+
+        early_fixmap_init();                                         /* 1 */
+        fdt = __fixmap_remap_fdt(dt_phys, &amp;size, PAGE_KERNEL);       /* 1 */
+
+        seed = get_kaslr_seed(fdt);                                  /* 2 */
+        if (!seed)
+            return 0;
+
+        cmdline = get_cmdline(fdt);
+        str = strstr(cmdline, "nokaslr");                            /* 3 */
+        if (str == cmdline || (str &gt; cmdline &amp;&amp; *(str - 1) == ' '))
+            return 0;
+
+        mask = ((1UL &lt;&lt; (VA_BITS - 2)) - 1) &amp; ~(SZ_2M - 1);          /* 4 */
+        offset = seed &amp; mask;
+
+        /* use the top 16 bits to randomize the linear region */
+        memstart_offset_seed = seed &gt;&gt; 48;                           /* 5 */
+
+        if ((((u64)_text + offset) &gt;&gt; SWAPPER_TABLE_SHIFT) !=
+            (((u64)_end + offset) &gt;&gt; SWAPPER_TABLE_SHIFT))
+            offset = round_down(offset, 1 &lt;&lt; SWAPPER_TABLE_SHIFT);   /* 6 */
+
+        return offset;
+    } 
+</code></pre>
+
+<p>由于dtb的地址是物理地址，因此第一步先为dtb区域建立映射。<br/>
+从dtb文件获取kaslr-seed属性的值。<br/>
+确保command line没有传递nokaslr参数，如果传递nokaslr则关闭KASLR。<br/>
+保证传递的偏移地址2M地址对齐，并且保证kernel位于VMALLOC区域大小的一半地址空间以下 (VA_BITS - 2)。当VA_BITS=48时，mask=0x0000_3fff_ffe0_0000。<br/>
+线性映射区地址也会随机化。<br/>
+kernel启动初期只有一个PUD页表，因此希望kernel映射在1G（1 &lt;&lt; SWAPPER_TABLE_SHIFT）大小范围内，这样就不用两个PUD页表。如果kernel加上偏移offset后不满足这点，自然要重新对齐。</p>
+
+<h3>如何创建映射</h3>
+
+<p>kernel启动初期在汇编阶段创建映射关系。代码位于head.S文件。在<code>__primary_switched</code>函数中会调用kaslr_early_init得到偏移地址。保存在x23寄存器中。然后重新创建kernel image的映射。</p>
+
+<pre><code>    __primary_switched:
+        tst x23, ~(MIN_KIMG_ALIGN - 1)  // already running randomized?
+        b.ne    0f
+        mov x0, x21                     // pass FDT address in x0
+        bl  kaslr_early_init            // parse FDT for KASLR options
+        cbz x0, 0f                      // KASLR disabled? just proceed
+        orr x23, x23, x0                // record KASLR offset
+        ldp x29, x30, [sp], #16         // we must enable KASLR, return
+        ret                             // to __primary_switch() 
+</code></pre>
+
+<p>创建映射的函数是<code>__create_page_tables</code>。</p>
+
+<pre><code>    __create_page_tables:
+        /*
+         * Map the kernel image.
+         */
+        adrp    x0, swapper_pg_dir
+        mov_q   x5, KIMAGE_VADDR + TEXT_OFFSET  // compile time __va(_text)
+        add x5, x5, x23                         // add KASLR displacement
+        create_pgd_entry x0, x5, x3, x6
+        adrp    x6, _end                        // runtime __pa(_end)
+        adrp    x3, _text                       // runtime __pa(_text)
+        sub x6, x6, x3                          // _end - _text
+        add x6, x6, x5                          // runtime __va(_end)
+        create_block_map x0, x7, x3, x5, x6
+</code></pre>
+
+<p>这段代码在我的另一篇文章《ARM64 Kernel Image Mapping的变化》已经有分析过，这里就略过了。注意第7行，kernel image映射的虚拟地址加上了一个偏移地址x23。还有一点需要说明，就是对重定位段进行重定位。这部分代码在arch/arm64/kernel/head.S文件<code>__relocate_kernel</code>函数实现。大概说下<code>__relocate_kernel</code>有什么用呢！例如链接脚本中常见的几个变量<em>text、</em>etext、<em>end。这几个你应该很熟悉，他们是一个地址并且他们的值是链接的时候确定下来，那么现在使能kaslr的情况下，代码中再访问</em>text的值就很明显不是运行时的虚拟地址，而是链接时候的值。因此，<code>__relocate_kernel</code>函数可以负责重定位这些变量。保证访问这些变量的值依然是正确的值。这部分涉及编译和链接，有兴趣的可以研究一下《程序员的自我修养》这本书（我不太熟悉）。</p>
+
+<h3>addr2line怎么办</h3>
+
+<p>KASLR在技术上增加了OS安全性，但是对于调试或许增加了些难度。何以见得呢？首先，我们知道编译kernel的时候链接地址和最终运行地址是不一样的，因此如果发生oops，栈的回溯信息中的函数地址其实都是运行地址。如果你使用过addr2line工具的话，应该不会陌生addr2line -e vmlinux 0xffffff8000080000这条命令获取某个地址在代码中的哪一行。那么现在问题是oops中的地址和链接地址有一个偏差，并且这个偏差随着bootloader传递的值而变化。现在摆在我们眼前的是addr2line工具还怎么用？下面就为你答疑解惑。kernel开机log中会打印Virtual kernel memory layout。举例如下。</p>
+
+<pre><code class="`">    Virtual kernel memory layout:
+      modules : 0xffffff8000000000 - 0xffffff8008000000   (   128 MB)
+      vmalloc : 0xffffff8008000000 - 0xffffffbebfff0000   (   250 GB)
+        .text : 0xffffff80ae280000 - 0xffffff80af2e0000   ( 16768 KB)
+      .rodata : 0xffffff80af300000 - 0xffffff80afb60000   (  8576 KB)
+        .init : 0xffffff80afb60000 - 0xffffff80b01e0000   (  6656 KB)
+        .data : 0xffffff80b01e0000 - 0xffffff80b044f200   (  2493 KB)
+         .bss : 0xffffff80b044f200 - 0xffffff80b0e18538   ( 10021 KB)
+      fixed   : 0xffffffbefe7fb000 - 0xffffffbefec00000   (  4116 KB)
+      PCI I/O : 0xffffffbefee00000 - 0xffffffbeffe00000   (    16 MB)
+      vmemmap : 0xffffffbf00000000 - 0xffffffc000000000   (     4 GB maximum)
+            0xffffffbf00000000 - 0xffffffbf03000000   (    48 MB actual)
+      memory  : 0xffffffc000000000 - 0xffffffc0c0000000   (  3072 MB)
+</code></pre>
+
+<p>注意看以上.text区域（kernel代码段）起始地址和结束地址是不是位于VMALLOC区域。如果发生oops，log中函数的地址必然是一个位于.text段的地址，假设是addr_run，但是链接地址应该是KIMAGE_VADDR + TEXT_OFFSET，这两个宏定义参考这篇文章《ARM64 Kernel Image Mapping的变化》。在这个例子中，KIMAGE_VADDR = 0xffffff8008000000，TEXT_OFFSET = 0x80000。addr2line工具使用的必须是链接地址，因此需要将addr_run转换成链接地址。公式很容易推导出来，addr_link = addr_run - .text_start + vmalloc_start + TEXT_OFFSET。在这个例子中就是addr_link = addr_run - 0xffffff80ae280000 + 0xffffff8008000000 + 0x80000。计算的addr_link就可以使用addr2line工具解析了。Have fun！</p>
+]]></content>
+  </entry>
+  
+</feed>

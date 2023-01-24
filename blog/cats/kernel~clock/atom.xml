@@ -1,0 +1,1757 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+
+  <title><![CDATA[Category: kernel~clock | kk Blog —— 通用基础]]></title>
+  <link href="http://abcdxyzk.github.io/blog/cats/kernel~clock/atom.xml" rel="self"/>
+  <link href="http://abcdxyzk.github.io/"/>
+  <updated>2023-01-24T19:27:19+08:00</updated>
+  <id>http://abcdxyzk.github.io/</id>
+  <author>
+    <name><![CDATA[kk]]></name>
+    
+  </author>
+  <generator uri="http://octopress.org/">Octopress</generator>
+
+  
+  <entry>
+    <title type="html"><![CDATA[高精度定时器示例]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2021/06/06/clock-ht/"/>
+    <updated>2021-06-06T22:54:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2021/06/06/clock-ht</id>
+    <content type="html"><![CDATA[<p>这样设置会更好？？？
+<code>
+    nohz=off highres=off
+</code></p>
+
+<hr />
+
+<p><a href="http://blog.chinaunix.net/uid-361890-id-257337.html">http://blog.chinaunix.net/uid-361890-id-257337.html</a></p>
+
+<pre><code>    #include &lt;linux/module.h&gt;
+    #include &lt;linux/kernel.h&gt;
+    #include &lt;linux/hrtimer.h&gt;
+    #include &lt;linux/jiffies.h&gt;
+
+    static struct hrtimer timer;
+    ktime_t kt;
+
+    static enum hrtimer_restart hrtimer_handler(struct hrtimer *timer)
+    {
+        //kt = ktime_set(1, 10);
+        printk(" ------ I am in hrtimer -----\n");
+        hrtimer_forward(timer, timer-&gt;base-&gt;get_time(), kt);
+        return HRTIMER_RESTART;
+    }
+
+    static int __init test_init(void)
+    {
+        pr_info("timer resolution: %lu\n", TICK_NSEC);
+        kt = ktime_set(1, 10); /* 1 sec, 10 nsec */
+        hrtimer_init(&amp;timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+        //hrtimer_set_expires(&amp;timer, kt);
+        hrtimer_start(&amp;timer, kt, HRTIMER_MODE_REL);
+        timer.function = hrtimer_handler;
+
+        printk("\n-------- test start ---------\n");
+        return 0;
+    }
+
+    static void __exit test_exit(void)
+    {
+        hrtimer_cancel(&amp;timer);
+        printk("-------- test over ----------\n");
+        return;
+    }
+
+    MODULE_LICENSE("GPL");
+
+    module_init(test_init);
+    module_exit(test_exit);
+</code></pre>
+
+<p>编译：</p>
+
+<pre><code>    name = test.o
+    obj-m := $(name)
+
+    KERNELDIR := /home/tangyt/tmp/linux-2.6-cloud.p1020/
+
+    default:
+        make -C $(KERNELDIR) M=$(shell pwd) modules
+
+    clean:
+        make -C $(KERNELDIR) M=$(shell pwd) clean
+</code></pre>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[Linux时间子系统之八：动态时钟框架(CONFIG_NO_HZ、tickless)]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2017/07/23/kernel-clock-8/"/>
+    <updated>2017-07-23T18:19:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2017/07/23/kernel-clock-8</id>
+    <content type="html"><![CDATA[<p><a href="http://blog.csdn.net/DroidPhone/article/details/8112948">http://blog.csdn.net/DroidPhone/article/details/8112948</a></p>
+
+<p>在前面章节的讨论中，我们一直基于一个假设：Linux中的时钟事件都是由一个周期时钟提供，不管系统中的clock_event_device是工作于周期触发模式，还是工作于单触发模式，也不管定时器系统是工作于低分辨率模式，还是高精度模式，内核都竭尽所能，用不同的方式提供周期时钟，以产生定期的tick事件，tick事件或者用于全局的时间管理（jiffies和时间的更新），或者用于本地cpu的进程统计、时间轮定时器框架等等。周期性时钟虽然简单有效，但是也带来了一些缺点，尤其在系统的功耗上，因为就算系统目前无事可做，也必须定期地发出时钟事件，激活系统。为此，内核的开发者提出了动态时钟这一概念，我们可以通过内核的配置项CONFIG_NO_HZ来激活特性。有时候这一特性也被叫做tickless，不过还是把它称呼为动态时钟比较合适，因为并不是真的没有tick事件了，只是在系统无事所做的idle阶段，我们可以通过停止周期时钟来达到降低系统功耗的目的，只要有进程处于活动状态，时钟事件依然会被周期性地发出。</p>
+
+<p>在动态时钟正确工作之前，系统需要切换至动态时钟模式，而要切换至动态时钟模式，需要一些前提条件，最主要的一条就是cpu的时钟事件设备必须要支持单触发模式，当条件满足时，系统切换至动态时钟模式，接着，由idle进程决定是否可以停止周期时钟，退出idle进程时则需要恢复周期时钟。</p>
+
+<h4>1. 数据结构</h4>
+
+<p>在上一章的内容里，我们曾经提到，切换到高精度模式后，高精度定时器系统需要使用一个高精度定时器来模拟传统的周期时钟，其中利用了tick_sched结构中的一些字段，事实上，tick_sched结构也是实现动态时钟的一个重要的数据结构，在smp系统中，内核会为每个cpu都定义一个tick_sched结构，这通过一个percpu全局变量tick_cpu_sched来实现，它在kernel/time/tick-sched.c中定义：</p>
+
+<pre><code>    /* 
+     * Per cpu nohz control structure 
+     */
+    static DEFINE_PER_CPU(struct tick_sched, tick_cpu_sched);
+</code></pre>
+
+<p>tick_sched结构在include/linux/tick.h中定义，我们看看tick_sched结构的详细定义：
+<code>
+    struct tick_sched {
+        struct hrtimer          sched_timer;
+        unsigned long           check_clocks;
+        enum tick_nohz_mode     nohz_mode;
+        ktime_t             idle_tick;
+        int             inidle;
+        int             tick_stopped;
+        unsigned long           idle_jiffies;
+        unsigned long           idle_calls;
+        unsigned long           idle_sleeps;
+        int             idle_active;
+        ktime_t             idle_entrytime;
+        ktime_t             idle_waketime;
+        ktime_t             idle_exittime;
+        ktime_t             idle_sleeptime;
+        ktime_t             iowait_sleeptime;
+        ktime_t             sleep_length;
+        unsigned long           last_jiffies;
+        unsigned long           next_jiffies;
+        ktime_t             idle_expires;
+        int             do_timer_last;
+    };
+</code></p>
+
+<p>sched_timer  该字段用于在高精度模式下，模拟周期时钟的一个hrtimer，请参看Linux时间子系统之六：高精度定时器（HRTIMER）的原理和实现。</p>
+
+<p>check_clocks  该字段用于实现clock_event_device和clocksource的异步通知机制，帮助系统切换至高精度模式或者是动态时钟模式。</p>
+
+<p>nohz_mode  保存动态时钟的工作模式，基于低分辨率和高精度模式下，动态时钟的实现稍有不同，根据模式它可以是以下的值：</p>
+
+<pre><code>NOHZ_MODE_INACTIVE  系统动态时钟尚未激活
+NOHZ_MODE_LOWRES  系统工作于低分辨率模式下的动态时钟
+NOHZ_MODE_HIGHRES  系统工作于高精度模式下的动态时钟
+</code></pre>
+
+<p>idle_tick  该字段用于保存停止周期时钟是的内核时间，当退出idle时要恢复周期时钟，需要使用该时间，以保持系统中时间线（jiffies）的正确性。</p>
+
+<p>tick_stopped  该字段用于表明idle状态的周期时钟已经停止。</p>
+
+<p>idle_jiffies  系统进入idle时的jiffies值，用于信息统计。</p>
+
+<p>idle_calls 系统进入idle的统计次数。</p>
+
+<p>idle_sleeps  系统进入idle且成功停掉周期时钟的次数。</p>
+
+<p>idle_active  表明目前系统是否处于idle状态中。</p>
+
+<p>idle_entrytime  系统进入idle的时刻。</p>
+
+<p>idle_waketime  idle状态被打断的时刻。</p>
+
+<p>idle_exittime  系统退出idle的时刻。</p>
+
+<p>idle_sleeptime  累计各次idle中停止周期时钟的总时间。</p>
+
+<p>sleep_length  本次idle中停止周期时钟的时间。</p>
+
+<p>last_jiffies  系统中最后一次周期时钟的jiffies值。</p>
+
+<p>next_jiffies  预计下一次周期时钟的jiffies。</p>
+
+<p>idle_expires  进入idle后，下一个最先到期的定时器时刻。</p>
+
+<p>我们知道，根据系统目前的工作模式，系统提供周期时钟（tick）的方式会有所不同，当处于低分辨率模式时，由cpu的tick_device提供周期时钟，而当处于高精度模式时，是由一个高精度定时器来提供周期时钟，下面我们分别讨论一下在两种模式下的动态时钟实现方式。</p>
+
+<h4>2. 低分辨率下的动态时钟</h4>
+
+<p>回看之前一篇文章：Linux时间子系统之四：定时器的引擎：clock_event_device中的关于tick_device一节，不管tick_device的工作模式（周期触发或者是单次触发），tick_device所关联的clock_event_device的事件回调处理函数都是：tick_handle_periodic，不管当前是否处于idle状态，他都会精确地按HZ数来提供周期性的tick事件，这不符合动态时钟的要求，所以，要使动态时钟发挥作用，系统首先要切换至支持动态时钟的工作模式：NOHZ_MODE_LOWRES  。</p>
+
+<h5>2.1  切换至动态时钟模式</h5>
+
+<p>动态时钟模式的切换过程的前半部分和切换至高精度定时器模式所经过的路径是一样的，请参考：Linux时间子系统之六：高精度定时器（HRTIMER）的原理和实现。这里再简单描述一下过程：系统工作于周期时钟模式，定期地发出tick事件中断，tick事件中断触发定时器软中断：TIMER_SOFTIRQ，执行软中断处理函数run_timer_softirq，run_timer_softirq调用hrtimer_run_pending函数：</p>
+
+<pre><code>    void hrtimer_run_pending(void)
+    {
+        if (hrtimer_hres_active())
+            return;
+            ......
+        if (tick_check_oneshot_change(!hrtimer_is_hres_enabled()))
+            hrtimer_switch_to_hres();
+    }
+</code></pre>
+
+<p>tick_check_oneshot_change函数的参数决定了现在是要切换至低分辨率动态时钟模式，还是高精度定时器模式，我们现在假设系统不支持高精度定时器模式，hrtimer_is_hres_enabled会直接返回false，对应的tick_check_oneshot_change函数的参数则是true，表明需要切换至动态时钟模式。tick_check_oneshot_change在检查过timekeeper和clock_event_device都具备动态时钟的条件后，通过tick_nohz_switch_to_nohz函数切换至动态时钟模式：</p>
+
+<p>首先，该函数通过tick_switch_to_oneshot函数把tick_device的工作模式设置为单触发模式，并把它的中断事件回调函数置换为tick_nohz_handler，接着把tick_sched结构中的模式字段设置为NOHZ_MODE_LOWRES：</p>
+
+<pre><code>    static void tick_nohz_switch_to_nohz(void)
+    {
+        struct tick_sched *ts = &amp;__get_cpu_var(tick_cpu_sched);
+        ktime_t next;
+
+        if (!tick_nohz_enabled)
+            return;
+
+        local_irq_disable();
+        if (tick_switch_to_oneshot(tick_nohz_handler)) {
+            local_irq_enable();
+            return;
+        }
+
+        ts-&gt;nohz_mode = NOHZ_MODE_LOWRES;
+
+    然后，初始化tick_sched结构中的sched_timer定时器，
+    通过tick_init_jiffy_update获取下一次tick事件的时间并初始化全局变量last_jiffies_update，
+    以便后续可以正确地更新jiffies计数值，最后，把下一次tick事件的时间编程到tick_device中，
+    到此，系统完成了到低分辨率动态时钟的切换过程。
+
+        hrtimer_init(&amp;ts-&gt;sched_timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
+        /* Get the next period */
+        next = tick_init_jiffy_update();
+
+        for (;;) {
+            hrtimer_set_expires(&amp;ts-&gt;sched_timer, next);
+            if (!tick_program_event(next, 0))
+                break;
+            next = ktime_add(next, tick_period);
+        }
+        local_irq_enable();
+    }
+</code></pre>
+
+<p>上面的代码中，明明现在没有切换至高精度模式，为什么要初始化tick_sched结构中的高精度定时器？原因并不是要使用它的定时功能，而是想重用hrtimer代码中的hrtimer_forward函数，利用这个函数来计算下一次tick事件的时间。</p>
+
+<h5>2.2  低分辨率动态时钟下的事件中断处理函数</h5>
+
+<p>上一节提到，当切换至低分辨率动态时钟模式后，tick_device的事件中断处理函数会被设置为tick_nohz_handler，总体来说，它和周期时钟模式的事件处理函数tick_handle_periodic所完成的工作大致类似：更新时间、更新jiffies计数值、调用update_process_time更新进程信息和触发定时器软中断等等，最后重新编程tick_device，使得它在下一个正确的tick时刻再次触发本函数：</p>
+
+<pre><code>    static void tick_nohz_handler(struct clock_event_device *dev)
+    {
+            ......
+        dev-&gt;next_event.tv64 = KTIME_MAX;
+
+        if (unlikely(tick_do_timer_cpu == TICK_DO_TIMER_NONE))
+            tick_do_timer_cpu = cpu;
+
+        /* Check, if the jiffies need an update */
+        if (tick_do_timer_cpu == cpu)
+            tick_do_update_jiffies64(now);
+            ......  
+        if (ts-&gt;tick_stopped) {
+            touch_softlockup_watchdog();
+            ts-&gt;idle_jiffies++;
+        }
+
+        update_process_times(user_mode(regs));
+        profile_tick(CPU_PROFILING);
+
+        while (tick_nohz_reprogram(ts, now)) {
+            now = ktime_get();
+            tick_do_update_jiffies64(now);
+        }
+    }
+</code></pre>
+
+<p>因为现在工作于动态时钟模式，所以，tick时钟可能在idle进程中被停掉不止一个tick周期，所以当该函数被再次触发时，离上一次触发的时间可能已经不止一个tick周期，tick_nohz_reprogram对tick_device进行编程时必须正确地处理这一情况，它利用了前面所说的hrtimer_forward函数来实现这一特性：
+<code>
+    static int tick_nohz_reprogram(struct tick_sched *ts, ktime_t now)
+    {
+        hrtimer_forward(&amp;ts-&gt;sched_timer, now, tick_period);
+        return tick_program_event(hrtimer_get_expires(&amp;ts-&gt;sched_timer), 0);
+    }
+</code></p>
+
+<h5>2.3  动态时钟：停止周期tick时钟事件</h5>
+
+<p>开启动态时钟模式后，周期时钟的开启和关闭由idle进程控制，idle进程内最终是一个循环，循环的一开始通过tick_nohz_idle_enter检测是否允许关闭周期时钟若干时间，然后进入低功耗的idle模式，当有中断事件使得cpu退出低功耗idle模式后，判断是否有新的进程被激活从而需要重新调度，如果需要则通过tick_nohz_idle_exit重新启用周期时钟，然后重新进行进程调度，等待下一次idle的发生，我们可以用下图来表示：</p>
+
+<p><img src="/images/kernel/2017-07-23-10.png" alt="" /></p>
+
+<p>图2.3.1  idle进程中的动态时钟处理</p>
+
+<p>停止周期时钟的时机在tick_nohz_idle_enter函数中，它把主要的工作交由tick_nohz_stop_sched_tick函数来完成。内核也不是每次进入tick_nohz_stop_sched_tick都会停止周期时钟，那么什么时候才会停止？我们想一想，这时候既然idle进程在运行，说明系统中的其他进程都在等待某种事件，系统处于无事所做的状态，唯一要处理的就是中断，除了定时器中断，其它的中断我们无法预测它会何时发生，但是我们可以知道最先一个到期的定时器的到期时间，也就是说，在该时间到期前，产生周期时钟是没有必要的，我们可以据此推算出周期时钟可以停止的tick数，然后重新对tick_device进行编程，使得在最早一个定时器到期前都不会产生周期时钟，实际上，tick_nohz_stop_sched_tick还做了一些限制：当下一个定时器的到期时间与当前jiffies值只相差1时，不会停止周期时钟，当定时器的到期时间与当前的jiffies值相差的时间大于timekeeper允许的最大idle时间时，则下一个tick时刻被设置timekeeper允许的最大idle时间，这主要是为了防止太长时间不去更新timekeeper中的系统时间，有可能导致clocksource的溢出问题。tick_nohz_stop_sched_tick函数体看起来很长，实现的也就是上述的逻辑，所以这里就不贴它的代码了，有兴趣的读者可以自行阅读内核的代码：kernel/time/tick-sched.c。</p>
+
+<p>看了动态时钟的停止过程和tick_nohz_handler的实现方式，其实还有一个情况没有处理：当系统进入idle进程后，周期时钟被停止若干个tick周期，当这若干个tick周期到期后，tick事件必然会产生，tick_nohz_handler被触发调用，然后最先到期的定时器被处理。但是在tick_nohz_handler的最后，tick_device一定会被编程为紧跟着的下一个tick周期的时刻被触发，如果刚才的定时器处理后，并没有激活新的进程，我们的期望是周期时钟可以用下一个新的定时器重新计算可以停止的时间，而不是下一个tick时刻，但是tick_nohz_handler却仅仅简单地把tick_device的到期时间设为下一个周期的tick时刻，这导致了周期时钟被恢复，显然这不是我们想要的。为了处理这种情况，内核使用了一点小伎俩，我们知道定时器是在软中断中执行的，所以内核在irq_exit中的软件中断处理完后，加入了一小段代码，kernel/softirq.c ：</p>
+
+<pre><code>    void irq_exit(void)
+    {
+            ......
+        if (!in_interrupt() &amp;&amp; local_softirq_pending())
+            invoke_softirq();
+
+    #ifdef CONFIG_NO_HZ
+        /* Make sure that timer wheel updates are propagated */
+        if (idle_cpu(smp_processor_id()) &amp;&amp; !in_interrupt() &amp;&amp; !need_resched())
+            tick_nohz_irq_exit();
+    #endif
+            ......
+    }
+</code></pre>
+
+<p>关键的调用是tick_nohz_irq_exit：</p>
+
+<pre><code>    void tick_nohz_irq_exit(void)
+    {
+        struct tick_sched *ts = &amp;__get_cpu_var(tick_cpu_sched);
+
+        if (!ts-&gt;inidle)
+            return;
+
+        tick_nohz_stop_sched_tick(ts);
+    }
+</code></pre>
+
+<p>tick_nohz_irq_exit再次调用了tick_nohz_stop_sched_tick函数，使得系统有机会再次停止周期时钟若干个tick周期。</p>
+
+<h5>2.3 动态时钟：重新开启周期tick时钟事件</h5>
+
+<p>回到图2.3.1，当在idle进程中停止周期时钟后，在某一时刻，有新的进程被激活，在重新调度前，tick_nohz_idle_exit会被调用，该函数负责恢复被停止的周期时钟。tick_nohz_idle_exit最终会调用tick_nohz_restart函数，由tick_nohz_restart函数最后完成恢复周期时钟的工作。函数并不复杂：先是把上一次停止周期时钟的时刻设置到tick_sched结构的sched_timer定时器中，然后在通过hrtimer_forward函数把该定时器的到期时刻设置为当前时间的下一个tick时刻，对于高精度模式，启动该定时器即可，对于低分辨率模式，使用该时间对tick_device重新编程，最后通过tick_do_update_jiffies64更新jiffies数值，为了防止此时正在一个tick时刻的边界，可能当前时刻正好刚刚越过了该到期时间，函数使用了一个while循环：</p>
+
+<pre><code>    static void tick_nohz_restart(struct tick_sched *ts, ktime_t now)
+    {
+        hrtimer_cancel(&amp;ts-&gt;sched_timer);
+        hrtimer_set_expires(&amp;ts-&gt;sched_timer, ts-&gt;idle_tick);
+
+        while (1) {
+            /* Forward the time to expire in the future */
+            hrtimer_forward(&amp;ts-&gt;sched_timer, now, tick_period);
+
+            if (ts-&gt;nohz_mode == NOHZ_MODE_HIGHRES) {
+                hrtimer_start_expires(&amp;ts-&gt;sched_timer,
+                              HRTIMER_MODE_ABS_PINNED);
+                /* Check, if the timer was already in the past */
+                if (hrtimer_active(&amp;ts-&gt;sched_timer))
+                    break;
+            } else {
+                if (!tick_program_event(
+                    hrtimer_get_expires(&amp;ts-&gt;sched_timer), 0))
+                    break;
+            }
+            /* Reread time and update jiffies */
+            now = ktime_get();
+            tick_do_update_jiffies64(now);
+        }
+    }
+</code></pre>
+
+<h4>3. 高精度模式下的动态时钟</h4>
+
+<p>高精度模式和低分辨率模式的主要区别是在切换过程中，怎样切换到高精度模式，我已经在上一篇文章中做了说明，切换到高精度模式后，动态时钟的开启和关闭和低分辨率模式下没有太大的区别，也是通过tick_nohz_stop_sched_tick和tick_nohz_restart来控制，在这两个函数中，分别判断了当前的两种模式：</p>
+
+<pre><code>NOHZ_MODE_HIGHRES
+NOHZ_MODE_LOWRES
+</code></pre>
+
+<p>如果是NOHZ_MODE_HIGHRES则对tick_sched结构的sched_timer定时器进行设置，如果是NOHZ_MODE_LOWRES，则直接对tick_device进行操作。</p>
+
+<h4>4. 动态时钟对中断的影响</h4>
+
+<p>在进入和退出中断时，因为动态时钟的关系，中断系统需要作出一些配合。先说中断发生于周期时钟停止期间，如果不做任何处理，中断服务程序中如果要访问jiffies计数值，可能得到一个滞后的jiffies值，因为正常状态下，jiffies值会在恢复周期时钟时正确地更新，所以，为了防止这种情况发生，在进入中断的irq_enter期间，tick_check_idle会被调用：
+<code>
+    void tick_check_idle(int cpu)
+    {
+        tick_check_oneshot_broadcast(cpu);
+        tick_check_nohz(cpu);
+    }
+</code>
+tick_check_nohz函数的最重要的作用就是更新jiffies计数值：
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+<span class='line-number'>82</span>
+<span class='line-number'>83</span>
+<span class='line-number'>84</span>
+<span class='line-number'>85</span>
+<span class='line-number'>86</span>
+<span class='line-number'>87</span>
+<span class='line-number'>88</span>
+<span class='line-number'>89</span>
+<span class='line-number'>90</span>
+<span class='line-number'>91</span>
+<span class='line-number'>92</span>
+<span class='line-number'>93</span>
+<span class='line-number'>94</span>
+<span class='line-number'>95</span>
+<span class='line-number'>96</span>
+<span class='line-number'>97</span>
+<span class='line-number'>98</span>
+<span class='line-number'>99</span>
+<span class='line-number'>100</span>
+<span class='line-number'>101</span>
+<span class='line-number'>102</span>
+<span class='line-number'>103</span>
+<span class='line-number'>104</span>
+<span class='line-number'>105</span>
+<span class='line-number'>106</span>
+<span class='line-number'>107</span>
+<span class='line-number'>108</span>
+<span class='line-number'>109</span>
+<span class='line-number'>110</span>
+<span class='line-number'>111</span>
+<span class='line-number'>112</span>
+<span class='line-number'>113</span>
+<span class='line-number'>114</span>
+<span class='line-number'>115</span>
+<span class='line-number'>116</span>
+<span class='line-number'>117</span>
+<span class='line-number'>118</span>
+<span class='line-number'>119</span>
+<span class='line-number'>120</span>
+<span class='line-number'>121</span>
+<span class='line-number'>122</span>
+<span class='line-number'>123</span>
+<span class='line-number'>124</span>
+<span class='line-number'>125</span>
+<span class='line-number'>126</span>
+<span class='line-number'>127</span>
+<span class='line-number'>128</span>
+<span class='line-number'>129</span>
+<span class='line-number'>130</span>
+<span class='line-number'>131</span>
+<span class='line-number'>132</span>
+<span class='line-number'>133</span>
+<span class='line-number'>134</span>
+<span class='line-number'>135</span>
+<span class='line-number'>136</span>
+<span class='line-number'>137</span>
+<span class='line-number'>138</span>
+<span class='line-number'>139</span>
+<span class='line-number'>140</span>
+<span class='line-number'>141</span>
+<span class='line-number'>142</span>
+<span class='line-number'>143</span>
+<span class='line-number'>144</span>
+<span class='line-number'>145</span>
+<span class='line-number'>146</span>
+<span class='line-number'>147</span>
+<span class='line-number'>148</span>
+<span class='line-number'>149</span>
+<span class='line-number'>150</span>
+<span class='line-number'>151</span>
+<span class='line-number'>152</span>
+<span class='line-number'>153</span>
+<span class='line-number'>154</span>
+<span class='line-number'>155</span>
+<span class='line-number'>156</span>
+<span class='line-number'>157</span>
+<span class='line-number'>158</span>
+<span class='line-number'>159</span>
+<span class='line-number'>160</span>
+<span class='line-number'>161</span>
+<span class='line-number'>162</span>
+<span class='line-number'>163</span>
+<span class='line-number'>164</span>
+<span class='line-number'>165</span>
+<span class='line-number'>166</span>
+<span class='line-number'>167</span>
+<span class='line-number'>168</span>
+<span class='line-number'>169</span>
+<span class='line-number'>170</span>
+<span class='line-number'>171</span>
+<span class='line-number'>172</span>
+<span class='line-number'>173</span>
+<span class='line-number'>174</span>
+<span class='line-number'>175</span>
+<span class='line-number'>176</span>
+<span class='line-number'>177</span>
+<span class='line-number'>178</span>
+<span class='line-number'>179</span>
+<span class='line-number'>180</span>
+<span class='line-number'>181</span>
+<span class='line-number'>182</span>
+<span class='line-number'>183</span>
+<span class='line-number'>184</span>
+<span class='line-number'>185</span>
+<span class='line-number'>186</span>
+<span class='line-number'>187</span>
+<span class='line-number'>188</span>
+<span class='line-number'>189</span>
+<span class='line-number'>190</span>
+<span class='line-number'>191</span>
+<span class='line-number'>192</span>
+<span class='line-number'>193</span>
+<span class='line-number'>194</span>
+<span class='line-number'>195</span>
+<span class='line-number'>196</span>
+<span class='line-number'>197</span>
+<span class='line-number'>198</span>
+<span class='line-number'>199</span>
+<span class='line-number'>200</span>
+<span class='line-number'>201</span>
+<span class='line-number'>202</span>
+<span class='line-number'>203</span>
+<span class='line-number'>204</span>
+<span class='line-number'>205</span>
+<span class='line-number'>206</span>
+<span class='line-number'>207</span>
+<span class='line-number'>208</span>
+<span class='line-number'>209</span>
+<span class='line-number'>210</span>
+<span class='line-number'>211</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static inline void tick_check_nohz(int cpu)
+</span><span class='line'>{
+</span><span class='line'>    struct tick_sched *ts = &amp;per_cpu(tick_cpu_sched, cpu);
+</span><span class='line'>    ktime_t now;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    if (!ts-&gt;idle_active &amp;&amp; !ts-&gt;tick_stopped)
+</span><span class='line'>    return;
+</span><span class='line'>now = ktime_get();
+</span><span class='line'>if (ts-&gt;idle_active)
+</span><span class='line'>    tick_nohz_stop_idle(cpu, now);
+</span><span class='line'>if (ts-&gt;tick_stopped) {
+</span><span class='line'>    tick_nohz_update_jiffies(now);
+</span><span class='line'>    tick_nohz_kick_tick(cpu, now);
+</span><span class='line'>}
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;```
+</span><span class='line'>另外一种情况是在退出定时器中断时，需要重新评估周期时钟的运行状况，这一点已经在2.3节中做了说明，这里就不在赘述了。&lt;/p&gt;
+</span><span class='line'>]]&gt;&lt;/content&gt;
+</span><span class='line'>  &lt;/entry&gt;
+</span><span class='line'>  
+</span><span class='line'>  &lt;entry&gt;
+</span><span class='line'>&lt;title type="html"&gt;&lt;![CDATA[Linux时间子系统之七：定时器的应用--msleep()，hrtimer_nanosleep()]]&gt;&lt;/title&gt;
+</span><span class='line'>&lt;link href="http://abcdxyzk.github.io/blog/2017/07/23/kernel-clock-7/"/&gt;
+</span><span class='line'>&lt;updated&gt;2017-07-23T18:06:00+08:00&lt;/updated&gt;
+</span><span class='line'>&lt;id&gt;http://abcdxyzk.github.io/blog/2017/07/23/kernel-clock-7&lt;/id&gt;
+</span><span class='line'>&lt;content type="html"&gt;&lt;![CDATA[&lt;p&gt;&lt;a href="http://blog.csdn.net/DroidPhone/article/details/8104433"&gt;http://blog.csdn.net/DroidPhone/article/details/8104433&lt;/a&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;我们已经在前面几章介绍了低分辨率定时器和高精度定时器的实现原理，内核为了方便其它子系统，在时间子系统中提供了一些用于延时或调度的API，例如msleep，hrtimer_nanosleep等等，这些API基于低分辨率定时器或高精度定时器来实现，本章的内容就是讨论这些方便、好用的API是如何利用定时器系统来完成所需的功能的。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h4&gt;1. msleep&lt;/h4&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;msleep相信大家都用过，它可能是内核用使用最广泛的延时函数之一，它会使当前进程被调度并让出cpu一段时间，因为这一特性，它不能用于中断上下文，只能用于进程上下文中。要想在中断上下文中使用延时函数，请使用会阻塞cpu的无调度版本mdelay。msleep的函数原型如下：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    void msleep(unsigned int msecs)
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;延时的时间由参数msecs指定，单位是毫秒，事实上，msleep的实现基于低分辨率定时器，所以msleep的实际精度只能也是1/HZ级别。内核还提供了另一个比较类似的延时函数msleep_interruptible：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    unsigned long msleep_interruptible(unsigned int msecs)
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;延时的单位同样毫秒数，它们的区别如下：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;函数                    延时单位        返回值          是否可被信号中断
+</span><span class='line'>msleep                  毫秒            无              否
+</span><span class='line'>msleep_interruptible    毫秒            未完成的毫秒数  是
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;最主要的区别就是msleep会保证所需的延时一定会被执行完，而msleep_interruptible则可以在延时进行到一半时被信号打断而退出延时，剩余的延时数则通过返回值返回。两个函数最终的代码都会到达schedule_timeout函数，它们的调用序列如下图所示：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;&lt;img src="/images/kernel/2017-07-23-7.png" alt="" /&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;图1.1  两个延时函数的调用序列&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;下面我们看看schedule_timeout函数的实现，函数首先处理两种特殊情况，一种是传入的延时jiffies数是个负数，则打印一句警告信息，然后马上返回，另一种是延时jiffies数是MAX_SCHEDULE_TIMEOUT，表明需要一直延时，直接执行调度即可：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    signed long __sched schedule_timeout(signed long timeout)
+</span><span class='line'>{
+</span><span class='line'>    struct timer_list timer;
+</span><span class='line'>    unsigned long expire;
+</span><span class='line'>
+</span><span class='line'>    switch (timeout)
+</span><span class='line'>    {
+</span><span class='line'>    case MAX_SCHEDULE_TIMEOUT:
+</span><span class='line'>        schedule();
+</span><span class='line'>        goto out;
+</span><span class='line'>    default:
+</span><span class='line'>        if (timeout &lt; 0) {
+</span><span class='line'>            printk(KERN_ERR "schedule_timeout: wrong timeout "
+</span><span class='line'>                "value %lx\n", timeout);
+</span><span class='line'>            dump_stack();
+</span><span class='line'>            current-&gt;state = TASK_RUNNING;
+</span><span class='line'>            goto out;
+</span><span class='line'>        }
+</span><span class='line'>    }
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;然后计算到期的jiffies数，并在堆栈上建立一个低分辨率定时器，把到期时间设置到该定时器中，启动定时器后，通过schedule把当前进程调度出cpu的运行队列：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    expire = timeout + jiffies;
+</span><span class='line'>
+</span><span class='line'>setup_timer_on_stack(&amp;timer, process_timeout, (unsigned long)current);
+</span><span class='line'>__mod_timer(&amp;timer, expire, false, TIMER_NOT_PINNED);
+</span><span class='line'>schedule();
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;到这个时候，进程已经被调度走，那它如何返回继续执行？我们看到定时器的到期回调函数是process_timeout，参数是当前进程的task_struct指针，看看它的实现：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    static void process_timeout(unsigned long __data)
+</span><span class='line'>{
+</span><span class='line'>    wake_up_process((struct task_struct *)__data);
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;噢，没错，定时器一旦到期，进程会被唤醒并继续执行：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;        del_singleshot_timer_sync(&amp;timer);
+</span><span class='line'>
+</span><span class='line'>    /* Remove the timer from the object tracker */
+</span><span class='line'>    destroy_timer_on_stack(&amp;timer);
+</span><span class='line'>
+</span><span class='line'>    timeout = expire - jiffies;
+</span><span class='line'>
+</span><span class='line'> out:
+</span><span class='line'>    return timeout &lt; 0 ? 0 : timeout;
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;schedule返回后，说明要不就是定时器到期，要不就是因为其它时间导致进程被唤醒，函数要做的就是删除在堆栈上建立的定时器，返回剩余未完成的jiffies数。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;说完了关键的schedule_timeout函数，我们看看msleep如何实现：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    signed long __sched schedule_timeout_uninterruptible(signed long timeout)
+</span><span class='line'>{
+</span><span class='line'>    __set_current_state(TASK_UNINTERRUPTIBLE);
+</span><span class='line'>    return schedule_timeout(timeout);
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>void msleep(unsigned int msecs)
+</span><span class='line'>{
+</span><span class='line'>    unsigned long timeout = msecs_to_jiffies(msecs) + 1;
+</span><span class='line'>
+</span><span class='line'>    while (timeout)
+</span><span class='line'>        timeout = schedule_timeout_uninterruptible(timeout);
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;msleep先是把毫秒转换为jiffies数，通过一个while循环保证所有的延时被执行完毕，延时操作通过schedule_timeout_uninterruptible函数完成，它仅仅是在把进程的状态修改为TASK_UNINTERRUPTIBLE后，调用上述的schedule_timeout来完成具体的延时操作，TASK_UNINTERRUPTIBLE状态保证了msleep不会被信号唤醒，也就意味着在msleep期间，进程不能被kill掉。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;看看msleep_interruptible的实现：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    signed long __sched schedule_timeout_interruptible(signed long timeout)
+</span><span class='line'>{
+</span><span class='line'>    __set_current_state(TASK_INTERRUPTIBLE);
+</span><span class='line'>    return schedule_timeout(timeout);
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>unsigned long msleep_interruptible(unsigned int msecs)
+</span><span class='line'>{
+</span><span class='line'>    unsigned long timeout = msecs_to_jiffies(msecs) + 1;
+</span><span class='line'>
+</span><span class='line'>    while (timeout &amp;&amp; !signal_pending(current))
+</span><span class='line'>        timeout = schedule_timeout_interruptible(timeout);
+</span><span class='line'>    return jiffies_to_msecs(timeout);
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;msleep_interruptible通过schedule_timeout_interruptible中转，schedule_timeout_interruptible的唯一区别就是把进程的状态设置为了TASK_INTERRUPTIBLE，说明在延时期间有信号通知，while循环会马上终止，剩余的jiffies数被转换成毫秒返回。实际上，你也可以利用schedule_timeout_interruptible或schedule_timeout_uninterruptible构造自己的延时函数，同时，内核还提供了另外一个类似的函数，不用我解释，看代码就知道它的用意了：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    signed long __sched schedule_timeout_killable(signed long timeout)
+</span><span class='line'>{
+</span><span class='line'>    __set_current_state(TASK_KILLABLE);
+</span><span class='line'>    return schedule_timeout(timeout);
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h4&gt;2. hrtimer_nanosleep&lt;/h4&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;第一节讨论的msleep函数基于时间轮定时系统，只能提供毫秒级的精度，实际上，它的精度取决于HZ的配置值，如果HZ小于1000，它甚至无法达到毫秒级的精度，要想得到更为精确的延时，我们自然想到的是要利用高精度定时器来实现。没错，linux为用户空间提供了一个api：nanosleep，它能提供纳秒级的延时精度，该用户空间函数对应的内核实现是sys_nanosleep，它的工作交由高精度定时器系统的hrtimer_nanosleep函数实现，最终的大部分工作则由do_nanosleep完成。调用过程如下图所示：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;&lt;img src="/images/kernel/2017-07-23-8.png" alt="" /&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;图  2.1  nanosleep的调用过程&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;与msleep的实现相类似，hrtimer_nanosleep函数首先在堆栈中创建一个高精度定时器，设置它的到期时间，然后通过do_nanosleep完成最终的延时工作，当前进程在挂起相应的延时时间后，退出do_nanosleep函数，销毁堆栈中的定时器并返回0值表示执行成功。不过do_nanosleep可能在没有达到所需延时数量时由于其它原因退出，如果出现这种情况，hrtimer_nanosleep的最后部分把剩余的延时时间记入进程的restart_block中，并返回ERESTART_RESTARTBLOCK错误代码，系统或者用户空间可以根据此返回值决定是否重新调用nanosleep以便把剩余的延时继续执行完成。下面是hrtimer_nanosleep的代码：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    long hrtimer_nanosleep(struct timespec *rqtp, struct timespec __user *rmtp,
+</span><span class='line'>               const enum hrtimer_mode mode, const clockid_t clockid)
+</span><span class='line'>{
+</span><span class='line'>    struct restart_block *restart;
+</span><span class='line'>    struct hrtimer_sleeper t;
+</span><span class='line'>    int ret = 0;
+</span><span class='line'>    unsigned long slack;
+</span><span class='line'>
+</span><span class='line'>    slack = current-&gt;timer_slack_ns;
+</span><span class='line'>    if (rt_task(current))
+</span><span class='line'>        slack = 0;
+</span><span class='line'>
+</span><span class='line'>    hrtimer_init_on_stack(&amp;t.timer, clockid, mode);
+</span><span class='line'>    hrtimer_set_expires_range_ns(&amp;t.timer, timespec_to_ktime(*rqtp), slack);
+</span><span class='line'>    if (do_nanosleep(&amp;t, mode))
+</span><span class='line'>        goto out;
+</span><span class='line'>
+</span><span class='line'>    /* Absolute timers do not update the rmtp value and restart: */
+</span><span class='line'>    if (mode == HRTIMER_MODE_ABS) {
+</span><span class='line'>        ret = -ERESTARTNOHAND;
+</span><span class='line'>        goto out;
+</span><span class='line'>    }
+</span><span class='line'>
+</span><span class='line'>    if (rmtp) {
+</span><span class='line'>        ret = update_rmtp(&amp;t.timer, rmtp);
+</span><span class='line'>        if (ret &lt;= 0)
+</span><span class='line'>            goto out;
+</span><span class='line'>    }
+</span><span class='line'>
+</span><span class='line'>    restart = ¤t_thread_info()-&gt;restart_block;
+</span><span class='line'>    restart-&gt;fn = hrtimer_nanosleep_restart;
+</span><span class='line'>    restart-&gt;nanosleep.clockid = t.timer.base-&gt;clockid;
+</span><span class='line'>    restart-&gt;nanosleep.rmtp = rmtp;
+</span><span class='line'>    restart-&gt;nanosleep.expires = hrtimer_get_expires_tv64(&amp;t.timer);
+</span><span class='line'>
+</span><span class='line'>    ret = -ERESTART_RESTARTBLOCK;
+</span><span class='line'>out:
+</span><span class='line'>    destroy_hrtimer_on_stack(&amp;t.timer);
+</span><span class='line'>    return ret;
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;接着我们看看do_nanosleep的实现代码，它首先通过hrtimer_init_sleeper函数，把定时器的回调函数设置为hrtimer_wakeup，把当前进程的task_struct结构指针保存在hrtimer_sleeper结构的task字段中：</span></code></pre></td></tr></table></div></figure>
+    void hrtimer_init_sleeper(struct hrtimer_sleeper <em>sl, struct task_struct </em>task)
+    {
+        sl->timer.function = hrtimer_wakeup;
+        sl->task = task;
+    }
+    EXPORT_SYMBOL_GPL(hrtimer_init_sleeper);</p>
+
+<pre><code>static int __sched do_nanosleep(struct hrtimer_sleeper *t, enum hrtimer_mode mode)
+{
+    hrtimer_init_sleeper(t, current);
+</code></pre>
+
+<pre><code>
+然后，通过一个do/while循环内：启动定时器，挂起当前进程，等待定时器或其它事件唤醒进程。这里的循环体实现比较怪异，它使用hrtimer_active函数间接地判断定时器是否到期，如果hrtimer_active返回false，说明定时器已经过期，然后把hrtimer_sleeper结构的task字段设置为NULL，从而导致循环体的结束，另一个结束条件是当前进程收到了信号事件，所以，当因为是定时器到期而退出时，do_nanosleep返回true，否则返回false，上述的hrtimer_nanosleep正是利用了这一特性来决定它的返回值。以下是do_nanosleep循环体的代码：
+</code></pre>
+
+<pre><code>    do {
+        set_current_state(TASK_INTERRUPTIBLE);
+        hrtimer_start_expires(&amp;t-&gt;timer, mode);
+        if (!hrtimer_active(&amp;t-&gt;timer))
+            t-&gt;task = NULL;
+
+        if (likely(t-&gt;task))
+            schedule();
+
+        hrtimer_cancel(&amp;t-&gt;timer);
+        mode = HRTIMER_MODE_ABS;
+
+    } while (t-&gt;task &amp;&amp; !signal_pending(current));
+
+    __set_current_state(TASK_RUNNING);
+
+    return t-&gt;task == NULL;
+}
+</code></pre>
+
+<p>```</p>
+
+<p>除了hrtimer_nanosleep，高精度定时器系统还提供了几种用于延时/挂起进程的api：</p>
+
+<pre><code>schedule_hrtimeout    使得当前进程休眠指定的时间，使用CLOCK_MONOTONIC计时系统；
+schedule_hrtimeout_range    使得当前进程休眠指定的时间范围，使用CLOCK_MONOTONIC计时系统；
+schedule_hrtimeout_range_clock    使得当前进程休眠指定的时间范围，可以自行指定计时系统；
+usleep_range 使得当前进程休眠指定的微妙数，使用CLOCK_MONOTONIC计时系统；
+</code></pre>
+
+<p>它们之间的调用关系如下：</p>
+
+<p><img src="/images/kernel/2017-07-23-9.png" alt="" /></p>
+
+<p>图 2.2  schedule_hrtimeout_xxxx系列函数</p>
+
+<p>最终，所有的实现都会进入到schedule_hrtimeout_range_clock函数。需要注意的是schedule_hrtimeout_xxxx系列函数在调用前，最好利用set_current_state函数先设置进程的状态，在这些函数返回前，进城的状态会再次被设置为TASK_RUNNING。如果事先把状态设置为TASK_UNINTERRUPTIBLE，它们会保证函数返回前一定已经经过了所需的延时时间，如果事先把状态设置为TASK_INTERRUPTIBLE，则有可能在尚未到期时由其它信号唤醒进程从而导致函数返回。主要实现该功能的函数schedule_hrtimeout_range_clock和前面的do_nanosleep函数实现原理基本一致。大家可以自行参考内核的代码，它们位于：kernel/hrtimer.c。</p>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[Linux时间子系统之六：高精度定时器（HRTIMER）的原理和实现]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2017/07/23/kernel-clock-6/"/>
+    <updated>2017-07-23T16:59:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2017/07/23/kernel-clock-6</id>
+    <content type="html"><![CDATA[<p><a href="http://blog.csdn.net/DroidPhone/article/details/8074892">http://blog.csdn.net/DroidPhone/article/details/8074892</a></p>
+
+<p>上一篇文章，我介绍了传统的低分辨率定时器的实现原理。而随着内核的不断演进，大牛们已经对这种低分辨率定时器的精度不再满足，而且，硬件也在不断地发展，系统中的定时器硬件的精度也越来越高，这也给高分辨率定时器的出现创造了条件。内核从2.6.16开始加入了高精度定时器架构。在实现方式上，内核的高分辨率定时器的实现代码几乎没有借用低分辨率定时器的数据结构和代码，内核文档给出的解释主要有以下几点：</p>
+
+<p>低分辨率定时器的代码和jiffies的关系太过紧密，并且默认按32位进行设计，并且它的代码已经经过长时间的优化，目前的使用也是没有任何错误，如果硬要基于它来实现高分辨率定时器，势必会打破原有的时间轮概念，并且会引入一大堆#if&ndash;#else判断；</p>
+
+<p>虽然大部分时间里，时间轮可以实现O(1)时间复杂度，但是当有进位发生时，不可预测的O(N)定时器级联迁移时间，这对于低分辨率定时器来说问题不大，可是它大大地影响了定时器的精度；</p>
+
+<p>低分辨率定时器几乎是为“超时”而设计的，并为此对它进行了大量的优化，对于这些以“超时”未目的而使用定时器，它们大多数期望在超时到来之前获得正确的结果，然后删除定时器，精确时间并不是它们主要的目的，例如网络通信、设备IO等等。</p>
+
+<p>为此，内核为高精度定时器重新设计了一套软件架构，它可以为我们提供纳秒级的定时精度，以满足对精确时间有迫切需求的应用程序或内核驱动，例如多媒体应用，音频设备的驱动程序等等。以下的讨论用hrtimer(high resolution timer)表示高精度定时器。</p>
+
+<h4>1. 如何组织hrtimer？</h4>
+
+<p>我们知道，低分辨率定时器使用5个链表数组来组织timer_list结构，形成了著名的时间轮概念，对于高分辨率定时器，我们期望组织它们的数据结构至少具备以下条件：</p>
+
+<pre><code>稳定而且快速的查找能力；
+快速地插入和删除定时器的能力；
+排序功能；
+</code></pre>
+
+<p>内核的开发者考察了多种数据结构，例如基数树、哈希表等等，最终他们选择了红黑树（rbtree）来组织hrtimer，红黑树已经以库的形式存在于内核中，并被成功地使用在内存管理子系统和文件系统中，随着系统的运行，hrtimer不停地被创建和销毁，新的hrtimer按顺序被插入到红黑树中，树的最左边的节点就是最快到期的定时器，内核用一个hrtimer结构来表示一个高精度定时器：</p>
+
+<pre><code>    struct hrtimer {
+        struct timerqueue_node      node;
+        ktime_t             _softexpires;
+        enum hrtimer_restart        (*function)(struct hrtimer *);
+        struct hrtimer_clock_base   *base;
+        unsigned long           state;
+            ......
+    };
+</code></pre>
+
+<p>定时器的到期时间用ktime_t来表示，_softexpires字段记录了时间，定时器一旦到期，function字段指定的回调函数会被调用，该函数的返回值为一个枚举值，它决定了该hrtimer是否需要被重新激活：</p>
+
+<pre><code>    enum hrtimer_restart {
+        HRTIMER_NORESTART,  /* Timer is not restarted */
+        HRTIMER_RESTART,    /* Timer must be restarted */
+    };
+</code></pre>
+
+<p>state字段用于表示hrtimer当前的状态，有几下几种位组合：</p>
+
+<pre><code>    #define HRTIMER_STATE_INACTIVE  0x00  // 定时器未激活
+    #define HRTIMER_STATE_ENQUEUED  0x01  // 定时器已经被排入红黑树中
+    #define HRTIMER_STATE_CALLBACK  0x02  // 定时器的回调函数正在被调用
+    #define HRTIMER_STATE_MIGRATE   0x04  // 定时器正在CPU之间做迁移
+</code></pre>
+
+<p>hrtimer的到期时间可以基于以下几种时间基准系统：</p>
+
+<pre><code>    enum  hrtimer_base_type {
+        HRTIMER_BASE_MONOTONIC,  // 单调递增的monotonic时间，不包含休眠时间
+        HRTIMER_BASE_REALTIME,   // 平常使用的墙上真实时间
+        HRTIMER_BASE_BOOTTIME,   // 单调递增的boottime，包含休眠时间
+        HRTIMER_MAX_CLOCK_BASES, // 用于后续数组的定义
+    };
+</code></pre>
+
+<p>和低分辨率定时器一样，处于效率和上锁的考虑，每个cpu单独管理属于自己的hrtimer，为此，专门定义了一个结构hrtimer_cpu_base：</p>
+
+<pre><code>    struct hrtimer_cpu_base {
+            ......
+        struct hrtimer_clock_base   clock_base[HRTIMER_MAX_CLOCK_BASES];
+    };
+</code></pre>
+
+<p>其中，clock_base数组为每种时间基准系统都定义了一个hrtimer_clock_base结构，它的定义如下：</p>
+
+<pre><code>    struct hrtimer_clock_base {
+        struct hrtimer_cpu_base *cpu_base;  // 指向所属cpu的hrtimer_cpu_base结构
+            ......
+        struct timerqueue_head  active;     // 红黑树，包含了所有使用该时间基准系统的hrtimer
+        ktime_t         resolution; // 时间基准系统的分辨率
+        ktime_t         (*get_time)(void); // 获取该基准系统的时间函数
+        ktime_t         softirq_time;// 当用jiffies
+        ktime_t         offset;      // 
+    };
+</code></pre>
+
+<p>active字段是一个timerqueue_head结构，它实际上是对rbtree的进一步封装：
+```
+    struct timerqueue_node {
+        struct rb_node node;  // 红黑树的节点
+        ktime_t expires;      // 该节点代表队hrtimer的到期时间，与hrtimer结构中的_softexpires稍有不同
+    };</p>
+
+<pre><code>struct timerqueue_head {
+    struct rb_root head;          // 红黑树的根节点
+    struct timerqueue_node *next; // 该红黑树中最早到期的节点，也就是最左下的节点
+};
+</code></pre>
+
+<pre><code>
+timerqueue_head结构在红黑树的基础上，增加了一个next字段，用于保存树中最先到期的定时器节点，实际上就是树的最左下方的节点，有了next字段，当到期事件到来时，系统不必遍历整个红黑树，只要取出next字段对应的节点进行处理即可。timerqueue_node用于表示一个hrtimer节点，它在标准红黑树节点rb_node的基础上增加了expires字段，该字段和hrtimer中的_softexpires字段一起，设定了hrtimer的到期时间的一个范围，hrtimer可以在hrtimer._softexpires至timerqueue_node.expires之间的任何时刻到期，我们也称timerqueue_node.expires为硬过期时间(hard)，意思很明显：到了此时刻，定时器一定会到期，有了这个范围可以选择，定时器系统可以让范围接近的多个定时器在同一时刻同时到期，这种设计可以降低进程频繁地被hrtimer进行唤醒。经过以上的讨论，我们可以得出以下的图示，它表明了每个cpu上的hrtimer是如何被组织在一起的：
+
+![](/images/kernel/2017-07-23-5.png)
+
+图 1.1  每个cpu的hrtimer组织结构
+
+总结一下：
+
+    每个cpu有一个hrtimer_cpu_base结构；
+    hrtimer_cpu_base结构管理着3种不同的时间基准系统的hrtimer，分别是：实时时间，启动时间和单调时间；
+    每种时间基准系统通过它的active字段（timerqueue_head结构指针），指向它们各自的红黑树；
+    红黑树上，按到期时间进行排序，最先到期的hrtimer位于最左下的节点，并被记录在active.next字段中；
+    3中时间基准的最先到期时间可能不同，所以，它们之中最先到期的时间被记录在hrtimer_cpu_base的expires_next字段中。
+
+
+#### 2. hrtimer如何运转
+
+hrtimer的实现需要一定的硬件基础，它的实现依赖于我们前几章介绍的timekeeper和clock_event_device，如果你对timekeeper和clock_event_device不了解请参考以下文章：Linux时间子系统之三：时间的维护者：timekeeper，Linux时间子系统之四：定时器的引擎：clock_event_device。hrtimer系统需要通过timekeeper获取当前的时间，计算与到期时间的差值，并根据该差值，设定该cpu的tick_device（clock_event_device）的下一次的到期时间，时间一到，在clock_event_device的事件回调函数中处理到期的hrtimer。现在你或许有疑问：前面在介绍clock_event_device时，我们知道，每个cpu有自己的tick_device，通常用于周期性地产生进程调度和时间统计的tick事件，这里又说要用tick_device调度hrtimer系统，通常cpu只有一个tick_device，那他们如何协调工作？这个问题也一度困扰着我，如果再加上NO_HZ配置带来tickless特性，你可能会更晕。这里我们先把这个疑问放下，我将在后面的章节中来讨论这个问题，现在我们只要先知道，一旦开启了hrtimer，tick_device所关联的clock_event_device的事件回调函数会被修改为：hrtimer_interrupt，并且会被设置成工作于CLOCK_EVT_MODE_ONESHOT单触发模式。
+
+##### 2.1  添加一个hrtimer
+
+要添加一个hrtimer，系统提供了一些api供我们使用，首先我们需要定义一个hrtimer结构的实例，然后用hrtimer_init函数对它进行初始化，它的原型如下：
+</code></pre>
+
+<pre><code>void hrtimer_init(struct hrtimer *timer, clockid_t which_clock,
+             enum hrtimer_mode mode);
+</code></pre>
+
+<pre><code>
+which_clock可以是CLOCK_REALTIME、CLOCK_MONOTONIC、CLOCK_BOOTTIME中的一种，mode则可以是相对时间HRTIMER_MODE_REL，也可以是绝对时间HRTIMER_MODE_ABS。设定回调函数：
+</code></pre>
+
+<pre><code>timer.function = hr_callback;
+</code></pre>
+
+<pre><code>
+如果定时器无需指定一个到期范围，可以在设定回调函数后直接使用hrtimer_start激活该定时器：
+</code></pre>
+
+<pre><code>int hrtimer_start(struct hrtimer *timer, ktime_t tim,
+             const enum hrtimer_mode mode);
+</code></pre>
+
+<pre><code>
+如果需要指定到期范围，则可以使用hrtimer_start_range_ns激活定时器：
+</code></pre>
+
+<pre><code>hrtimer_start_range_ns(struct hrtimer *timer, ktime_t tim,
+            unsigned long range_ns, const enum hrtimer_mode mode);
+</code></pre>
+
+<pre><code>
+要取消一个hrtimer，使用hrtimer_cancel：
+</code></pre>
+
+<pre><code>int hrtimer_cancel(struct hrtimer *timer);
+</code></pre>
+
+<pre><code>
+以下两个函数用于推后定时器的到期时间：
+</code></pre>
+
+<pre><code>extern u64
+hrtimer_forward(struct hrtimer *timer, ktime_t now, ktime_t interval);
+
+/* Forward a hrtimer so it expires after the hrtimer's current now */
+static inline u64 hrtimer_forward_now(struct hrtimer *timer,
+                      ktime_t interval)
+{
+    return hrtimer_forward(timer, timer-&gt;base-&gt;get_time(), interval);
+}
+</code></pre>
+
+<pre><code>
+以下几个函数用于获取定时器的当前状态：
+</code></pre>
+
+<pre><code>static inline int hrtimer_active(const struct hrtimer *timer)
+{
+    return timer-&gt;state != HRTIMER_STATE_INACTIVE;
+}
+
+static inline int hrtimer_is_queued(struct hrtimer *timer)
+{
+    return timer-&gt;state &amp; HRTIMER_STATE_ENQUEUED;
+}
+
+static inline int hrtimer_callback_running(struct hrtimer *timer)
+{
+    return timer-&gt;state &amp; HRTIMER_STATE_CALLBACK;
+}
+</code></pre>
+
+<pre><code>
+hrtimer_init最终会进入__hrtimer_init函数，该函数的主要目的是初始化hrtimer的base字段，同时初始化作为红黑树的节点的node字段：
+</code></pre>
+
+<pre><code>static void __hrtimer_init(struct hrtimer *timer, clockid_t clock_id,
+               enum hrtimer_mode mode)
+{
+    struct hrtimer_cpu_base *cpu_base;
+    int base;
+
+    memset(timer, 0, sizeof(struct hrtimer));
+
+    cpu_base = &amp;__raw_get_cpu_var(hrtimer_bases);
+
+    if (clock_id == CLOCK_REALTIME &amp;&amp; mode != HRTIMER_MODE_ABS)
+        clock_id = CLOCK_MONOTONIC;
+
+    base = hrtimer_clockid_to_base(clock_id);
+    timer-&gt;base = &amp;cpu_base-&gt;clock_base[base];
+    timerqueue_init(&amp;timer-&gt;node);
+        ......
+}
+</code></pre>
+
+<pre><code>
+hrtimer_start和hrtimer_start_range_ns最终会把实际的工作交由__hrtimer_start_range_ns来完成：
+</code></pre>
+
+<pre><code>int __hrtimer_start_range_ns(struct hrtimer *timer, ktime_t tim,
+        unsigned long delta_ns, const enum hrtimer_mode mode,
+        int wakeup)
+{
+    ......        
+    /* 取得hrtimer_clock_base指针 */
+    base = lock_hrtimer_base(timer, &amp;flags); 
+    /* 如果已经在红黑树中，先移除它: */
+    ret = remove_hrtimer(timer, base); ......
+    /* 如果是相对时间，则需要加上当前时间，因为内部是使用绝对时间 */
+    if (mode &amp; HRTIMER_MODE_REL) {
+            tim = ktime_add_safe(tim, new_base-&gt;get_time());
+            ......
+    } 
+    /* 设置到期的时间范围 */
+    hrtimer_set_expires_range_ns(timer, tim, delta_ns);
+    ...... 
+    /* 把hrtime按到期时间排序，加入到对应时间基准系统的红黑树中 */
+    /* 如果该定时器的是最早到期的，将会返回true */
+    leftmost = enqueue_hrtimer(timer, new_base);
+    /*
+    * Only allow reprogramming if the new base is on this CPU.
+    * (it might still be on another CPU if the timer was pending)
+    *
+    * XXX send_remote_softirq() ? 
+    * 定时器比之前的到期时间要早，所以需要重新对tick_device进行编程，重新设定的的到期时间 
+    */
+    if (leftmost &amp;&amp; new_base-&gt;cpu_base == &amp;__get_cpu_var(hrtimer_bases))
+            hrtimer_enqueue_reprogram(timer, new_base, wakeup);
+    unlock_hrtimer_base(timer, &amp;flags);
+    return ret;
+}
+</code></pre>
+
+<pre><code>
+##### 2.2 hrtimer的到期处理
+
+高精度定时器系统有3个入口可以对到期定时器进行处理，它们分别是：
+
+    没有切换到高精度模式时，在每个jiffie的tick事件中断中进行查询和处理；
+    在HRTIMER_SOFTIRQ软中断中进行查询和处理；
+    切换到高精度模式后，在每个clock_event_device的到期事件中断中进行查询和处理；
+
+低精度模式  因为系统并不是一开始就会支持高精度模式，而是在系统启动后的某个阶段，等待所有的条件都满足后，才会切换到高精度模式，当系统还没有切换到高精度模式时，所有的高精度定时器运行在低精度模式下，在每个jiffie的tick事件中断中进行到期定时器的查询和处理，显然这时候的精度和低分辨率定时器是一样的（HZ级别）。低精度模式下，每个tick事件中断中，hrtimer_run_queues函数会被调用，由它完成定时器的到期处理。hrtimer_run_queues首先判断目前高精度模式是否已经启用，如果已经切换到了高精度模式，什么也不做，直接返回：
+</code></pre>
+
+<pre><code>void hrtimer_run_queues(void)
+{
+
+    if (hrtimer_hres_active())
+        return;
+</code></pre>
+
+<pre><code>
+如果hrtimer_hres_active返回false，说明目前处于低精度模式下，则继续处理，它用一个for循环遍历各个时间基准系统，查询每个hrtimer_clock_base对应红黑树的左下节点，判断它的时间是否到期，如果到期，通过__run_hrtimer函数，对到期定时器进行处理，包括：调用定时器的回调函数、从红黑树中移除该定时器、根据回调函数的返回值决定是否重新启动该定时器等等：
+</code></pre>
+
+<pre><code>for (index = 0; index &lt; HRTIMER_MAX_CLOCK_BASES; index++) {
+    base = &amp;cpu_base-&gt;clock_base[index];
+    if (!timerqueue_getnext(&amp;base-&gt;active))
+        continue;
+
+    if (gettime) {
+        hrtimer_get_softirq_time(cpu_base);
+        gettime = 0;
+    }
+
+    raw_spin_lock(&amp;cpu_base-&gt;lock);
+
+    while ((node = timerqueue_getnext(&amp;base-&gt;active))) {
+        struct hrtimer *timer;
+
+        timer = container_of(node, struct hrtimer, node);
+        if (base-&gt;softirq_time.tv64 &lt;=
+                hrtimer_get_expires_tv64(timer))
+            break;
+
+        __run_hrtimer(timer, &amp;base-&gt;softirq_time);
+    }
+    raw_spin_unlock(&amp;cpu_base-&gt;lock);
+}
+</code></pre>
+
+<pre><code>
+上面的timerqueue_getnext函数返回红黑树中的左下节点，之所以可以在while循环中使用该函数，是因为__run_hrtimer会在移除旧的左下节点时，新的左下节点会被更新到base-&gt;active-&gt;next字段中，使得循环可以继续执行，直到没有新的到期定时器为止。
+
+高精度模式  切换到高精度模式后，原来给cpu提供tick事件的tick_device（clock_event_device）会被高精度定时器系统接管，它的中断事件回调函数被设置为hrtimer_interrupt，红黑树中最左下的节点的定时器的到期时间被编程到该clock_event_device中，这样每次clock_event_device的中断意味着至少有一个高精度定时器到期。另外，当timekeeper系统中的时间需要修正，或者clock_event_device的到期事件时间被重新编程时，系统会发出HRTIMER_SOFTIRQ软中断，软中断的处理函数run_hrtimer_softirq最终也会调用hrtimer_interrupt函数对到期定时器进行处理，所以在这里我们只要讨论hrtimer_interrupt函数的实现即可。
+
+hrtimer_interrupt函数的前半部分和低精度模式下的hrtimer_run_queues函数完成相同的事情：它用一个for循环遍历各个时间基准系统，查询每个hrtimer_clock_base对应红黑树的左下节点，判断它的时间是否到期，如果到期，通过__run_hrtimer函数，对到期定时器进行处理，所以我们只讨论后半部分，在处理完所有到期定时器后，下一个到期定时器的到期时间保存在变量expires_next中，接下来的工作就是把这个到期时间编程到tick_device中：
+</code></pre>
+
+<pre><code>void hrtimer_interrupt(struct clock_event_device *dev)
+{
+        ......
+    for (i = 0; i &lt; HRTIMER_MAX_CLOCK_BASES; i++) {
+                ......
+        while ((node = timerqueue_getnext(&amp;base-&gt;active))) {
+                        ......
+            if (basenow.tv64 &lt; hrtimer_get_softexpires_tv64(timer)) {
+                ktime_t expires;
+
+                expires = ktime_sub(hrtimer_get_expires(timer),
+                            base-&gt;offset);
+                if (expires.tv64 &lt; expires_next.tv64)
+                    expires_next = expires;
+                break;
+            }
+
+            __run_hrtimer(timer, &amp;basenow);
+        }
+    }
+
+    /* 
+     * Store the new expiry value so the migration code can verify 
+     * against it. 
+     */
+    cpu_base-&gt;expires_next = expires_next;
+    raw_spin_unlock(&amp;cpu_base-&gt;lock);
+
+    /* Reprogramming necessary ? */
+    if (expires_next.tv64 == KTIME_MAX ||
+        !tick_program_event(expires_next, 0)) {
+        cpu_base-&gt;hang_detected = 0;
+        return;
+    }
+
+如果这时的tick_program_event返回了非0值，表示过期时间已经在当前时间的前面，这通常由以下原因造成：
+
+    系统正在被调试跟踪，导致时间在走，程序不走；
+    定时器的回调函数花了太长的时间；
+    系统运行在虚拟机中，而虚拟机被调度导致停止运行；
+
+为了避免这些情况的发生，接下来系统提供3次机会，重新执行前面的循环，处理到期的定时器：
+
+
+    raw_spin_lock(&amp;cpu_base-&gt;lock);
+    now = hrtimer_update_base(cpu_base);
+    cpu_base-&gt;nr_retries++;
+    if (++retries &lt; 3)
+        goto retry;
+
+如果3次循环后还无法完成到期处理，系统不再循环，转为计算本次总循环的时间，
+然后把tick_device的到期时间强制设置为当前时间加上本次的总循环时间，不过推后的时间被限制在100ms以内：
+
+
+    delta = ktime_sub(now, entry_time);
+    if (delta.tv64 &gt; cpu_base-&gt;max_hang_time.tv64)
+        cpu_base-&gt;max_hang_time = delta;
+    /* 
+     * Limit it to a sensible value as we enforce a longer 
+     * delay. Give the CPU at least 100ms to catch up. 
+     */
+    if (delta.tv64 &gt; 100 * NSEC_PER_MSEC)
+        expires_next = ktime_add_ns(now, 100 * NSEC_PER_MSEC);
+    else
+        expires_next = ktime_add(now, delta);
+    tick_program_event(expires_next, 1);
+    printk_once(KERN_WARNING "hrtimer: interrupt took %llu ns\n",
+            ktime_to_ns(delta));
+}
+</code></pre>
+
+<pre><code>
+#### 3. 切换到高精度模式
+
+上面提到，尽管内核配置成支持高精度定时器，但并不是一开始就工作于高精度模式，系统在启动的开始阶段，还是按照传统的模式在运行：tick_device按HZ频率定期地产生tick事件，这时的hrtimer工作在低分辨率模式，到期事件在每个tick事件中断中由hrtimer_run_queues函数处理，同时，在低分辨率定时器（时间轮）的软件中断TIMER_SOFTIRQ中，hrtimer_run_pending会被调用，系统在这个函数中判断系统的条件是否满足切换到高精度模式，如果条件满足，则会切换至高分辨率模式，另外提一下，NO_HZ模式也是在该函数中判断并切换。
+</code></pre>
+
+<pre><code>void hrtimer_run_pending(void)
+{
+    if (hrtimer_hres_active())
+        return;
+        ......
+    if (tick_check_oneshot_change(!hrtimer_is_hres_enabled()))
+        hrtimer_switch_to_hres();
+}
+</code></pre>
+
+<pre><code>
+因为不管系统是否工作于高精度模式，每个TIMER_SOFTIRQ期间，该函数都会被调用，所以函数一开始先用hrtimer_hres_active判断目前高精度模式是否已经激活，如果已经激活，则说明之前的调用中已经切换了工作模式，不必再次切换，直接返回。hrtimer_hres_active很简单：
+</code></pre>
+
+<pre><code>DEFINE_PER_CPU(struct hrtimer_cpu_base, hrtimer_bases) = {
+        ......
+}
+
+static inline int hrtimer_hres_active(void)
+{
+    return __this_cpu_read(hrtimer_bases.hres_active);
+}
+</code></pre>
+
+<pre><code>
+hrtimer_run_pending函数接着通过tick_check_oneshot_change判断系统是否可以切换到高精度模式，
+</code></pre>
+
+<pre><code>int tick_check_oneshot_change(int allow_nohz)
+{
+    struct tick_sched *ts = &amp;__get_cpu_var(tick_cpu_sched);
+
+    if (!test_and_clear_bit(0, &amp;ts-&gt;check_clocks))
+        return 0;
+
+    if (ts-&gt;nohz_mode != NOHZ_MODE_INACTIVE)
+        return 0;
+
+    if (!timekeeping_valid_for_hres() || !tick_is_oneshot_available())
+        return 0;
+
+    if (!allow_nohz)
+        return 1;
+
+    tick_nohz_switch_to_nohz();
+    return 0;
+}
+</code></pre>
+
+<pre><code>
+函数的一开始先判断check_clock标志的第0位是否被置位，如果没有置位，说明系统中没有注册符合要求的时钟事件设备，函数直接返回，check_clock标志由clocksource和clock_event_device系统的notify系统置位，当系统中有更高精度的clocksource被注册和选择后，或者有更精确的支持CLOCK_EVT_MODE_ONESHOT模式的clock_event_device被注册时，通过它们的notify函数，check_clock标志的第0为会置位。
+
+如果tick_sched结构中的nohz_mode字段不是NOHZ_MODE_INACTIVE，表明系统已经切换到其它模式，直接返回。nohz_mode的取值有3种：
+
+    NOHZ_MODE_INACTIVE    // 未启用NO_HZ模式
+    NOHZ_MODE_LOWRES      // 启用NO_HZ模式，hrtimer工作于低精度模式下
+    NOHZ_MODE_HIGHRES     // 启用NO_HZ模式，hrtimer工作于高精度模式下
+
+接下来的timerkeeping_valid_for_hres判断timekeeper系统是否支持高精度模式，tick_is_oneshot_available判断tick_device是否支持CLOCK_EVT_MODE_ONESHOT模式。如果都满足要求，则继续往下判断。allow_nohz是函数的参数，为true表明可以切换到NOHZ_MODE_LOWRES 模式，函数将进入tick_nohz_switch_to_nohz，切换至NOHZ_MODE_LOWRES 模式，这里我们传入的allow_nohz是表达式：
+</code></pre>
+
+<pre><code>(!hrtimer_is_hres_enabled())
+</code></pre>
+
+<pre><code>
+所以当系统不允许高精度模式时，将会在tick_check_oneshot_change函数内，通过tick_nohz_switch_to_nohz切换至NOHZ_MODE_LOWRES 模式，如果系统允许高精度模式，传入的allow_nohz参数为false，tick_check_oneshot_change函数返回1，回到上面的hrtimer_run_pending函数，hrtimer_switch_to_hres函数将会被调用，已完成切换到NOHZ_MODE_HIGHRES高精度模式。好啦，真正的切换函数找到了，我们看一看它如何切换：
+
+首先，它通过hrtimer_cpu_base中的hres_active字段判断该cpu是否已经切换至高精度模式，如果是则直接返回：
+</code></pre>
+
+<pre><code>static int hrtimer_switch_to_hres(void)
+{
+    int i, cpu = smp_processor_id();
+    struct hrtimer_cpu_base *base = &amp;per_cpu(hrtimer_bases, cpu);
+    unsigned long flags;
+
+    if (base-&gt;hres_active)
+        return 1;
+
+接着，通过tick_init_highres函数接管tick_device关联的clock_event_device：
+
+    local_irq_save(flags);
+
+    if (tick_init_highres()) {
+        local_irq_restore(flags);
+        printk(KERN_WARNING "Could not switch to high resolution "
+                    "mode on CPU %d\n", cpu);
+        return 0;
+    }
+</code></pre>
+
+<pre><code>
+tick_init_highres函数把tick_device切换到CLOCK_EVT_FEAT_ONESHOT模式，同时把clock_event_device的回调handler设置为hrtimer_interrupt，这样设置以后，tick_device的中断回调将由hrtimer_interrupt接管，hrtimer_interrupt在上面已经讨论过，它将完成高精度定时器的调度和到期处理。
+
+接着，设置hres_active标志，以表明高精度模式已经切换，然后把3个时间基准系统的resolution字段设为KTIME_HIGH_RES：
+</code></pre>
+
+<pre><code>    base-&gt;hres_active = 1;
+    for (i = 0; i &lt; HRTIMER_MAX_CLOCK_BASES; i++)
+        base-&gt;clock_base[i].resolution = KTIME_HIGH_RES;
+</code></pre>
+
+<pre><code>
+最后，因为tick_device被高精度定时器接管，它将不会再提供原有的tick事件机制，所以需要由高精度定时器系统模拟一个tick事件设备，继续为系统提供tick事件能力，这个工作由tick_setup_sched_timer函数完成。因为刚刚完成切换，tick_device的到期时间并没有被正确地设置为下一个到期定时器的时间，这里使用retrigger_next_event函数，传入参数NULL，使得tick_device立刻产生到期中断，hrtimer_interrupt被调用一次，然后下一个到期的定时器的时间会编程到tick_device中，从而完成了到高精度模式的切换：
+</code></pre>
+
+<pre><code>    tick_setup_sched_timer();
+    /* "Retrigger" the interrupt to get things going */
+    retrigger_next_event(NULL);
+    local_irq_restore(flags);
+    return 1;
+</code></pre>
+
+<pre><code>
+整个切换过程可以用下图表示：
+
+![](/images/kernel/2017-07-23-6.png)
+
+图3.1  低精度模式切换至高精度模式
+
+#### 4. 模拟tick事件
+
+根据上一节的讨论，当系统切换到高精度模式后，tick_device被高精度定时器系统接管，不再定期地产生tick事件，我们知道，到目前的版本为止（V3.4），内核还没有彻底废除jiffies机制，系统还是依赖定期到来的tick事件，供进程调度系统和时间更新等操作，大量存在的低精度定时器也仍然依赖于jiffies的计数，所以，尽管tick_device被接管，高精度定时器系统还是要想办法继续提供定期的tick事件。为了达到这一目的，内核使用了一个取巧的办法：既然高精度模式已经启用，可以定义一个hrtimer，把它的到期时间设定为一个jiffy的时间，当这个hrtimer到期时，在这个hrtimer的到期回调函数中，进行和原来的tick_device同样的操作，然后把该hrtimer的到期时间顺延一个jiffy周期，如此反复循环，完美地模拟了原有tick_device的功能。下面我们看看具体点代码是如何实现的。
+
+在kernel/time/tick-sched.c中，内核定义了一个per_cpu全局变量：tick_cpu_sched，从而为每个cpu提供了一个tick_sched结构， 该结构主要用于管理NO_HZ配置下的tickless处理，因为模拟tick事件与tickless有很强的相关性，所以高精度定时器系统也利用了该结构的以下字段，用于完成模拟tick事件的操作：
+</code></pre>
+
+<pre><code>struct tick_sched {
+    struct hrtimer          sched_timer;
+    unsigned long           check_clocks;
+    enum tick_nohz_mode     nohz_mode;
+        ......
+};
+</code></pre>
+
+<pre><code>
+sched_timer就是要用于模拟tick事件的hrtimer，check_clock上面几节已经讨论过，用于notify系统通知hrtimer系统需要检查是否切换到高精度模式，nohz_mode则用于表示当前的工作模式。
+
+上一节提到，用于切换至高精度模式的函数是hrtimer_switch_to_hres，在它的最后，调用了函数tick_setup_sched_timer，该函数的作用就是设置一个用于模拟tick事件的hrtimer：
+</code></pre>
+
+<pre><code>void tick_setup_sched_timer(void)
+{
+    struct tick_sched *ts = &amp;__get_cpu_var(tick_cpu_sched);
+    ktime_t now = ktime_get();
+
+    /* 
+     * Emulate tick processing via per-CPU hrtimers: 
+     */
+    hrtimer_init(&amp;ts-&gt;sched_timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
+    ts-&gt;sched_timer.function = tick_sched_timer;
+
+    /* Get the next period (per cpu) */
+    hrtimer_set_expires(&amp;ts-&gt;sched_timer, tick_init_jiffy_update());
+
+    for (;;) {
+        hrtimer_forward(&amp;ts-&gt;sched_timer, now, tick_period);
+        hrtimer_start_expires(&amp;ts-&gt;sched_timer,
+                      HRTIMER_MODE_ABS_PINNED);
+        /* Check, if the timer was already in the past */
+        if (hrtimer_active(&amp;ts-&gt;sched_timer))
+            break;
+        now = ktime_get();
+    }
+
+#ifdef CONFIG_NO_HZ
+    if (tick_nohz_enabled)
+        ts-&gt;nohz_mode = NOHZ_MODE_HIGHRES;
+#endif
+}
+</code></pre>
+
+<pre><code>
+该函数首先初始化该cpu所属的tick_sched结构中sched_timer字段，把该hrtimer的回调函数设置为tick_sched_timer，然后把它的到期时间设定为下一个jiffy时刻，返回前把工作模式设置为NOHZ_MODE_HIGHRES，表明是利用高精度模式实现NO_HZ。
+
+接着我们关注一下hrtimer的回调函数tick_sched_timer，我们知道，系统中的jiffies计数，时间更新等是全局操作，在smp系统中，只有一个cpu负责该工作，所以在tick_sched_timer的一开始，先判断当前cpu是否负责更新jiffies和时间，如果是，则执行更新操作：
+</code></pre>
+
+<pre><code>static enum hrtimer_restart tick_sched_timer(struct hrtimer *timer)
+{
+        ......
+
+#ifdef CONFIG_NO_HZ
+    if (unlikely(tick_do_timer_cpu == TICK_DO_TIMER_NONE))
+        tick_do_timer_cpu = cpu;
+#endif
+
+    /* Check, if the jiffies need an update */
+    if (tick_do_timer_cpu == cpu)
+        tick_do_update_jiffies64(now);
+
+然后，利用regs指针确保当前是在中断上下文中，然后调用update_process_timer：
+
+    if (regs) {
+                   ......
+        update_process_times(user_mode(regs));
+        ......
+    }
+
+最后，把hrtimer的到期时间推进一个tick周期，返回HRTIMER_RESTART表明该hrtimer需要再次启动，以便产生下一个tick事件。
+
+    hrtimer_forward(timer, now, tick_period);
+
+    return HRTIMER_RESTART;
+}
+</code></pre>
+
+<p>```</p>
+
+<p>关于update_process_times，如果你你感兴趣，回看一下本系列关于clock_event_device的那一章：Linux时间子系统之四：定时器的引擎：clock_event_device中的第5小节，对比一下模拟tick事件的hrtimer的回调函数tick_sched_timer和切换前tick_device的回调函数tick_handle_periodic，它们是如此地相像，实际上，它们几乎完成了一样的工作。</p>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[Linux时间子系统之五：低分辨率定时器的原理和实现]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2017/07/23/kernel-clock-5/"/>
+    <updated>2017-07-23T16:38:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2017/07/23/kernel-clock-5</id>
+    <content type="html"><![CDATA[<p><a href="http://blog.csdn.net/DroidPhone/article/details/8051405">http://blog.csdn.net/DroidPhone/article/details/8051405</a></p>
+
+<p>利用定时器，我们可以设定在未来的某一时刻，触发一个特定的事件。所谓低分辨率定时器，是指这种定时器的计时单位基于jiffies值的计数，也就是说，它的精度只有1/HZ，假如你的内核配置的HZ是1000，那意味着系统中的低分辨率定时器的精度就是1ms。早期的内核版本中，内核并不支持高精度定时器，理所当然只能使用这种低分辨率定时器，我们有时候把这种基于HZ的定时器机制成为时间轮：time wheel。虽然后来出现了高分辨率定时器，但它只是内核的一个可选配置项，所以直到目前最新的内核版本，这种低分辨率定时器依然被大量地使用着。</p>
+
+<h4>1. 定时器的使用方法</h4>
+
+<p>在讨论定时器的实现原理之前，我们先看看如何使用定时器。要在内核编程中使用定时器，首先我们要定义一个time_list结构，该结构在include/Linux/timer.h中定义：</p>
+
+<pre><code>    struct timer_list {
+        /* 
+         * All fields that change during normal runtime grouped to the 
+         * same cacheline 
+         */
+        struct list_head entry;
+        unsigned long expires;
+        struct tvec_base *base;
+
+        void (*function)(unsigned long);
+        unsigned long data;
+
+        int slack;
+            ......
+    };
+
+    entry  字段用于把一组定时器组成一个链表，至于内核如何对定时器进行分组，我们会在后面进行解释。
+
+    expires  字段指出了该定时器的到期时刻，也就是期望定时器到期时刻的jiffies计数值。
+
+    base  每个cpu拥有一个自己的用于管理定时器的tvec_base结构，该字段指向该定时器所属的cpu所对应tvec_base结构。
+
+    function  字段是一个函数指针，定时器到期时，系统将会调用该回调函数，用于响应该定时器的到期事件。
+
+    data  该字段用于上述回调函数的参数。
+
+    slack  对有些对到期时间精度不太敏感的定时器，到期时刻允许适当地延迟一小段时间，该字段用于计算每次延迟的HZ数。
+</code></pre>
+
+<p>要定义一个timer_list，我们可以使用静态和动态两种办法，静态方法使用DEFINE_TIMER宏：
+<code>
+    #define DEFINE_TIMER(_name, _function, _expires, _data)
+</code></p>
+
+<p>该宏将得到一个名字为<em>name，并分别用</em>function,<em>expires,</em>data参数填充timer_list的相关字段。</p>
+
+<p>如果要使用动态的方法，则可以自己声明一个timer_list结构，然后手动初始化它的各个字段：</p>
+
+<pre><code>    struct timer_list timer;
+    ......
+    init_timer(&amp;timer);
+    timer.function = _function;
+    timer.expires = _expires;
+    timer.data = _data;
+</code></pre>
+
+<p>要激活一个定时器，我们只要调用add_timer即可：</p>
+
+<pre><code>    add_timer(&amp;timer);
+</code></pre>
+
+<p>要修改定时器的到期时间，我们只要调用mod_timer即可：</p>
+
+<pre><code>    mod_timer(&amp;timer, jiffies+50);
+</code></pre>
+
+<p>要移除一个定时器，我们只要调用del_timer即可：</p>
+
+<pre><code>    del_timer(&amp;timer);
+</code></pre>
+
+<p>定时器系统还提供了以下这些API供我们使用：</p>
+
+<pre><code>    void add_timer_on(struct timer_list *timer, int cpu);  // 在指定的cpu上添加定时器
+    int mod_timer_pending(struct timer_list *timer, unsigned long expires);  //  只有当timer已经处在激活状态时，才修改timer的到期时刻
+    int mod_timer_pinned(struct timer_list *timer, unsigned long expires);  //  当
+    void set_timer_slack(struct timer_list *time, int slack_hz);  //  设定timer允许的到期时刻的最大延迟，用于对精度不敏感的定时器
+    int del_timer_sync(struct timer_list *timer);  //  如果该timer正在被处理中，则等待timer处理完成才移除该timer
+</code></pre>
+
+<h4>2. 定时器的软件架构</h4>
+
+<p>低分辨率定时器是基于HZ来实现的，也就是说，每个tick周期，都有可能有定时器到期，关于tick如何产生，请参考：Linux时间子系统之四：定时器的引擎：clock_event_device。系统中有可能有成百上千个定时器，难道在每个tick中断中遍历一下所有的定时器，检查它们是否到期？内核当然不会使用这么笨的办法，它使用了一个更聪明的办法：按定时器的到期时间对定时器进行分组。因为目前的多核处理器使用越来越广泛，连智能手机的处理器动不动就是4核心，内核对多核处理器有较好的支持，低分辨率定时器在实现时也充分地考虑了多核处理器的支持和优化。为了较好地利用cache line，也为了避免cpu之间的互锁，内核为多核处理器中的每个cpu单独分配了管理定时器的相关数据结构和资源，每个cpu独立地管理属于自己的定时器。</p>
+
+<h5>2.1  定时器的分组</h5>
+
+<p>首先，内核为每个cpu定义了一个tvec_base结构指针：</p>
+
+<pre><code>    static DEFINE_PER_CPU(struct tvec_base *, tvec_bases) = &amp;boot_tvec_bases;
+</code></pre>
+
+<p>tvec_base结构的定义如下：</p>
+
+<pre><code>    struct tvec_base {
+        spinlock_t lock;
+        struct timer_list *running_timer;
+        unsigned long timer_jiffies;
+        unsigned long next_timer;
+        struct tvec_root tv1;
+        struct tvec tv2;
+        struct tvec tv3;
+        struct tvec tv4;
+        struct tvec tv5;
+    } ____cacheline_aligned;
+
+running_timer  该字段指向当前cpu正在处理的定时器所对应的timer_list结构。
+
+timer_jiffies  该字段表示当前cpu定时器所经历过的jiffies数，大多数情况下，该值和jiffies计数值相等，当cpu的idle状态连续持续了多个jiffies时间时，当退出idle状态时，jiffies计数值就会大于该字段，在接下来的tick中断后，定时器系统会让该字段的值追赶上jiffies值。
+
+next_timer  该字段指向该cpu下一个即将到期的定时器。
+
+tv1--tv5  这5个字段用于对定时器进行分组，实际上，tv1--tv5都是一个链表数组，其中tv1的数组大小为TVR_SIZE， tv2 tv3 tv4 tv5的数组大小为TVN_SIZE，根据CONFIG_BASE_SMALL配置项的不同，它们有不同的大小：
+</code></pre>
+
+<pre><code>    #define TVN_BITS (CONFIG_BASE_SMALL ? 4 : 6)
+    #define TVR_BITS (CONFIG_BASE_SMALL ? 6 : 8)
+    #define TVN_SIZE (1 &lt;&lt; TVN_BITS)
+    #define TVR_SIZE (1 &lt;&lt; TVR_BITS)
+    #define TVN_MASK (TVN_SIZE - 1)
+    #define TVR_MASK (TVR_SIZE - 1)
+
+    struct tvec {
+        struct list_head vec[TVN_SIZE];
+    };
+
+    struct tvec_root {
+        struct list_head vec[TVR_SIZE];
+    };
+</code></pre>
+
+<p>默认情况下，没有使能CONFIG_BASE_SMALL，TVR_SIZE的大小是256，TVN_SIZE的大小则是64，当需要节省内存空间时，也可以使能CONFIG_BASE_SMALL，这时TVR_SIZE的大小是64，TVN_SIZE的大小则是16，以下的讨论我都是基于没有使能CONFIG_BASE_SMALL的情况。当有一个新的定时器要加入时，系统根据定时器到期的jiffies值和timer_jiffies字段的差值来决定该定时器被放入tv1至tv5中的哪一个数组中，最终，系统中所有的定时器的组织结构如下图所示：</p>
+
+<p><img src="/images/kernel/2017-07-23-4.png" alt="" /></p>
+
+<p>图 2.1.1  定时器在系统中的组织结构</p>
+
+<h5>2.2  定时器的添加</h5>
+
+<p>要加入一个新的定时器，我们可以通过api函数add_timer或mod_timer来完成，最终的工作会交由internal_add_timer函数来处理。该函数按以下步骤进行处理：</p>
+
+<p>计算定时器到期时间和所属cpu的tvec_base结构中的timer_jiffies字段的差值，记为idx；</p>
+
+<p>根据idx的值，选择该定时器应该被放到tv1&ndash;tv5中的哪一个链表数组中，可以认为tv1-tv5分别占据一个32位数的不同比特位，tv1占据最低的8位，tv2占据紧接着的6位，然后tv3再占位，以此类推，最高的6位分配给tv5。最终的选择规则如下表所示：</p>
+
+<pre><code>    链表数组    idx范围
+    tv1     0-255(2^8)
+    tv2     256--16383(2^14)
+    tv3     16384--1048575(2^20)
+    tv4     1048576--67108863(2^26)
+    tv5     67108864--4294967295(2^32)
+</code></pre>
+
+<p>确定链表数组后，接着要确定把该定时器放入数组中的哪一个链表中，如果时间差idx小于256，按规则要放入tv1中，因为tv1包含了256个链表，所以可以简单地使用timer_list.expires的低8位作为数组的索引下标，把定时器链接到tv1中相应的链表中即可。如果时间差idx的值在256&ndash;18383之间，则需要把定时器放入tv2中，同样的，使用timer_list.expires的8&ndash;14位作为数组的索引下标，把定时器链接到tv2中相应的链表中,。定时器要加入tv3 tv4 tv5使用同样的原理。经过这样分组后的定时器，在后续的tick事件中，系统可以很方便地定位并取出相应的到期定时器进行处理。以上的讨论都体现在internal_add_timer的代码中：</p>
+
+<pre><code>    static void internal_add_timer(struct tvec_base *base, struct timer_list *timer)
+    {
+        unsigned long expires = timer-&gt;expires;
+        unsigned long idx = expires - base-&gt;timer_jiffies;
+        struct list_head *vec;
+
+        if (idx &lt; TVR_SIZE) {
+            int i = expires &amp; TVR_MASK;
+            vec = base-&gt;tv1.vec + i;
+        } else if (idx &lt; 1 &lt;&lt; (TVR_BITS + TVN_BITS)) {
+            int i = (expires &gt;&gt; TVR_BITS) &amp; TVN_MASK;
+            vec = base-&gt;tv2.vec + i;
+        } else if (idx &lt; 1 &lt;&lt; (TVR_BITS + 2 * TVN_BITS)) {
+            int i = (expires &gt;&gt; (TVR_BITS + TVN_BITS)) &amp; TVN_MASK;
+            vec = base-&gt;tv3.vec + i;
+        } else if (idx &lt; 1 &lt;&lt; (TVR_BITS + 3 * TVN_BITS)) {
+            int i = (expires &gt;&gt; (TVR_BITS + 2 * TVN_BITS)) &amp; TVN_MASK;
+            vec = base-&gt;tv4.vec + i;
+        } else if ((signed long) idx &lt; 0) {
+                    ......
+        } else {
+                    ......
+            i = (expires &gt;&gt; (TVR_BITS + 3 * TVN_BITS)) &amp; TVN_MASK;
+            vec = base-&gt;tv5.vec + i;
+        }
+        list_add_tail(&amp;timer-&gt;entry, vec);
+    }
+</code></pre>
+
+<h5>2.2  定时器的到期处理</h5>
+
+<p>经过2.1节的处理后，系统中的定时器按到期时间有规律地放置在tv1&ndash;tv5各个链表数组中，其中tv1中放置着在接下来的256个jiffies即将到期的定时器列表，需要注意的是，并不是tv1.vec[0]中放置着马上到期的定时器列表，tv1.vec[1]中放置着将在jiffies+1到期的定时器列表。因为base.timer_jiffies的值一直在随着系统的运行而动态地增加，原则上是每个tick事件会加1，base.timer_jiffies代表者该cpu定时器系统当前时刻，定时器也是动态地加入头256个链表tv1中，按2.1节的讨论，定时器加入tv1中使用的下标索引是定时器到期时间expires的低8位，所以假设当前的base.timer_jiffies值是0x34567826，则马上到期的定时器是在tv1.vec[0x26]中，如果这时候系统加入一个在jiffies值0x34567828到期的定时器，他将会加入到tv1.vec[0x28]中，运行两个tick后，base.timer_jiffies的值会变为0x34567828，很显然，在每次tick事件中，定时器系统只要以base.timer_jiffies的低8位作为索引，取出tv1中相应的链表，里面正好包含了所有在该jiffies值到期的定时器列表。</p>
+
+<p>那什么时候处理tv2&ndash;tv5中的定时器？每当base.timer_jiffies的低8位为0值时，这表明base.timer_jiffies的第8-13位有进位发生，这6位正好代表着tv2，这时只要按base.timer_jiffies的第8-13位的值作为下标，移出tv2中对应的定时器链表，然后用internal_add_timer把它们从新加入到定时器系统中来，因为这些定时器一定会在接下来的256个tick期间到期，所以它们肯定会被加入到tv1数组中，这样就完成了tv2往tv1迁移的过程。同样地，当base.timer_jiffies的第8-13位为0时，这表明base.timer_jiffies的第14-19位有进位发生，这6位正好代表着tv3，按base.timer_jiffies的第14-19位的值作为下标，移出tv3中对应的定时器链表，然后用internal_add_timer把它们从新加入到定时器系统中来，显然它们会被加入到tv2中，从而完成tv3到tv2的迁移，tv4，tv5的处理可以以此作类推。具体迁移的代码如下，参数index为事先计算好的高一级tv的需要迁移的数组索引：</p>
+
+<pre><code>    static int cascade(struct tvec_base *base, struct tvec *tv, int index)
+    {
+        /* cascade all the timers from tv up one level */
+        struct timer_list *timer, *tmp;
+        struct list_head tv_list;
+
+        list_replace_init(tv-&gt;vec + index, &amp;tv_list);  //  移除需要迁移的链表
+
+        /* 
+         * We are removing _all_ timers from the list, so we 
+         * don't have to detach them individually. 
+         */
+        list_for_each_entry_safe(timer, tmp, &amp;tv_list, entry) {
+            BUG_ON(tbase_get_base(timer-&gt;base) != base);
+                    //  重新加入到定时器系统中，实际上将会迁移到下一级的tv数组中
+            internal_add_timer(base, timer);  
+        }
+
+        return index;
+    }
+</code></pre>
+
+<p>每个tick事件到来时，内核会在tick定时中断处理期间激活定时器软中断：TIMER_SOFTIRQ，关于软件中断，请参考另一篇博文：Linux中断（interrupt）子系统之五：软件中断（softIRQ。TIMER_SOFTIRQ的执行函数是<code>__run_timers</code>，它实现了本节讨论的逻辑，取出tv1中到期的定时器，执行定时器的回调函数，由此可见，低分辨率定时器的回调函数是执行在软件中断上下文中的，这点在写定时器的回调函数时需要注意。<code>__run_timers</code>的代码如下：</p>
+
+<pre><code>    static inline void __run_timers(struct tvec_base *base)
+    {
+        struct timer_list *timer;
+
+        spin_lock_irq(&amp;base-&gt;lock);
+            /* 同步jiffies，在NO_HZ情况下，base-&gt;timer_jiffies可能落后不止一个tick  */
+        while (time_after_eq(jiffies, base-&gt;timer_jiffies)) {  
+            struct list_head work_list;
+            struct list_head *head = &amp;work_list;
+                    /*  计算到期定时器链表在tv1中的索引  */
+            int index = base-&gt;timer_jiffies &amp; TVR_MASK;  
+
+            /* 
+             * /*  tv2--tv5定时器列表迁移处理  */
+             */
+            if (!index &amp;&amp;
+                (!cascade(base, &amp;base-&gt;tv2, INDEX(0))) &amp;&amp;              
+                    (!cascade(base, &amp;base-&gt;tv3, INDEX(1))) &amp;&amp;      
+                        !cascade(base, &amp;base-&gt;tv4, INDEX(2)))  
+                cascade(base, &amp;base-&gt;tv5, INDEX(3));  
+                    /*  该cpu定时器系统运行时间递增一个tick  */                 
+            ++base-&gt;timer_jiffies;  
+                    /*  取出到期的定时器链表  */                                       
+            list_replace_init(base-&gt;tv1.vec + index, &amp;work_list);
+                    /*  遍历所有的到期定时器  */          
+            while (!list_empty(head)) {                                    
+                void (*fn)(unsigned long);
+                unsigned long data;
+
+                timer = list_first_entry(head, struct timer_list,entry);
+                fn = timer-&gt;function;
+                data = timer-&gt;data;
+
+                timer_stats_account_timer(timer);
+
+                base-&gt;running_timer = timer;    /*  标记正在处理的定时器  */
+                detach_timer(timer, 1);
+
+                spin_unlock_irq(&amp;base-&gt;lock);
+                call_timer_fn(timer, fn, data);  /*  调用定时器的回调函数  */
+                spin_lock_irq(&amp;base-&gt;lock);
+            }
+        }
+        base-&gt;running_timer = NULL;
+        spin_unlock_irq(&amp;base-&gt;lock);
+    }
+</code></pre>
+
+<p>通过上面的讨论，我们可以发现，内核的低分辨率定时器的实现非常精妙，既实现了大量定时器的管理，又实现了快速的O(1)查找到期定时器的能力，利用巧妙的数组结构，使得只需在间隔256个tick时间才处理一次迁移操作，5个数组就好比是5个齿轮，它们随着base->timer_jifffies的增长而不停地转动，每次只需处理第一个齿轮的某一个齿节，低一级的齿轮转动一圈，高一级的齿轮转动一个齿，同时自动把即将到期的定时器迁移到上一个齿轮中，所以低分辨率定时器通常又被叫做时间轮：time wheel。事实上，它的实现是一个很好的空间换时间软件算法。</p>
+
+<h4>3. 定时器软件中断</h4>
+
+<p>系统初始化时，start_kernel会调用定时器系统的初始化函数init_timers：</p>
+
+<pre><code>    void __init init_timers(void)
+    {      
+        int err = timer_cpu_notify(&amp;timers_nb, (unsigned long)CPU_UP_PREPARE, 
+                    (void *)(long)smp_processor_id());
+
+        init_timer_stats();
+
+        BUG_ON(err != NOTIFY_OK);
+        register_cpu_notifier(&amp;timers_nb);  /* 注册cpu notify，以便在hotplug时在cpu之间进行定时器的迁移 */
+        open_softirq(TIMER_SOFTIRQ, run_timer_softirq);
+    }
+</code></pre>
+
+<p>可见，open_softirq把run_timer_softirq注册为TIMER_SOFTIRQ的处理函数，另外，当cpu的每个tick事件到来时，在事件处理中断中，update_process_times会被调用，该函数会进一步调用run_local_timers，run_local_timers会触发TIMER_SOFTIRQ软中断：</p>
+
+<pre><code>    void run_local_timers(void)
+    {
+        hrtimer_run_queues();
+        raise_softirq(TIMER_SOFTIRQ);
+    }
+</code></pre>
+
+<p>TIMER_SOFTIRQ的处理函数是run_timer_softirq：</p>
+
+<pre><code>    static void run_timer_softirq(struct softirq_action *h)
+    {
+        struct tvec_base *base = __this_cpu_read(tvec_bases);
+
+        hrtimer_run_pending();
+
+        if (time_after_eq(jiffies, base-&gt;timer_jiffies))
+            __run_timers(base);
+    }
+</code></pre>
+
+<p>好啦，终于看到<code>__run_timers</code>函数了，2.2节已经介绍过，正是这个函数完成了对到期定时器的处理工作，也完成了时间轮的不停转动。</p>
+]]></content>
+  </entry>
+  
+</feed>

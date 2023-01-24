@@ -1,0 +1,1227 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+
+  <title><![CDATA[Category: 2019~12 | kk Blog —— 通用基础]]></title>
+  <link href="http://abcdxyzk.github.io/blog/cats/2019~12/atom.xml" rel="self"/>
+  <link href="http://abcdxyzk.github.io/"/>
+  <updated>2023-01-24T19:27:19+08:00</updated>
+  <id>http://abcdxyzk.github.io/</id>
+  <author>
+    <name><![CDATA[kk]]></name>
+    
+  </author>
+  <generator uri="http://octopress.org/">Octopress</generator>
+
+  
+  <entry>
+    <title type="html"><![CDATA[DNS示例]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2019/12/21/dns-sample/"/>
+    <updated>2019-12-21T17:05:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2019/12/21/dns-sample</id>
+    <content type="html"><![CDATA[<p><a href="https://gist.github.com/fffaraz/9d9170b57791c28ccda9255b48315168">https://gist.github.com/fffaraz/9d9170b57791c28ccda9255b48315168</a></p>
+
+<h3>DNS 示例</h3>
+
+<pre><code>    // gcc dns.c -lpthread
+
+    #include &lt;stdio.h&gt;  //printf
+    #include &lt;string.h&gt; //strlen
+    #include &lt;stdlib.h&gt; //malloc
+    #include &lt;sys/socket.h&gt; //you know what this is for
+    #include &lt;arpa/inet.h&gt;  //inet_addr, inet_ntoa, ntohs etc
+    #include &lt;netinet/in.h&gt;
+    #include &lt;unistd.h&gt; //getpid
+    #include &lt;pthread.h&gt;
+    #include &lt;time.h&gt;
+
+    #define T_A 1   //IPv4 address
+    #define T_NS    2   //Nameserver
+    #define T_CNAME 5   // canonical name
+    #define T_SOA   6   /* start of authority zone */
+    #define T_PTR   12  /* domain name pointer */
+    #define T_MX    15  //Mail server
+    #define T_AAAA  28  // IPv6
+
+    #define NIPQUAD(addr) ((unsigned char *)addr)[0], ((unsigned char *)addr)[1], ((unsigned char *)addr)[2], ((unsigned char *)addr)[3]
+
+    //DNS header structure
+    struct DNS_HEADER
+    {
+        unsigned short id;  // identification number
+
+        unsigned char rd :1;    // recursion desired
+        unsigned char tc :1;    // truncated message
+        unsigned char aa :1;    // authoritive answer
+        unsigned char opcode :4;    // purpose of message
+        unsigned char qr :1;    // query/response flag
+
+        unsigned char rcode :4; // response code
+        unsigned char cd :1;    // checking disabled
+        unsigned char ad :1;    // authenticated data
+        unsigned char z :1; // its z! reserved
+        unsigned char ra :1;    // recursion available
+
+        unsigned short q_count; // number of question entries
+        unsigned short ans_count;   // number of answer entries
+        unsigned short auth_count;  // number of authority entries
+        unsigned short add_count; // number of resource entries
+    };
+
+    //Constant sized fields of query structure
+    struct QUESTION
+    {
+        unsigned short qtype;
+        unsigned short qclass;
+    };
+
+    //Constant sized fields of the resource record structure
+    #pragma pack(push, 1)
+    struct R_DATA
+    {
+        unsigned short type;
+        unsigned short _class;
+        unsigned int ttl;
+        unsigned short data_len;
+    };
+    #pragma pack(pop)
+
+    //Pointers to resource record contents
+    struct RES_RECORD
+    {
+        unsigned char *name;
+        struct R_DATA *resource;
+        unsigned char *rdata;
+    };
+
+    //Structure of a Query
+    typedef struct
+    {
+        unsigned char *name;
+        struct QUESTION *ques;
+    } QUERY;
+
+    // convert www.google.com to 3www6google3com
+    void ChangetoDnsNameFormat(unsigned char* dns, unsigned char* host)
+    {
+        int lock = 0, i;
+        for (i = 0; i &lt;= strlen(host); i ++) {
+            if (host[i] == '.' || host[i] == '\0') {
+                *dns++ = i - lock;
+                for( ; lock &lt; i; lock ++)
+                    *dns++ = host[lock];
+                lock ++;
+            }
+        }
+        *dns++ = '\0';
+    }
+
+    // convert 3www6google3com0 to www.google.com
+    void changeToHost(unsigned char *dns)
+    {
+        int i = 0, j = 0, p;
+
+        while (i &lt; 90 &amp;&amp; dns[i] &amp;&amp; i + dns[i] + 1 &lt; 90) {
+            p = dns[i];
+            i = i + p + 1;
+            while (p -- &amp;&amp; j &lt; 90) {
+                dns[j] = dns[j+1];
+                j ++;
+            }
+            dns[j++] = '.';
+        }
+        if (j == 0)
+            j = 1;
+        dns[j-1] = '\0'; //remove the last dot
+    }
+
+    int readName(unsigned char *reader, unsigned char *buffer, unsigned char *to, unsigned char *end)
+    {
+        unsigned char *start = reader;
+        unsigned int p = 0, step = 1, offset, count = 0;
+        int i, j;
+
+        //read the names in 3www6google3com format
+
+        while (reader &lt; end &amp;&amp; *reader != 0) {
+            if (*reader &gt;= 0xc0) {
+                offset = (*reader)*256 + *(reader+1) - 0xc000; //49152 = 11000000 00000000
+                reader = buffer + offset;
+                step = 0;
+            } else {
+                to[p++] = *reader ++;
+                count += step;
+            }
+            if (reader &gt; end)
+                goto err;
+        }
+        to[p] = '\0';
+        count += (step == 0) ? 2 : 1;
+
+        if (start + count &gt; end)
+            goto err;
+
+        changeToHost(to);
+
+        return count;
+    err:
+        return 1000000;
+    }
+
+    /*
+     * sending a packet
+     */
+    void sendPacket(int fd, struct sockaddr_in *dest, unsigned char *host, int query_type)
+    {
+        unsigned char buf[65536], *qname, *reader;
+        int i, j;
+
+        struct DNS_HEADER *dns = NULL;
+        struct QUESTION *qinfo = NULL;
+
+        //Set the DNS structure to standard queries
+        dns = (struct DNS_HEADER *)&amp;buf;
+
+        dns-&gt;id = htons(getpid());
+        dns-&gt;qr = 0; //This is a query
+        dns-&gt;opcode = 0; //This is a standard query
+        dns-&gt;aa = 0; //Not Authoritative
+        dns-&gt;tc = 0; //This message is not truncated
+        dns-&gt;rd = 1; //Recursion Desired
+        dns-&gt;ra = 0; //Recursion not available! hey we dont have it (lol)
+        dns-&gt;z = 0;
+        dns-&gt;ad = 0;
+        dns-&gt;cd = 0;
+        dns-&gt;rcode = 0;
+        dns-&gt;q_count = htons(1); //we have only 1 question
+        dns-&gt;ans_count = 0;
+        dns-&gt;auth_count = 0;
+        dns-&gt;add_count = 0;
+
+        //point to the query portion
+        qname = &amp;buf[sizeof(struct DNS_HEADER)];
+
+        ChangetoDnsNameFormat(qname, host);
+        qinfo = (struct QUESTION*)&amp;buf[sizeof(struct DNS_HEADER) + (strlen(qname) + 1)]; //fill it
+
+        qinfo-&gt;qtype = htons(query_type); //type of the query, A, MX, CNAME, NS etc
+        qinfo-&gt;qclass = htons(1); //its internet (lol)
+
+        if (sendto(fd, buf, sizeof(struct DNS_HEADER) + (strlen(qname) + 1) + sizeof(struct QUESTION), 0, (struct sockaddr*)dest, sizeof(*dest)) &lt; 0) {
+            perror("sendto failed");
+        }
+        printf("send Done\n");
+        return;
+    }
+
+    int expBuf(char buf[], int len)
+    {
+        unsigned char *end = buf + len;
+
+        struct DNS_HEADER *dns = NULL;
+        struct QUESTION *qinfo = NULL;
+        struct R_DATA *resource;
+
+        unsigned char *qname, *reader;
+
+        char name[256];
+        char rdata[256];
+        int i, j;
+
+        if (len &lt; sizeof(struct DNS_HEADER))
+            goto err;
+
+        dns = (struct DNS_HEADER*) buf;
+
+        printf("The response contains:\n");
+        printf("%d Questions.\n", ntohs(dns-&gt;q_count));
+        printf("%d Answers.\n", ntohs(dns-&gt;ans_count));
+        printf("%d Authoritative Servers.\n", ntohs(dns-&gt;auth_count));
+        printf("%d Additional records.\n\n", ntohs(dns-&gt;add_count));
+
+        //move ahead of the dns header and the query field
+        //reader = &amp;buf[sizeof(struct DNS_HEADER) + (strlen((const char*)qname) + 1) + sizeof(struct QUESTION)];
+        reader = &amp;buf[sizeof(struct DNS_HEADER)];
+
+        //Start reading answers
+        printf("Questions Records: %d\n", ntohs(dns-&gt;q_count));
+        for (i = 0; i &lt; ntohs(dns-&gt;q_count); i ++) {
+            reader += readName(reader, buf, name, end);
+            qinfo = (struct QUESTION *)reader;
+            reader = reader + sizeof(struct QUESTION);
+            if (reader &gt; end)
+                goto err;
+
+            printf("Name: %s Type: %d\n", name, ntohs(qinfo-&gt;qtype));
+        }
+        printf("\n");
+
+        printf("Answer Records: %d\n", ntohs(dns-&gt;ans_count));
+        for (i = 0; i &lt; ntohs(dns-&gt;ans_count); i++) {
+            reader += readName(reader, buf, name, end);
+            resource = (struct R_DATA*)(reader);
+            reader = reader + sizeof(struct R_DATA);
+            if (reader &gt; end)
+                goto err;
+
+            printf("Name: %s Type: %d ", name, ntohs(resource-&gt;type));
+
+            if (ntohs(resource-&gt;type) == T_A || ntohs(resource-&gt;type) == T_AAAA) { //if its an ipv4 address
+                if (reader + ntohs(resource-&gt;data_len) &gt; end)
+                    goto err;
+                printf("IPv4: %d.%d.%d.%d", NIPQUAD(reader));
+                reader = reader + ntohs(resource-&gt;data_len);
+            } else {
+                reader += readName(reader, buf, rdata, end);
+                if (reader &gt; end)
+                    goto err;
+                if (ntohs(resource-&gt;type) == T_CNAME)
+                    printf("CNAME: %s", rdata);
+            }
+            printf("\n");
+        }
+        printf("\n");
+
+        //read authorities
+        printf("Authoritive Records: %d\n", ntohs(dns-&gt;auth_count));
+        for(i = 0; i &lt; ntohs(dns-&gt;auth_count); i++) {
+            reader += readName(reader, buf, name, end);
+            resource = (struct R_DATA*)(reader);
+            reader += sizeof(struct R_DATA);
+            if (reader &gt; end)
+                goto err;
+
+            reader += readName(reader, buf, rdata, end);
+            if (reader &gt; end)
+                goto err;
+
+            printf("Name: %s Type: %d ", name, ntohs(resource-&gt;type));
+
+            if (ntohs(resource-&gt;type) == T_NS) {
+                printf("nameserver: %s", rdata);
+            }
+            printf("\n");
+        }
+        printf("\n");
+
+        //read additional
+        printf("Additional Records: %d\n", ntohs(dns-&gt;add_count));
+        for(i = 0; i &lt; ntohs(dns-&gt;add_count); i++) {
+            reader += readName(reader, buf, name, end);
+            resource = (struct R_DATA*)(reader);
+            reader += sizeof(struct R_DATA);
+            if (reader &gt; end)
+                goto err;
+
+            printf("Name: %s Type: %d ", name, ntohs(resource-&gt;type));
+
+            if (ntohs(resource-&gt;type) == T_A || ntohs(resource-&gt;type) == T_AAAA) {
+                if (reader + ntohs(resource-&gt;data_len) &gt; end)
+                    goto err;
+                printf("IPv4: %d.%d.%d.%d", NIPQUAD(reader));
+                reader = reader + ntohs(resource-&gt;data_len);
+            } else {
+                reader += readName(reader, buf, rdata, end);
+                if (reader &gt; end)
+                    goto err;
+            }
+            printf("\n");
+        }
+        printf("\n\n");
+        return 0;
+    err:
+        printf("\n\n");
+        return -1;
+    }
+
+    void *recvPacket(void *arg)
+    {
+        int fd = *((int *)arg);
+        struct sockaddr_in dest;
+        unsigned char buf[65536];
+        int s, len;
+
+        while (1) {
+            //Receive the answer
+            s = sizeof(dest);
+            if ((len = recvfrom(fd, buf, 65536, 0, (struct sockaddr*)&amp;dest, (socklen_t*)&amp;s)) &lt; 0) {
+                perror("recvfrom failed");
+            }
+            printf("recv Done. len=%d\n", len);
+            if (expBuf(buf, len)) {
+                printf("exp err\n");
+            }
+        }
+    }
+
+    /*
+     * Get the DNS servers from /etc/resolv.conf file on Linux
+     */
+    void get_dns_servers(char dns_servers[])
+    {
+        FILE *fp;
+        char line[200], *p;
+        if ((fp = fopen("/etc/resolv.conf", "r")) == NULL) {
+            printf("Failed opening /etc/resolv.conf file \n");
+        }
+
+        while (fgets(line, 200, fp)) {
+            if (line[0] == '#') {
+                continue;
+            }
+            if (strncmp(line, "nameserver", 10) == 0) {
+                p = strtok(line, " ");
+                p = strtok(NULL, " ");
+
+                //p now is the dns ip :)
+                //????
+            }
+        }
+
+        strcpy(dns_servers, "127.0.1.1");
+    }
+
+    int main(int argc, char *argv[])
+    {
+        int fd;
+        struct sockaddr_in dest;
+        unsigned char hostname[100];
+        pthread_t tid;
+
+        char dns_servers[100];
+
+        //Get the DNS servers from the resolv.conf file
+        get_dns_servers(dns_servers);
+
+        dest.sin_family = AF_INET;
+        dest.sin_port = htons(53);
+        dest.sin_addr.s_addr = inet_addr(dns_servers);
+
+        fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+
+        if (pthread_create(&amp;tid, NULL, recvPacket, (void *)&amp;fd)) {
+            printf("pthread err\n");
+            exit(-1);
+        }
+
+        while (1) {
+            printf("Enter Hostname to Lookup: ");
+            scanf("%s", hostname);
+            sendPacket(fd, &amp;dest, hostname, T_A);
+            usleep(500000);
+        }
+
+        pthread_join(tid, NULL);
+        return 0;
+    }
+</code></pre>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[API购买CVM]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2019/12/12/buy-cvm/"/>
+    <updated>2019-12-12T17:26:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2019/12/12/buy-cvm</id>
+    <content type="html"><![CDATA[<h4>CVM 添加辅助网卡并绑定多 IP</h4>
+
+<p><a href="https://cloud.tencent.com/document/product/1199/44153">https://cloud.tencent.com/document/product/1199/44153</a></p>
+
+<pre><code>    $ vim /etc/network/interfaces   # 增加如下
+
+    auto eth1
+    iface eth1 inet static
+    address 172.19.0.13
+    netmask 172.19.15.255
+    gateway 172.19.0.1
+
+    $ ifconfig eth1 172.19.0.13/20
+
+    $ find /proc/sys/net/ -name rp_filter -exec sh -c "echo 0 &gt; {} " \;
+    $ find /proc/sys/net/ -name rp_filter -exec cat {} \;
+</code></pre>
+
+<hr />
+
+<h2>python</h2>
+
+<p>代理设置
+export http_proxy=<a href="http://">http://</a></p>
+
+<p>export https_proxy=<a href="http://">http://</a></p>
+
+<h4>SDK</h4>
+
+<h5>手动安装</h5>
+
+<p><a href="https://github.com/TencentCloud/tencentcloud-sdk-python">https://github.com/TencentCloud/tencentcloud-sdk-python</a></p>
+
+<p>git clone <a href="https://github.com/TencentCloud/tencentcloud-sdk-python.git">https://github.com/TencentCloud/tencentcloud-sdk-python.git</a></p>
+
+<p>python setup.py install</p>
+
+<h5>pip 安装</h5>
+
+<p>sudo apt-get install python-pip</p>
+
+<p>pip install tencentcloud-sdk-python</p>
+
+<p>请注意，如果同时有 python2 和 python3 环境， python3 环境需要使用 pip3 命令安装。</p>
+
+<h4>密钥</h4>
+
+<p><a href="https://console.cloud.tencent.com/cam/capi">https://console.cloud.tencent.com/cam/capi</a></p>
+
+<p>export TENCENTCLOUD_SECRET_ID=xx</p>
+
+<p>export TENCENTCLOUD_SECRET_KEY=xx</p>
+
+<h3>v2.0</h3>
+
+<p>方便被其他程序调用，例如网页实现购买</p>
+
+<p>cred = credential.Credential(&ldquo;your_id&rdquo;, &ldquo;your_key&rdquo;)
+中替换自己的ID，KEY</p>
+
+<p>用法: python CVM.py hk 1   会先查寻，如果个数>=n就不购买</p>
+
+<p>查看结果: cat show.log  API返回时一般还没分配IP，多调几次 python CVM.py hk 0 就有结果了</p>
+
+<pre><code>    # -*- coding: utf-8 -*-
+    import os
+    import time
+    import logging
+    import sys
+
+    handler = logging.FileHandler("all.log") #, encoding='utf-8')
+    handler.setFormatter(logging.Formatter(fmt='%(asctime)s %(process)d %(levelname)s %(message)s'))
+    log = logging.getLogger("QQ")
+    log.addHandler(handler)
+    log.setLevel(logging.INFO)
+
+    handler = logging.FileHandler("show.log", mode='w')
+    handler.setFormatter(logging.Formatter(fmt='%(asctime)s %(message)s'))
+    log2 = logging.getLogger("QQQ")
+    log2.addHandler(handler)
+    log2.setLevel(logging.INFO)
+
+    RZ = {
+            "hk" : {
+                "Region" : "ap-hongkong",
+                "Zone" : ["ap-hongkong-2", "ap-hongkong-1"],
+                "ImageId" : "img-3tdtc58k",
+                "InstanceType" : ["S2.SMALL1", ],
+                "ActionTime" : [1, 2, 3]
+                },
+            "gz" : {
+                "Region" : "ap-guangzhou",
+                "Zone" : ["ap-guangzhou-3", "ap-guangzhou-4"],
+                "ImageId" : "img-822xs3s2",
+                "InstanceType" : ["S2.SMALL1", ],
+                "ActionTime" : [1, 2, 3]
+                }
+            }
+
+    from tencentcloud.common import credential
+    from tencentcloud.common.exception.tencent_cloud_sdk_exception import TencentCloudSDKException
+    # 导入对应产品模块的client models。
+    from tencentcloud.cvm.v20170312 import cvm_client, models
+
+    # 导入可选配置类
+    from tencentcloud.common.profile.client_profile import ClientProfile
+    from tencentcloud.common.profile.http_profile import HttpProfile
+
+    def del_ins(client, ins):
+        req = models.TerminateInstancesRequest()
+
+        params = '''{
+            "InstanceIds" : [
+                "%s"
+            ]
+        }''' % (ins)
+        req.from_json_string(params)
+
+        resp = client.TerminateInstances(req)
+        #print(resp.to_json_string(indent=2))
+        log.error("%s" % req)
+        log.error("%s" % resp)
+
+
+    def buy_ins(client, rz):
+        req = models.RunInstancesRequest()
+        endtime = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time()+3600*RZ[rz]["ActionTime"][0]-100))
+
+        params = '''{
+            "Placement" : {
+                "Zone" : "%s"
+            },
+            "ImageId" : "%s",
+            "InstanceType" : "%s",
+            "InstanceName" : "%s",
+            "InstanceChargeType" : "POSTPAID_BY_HOUR",
+            "InternetAccessible" : {
+                "InternetChargeType" : "TRAFFIC_POSTPAID_BY_HOUR",
+                "InternetMaxBandwidthOut" : 10
+            },
+            "LoginSettings" : {
+                "Password" : "Dis@init3"
+            },
+            "EnhancedService" : {
+                "SecurityService" : {
+                    "Enabled" : false
+                },
+                "MonitorService" : {
+                    "Enabled" : false
+                }
+            },
+            "ActionTimer" : {
+                "Externals" : {
+                },
+                "TimerAction" : "TerminateInstances",
+                "ActionTime" : "%s"
+            }
+        }''' % (RZ[rz]["Zone"][0], RZ[rz]["ImageId"], RZ[rz]["InstanceType"][0], endtime, endtime)
+
+        req.from_json_string(params)
+
+        resp = client.RunInstances(req)
+        #print(resp.to_json_string(indent=2))
+        log.warning("%s" % req)
+        log.warning("%s" % resp)
+
+
+        count = len(resp.InstanceIdSet)
+        log2.info("BUY %s count=%d" % (req.Placement.Zone, count))
+        return count
+
+
+    def show_ins(client, rz):
+        req = models.DescribeInstancesRequest()
+
+        respFilter = models.Filter()
+        respFilter.Name = "zone"
+        respFilter.Values = RZ[rz]["Zone"]
+        req.Filters = [respFilter]
+
+        resp = client.DescribeInstances(req)
+        #print(resp.to_json_string(indent=2))
+        log.info("%s" % req)
+        log.info("%s" % resp)
+
+        for ins in resp.InstanceSet:
+            if ins.PublicIpAddresses and len(ins.PublicIpAddresses) &gt; 0:
+                log2.info("%s &lt;/br&gt;%s %sMb/s %s &lt;/br&gt;&lt;/br&gt;" % (ins.PublicIpAddresses[0], ins.InstanceName, ins.InternetAccessible.InternetMaxBandwidthOut, ins.InstanceId))
+            else:
+                log2.info("%s &lt;/br&gt;%s %sMb/s %s &lt;/br&gt;&lt;/br&gt;" % ("null", ins.InstanceName, ins.InternetAccessible.InternetMaxBandwidthOut, ins.InstanceId))
+        log2.info("SHOW zone=%s count=%d &lt;/br&gt;" % (RZ[rz]["Zone"], resp.TotalCount))
+        return resp.TotalCount
+
+    try:
+        # 实例化一个认证对象，入参需要传入腾讯云账户secretId，secretKey
+        #cred = credential.Credential(os.environ.get("TENCENTCLOUD_SECRET_ID"), os.environ.get("TENCENTCLOUD_SECRET_KEY"))
+        # TODO
+        cred = credential.Credential("your_id", "your_key")
+
+        # 实例化一个http选项，可选的，没有特殊需求可以跳过。
+        httpProfile = HttpProfile()
+        httpProfile.reqMethod = "GET"  # post请求(默认为post请求)
+        httpProfile.reqTimeout = 30    # 请求超时时间，单位为秒(默认60秒)
+        httpProfile.endpoint = "cvm.ap-guangzhou.tencentcloudapi.com"  # 指定接入地域域名(默认就近接入)
+
+        # 实例化一个client选项，可选的，没有特殊需求可以跳过。
+        clientProfile = ClientProfile()
+        clientProfile.signMethod = "TC3-HMAC-SHA256"  # 指定签名算法
+        clientProfile.language = "en-US"
+        clientProfile.httpProfile = httpProfile
+
+        rz = "hk"
+        count = 0
+        if len(sys.argv) &gt;= 2:
+            rz = sys.argv[1]
+
+        if len(sys.argv) &gt;= 3:
+            count = int(sys.argv[2])
+
+        if rz not in RZ:
+            quit()
+
+        # 实例化要请求产品(以cvm为例)的client对象，clientProfile是可选的。
+        client = cvm_client.CvmClient(cred, RZ[rz]["Region"], clientProfile)
+
+        if show_ins(client, rz) &lt; count:
+            if buy_ins(client, rz) &gt; 0:
+                show_ins(client, rz)
+
+        #del_ins(client, "")
+
+    except TencentCloudSDKException as err:
+        print(err)
+</code></pre>
+
+<hr />
+
+<h3>v1.0</h3>
+
+<h4>查询</h4>
+
+<p>来自SDK样例</p>
+
+<pre><code>    # -*- coding: utf-8 -*-
+    import os
+
+    from tencentcloud.common import credential
+    from tencentcloud.common.exception.tencent_cloud_sdk_exception import TencentCloudSDKException
+    # 导入对应产品模块的client models。
+    from tencentcloud.cvm.v20170312 import cvm_client, models
+
+    # 导入可选配置类
+    from tencentcloud.common.profile.client_profile import ClientProfile
+    from tencentcloud.common.profile.http_profile import HttpProfile
+    try:
+        # 实例化一个认证对象，入参需要传入腾讯云账户secretId，secretKey
+        cred = credential.Credential(
+            os.environ.get("TENCENTCLOUD_SECRET_ID"),
+            os.environ.get("TENCENTCLOUD_SECRET_KEY"))
+
+        # 实例化一个http选项，可选的，没有特殊需求可以跳过。
+        httpProfile = HttpProfile()
+        httpProfile.reqMethod = "GET"  # post请求(默认为post请求)
+        httpProfile.reqTimeout = 30    # 请求超时时间，单位为秒(默认60秒)
+        httpProfile.endpoint = "cvm.ap-guangzhou.tencentcloudapi.com"  # 指定接入地域域名(默认就近接入)
+
+        # 实例化一个client选项，可选的，没有特殊需求可以跳过。
+        clientProfile = ClientProfile()
+        clientProfile.signMethod = "TC3-HMAC-SHA256"  # 指定签名算法
+        clientProfile.language = "en-US"
+        clientProfile.httpProfile = httpProfile
+
+        # 实例化要请求产品(以cvm为例)的client对象，clientProfile是可选的。
+        client = cvm_client.CvmClient(cred, "ap-hongkong", clientProfile)
+
+        # 实例化一个cvm实例信息查询请求对象,每个接口都会对应一个request对象。
+        req = models.DescribeInstancesRequest()
+
+        # 填充请求参数,这里request对象的成员变量即对应接口的入参。
+        # 你可以通过官网接口文档或跳转到request对象的定义处查看请求参数的定义。
+        respFilter = models.Filter()  # 创建Filter对象, 以zone的维度来查询cvm实例。
+        respFilter.Name = "zone"
+        respFilter.Values = ["ap-hongkong-1", "ap-hongkong-2"]
+        req.Filters = [respFilter]  # Filters 是成员为Filter对象的列表
+
+        # 这里还支持以标准json格式的string来赋值请求参数的方式。下面的代码跟上面的参数赋值是等效的。
+        params = '''{
+            "Filters": [
+                {
+                    "Name": "zone",
+                    "Values": ["ap-hongkong-1", "ap-hongkong-2"]
+                }
+            ]
+        }'''
+        req.from_json_string(params)
+
+        # 通过client对象调用DescribeInstances方法发起请求。注意请求方法名与请求对象是对应的。
+        # 返回的resp是一个DescribeInstancesResponse类的实例，与请求对象对应。
+        resp = client.DescribeInstances(req)
+
+        # 输出json格式的字符串回包
+        print(resp.to_json_string(indent=2))
+
+    except TencentCloudSDKException as err:
+        print(err)
+</code></pre>
+
+<h4>购买 香港-1core-1GB-5Mbps-1小时后销毁</h4>
+
+<p>ImageId 换个公共的 或 自己制作一个</p>
+
+<p><a href="https://console.cloud.tencent.com/cvm/image?rid=5&amp;imageType=PUBLIC_IMAGE">https://console.cloud.tencent.com/cvm/image?rid=5&amp;imageType=PUBLIC_IMAGE</a></p>
+
+<pre><code>    # -*- coding: utf-8 -*-
+    import os
+    import time
+
+    from tencentcloud.common import credential
+    from tencentcloud.common.exception.tencent_cloud_sdk_exception import TencentCloudSDKException
+    # 导入对应产品模块的client models。
+    from tencentcloud.cvm.v20170312 import cvm_client, models
+
+    # 导入可选配置类
+    from tencentcloud.common.profile.client_profile import ClientProfile
+    from tencentcloud.common.profile.http_profile import HttpProfile
+    try:
+        # 实例化一个认证对象，入参需要传入腾讯云账户secretId，secretKey
+        cred = credential.Credential(
+            os.environ.get("TENCENTCLOUD_SECRET_ID"),
+            os.environ.get("TENCENTCLOUD_SECRET_KEY"))
+
+        # 实例化一个http选项，可选的，没有特殊需求可以跳过。
+        httpProfile = HttpProfile()
+        httpProfile.reqMethod = "GET"  # post请求(默认为post请求)
+        httpProfile.reqTimeout = 30    # 请求超时时间，单位为秒(默认60秒)
+        httpProfile.endpoint = "cvm.ap-guangzhou.tencentcloudapi.com"  # 指定接入地域域名(默认就近接入)
+
+        # 实例化一个client选项，可选的，没有特殊需求可以跳过。
+        clientProfile = ClientProfile()
+        clientProfile.signMethod = "TC3-HMAC-SHA256"  # 指定签名算法
+        clientProfile.language = "en-US"
+        clientProfile.httpProfile = httpProfile
+
+        # 实例化要请求产品(以cvm为例)的client对象，clientProfile是可选的。
+        client = cvm_client.CvmClient(cred, "ap-hongkong", clientProfile)
+
+        # 实例化一个cvm实例信息查询请求对象,每个接口都会对应一个request对象。
+        req = models.RunInstancesRequest()
+
+        # 填充请求参数,这里request对象的成员变量即对应接口的入参。
+        # 你可以通过官网接口文档或跳转到request对象的定义处查看请求参数的定义。
+
+        # 这里还支持以标准json格式的string来赋值请求参数的方式。下面的代码跟上面的参数赋值是等效的。
+        params = '''{
+            "Region" : "ap-hongkong",
+            "Placement" : {
+                "Zone" : "ap-hongkong-2"
+            },
+            "ImageId" : "img-7b63u5v2",
+            "InstanceChargeType" : "POSTPAID_BY_HOUR",
+            "InstanceType" : "S2.SMALL1",
+            "InternetAccessible" : {
+                "InternetChargeType" : "TRAFFIC_POSTPAID_BY_HOUR",
+                "InternetMaxBandwidthOut" : 5
+            },
+            "LoginSettings" : {
+                "Password" : "QAZwsx123"
+            },
+            "EnhancedService" : {
+                "SecurityService" : {
+                    "Enabled" : false
+                },
+                "MonitorService" : {
+                    "Enabled" : false
+                }
+            },
+            "ActionTimer" : {
+                "Externals" : {
+                },
+                "TimerAction" : "TerminateInstances",
+                "ActionTime" : "%s"
+            }
+        }''' % (time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time()+3300)))
+
+        req.from_json_string(params)
+
+        #print(req)
+
+        # 通过client对象调用DescribeInstances方法发起请求。注意请求方法名与请求对象是对应的。
+        # 返回的resp是一个DescribeInstancesResponse类的实例，与请求对象对应。
+        resp = client.RunInstances(req)
+
+        # 输出json格式的字符串回包
+        print(resp.to_json_string(indent=2))
+
+    except TencentCloudSDKException as err:
+        print(err)
+</code></pre>
+
+<h4>退还CVM</h4>
+
+<pre><code>    # -*- coding: utf-8 -*-
+    import os
+
+    from tencentcloud.common import credential
+    from tencentcloud.common.exception.tencent_cloud_sdk_exception import TencentCloudSDKException
+    # 导入对应产品模块的client models。
+    from tencentcloud.cvm.v20170312 import cvm_client, models
+
+    # 导入可选配置类
+    from tencentcloud.common.profile.client_profile import ClientProfile
+    from tencentcloud.common.profile.http_profile import HttpProfile
+    try:
+        # 实例化一个认证对象，入参需要传入腾讯云账户secretId，secretKey
+        cred = credential.Credential(
+            os.environ.get("TENCENTCLOUD_SECRET_ID"),
+            os.environ.get("TENCENTCLOUD_SECRET_KEY"))
+
+        # 实例化一个http选项，可选的，没有特殊需求可以跳过。
+        httpProfile = HttpProfile()
+        httpProfile.reqMethod = "GET"  # post请求(默认为post请求)
+        httpProfile.reqTimeout = 30    # 请求超时时间，单位为秒(默认60秒)
+        httpProfile.endpoint = "cvm.ap-guangzhou.tencentcloudapi.com"  # 指定接入地域域名(默认就近接入)
+
+        # 实例化一个client选项，可选的，没有特殊需求可以跳过。
+        clientProfile = ClientProfile()
+        clientProfile.signMethod = "TC3-HMAC-SHA256"  # 指定签名算法
+        clientProfile.language = "en-US"
+        clientProfile.httpProfile = httpProfile
+
+        # 实例化要请求产品(以cvm为例)的client对象，clientProfile是可选的。
+        client = cvm_client.CvmClient(cred, "ap-hongkong", clientProfile)
+
+        # 实例化一个cvm实例信息查询请求对象,每个接口都会对应一个request对象。
+        req = models.TerminateInstancesRequest()
+
+        # 填充请求参数,这里request对象的成员变量即对应接口的入参。
+        params = '''{
+            "InstanceIds" : [
+                "ins-6y6yfpdw"
+            ]
+        }'''
+        req.from_json_string(params)
+
+        #print(req)
+        # 通过client对象调用DescribeInstances方法发起请求。注意请求方法名与请求对象是对应的。
+        # 返回的resp是一个DescribeInstancesResponse类的实例，与请求对象对应。
+        resp = client.TerminateInstances(req)
+
+        # 输出json格式的字符串回包
+        print(resp.to_json_string(indent=2))
+
+    except TencentCloudSDKException as err:
+        print(err)
+</code></pre>
+
+<p>phpSDK 已经更新，以下需要改</p>
+
+<h2>php</h2>
+
+<p>看 vendor/GuzzleHttp/Client.php 中 configureDefaults ，代理需要设置</p>
+
+<p>export HTTP_PROXY=tcp://xx</p>
+
+<p>export HTTPS_PROXY=tcp://xx</p>
+
+<p>或者安装 php-curl 就可以改用</p>
+
+<p>export http_proxy=<a href="http://">http://</a></p>
+
+<p>export https_proxy=<a href="http://">http://</a></p>
+
+<h4>SDK</h4>
+
+<p><a href="https://github.com/TencentCloud/tencentcloud-sdk-php">https://github.com/TencentCloud/tencentcloud-sdk-php</a></p>
+
+<p>git clone <a href="https://github.com/TencentCloud/tencentcloud-sdk-php.git">https://github.com/TencentCloud/tencentcloud-sdk-php.git</a></p>
+
+<h4>密钥</h4>
+
+<p><a href="https://console.cloud.tencent.com/cam/capi">https://console.cloud.tencent.com/cam/capi</a></p>
+
+<p>export TENCENTCLOUD_SECRET_ID=xx</p>
+
+<p>export TENCENTCLOUD_SECRET_KEY=xx</p>
+
+<h4>查询</h4>
+
+<p>来自SDK样例
+```
+    &lt;?php
+    require_once &lsquo;../../../TCloudAutoLoader.php&rsquo;;
+    // 导入对应产品模块的client
+    use TencentCloud\Cvm\V20170312\CvmClient;
+    // 导入要请求接口对应的Request类
+    use TencentCloud\Cvm\V20170312\Models\DescribeInstancesRequest;
+    use TencentCloud\Cvm\V20170312\Models\Filter;
+    use TencentCloud\Common\Exception\TencentCloudSDKException;
+    use TencentCloud\Common\Credential;
+    // 导入可选配置类
+    use TencentCloud\Common\Profile\ClientProfile;
+    use TencentCloud\Common\Profile\HttpProfile;</p>
+
+<pre><code>try {
+    // 实例化一个证书对象，入参需要传入腾讯云账户secretId，secretKey
+    //$cred = new Credential("secretId", "secretKey");
+    $cred = new Credential(getenv("TENCENTCLOUD_SECRET_ID"), getenv("TENCENTCLOUD_SECRET_KEY"));
+
+    // 实例化一个http选项，可选的，没有特殊需求可以跳过
+    $httpProfile = new HttpProfile();
+    $httpProfile-&gt;setReqMethod("GET");  // post请求(默认为post请求)
+    $httpProfile-&gt;setReqTimeout(30);    // 请求超时时间，单位为秒(默认60秒)
+    $httpProfile-&gt;setEndpoint("cvm.ap-guangzhou.tencentcloudapi.com");  // 指定接入地域域名(默认就近接入)
+
+    // 实例化一个client选项，可选的，没有特殊需求可以跳过
+    $clientProfile = new ClientProfile();
+    $clientProfile-&gt;setSignMethod("TC3-HMAC-SHA256");  // 指定签名算法(默认为HmacSHA256)
+    $clientProfile-&gt;setHttpProfile($httpProfile);
+
+    // 实例化要请求产品(以cvm为例)的client对象,clientProfile是可选的
+    $client = new CvmClient($cred, "ap-hongkong", $clientProfile);
+
+    // 实例化一个cvm实例信息查询请求对象,每个接口都会对应一个request对象。
+    $req = new DescribeInstancesRequest();
+
+    // 填充请求参数,这里request对象的成员变量即对应接口的入参
+    // 你可以通过官网接口文档或跳转到request对象的定义处查看请求参数的定义
+    $respFilter = new Filter();  // 创建Filter对象, 以zone的维度来查询cvm实例
+    $respFilter-&gt;Name = "zone";
+    $respFilter-&gt;Values = ["ap-hongkong-1", "ap-hongkong-2"];
+    $req-&gt;Filters = [$respFilter];  // Filters 是成员为Filter对象的列表
+
+    // 这里还支持以标准json格式的string来赋值请求参数的方式。下面的代码跟上面的参数赋值是等效的
+    $params = [
+        "Filters" =&gt; [
+            [
+                "Name" =&gt; "zone",
+                "Values" =&gt; ["ap-hongkong-1", "ap-hongkong-2"]
+            ]
+        ]
+    ];
+    $req-&gt;fromJsonString(json_encode($params));
+
+    // 通过client对象调用DescribeInstances方法发起请求。注意请求方法名与请求对象是对应的
+    // 返回的resp是一个DescribeInstancesResponse类的实例，与请求对象对应
+    $resp = $client-&gt;DescribeInstances($req);
+
+    // 输出json格式的字符串回包
+    print_r($resp-&gt;toJsonString());
+}
+catch(TencentCloudSDKException $e) {
+    echo $e;
+}
+</code></pre>
+
+<pre><code>
+#### 购买 香港-1core-1GB-5Mbps-1小时后销毁
+
+ImageId 换个公共的 或 自己制作一个
+
+https://console.cloud.tencent.com/cvm/image?rid=5&amp;imageType=PUBLIC_IMAGE
+</code></pre>
+
+<pre><code>&lt;?php
+require_once '../../../TCloudAutoLoader.php';
+// 导入对应产品模块的client
+use TencentCloud\Cvm\V20170312\CvmClient;
+// 导入要请求接口对应的Request类
+use TencentCloud\Cvm\V20170312\Models\RunInstancesRequest;
+use TencentCloud\Cvm\V20170312\Models\Filter;
+use TencentCloud\Common\Exception\TencentCloudSDKException;
+use TencentCloud\Common\Credential;
+// 导入可选配置类
+use TencentCloud\Common\Profile\ClientProfile;
+use TencentCloud\Common\Profile\HttpProfile;
+
+try {
+    // 实例化一个证书对象，入参需要传入腾讯云账户secretId，secretKey
+    //$cred = new Credential("secretId", "secretKey");
+    $cred = new Credential(getenv("TENCENTCLOUD_SECRET_ID"), getenv("TENCENTCLOUD_SECRET_KEY"));
+
+    // 实例化一个http选项，可选的，没有特殊需求可以跳过
+    $httpProfile = new HttpProfile();
+    $httpProfile-&gt;setReqMethod("GET");  // post请求(默认为post请求)
+    $httpProfile-&gt;setReqTimeout(30);    // 请求超时时间，单位为秒(默认60秒)
+    $httpProfile-&gt;setEndpoint("cvm.ap-guangzhou.tencentcloudapi.com");  // 指定接入地域域名(默认就近接入)
+
+    // 实例化一个client选项，可选的，没有特殊需求可以跳过
+    $clientProfile = new ClientProfile();
+    $clientProfile-&gt;setSignMethod("TC3-HMAC-SHA256");  // 指定签名算法(默认为HmacSHA256)
+    $clientProfile-&gt;setHttpProfile($httpProfile);
+
+    // 实例化要请求产品(以cvm为例)的client对象,clientProfile是可选的
+    $client = new CvmClient($cred, "ap-hongkong", $clientProfile);
+
+    // 实例化一个cvm实例信息查询请求对象,每个接口都会对应一个request对象。
+    $req = new RunInstancesRequest();
+
+    // 填充请求参数,这里request对象的成员变量即对应接口的入参
+    // 你可以通过官网接口文档或跳转到request对象的定义处查看请求参数的定义
+    // 这里还支持以标准json格式的string来赋值请求参数的方式。下面的代码跟上面的参数赋值是等效的
+    $params = [
+        "Region" =&gt; "ap-hongkong",
+        "Placement" =&gt; [
+            "Zone" =&gt; "ap-hongkong-2"
+        ],
+        "ImageId" =&gt; "img-7b63u5v2",
+        "InstanceChargeType" =&gt; "POSTPAID_BY_HOUR",
+        "InstanceType" =&gt; "S2.SMALL1",
+        "InternetAccessible" =&gt; [
+            "InternetChargeType" =&gt; "TRAFFIC_POSTPAID_BY_HOUR",
+            "InternetMaxBandwidthOut" =&gt; 5
+        ],
+        "LoginSettings" =&gt; [
+            "Password" =&gt; "QAZwsx123"
+        ],
+        "EnhancedService" =&gt; [
+            "SecurityService" =&gt; [
+                "Enabled" =&gt; false
+            ],
+            "MonitorService" =&gt; [
+                "Enabled" =&gt; false
+            ]
+        ],
+        "ActionTimer" =&gt; [
+            "Externals" =&gt; [
+            ],
+            "TimerAction" =&gt; "TerminateInstances",
+            "ActionTime" =&gt; date('Y-m-d H:i:s', time()+3300),
+        ]
+    ];
+    $req-&gt;fromJsonString(json_encode($params));
+
+    #var_dump($req);
+    // 通过client对象调用DescribeInstances方法发起请求。注意请求方法名与请求对象是对应的
+    // 返回的resp是一个DescribeInstancesResponse类的实例，与请求对象对应
+    $resp = $client-&gt;RunInstances($req);
+
+    // 输出json格式的字符串回包
+    print_r($resp-&gt;toJsonString());
+}
+catch(TencentCloudSDKException $e) {
+    echo $e;
+}
+</code></pre>
+
+<pre><code>
+#### 退还CVM
+</code></pre>
+
+<pre><code>&lt;?php
+require_once '../../../TCloudAutoLoader.php';
+// 导入对应产品模块的client
+use TencentCloud\Cvm\V20170312\CvmClient;
+// 导入要请求接口对应的Request类
+use TencentCloud\Cvm\V20170312\Models\TerminateInstancesRequest;
+use TencentCloud\Cvm\V20170312\Models\Filter;
+use TencentCloud\Common\Exception\TencentCloudSDKException;
+use TencentCloud\Common\Credential;
+// 导入可选配置类
+use TencentCloud\Common\Profile\ClientProfile;
+use TencentCloud\Common\Profile\HttpProfile;
+
+try {
+    // 实例化一个证书对象，入参需要传入腾讯云账户secretId，secretKey
+    //$cred = new Credential("secretId", "secretKey");
+    $cred = new Credential(getenv("TENCENTCLOUD_SECRET_ID"), getenv("TENCENTCLOUD_SECRET_KEY"));
+
+    // 实例化一个http选项，可选的，没有特殊需求可以跳过
+    $httpProfile = new HttpProfile();
+    $httpProfile-&gt;setReqMethod("GET");  // post请求(默认为post请求)
+    $httpProfile-&gt;setReqTimeout(30);    // 请求超时时间，单位为秒(默认60秒)
+    $httpProfile-&gt;setEndpoint("cvm.ap-guangzhou.tencentcloudapi.com");  // 指定接入地域域名(默认就近接入)
+
+    // 实例化一个client选项，可选的，没有特殊需求可以跳过
+    $clientProfile = new ClientProfile();
+    $clientProfile-&gt;setSignMethod("TC3-HMAC-SHA256");  // 指定签名算法(默认为HmacSHA256)
+    $clientProfile-&gt;setHttpProfile($httpProfile);
+
+    // 实例化要请求产品(以cvm为例)的client对象,clientProfile是可选的
+    $client = new CvmClient($cred, "ap-hongkong", $clientProfile);
+
+    // 实例化一个cvm实例信息查询请求对象,每个接口都会对应一个request对象。
+    $req = new TerminateInstancesRequest();
+
+    // 填充请求参数,这里request对象的成员变量即对应接口的入参
+    // 你可以通过官网接口文档或跳转到request对象的定义处查看请求参数的定义
+    // 这里还支持以标准json格式的string来赋值请求参数的方式。下面的代码跟上面的参数赋值是等效的
+    $params = [
+        "InstanceIds" =&gt; [
+            "ins-1rfi3vms"
+        ]
+    ];
+    $req-&gt;fromJsonString(json_encode($params));
+
+    // 通过client对象调用DescribeInstances方法发起请求。注意请求方法名与请求对象是对应的
+    // 返回的resp是一个DescribeInstancesResponse类的实例，与请求对象对应
+    $resp = $client-&gt;TerminateInstances($req);
+
+    // 输出json格式的字符串回包
+    print_r($resp-&gt;toJsonString());
+}
+catch(TencentCloudSDKException $e) {
+    echo $e;
+}
+</code></pre>
+
+<p>```</p>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[ubuntu crash]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2019/12/12/debug-ubuntu-kdump/"/>
+    <updated>2019-12-12T12:55:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2019/12/12/debug-ubuntu-kdump</id>
+    <content type="html"><![CDATA[<p><a href="https://www.jianshu.com/p/3c92647140f7">https://www.jianshu.com/p/3c92647140f7</a></p>
+
+<p><a href="https://help.ubuntu.com/lts/serverguide/kernel-crash-dump.html">https://help.ubuntu.com/lts/serverguide/kernel-crash-dump.html</a></p>
+
+<h4>自己编译的内核会OOM，需要增大内存</h4>
+
+<p>If the dump does not work due to OOM (Out Of Memory) error, then try increasing the amount of reserved memory by editing</p>
+
+<p>/etc/default/grub.d/kdump-tools.cfg
+<code>
+    GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT crashkernel=384M-:256M"
+</code>
+run sudo update-grub and then reboot afterwards, and then test again.</p>
+
+<hr />
+
+<h4>安装</h4>
+
+<pre><code>    sudo apt-get install linux-crashdump
+</code></pre>
+
+<p>重启机器</p>
+
+<h4>需要启动下面的服务</h4>
+
+<pre><code>    $ service --status-all | grep ' k'
+    [ + ] kdump-tools
+    [ + ] kerneloops
+    [ + ] kexec
+    [ + ] kexec-load
+</code></pre>
+
+<h4>查看kdump的状态</h4>
+
+<pre><code>    $ kdump-config show
+    DUMP_MODE:        kdump
+    USE_KDUMP:        1
+    KDUMP_SYSCTL:     kernel.panic_on_oops=1
+    KDUMP_COREDIR:    /var/crash
+    crashkernel addr: 0x21000000
+       /var/lib/kdump/vmlinuz: symbolic link to /boot/vmlinuz-4.15.18
+    kdump initrd: 
+       /var/lib/kdump/initrd.img: symbolic link to /var/lib/kdump/initrd.img-4.15.18
+    current state:    ready to kdump
+</code></pre>
+
+<h4>验证</h4>
+
+<pre><code>    echo 1 &gt; /proc/sys/kernel/sysrq
+    echo c &gt; /proc/sysrq-trigger
+</code></pre>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[gdb struct]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2019/12/12/debug-gdb-struct/"/>
+    <updated>2019-12-12T11:23:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2019/12/12/debug-gdb-struct</id>
+    <content type="html"><![CDATA[<p><a href="http://bbs.chinaunix.net/thread-4101359-1-1.html">http://bbs.chinaunix.net/thread-4101359-1-1.html</a></p>
+
+<h4>查看结构体中成员的偏移</h4>
+
+<pre><code>    (gdb) p &amp;((struct task_struct *)0)-&gt;prio
+
+    (gdb) ptype struct malloc_chunk
+</code></pre>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[crash struct]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2019/12/12/debug-crash-struct/"/>
+    <updated>2019-12-12T11:21:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2019/12/12/debug-crash-struct</id>
+    <content type="html"><![CDATA[<p><a href="http://bbs.chinaunix.net/thread-4101359-1-1.html">http://bbs.chinaunix.net/thread-4101359-1-1.html</a></p>
+
+<h4>查看结构体中成员的偏移</h4>
+
+<pre><code>    crash&gt; struct -o task_struct
+
+    crash&gt; struct task_struct
+</code></pre>
+]]></content>
+  </entry>
+  
+</feed>

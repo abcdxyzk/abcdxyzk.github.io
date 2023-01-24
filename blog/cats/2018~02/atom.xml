@@ -1,0 +1,2498 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+
+  <title><![CDATA[Category: 2018~02 | kk Blog —— 通用基础]]></title>
+  <link href="http://abcdxyzk.github.io/blog/cats/2018~02/atom.xml" rel="self"/>
+  <link href="http://abcdxyzk.github.io/"/>
+  <updated>2023-01-24T19:27:19+08:00</updated>
+  <id>http://abcdxyzk.github.io/</id>
+  <author>
+    <name><![CDATA[kk]]></name>
+    
+  </author>
+  <generator uri="http://octopress.org/">Octopress</generator>
+
+  
+  <entry>
+    <title type="html"><![CDATA[内核模块签名--详解]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2018/02/09/kernel-signature-source/"/>
+    <updated>2018-02-09T02:33:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2018/02/09/kernel-signature-source</id>
+    <content type="html"><![CDATA[<h3>验证模块签名</h3>
+
+<p>kernel/module.c</p>
+
+<pre><code>    SYSCALL_DEFINE3(init_module, void __user *, umod,
+            unsigned long, len, const char __user *, uargs)
+    {
+        int err; 
+        struct load_info info = { }; 
+
+        err = may_init_module();
+        if (err)
+            return err; 
+
+        pr_debug("init_module: umod=%p, len=%lu, uargs=%p\n",
+               umod, len, uargs);
+
+        err = copy_module_from_user(umod, len, &amp;info);
+        if (err)
+            return err; 
+
+        return load_module(&amp;info, uargs, 0);
+    }
+</code></pre>
+
+<pre><code>    /* Allocate and load the module: note that size of section 0 is always
+       zero, and we rely on this for optional sections. */
+    static int load_module(struct load_info *info, const char __user *uargs,
+                   int flags)
+    {
+        struct module *mod;
+        struct module_ext *mod_ext;
+        long err;
+
+        err = module_sig_check(info);
+        if (err)
+            goto free_copy;
+        ...
+</code></pre>
+
+<pre><code>    static int module_sig_check(struct load_info *info)
+    {
+        int err = -ENOKEY;
+        const unsigned long markerlen = sizeof(MODULE_SIG_STRING) - 1;
+        const void *mod = info-&gt;hdr;
+
+        # 模块最后是 MODULE_SIG_STRING 字符串
+        if (info-&gt;len &gt; markerlen &amp;&amp;
+            memcmp(mod + info-&gt;len - markerlen, MODULE_SIG_STRING, markerlen) == 0) {
+            /* We truncate the module to discard the signature */
+            info-&gt;len -= markerlen;
+            err = mod_verify_sig(mod, &amp;info-&gt;len); // 检验签名
+        }
+
+        if (!err) {
+            info-&gt;sig_ok = true;
+            return 0;
+        }
+
+        /* Not having a signature is only an error if we're strict. */
+        if ((err == -ENOKEY &amp;&amp; !sig_enforce) &amp;&amp; (get_securelevel() &lt;= 0))
+            err = 0;
+
+        return err;
+    }
+</code></pre>
+
+<pre><code>    /*
+     * Verify the signature on a module.
+     */
+    int mod_verify_sig(const void *mod, unsigned long *_modlen)
+    {
+        struct public_key_signature *pks;
+        struct module_signature ms;
+        struct key *key;
+        const void *sig;
+        size_t modlen = *_modlen, sig_len;
+        int ret;
+
+        pr_devel("==&gt;%s(,%zu)\n", __func__, modlen);
+
+        if (modlen &lt;= sizeof(ms))
+            return -EBADMSG;
+
+        # 去除 MODULE_SIG_STRING 后，文件末尾是定义个字段长度的结构
+        memcpy(&amp;ms, mod + (modlen - sizeof(ms)), sizeof(ms));
+        modlen -= sizeof(ms);
+
+        # 签名长度
+        sig_len = be32_to_cpu(ms.sig_len);
+        if (sig_len &gt;= modlen)
+            return -EBADMSG;
+        modlen -= sig_len;
+
+        # 签名者长度，签名的标识ID长度，ID一般是一个20B的串
+        if ((size_t)ms.signer_len + ms.key_id_len &gt;= modlen)
+            return -EBADMSG;
+        modlen -= (size_t)ms.signer_len + ms.key_id_len;
+
+        *_modlen = modlen;
+        sig = mod + modlen;
+
+        /* For the moment, only support RSA and X.509 identifiers */
+        if (ms.algo != PKEY_ALGO_RSA ||
+            ms.id_type != PKEY_ID_X509)
+            return -ENOPKG;
+
+        if (ms.hash &gt;= PKEY_HASH__LAST ||
+            !hash_algo_name[ms.hash])
+            return -ENOPKG;
+
+        # 查找 .system_keyring
+        key = request_asymmetric_key(sig, ms.signer_len,
+                         sig + ms.signer_len, ms.key_id_len);
+        if (IS_ERR(key))
+            return PTR_ERR(key);
+
+        # 摘要
+        pks = mod_make_digest(ms.hash, mod, modlen);
+        if (IS_ERR(pks)) {
+            ret = PTR_ERR(pks);
+            goto error_put_key;
+        }
+
+        # hash算法的额外前缀
+        ret = mod_extract_mpi_array(pks, sig + ms.signer_len + ms.key_id_len,
+                        sig_len);
+        if (ret &lt; 0)
+            goto error_free_pks;
+
+        # 验证签名
+        ret = verify_signature(key, pks);
+        pr_devel("verify_signature() = %d\n", ret);
+
+    error_free_pks:
+        mpi_free(pks-&gt;rsa.s);
+        kfree(pks);
+    error_put_key:
+        key_put(key);
+        pr_devel("&lt;==%s() = %d\n", __func__, ret);
+        return ret;
+    }
+</code></pre>
+
+<pre><code>    /*
+     * Request an asymmetric key.
+     */
+    static struct key *request_asymmetric_key(const char *signer, size_t signer_len,
+                          const u8 *key_id, size_t key_id_len)
+    {
+        key_ref_t key;
+        size_t i;
+        char *id, *q;
+
+        pr_devel("==&gt;%s(,%zu,,%zu)\n", __func__, signer_len, key_id_len);
+
+        /* Construct an identifier. */
+        id = kmalloc(signer_len + 2 + key_id_len * 2 + 1, GFP_KERNEL);
+        if (!id)
+            return ERR_PTR(-ENOKEY);
+
+        memcpy(id, signer, signer_len);
+
+        q = id + signer_len;
+        *q++ = ':';
+        *q++ = ' ';
+        for (i = 0; i &lt; key_id_len; i++) {
+            *q++ = hex_asc[*key_id &gt;&gt; 4];
+            *q++ = hex_asc[*key_id++ &amp; 0x0f];
+        }
+
+        *q = 0;
+
+        pr_debug("Look up: \"%s\"\n", id);
+
+    #ifdef CONFIG_SYSTEM_BLACKLIST_KEYRING
+        key = keyring_search(make_key_ref(system_blacklist_keyring, 1),
+                       &amp;key_type_asymmetric, id);
+        if (!IS_ERR(key)) {
+            /* module is signed with a cert in the blacklist.  reject */
+            pr_err("Module key '%s' is in blacklist\n", id);
+            key_ref_put(key);
+            kfree(id);
+            return ERR_PTR(-EKEYREJECTED);
+        }
+    #endif
+
+        key = keyring_search(make_key_ref(system_trusted_keyring, 1),
+                     &amp;key_type_asymmetric, id);
+        if (IS_ERR(key))
+            pr_warn("Request for unknown module key '%s' err %ld\n",
+                id, PTR_ERR(key));
+        kfree(id);
+
+        if (IS_ERR(key)) {
+            switch (PTR_ERR(key)) {
+                /* Hide some search errors */
+            case -EACCES:
+            case -ENOTDIR:
+            case -EAGAIN:
+                return ERR_PTR(-ENOKEY);
+            default:
+                return ERR_CAST(key);
+            }
+        }
+
+        pr_devel("&lt;==%s() = 0 [%x]\n", __func__, key_serial(key_ref_to_ptr(key)));
+        return key_ref_to_ptr(key);
+    }
+</code></pre>
+
+<h3>内核密匙注册</h3>
+
+<h4>kernel/system_keyring.c</h4>
+
+<pre><code>    #include &lt;linux/export.h&gt;
+    #include &lt;linux/kernel.h&gt;
+    #include &lt;linux/sched.h&gt;
+    #include &lt;linux/cred.h&gt;
+    #include &lt;linux/err.h&gt;
+    #include &lt;keys/asymmetric-type.h&gt;
+    #include &lt;keys/system_keyring.h&gt;
+    #include "module-internal.h"
+
+    struct key *system_trusted_keyring;
+    EXPORT_SYMBOL_GPL(system_trusted_keyring);
+    #ifdef CONFIG_SYSTEM_BLACKLIST_KEYRING
+    struct key *system_blacklist_keyring;
+    #endif
+
+    extern __initconst const u8 system_certificate_list[];
+    extern __initconst const unsigned long system_certificate_list_size;
+
+    /*
+     * Load the compiled-in keys
+     */
+    static __init int system_trusted_keyring_init(void)
+    {
+        pr_notice("Initialise system trusted keyring\n");
+
+        system_trusted_keyring =
+            keyring_alloc(".system_keyring",
+                      KUIDT_INIT(0), KGIDT_INIT(0), current_cred(),
+                      ((KEY_POS_ALL &amp; ~KEY_POS_SETATTR) |
+                      KEY_USR_VIEW | KEY_USR_READ | KEY_USR_SEARCH),
+                      KEY_ALLOC_NOT_IN_QUOTA, NULL);
+        if (IS_ERR(system_trusted_keyring))
+            panic("Can't allocate system trusted keyring\n");
+
+        set_bit(KEY_FLAG_TRUSTED_ONLY, &amp;system_trusted_keyring-&gt;flags);
+
+    #ifdef CONFIG_SYSTEM_BLACKLIST_KEYRING
+        system_blacklist_keyring = keyring_alloc(".system_blacklist_keyring",
+                        KUIDT_INIT(0), KGIDT_INIT(0),
+                        current_cred(),
+                        (KEY_POS_ALL &amp; ~KEY_POS_SETATTR) |
+                        KEY_USR_VIEW | KEY_USR_READ,
+                        KEY_ALLOC_NOT_IN_QUOTA, NULL);
+        if (IS_ERR(system_blacklist_keyring))
+            panic("Can't allocate system blacklist keyring\n");
+
+        set_bit(KEY_FLAG_TRUSTED_ONLY, &amp;system_blacklist_keyring-&gt;flags);
+    #endif
+
+        return 0;
+    }
+
+    /*
+     * Must be initialised before we try and load the keys into the keyring.
+     */
+    device_initcall(system_trusted_keyring_init);
+
+    /*
+     * Load the compiled-in list of X.509 certificates.
+     */
+    static __init int load_system_certificate_list(void)
+    {
+        key_ref_t key;
+        const u8 *p, *end;
+        size_t plen;
+
+        pr_notice("Loading compiled-in X.509 certificates\n");
+
+        p = system_certificate_list;
+        end = p + system_certificate_list_size;
+        while (p &lt; end) {
+            /* Each cert begins with an ASN.1 SEQUENCE tag and must be more
+             * than 256 bytes in size.
+             */
+            if (end - p &lt; 4)
+                goto dodgy_cert;
+            if (p[0] != 0x30 &amp;&amp;
+                p[1] != 0x82)
+                goto dodgy_cert;
+            plen = (p[2] &lt;&lt; 8) | p[3];
+            plen += 4;
+            if (plen &gt; end - p)
+                goto dodgy_cert;
+
+            key = key_create_or_update(make_key_ref(system_trusted_keyring, 1),
+                           "asymmetric",
+                           NULL,
+                           p,
+                           plen,
+                           ((KEY_POS_ALL &amp; ~KEY_POS_SETATTR) |
+                           KEY_USR_VIEW | KEY_USR_READ),
+                           KEY_ALLOC_NOT_IN_QUOTA |
+                           KEY_ALLOC_TRUSTED);
+            if (IS_ERR(key)) {
+                pr_err("Problem loading in-kernel X.509 certificate (%ld)\n",
+                       PTR_ERR(key));
+            } else {
+                set_bit(KEY_FLAG_BUILTIN, &amp;key_ref_to_ptr(key)-&gt;flags);
+                pr_notice("Loaded X.509 cert '%s'\n",
+                      key_ref_to_ptr(key)-&gt;description);
+                key_ref_put(key);
+            }
+            p += plen;
+        }
+
+        return 0;
+
+    dodgy_cert:
+        pr_err("Problem parsing in-kernel X.509 certificate list\n");
+        return 0;
+    }
+    late_initcall(load_system_certificate_list);
+</code></pre>
+
+<h4>内核信任密匙是在编译的时候收集到的。收集 *.x509</h4>
+
+<h4>kernel/Makefile</h4>
+
+<pre><code>    obj-$(CONFIG_SYSTEM_TRUSTED_KEYRING) += system_keyring.o system_certificates.o
+    ...
+    ...
+
+    ###############################################################################
+    #
+    # Roll all the X.509 certificates that we can find together and pull them into
+    # the kernel so that they get loaded into the system trusted keyring during
+    # boot.
+    #
+    # We look in the source root and the build root for all files whose name ends
+    # in ".x509".  Unfortunately, this will generate duplicate filenames, so we
+    # have make canonicalise the pathnames and then sort them to discard the
+    # duplicates.
+    #
+    ###############################################################################
+    ifeq ($(CONFIG_SYSTEM_TRUSTED_KEYRING),y)
+    X509_CERTIFICATES-y := $(wildcard *.x509) $(wildcard $(srctree)/*.x509)
+    X509_CERTIFICATES-$(CONFIG_MODULE_SIG) += signing_key.x509
+    X509_CERTIFICATES := $(sort $(foreach CERT,$(X509_CERTIFICATES-y), \
+                $(or $(realpath $(CERT)),$(CERT))))
+
+    X509_TOOL_CERTIFICATES := $(wildcard $(srctree)/tool_certs/*.pub)
+
+    ifeq ($(X509_CERTIFICATES),)
+    $(warning *** No X.509 certificates found ***)
+    endif
+
+    ifneq ($(wildcard $(obj)/.x509.list),)
+    ifneq ($(shell cat $(obj)/.x509.list),$(X509_CERTIFICATES))
+    $(info X.509 certificate list changed)
+    $(shell rm $(obj)/.x509.list)
+    endif
+    endif
+
+    ifneq ($(wildcard $(obj)/.tool_x509.list),)
+    ifneq ($(shell cat $(obj)/.tool_x509.list),$(X509_TOOL_CERTIFICATES))
+    $(info X.509 tool_certificate list changed)
+    $(shell rm $(obj)/.tool_x509.list)
+    endif
+    endif
+
+    kernel/system_certificates.o: $(obj)/x509_certificate_list $(obj)/x509_tool_certificate_list
+
+    quiet_cmd_x509certs  = CERTS   $@  
+        cmd_x509certs  = cat $(X509_CERTIFICATES) /dev/null &gt;$@ $(foreach X509,$(X509_CERTIFICATES),; echo "  - Including cert $(X509)")
+    quiet_cmd_tool_x509certs  = CERTS   $@  
+        cmd_tool_x509certs  = cat $(X509_TOOL_CERTIFICATES) /dev/null &gt;$@ $(foreach X509,$(X509_TOOL_CERTIFICATES),; echo "  - Including cert $(X509)")
+
+    targets += $(obj)/x509_certificate_list
+    $(obj)/x509_certificate_list: $(X509_CERTIFICATES) $(obj)/.x509.list
+        $(call if_changed,x509certs)
+</code></pre>
+
+<h4>kernel/system_certificates.S</h4>
+
+<pre><code>    #include &lt;linux/export.h&gt;
+    #include &lt;linux/init.h&gt;
+
+        __INITRODATA
+
+        .align 8
+        .globl VMLINUX_SYMBOL(system_certificate_list)
+    VMLINUX_SYMBOL(system_certificate_list):
+    __cert_list_start:
+    #ifdef CONFIG_MODULE_SIG
+    #ifdef CONFIG_MODULE_SIG_FORCE
+        .incbin "kernel/x509_certificate_list"
+    #endif
+    #endif
+    __cert_list_end:
+
+        .align 8
+        .globl VMLINUX_SYMBOL(system_certificate_list_size)
+    VMLINUX_SYMBOL(system_certificate_list_size):
+    #ifdef CONFIG_64BIT
+        .quad __cert_list_end - __cert_list_start
+    #else
+        .long __cert_list_end - __cert_list_start
+    #endif
+
+        .align 8
+        .globl VMLINUX_SYMBOL(tool_certificate_list)
+    VMLINUX_SYMBOL(tool_certificate_list):
+    __tool_cert_list_start:
+    #ifdef CONFIG_MODULE_SIG
+    #ifdef CONFIG_MODULE_SIG_FORCE
+        .incbin "kernel/x509_tool_certificate_list"
+    #endif
+    #endif
+    __tool_cert_list_end:
+
+        .align 8
+        .globl VMLINUX_SYMBOL(tool_certificate_list_size)
+    VMLINUX_SYMBOL(tool_certificate_list_size):
+    #ifdef CONFIG_64BIT
+        .quad __tool_cert_list_end - __tool_cert_list_start
+    #else
+        .long __tool_cert_list_end - __tool_cert_list_start
+    #endif
+</code></pre>
+
+<h3>往内核插入自己密匙</h3>
+
+<p>kernel/system_keyring.c copy出来独立模块，将自己公匙导入系统</p>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[内核模块签名--命令行]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2018/02/09/kernel-signature-command/"/>
+    <updated>2018-02-09T01:38:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2018/02/09/kernel-signature-command</id>
+    <content type="html"><![CDATA[<p>依据 scripts/sign-file, 命令行签名模块及验证签名</p>
+
+<pre><code>    # 生成签名，密匙MOK_private.perm; 证书MOK.crt; DER格式证书MOK.der
+    openssl req -newkey rsa:4096 -nodes -keyout MOK_private.perm -new -x509 -sha512 -days 3650 -subj "/CN=my Machine Owner Key/" -out MOK.crt
+    openssl x509 -outform DER -in MOK.crt -out MOK.der
+
+    # 从密匙、证书提取公匙
+    openssl rsa -in MOK_private.perm -pubout -out MOK_pub.perm
+    openssl x509 -pubkey -in MOK.crt &gt; MOK_pub.perm
+
+
+    # 从ko中提取摘要
+    openssl dgst -sha512 -binary test.ko.tmp &gt; test.ko.sha512
+
+    # 依据 scripts/sign-file, 需要在摘要前加些东西再做签名
+    ./a.out &gt; test.ko.dgst
+    cat test.ko.sha512 &gt;&gt; test.ko.dgst
+
+    # 对摘要签名
+    openssl rsautl -sign -in test.ko.dgst -out test.ko.sig -inkey MOK_private.key
+
+    # 解密签名得到摘要
+    openssl rsautl -verify -inkey MOK.crt -certin -in test.ko.sig -o test.ko.verify1
+    openssl rsautl -verify -inkey MOK_pub.key -pubin -in test.ko.sig -o test.ko.verify2
+    diff test.ko.verify1 test.ko.dgst
+
+    # 直接用公匙验证签名
+    openssl dgst -sha512 -verify MOK_pub.key -signature test.ko.sig test.ko.tmp
+</code></pre>
+
+<p>a.c
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+<span class='line-number'>82</span>
+<span class='line-number'>83</span>
+<span class='line-number'>84</span>
+<span class='line-number'>85</span>
+<span class='line-number'>86</span>
+<span class='line-number'>87</span>
+<span class='line-number'>88</span>
+<span class='line-number'>89</span>
+<span class='line-number'>90</span>
+<span class='line-number'>91</span>
+<span class='line-number'>92</span>
+<span class='line-number'>93</span>
+<span class='line-number'>94</span>
+<span class='line-number'>95</span>
+<span class='line-number'>96</span>
+<span class='line-number'>97</span>
+<span class='line-number'>98</span>
+<span class='line-number'>99</span>
+<span class='line-number'>100</span>
+<span class='line-number'>101</span>
+<span class='line-number'>102</span>
+<span class='line-number'>103</span>
+<span class='line-number'>104</span>
+<span class='line-number'>105</span>
+<span class='line-number'>106</span>
+<span class='line-number'>107</span>
+<span class='line-number'>108</span>
+<span class='line-number'>109</span>
+<span class='line-number'>110</span>
+<span class='line-number'>111</span>
+<span class='line-number'>112</span>
+<span class='line-number'>113</span>
+<span class='line-number'>114</span>
+<span class='line-number'>115</span>
+<span class='line-number'>116</span>
+<span class='line-number'>117</span>
+<span class='line-number'>118</span>
+<span class='line-number'>119</span>
+<span class='line-number'>120</span>
+<span class='line-number'>121</span>
+<span class='line-number'>122</span>
+<span class='line-number'>123</span>
+<span class='line-number'>124</span>
+<span class='line-number'>125</span>
+<span class='line-number'>126</span>
+<span class='line-number'>127</span>
+<span class='line-number'>128</span>
+<span class='line-number'>129</span>
+<span class='line-number'>130</span>
+<span class='line-number'>131</span>
+<span class='line-number'>132</span>
+<span class='line-number'>133</span>
+<span class='line-number'>134</span>
+<span class='line-number'>135</span>
+<span class='line-number'>136</span>
+<span class='line-number'>137</span>
+<span class='line-number'>138</span>
+<span class='line-number'>139</span>
+<span class='line-number'>140</span>
+<span class='line-number'>141</span>
+<span class='line-number'>142</span>
+<span class='line-number'>143</span>
+<span class='line-number'>144</span>
+<span class='line-number'>145</span>
+<span class='line-number'>146</span>
+<span class='line-number'>147</span>
+<span class='line-number'>148</span>
+<span class='line-number'>149</span>
+<span class='line-number'>150</span>
+<span class='line-number'>151</span>
+<span class='line-number'>152</span>
+<span class='line-number'>153</span>
+<span class='line-number'>154</span>
+<span class='line-number'>155</span>
+<span class='line-number'>156</span>
+<span class='line-number'>157</span>
+<span class='line-number'>158</span>
+<span class='line-number'>159</span>
+<span class='line-number'>160</span>
+<span class='line-number'>161</span>
+<span class='line-number'>162</span>
+<span class='line-number'>163</span>
+<span class='line-number'>164</span>
+<span class='line-number'>165</span>
+<span class='line-number'>166</span>
+<span class='line-number'>167</span>
+<span class='line-number'>168</span>
+<span class='line-number'>169</span>
+<span class='line-number'>170</span>
+<span class='line-number'>171</span>
+<span class='line-number'>172</span>
+<span class='line-number'>173</span>
+<span class='line-number'>174</span>
+<span class='line-number'>175</span>
+<span class='line-number'>176</span>
+<span class='line-number'>177</span>
+<span class='line-number'>178</span>
+<span class='line-number'>179</span>
+<span class='line-number'>180</span>
+<span class='line-number'>181</span>
+<span class='line-number'>182</span>
+<span class='line-number'>183</span>
+<span class='line-number'>184</span>
+<span class='line-number'>185</span>
+<span class='line-number'>186</span>
+<span class='line-number'>187</span>
+<span class='line-number'>188</span>
+<span class='line-number'>189</span>
+<span class='line-number'>190</span>
+<span class='line-number'>191</span>
+<span class='line-number'>192</span>
+<span class='line-number'>193</span>
+<span class='line-number'>194</span>
+<span class='line-number'>195</span>
+<span class='line-number'>196</span>
+<span class='line-number'>197</span>
+<span class='line-number'>198</span>
+<span class='line-number'>199</span>
+<span class='line-number'>200</span>
+<span class='line-number'>201</span>
+<span class='line-number'>202</span>
+<span class='line-number'>203</span>
+<span class='line-number'>204</span>
+<span class='line-number'>205</span>
+<span class='line-number'>206</span>
+<span class='line-number'>207</span>
+<span class='line-number'>208</span>
+<span class='line-number'>209</span>
+<span class='line-number'>210</span>
+<span class='line-number'>211</span>
+<span class='line-number'>212</span>
+<span class='line-number'>213</span>
+<span class='line-number'>214</span>
+<span class='line-number'>215</span>
+<span class='line-number'>216</span>
+<span class='line-number'>217</span>
+<span class='line-number'>218</span>
+<span class='line-number'>219</span>
+<span class='line-number'>220</span>
+<span class='line-number'>221</span>
+<span class='line-number'>222</span>
+<span class='line-number'>223</span>
+<span class='line-number'>224</span>
+<span class='line-number'>225</span>
+<span class='line-number'>226</span>
+<span class='line-number'>227</span>
+<span class='line-number'>228</span>
+<span class='line-number'>229</span>
+<span class='line-number'>230</span>
+<span class='line-number'>231</span>
+<span class='line-number'>232</span>
+<span class='line-number'>233</span>
+<span class='line-number'>234</span>
+<span class='line-number'>235</span>
+<span class='line-number'>236</span>
+<span class='line-number'>237</span>
+<span class='line-number'>238</span>
+<span class='line-number'>239</span>
+<span class='line-number'>240</span>
+<span class='line-number'>241</span>
+<span class='line-number'>242</span>
+<span class='line-number'>243</span>
+<span class='line-number'>244</span>
+<span class='line-number'>245</span>
+<span class='line-number'>246</span>
+<span class='line-number'>247</span>
+<span class='line-number'>248</span>
+<span class='line-number'>249</span>
+<span class='line-number'>250</span>
+<span class='line-number'>251</span>
+<span class='line-number'>252</span>
+<span class='line-number'>253</span>
+<span class='line-number'>254</span>
+<span class='line-number'>255</span>
+<span class='line-number'>256</span>
+<span class='line-number'>257</span>
+<span class='line-number'>258</span>
+<span class='line-number'>259</span>
+<span class='line-number'>260</span>
+<span class='line-number'>261</span>
+<span class='line-number'>262</span>
+<span class='line-number'>263</span>
+<span class='line-number'>264</span>
+<span class='line-number'>265</span>
+<span class='line-number'>266</span>
+<span class='line-number'>267</span>
+<span class='line-number'>268</span>
+<span class='line-number'>269</span>
+<span class='line-number'>270</span>
+<span class='line-number'>271</span>
+<span class='line-number'>272</span>
+<span class='line-number'>273</span>
+<span class='line-number'>274</span>
+<span class='line-number'>275</span>
+<span class='line-number'>276</span>
+<span class='line-number'>277</span>
+<span class='line-number'>278</span>
+<span class='line-number'>279</span>
+<span class='line-number'>280</span>
+<span class='line-number'>281</span>
+<span class='line-number'>282</span>
+<span class='line-number'>283</span>
+<span class='line-number'>284</span>
+<span class='line-number'>285</span>
+<span class='line-number'>286</span>
+<span class='line-number'>287</span>
+<span class='line-number'>288</span>
+<span class='line-number'>289</span>
+<span class='line-number'>290</span>
+<span class='line-number'>291</span>
+<span class='line-number'>292</span>
+<span class='line-number'>293</span>
+<span class='line-number'>294</span>
+<span class='line-number'>295</span>
+<span class='line-number'>296</span>
+<span class='line-number'>297</span>
+<span class='line-number'>298</span>
+<span class='line-number'>299</span>
+<span class='line-number'>300</span>
+<span class='line-number'>301</span>
+<span class='line-number'>302</span>
+<span class='line-number'>303</span>
+<span class='line-number'>304</span>
+<span class='line-number'>305</span>
+<span class='line-number'>306</span>
+<span class='line-number'>307</span>
+<span class='line-number'>308</span>
+<span class='line-number'>309</span>
+<span class='line-number'>310</span>
+<span class='line-number'>311</span>
+<span class='line-number'>312</span>
+<span class='line-number'>313</span>
+<span class='line-number'>314</span>
+<span class='line-number'>315</span>
+<span class='line-number'>316</span>
+<span class='line-number'>317</span>
+<span class='line-number'>318</span>
+<span class='line-number'>319</span>
+<span class='line-number'>320</span>
+<span class='line-number'>321</span>
+<span class='line-number'>322</span>
+<span class='line-number'>323</span>
+<span class='line-number'>324</span>
+<span class='line-number'>325</span>
+<span class='line-number'>326</span>
+<span class='line-number'>327</span>
+<span class='line-number'>328</span>
+<span class='line-number'>329</span>
+<span class='line-number'>330</span>
+<span class='line-number'>331</span>
+<span class='line-number'>332</span>
+<span class='line-number'>333</span>
+<span class='line-number'>334</span>
+<span class='line-number'>335</span>
+<span class='line-number'>336</span>
+<span class='line-number'>337</span>
+<span class='line-number'>338</span>
+<span class='line-number'>339</span>
+<span class='line-number'>340</span>
+<span class='line-number'>341</span>
+<span class='line-number'>342</span>
+<span class='line-number'>343</span>
+<span class='line-number'>344</span>
+<span class='line-number'>345</span>
+<span class='line-number'>346</span>
+<span class='line-number'>347</span>
+<span class='line-number'>348</span>
+<span class='line-number'>349</span>
+<span class='line-number'>350</span>
+<span class='line-number'>351</span>
+<span class='line-number'>352</span>
+<span class='line-number'>353</span>
+<span class='line-number'>354</span>
+<span class='line-number'>355</span>
+<span class='line-number'>356</span>
+<span class='line-number'>357</span>
+<span class='line-number'>358</span>
+<span class='line-number'>359</span>
+<span class='line-number'>360</span>
+<span class='line-number'>361</span>
+<span class='line-number'>362</span>
+<span class='line-number'>363</span>
+<span class='line-number'>364</span>
+<span class='line-number'>365</span>
+<span class='line-number'>366</span>
+<span class='line-number'>367</span>
+<span class='line-number'>368</span>
+<span class='line-number'>369</span>
+<span class='line-number'>370</span>
+<span class='line-number'>371</span>
+<span class='line-number'>372</span>
+<span class='line-number'>373</span>
+<span class='line-number'>374</span>
+<span class='line-number'>375</span>
+<span class='line-number'>376</span>
+<span class='line-number'>377</span>
+<span class='line-number'>378</span>
+<span class='line-number'>379</span>
+<span class='line-number'>380</span>
+<span class='line-number'>381</span>
+<span class='line-number'>382</span>
+<span class='line-number'>383</span>
+<span class='line-number'>384</span>
+<span class='line-number'>385</span>
+<span class='line-number'>386</span>
+<span class='line-number'>387</span>
+<span class='line-number'>388</span>
+<span class='line-number'>389</span>
+<span class='line-number'>390</span>
+<span class='line-number'>391</span>
+<span class='line-number'>392</span>
+<span class='line-number'>393</span>
+<span class='line-number'>394</span>
+<span class='line-number'>395</span>
+<span class='line-number'>396</span>
+<span class='line-number'>397</span>
+<span class='line-number'>398</span>
+<span class='line-number'>399</span>
+<span class='line-number'>400</span>
+<span class='line-number'>401</span>
+<span class='line-number'>402</span>
+<span class='line-number'>403</span>
+<span class='line-number'>404</span>
+<span class='line-number'>405</span>
+<span class='line-number'>406</span>
+<span class='line-number'>407</span>
+<span class='line-number'>408</span>
+<span class='line-number'>409</span>
+<span class='line-number'>410</span>
+<span class='line-number'>411</span>
+<span class='line-number'>412</span>
+<span class='line-number'>413</span>
+<span class='line-number'>414</span>
+<span class='line-number'>415</span>
+<span class='line-number'>416</span>
+<span class='line-number'>417</span>
+<span class='line-number'>418</span>
+<span class='line-number'>419</span>
+<span class='line-number'>420</span>
+<span class='line-number'>421</span>
+<span class='line-number'>422</span>
+<span class='line-number'>423</span>
+<span class='line-number'>424</span>
+<span class='line-number'>425</span>
+<span class='line-number'>426</span>
+<span class='line-number'>427</span>
+<span class='line-number'>428</span>
+<span class='line-number'>429</span>
+<span class='line-number'>430</span>
+<span class='line-number'>431</span>
+<span class='line-number'>432</span>
+<span class='line-number'>433</span>
+<span class='line-number'>434</span>
+<span class='line-number'>435</span>
+<span class='line-number'>436</span>
+<span class='line-number'>437</span>
+<span class='line-number'>438</span>
+<span class='line-number'>439</span>
+<span class='line-number'>440</span>
+<span class='line-number'>441</span>
+<span class='line-number'>442</span>
+<span class='line-number'>443</span>
+<span class='line-number'>444</span>
+<span class='line-number'>445</span>
+<span class='line-number'>446</span>
+<span class='line-number'>447</span>
+<span class='line-number'>448</span>
+<span class='line-number'>449</span>
+<span class='line-number'>450</span>
+<span class='line-number'>451</span>
+<span class='line-number'>452</span>
+<span class='line-number'>453</span>
+<span class='line-number'>454</span>
+<span class='line-number'>455</span>
+<span class='line-number'>456</span>
+<span class='line-number'>457</span>
+<span class='line-number'>458</span>
+<span class='line-number'>459</span>
+<span class='line-number'>460</span>
+<span class='line-number'>461</span>
+<span class='line-number'>462</span>
+<span class='line-number'>463</span>
+<span class='line-number'>464</span>
+<span class='line-number'>465</span>
+<span class='line-number'>466</span>
+<span class='line-number'>467</span>
+<span class='line-number'>468</span>
+<span class='line-number'>469</span>
+<span class='line-number'>470</span>
+<span class='line-number'>471</span>
+<span class='line-number'>472</span>
+<span class='line-number'>473</span>
+<span class='line-number'>474</span>
+<span class='line-number'>475</span>
+<span class='line-number'>476</span>
+<span class='line-number'>477</span>
+<span class='line-number'>478</span>
+<span class='line-number'>479</span>
+<span class='line-number'>480</span>
+<span class='line-number'>481</span>
+<span class='line-number'>482</span>
+<span class='line-number'>483</span>
+<span class='line-number'>484</span>
+<span class='line-number'>485</span>
+<span class='line-number'>486</span>
+<span class='line-number'>487</span>
+<span class='line-number'>488</span>
+<span class='line-number'>489</span>
+<span class='line-number'>490</span>
+<span class='line-number'>491</span>
+<span class='line-number'>492</span>
+<span class='line-number'>493</span>
+<span class='line-number'>494</span>
+<span class='line-number'>495</span>
+<span class='line-number'>496</span>
+<span class='line-number'>497</span>
+<span class='line-number'>498</span>
+<span class='line-number'>499</span>
+<span class='line-number'>500</span>
+<span class='line-number'>501</span>
+<span class='line-number'>502</span>
+<span class='line-number'>503</span>
+<span class='line-number'>504</span>
+<span class='line-number'>505</span>
+<span class='line-number'>506</span>
+<span class='line-number'>507</span>
+<span class='line-number'>508</span>
+<span class='line-number'>509</span>
+<span class='line-number'>510</span>
+<span class='line-number'>511</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;stdio.h&gt;
+</span><span class='line'>int main()
+</span><span class='line'>{
+</span><span class='line'>    int i;
+</span><span class='line'>    char a[] = {    0x30, 0x51, 0x30, 0x0d, 0x06, 0x09,
+</span><span class='line'>            0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03,
+</span><span class='line'>            0x05, 0x00, 0x04, 0x40};&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    for (i = 0; i &lt; 19; i ++)
+</span><span class='line'>    printf("%c", a[i]);
+</span><span class='line'>return 0;
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>#### scripts/sign-file
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;不同算法需要在摘要前加下面内容
+</span><span class='line'>315 #
+</span><span class='line'>316 # Digest the data
+</span><span class='line'>317 #
+</span><span class='line'>318 my $prologue;
+</span><span class='line'>319 if ($dgst eq "sha1") {
+</span><span class='line'>320     $prologue = pack("C*",
+</span><span class='line'>321                      0x30, 0x21, 0x30, 0x09, 0x06, 0x05,
+</span><span class='line'>322                      0x2B, 0x0E, 0x03, 0x02, 0x1A,
+</span><span class='line'>323                      0x05, 0x00, 0x04, 0x14);
+</span><span class='line'>324     $hash = 2;
+</span><span class='line'>325 } elsif ($dgst eq "sha224") {
+</span><span class='line'>326     $prologue = pack("C*",
+</span><span class='line'>327                      0x30, 0x2d, 0x30, 0x0d, 0x06, 0x09,
+</span><span class='line'>328                      0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x04,
+</span><span class='line'>329                      0x05, 0x00, 0x04, 0x1C);
+</span><span class='line'>330     $hash = 7;
+</span><span class='line'>331 } elsif ($dgst eq "sha256") {
+</span><span class='line'>332     $prologue = pack("C*",
+</span><span class='line'>333                      0x30, 0x31, 0x30, 0x0d, 0x06, 0x09,
+</span><span class='line'>334                      0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01,
+</span><span class='line'>335                      0x05, 0x00, 0x04, 0x20);
+</span><span class='line'>336     $hash = 4;
+</span><span class='line'>337 } elsif ($dgst eq "sha384") {
+</span><span class='line'>338     $prologue = pack("C*",
+</span><span class='line'>339                      0x30, 0x41, 0x30, 0x0d, 0x06, 0x09,
+</span><span class='line'>340                      0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02,
+</span><span class='line'>341                      0x05, 0x00, 0x04, 0x30);
+</span><span class='line'>342     $hash = 5;
+</span><span class='line'>343 } elsif ($dgst eq "sha512") {
+</span><span class='line'>344     $prologue = pack("C*",
+</span><span class='line'>345                      0x30, 0x51, 0x30, 0x0d, 0x06, 0x09,
+</span><span class='line'>346                      0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03,
+</span><span class='line'>347                      0x05, 0x00, 0x04, 0x40);
+</span><span class='line'>348     $hash = 6;
+</span><span class='line'>349 } else {
+</span><span class='line'>350     die "Unknown hash algorithm: $dgst\n";
+</span><span class='line'>351 }
+</span><span class='line'>352
+</span><span class='line'>353 my $signature;
+</span><span class='line'>354 if ($signature_file) {
+</span><span class='line'>355         $signature = read_file($signature_file);
+</span><span class='line'>356 } else {
+</span><span class='line'>357         #
+</span><span class='line'>358         # Generate the digest and read from openssl's stdout
+</span><span class='line'>359         #
+</span><span class='line'>360         my $digest;  # 先算摘要
+</span><span class='line'>361         $digest = readpipe("openssl dgst -$dgst -binary $module") || die "openssl dgst";
+</span><span class='line'>362 
+</span><span class='line'>363         #
+</span><span class='line'>364         # Generate the binary signature, which will be just the integer that
+</span><span class='line'>365         # comprises the signature with no metadata attached.
+</span><span class='line'>366         #
+</span><span class='line'>367         my $pid;     # 签名命令，签名的输入372行
+</span><span class='line'>368         $pid = open2(*read_from, *write_to,
+</span><span class='line'>369                      "openssl rsautl -sign -inkey $private_key -keyform PEM") ||
+</span><span class='line'>370             die "openssl rsautl";
+</span><span class='line'>371         binmode write_to; # 签名的输入是 $prologue . $digest
+</span><span class='line'>372         print write_to $prologue . $digest || die "pipe to openssl rsautl";
+</span><span class='line'>373         close(write_to) || die "pipe to openssl rsautl";
+</span><span class='line'>374 
+</span><span class='line'>375         binmode read_from;
+</span><span class='line'>376         read(read_from, $signature, 4096) || die "pipe from openssl rsautl";
+</span><span class='line'>377         close(read_from) || die "pipe from openssl rsautl";
+</span><span class='line'>378         waitpid($pid, 0) || die;
+</span><span class='line'>379         die "openssl rsautl died: $?" if ($? &gt;&gt; 8);
+</span><span class='line'>380 }
+</span><span class='line'>381 $signature = pack("n", length($signature)) . $signature,
+</span><span class='line'>382 
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>----------------
+</span><span class='line'>
+</span><span class='line'>https://www.jianshu.com/p/215eee5dbb05
+</span><span class='line'>
+</span><span class='line'>整篇文章经由对[Signing Kernel Moudles For Security Boot][1]实践整理而成。如果能看懂原版的话，建议看该网页
+</span><span class='line'>
+</span><span class='line'>在我们安装一个自己编译的模块包后，需要modprobe xx 然而，可能出现required key not available这样的提示。
+</span><span class='line'>
+</span><span class='line'>这是由于采用EFI的Linux系统限制只有通过签名的模块才能加载运行。如果你是安装自己编译的模块，就需要自己签名了。
+</span><span class='line'>
+</span><span class='line'>#### 1.需要安装依赖的工具：
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;sudo yum install openssl
+</span><span class='line'>sudo yum install kernel-devel
+</span><span class='line'>sudo yum install perl
+</span><span class='line'>sudo yum install mokutil
+</span><span class='line'>sudo yum install keyutils
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>#### 2.对于System Key Rings的解释：
+</span><span class='line'>
+</span><span class='line'>咱们的X.509 Keys放在哪儿呢？请看下表
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;Source of X.509 Keys        User Ability to Add Keys    Keys Loaded During Boot
+</span><span class='line'>UEFI Secure Boot "db"       Limited             .system_keyring
+</span><span class='line'>UEFI Secure Boot "dbx"      Limited             .system_keyring
+</span><span class='line'>Machine Owner Key (MOK) list    Yes             .system_keyring
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>密钥要经过系统验证，也就是说咱们的一对密钥中的公钥要加载进MOK中
+</span><span class='line'>
+</span><span class='line'>#### 3.检查自己是否是EFI
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;sudo keyctl list %:.system_keyring
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>你看到的就是MOK list
+</span><span class='line'>
+</span><span class='line'>如果是EFI，你可以看到包含 EFI 字样的keyring。咱们在安装过程中，也要把自己的keyring也加到里面去。
+</span><span class='line'>
+</span><span class='line'>#### 4.生成自己的密钥对
+</span><span class='line'>
+</span><span class='line'>生成密钥配置文件
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;sudo cat &lt;&lt; EOF &gt; configuration_file.config
+</span><span class='line'>[ req ]
+</span><span class='line'>default_bits = 4096
+</span><span class='line'>distinguished_name = req_distinguished_name
+</span><span class='line'>prompt = no
+</span><span class='line'>string_mask = utf8only
+</span><span class='line'>x509_extensions = myexts
+</span><span class='line'>
+</span><span class='line'>[ req_distinguished_name ]
+</span><span class='line'>O = &lt;你的签名key的名字&gt;
+</span><span class='line'>emailAddress = &lt;你的E-mail&gt;
+</span><span class='line'>
+</span><span class='line'>[ myexts ]
+</span><span class='line'>basicConstraints=critical,CA:FALSE
+</span><span class='line'>keyUsage=digitalSignature
+</span><span class='line'>subjectKeyIdentifier=hash
+</span><span class='line'>authorityKeyIdentifier=keyid
+</span><span class='line'>EOF
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>你的名字和E-mail地址这些东西是为了标识你的签名密钥，毕竟是自己做的作品嘛。你还可以在* [req_distinguished_name] *部分添加更多信息，也可以删减。
+</span><span class='line'>
+</span><span class='line'>生成密钥
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;sudo openssl req -x509 -new -nodes -utf8 -sha256 -days 36500    \
+</span><span class='line'>-batch -config configuration_file.config -outform DER   \
+</span><span class='line'>-out public_key.der                 \  
+</span><span class='line'>-keyout private_key.priv
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>#### 5.登记你的公钥
+</span><span class='line'>
+</span><span class='line'>公钥要登记在MOK list里
+</span><span class='line'>
+</span><span class='line'>Centos7、RedHat EL7系系统,可以使用mokutil
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;sudo mokutil --import my_signing_key_pub.der
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;这时系统会要你为MOK登记设置一个密码
+</span><span class='line'>
+</span><span class='line'>设置完密码后，重启:
+</span><span class='line'>
+</span><span class='line'>sudo reboot```
+</span><span class='line'>
+</span><span class='line'>重启过程中会进入EFI的确认界面，输入刚刚设置的密码，一直确认就行
+</span><span class='line'>
+</span><span class='line'>重启后，输入
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;sudo keyctl list %:.system_keyring
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>你会发现MOK list比以前多了一项，也就是你的签名
+</span><span class='line'>
+</span><span class='line'>#### 6.给你的模块签名
+</span><span class='line'>
+</span><span class='line'>这里我结合我自己给wl模块签名的实例
+</span><span class='line'>
+</span><span class='line'>这里 我的wl模块 来源于我安装了一个叫wl-kmod的包，这是无线网卡驱动，为了找到模块位置，我先输入：
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;rpm -ql kmod-wl
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;
+</span><span class='line'>找到了wl.ko的位置在/lib/modules/3.10.0-514.10.2.el7.x86_64/extra/wl/wl.ko
+</span><span class='line'>
+</span><span class='line'>如果能给安装包直接签名貌似更好，但是我是已经安装完才进行补救的
+</span><span class='line'>
+</span><span class='line'>那么就是给wl.ko签名啦:
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;sudo perl /usr/src/kernels/$(uname -r)/scripts/sign-file \
+</span><span class='line'>sha256 \
+</span><span class='line'>/home/feyan/feyan_signing_key_pub.der\     #公钥文件（位置和名称视具体情况）
+</span><span class='line'>/home/fayan/feyan_signing_key.priv\        #私钥文件（位置和名称视具体情况）
+</span><span class='line'>/lib/modules/3.10.0-514.10.2.el7.x86_64/extra/wl/wl.ko   #模块文件
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;```&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;签名成功后，输入&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;sudo modprobe wl&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;&lt;strong&gt;载入模块没有问题，说明我的签名成功了&lt;/strong&gt;&lt;/p&gt;
+</span><span class='line'>]]&gt;&lt;/content&gt;
+</span><span class='line'>  &lt;/entry&gt;
+</span><span class='line'>  
+</span><span class='line'>  &lt;entry&gt;
+</span><span class='line'>&lt;title type="html"&gt;&lt;![CDATA[内核模块签名--密匙]]&gt;&lt;/title&gt;
+</span><span class='line'>&lt;link href="http://abcdxyzk.github.io/blog/2018/02/09/kernel-keyring/"/&gt;
+</span><span class='line'>&lt;updated&gt;2018-02-09T01:37:00+08:00&lt;/updated&gt;
+</span><span class='line'>&lt;id&gt;http://abcdxyzk.github.io/blog/2018/02/09/kernel-keyring&lt;/id&gt;
+</span><span class='line'>&lt;content type="html"&gt;&lt;![CDATA[&lt;p&gt;&lt;a href="https://www.ibm.com/developerworks/cn/linux/l-key-retention.html"&gt;https://www.ibm.com/developerworks/cn/linux/l-key-retention.html&lt;/a&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;Linux 密钥保留服务（Linux key retention service）是在 Linux 2.6 中引入的，它的主要意图是在 Linux 内核中缓存身份验证数据。远程文件系统和其他内核服务可以使用这个服务来管理密码学、身份验证标记、跨域用户映射和其他安全问题。它还使 Linux 内核能够快速访问所需的密钥，并可以用来将密钥操作（比如添加、更新和删除）委托给用户空间。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;本文将概述 Linux 密钥保留服务，定义它的术语，帮助您快速掌握 Linux 密钥的使用方法。您将通过示例代码了解如何在内核模块中使用 Linux 密钥保留服务。在编写本文时使用的内核版本是 2.6.20。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h4&gt;什么是密钥？&lt;/h4&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;密钥（key）是一组密码学数据、身份验证标记或某些相似的元素，它在内核中由 struct key 表示。在 Linux 内核源代码中，struct key 是在 include/linux/key.h 下定义的。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;清单 1 给出 struct key 中一些重要的字段。注意，为了支持密钥，已经修改了 task_struct、user_struct 和 signal_struct。
+</span><span class='line'>清单 1. struct key 中的重要字段&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code class=""&gt;    struct key {
+</span><span class='line'>    atomic_t             usage;         /* number of references */
+</span><span class='line'>    key_serial_t         serial;        /* key serial number */
+</span><span class='line'>    struct key_type      *type;         /* type of key */
+</span><span class='line'>    time_t               expiry;        /* time at which key expires (or 0) */
+</span><span class='line'>    uid_t                uid;           /* UID */
+</span><span class='line'>    gid_t                gid;           /* GID */
+</span><span class='line'>    key_perm_t           perm;          /* access permissions */
+</span><span class='line'>    unsigned short       quotalen;      /* length added to quota */
+</span><span class='line'>    unsigned short       datalen;       /* payload data length
+</span><span class='line'>    char                 *description;
+</span><span class='line'>    union {
+</span><span class='line'>        unsigned long       value;
+</span><span class='line'>        void                *data;
+</span><span class='line'>        struct keyring_list *subscriptions;
+</span><span class='line'>    } payload;                          /* Actual security data */
+</span><span class='line'>    ....
+</span><span class='line'>    ....
+</span><span class='line'>};
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h4&gt;密钥的属性&lt;/h4&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;密钥具有以下属性：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;  序号（Serial number）：一个惟一的 32 位非零正数。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;  类型（Type）：Linux 密钥保留服务定义两个标准密钥类型：user 和 keyring。要添加新的密钥类型，必须由一个内核服务注册它。用户空间程序不允许创建新的密钥类型。密钥类型在内核中由 struct key_type 表示，这是在 include/linux/key.h 中定义的。key_type 结构的一些重要字段见清单 2。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;  清单 2. key_type 的重要字段&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code&gt;    struct key_type {
+</span><span class='line'>    const char *name;
+</span><span class='line'>    size_t def_datalen;
+</span><span class='line'>
+</span><span class='line'>    /* Operations that can be defined for a key_type */
+</span><span class='line'>    int (*instantiate)(struct key *key, const void *data, size_t datalen);
+</span><span class='line'>    int (*update)(struct key *key, const void *data, size_t datalen);
+</span><span class='line'>    int (*match)(const struct key *key, const void *desc);
+</span><span class='line'>    void (*revoke)(struct key *key);
+</span><span class='line'>    void (*destroy)(struct key *key);
+</span><span class='line'>    void (*describe)(const struct key *key, struct seq_file *p);
+</span><span class='line'>    long (*read)(const struct key *key, char __user *buffer, size_t buflen);
+</span><span class='line'>    ....
+</span><span class='line'>    ....
+</span><span class='line'>};
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;  还可以将一组操作与一个密钥类型相关联。key_type 可以定义以下操作：
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>    instantiate 创建指定类型的一个新密钥。
+</span><span class='line'>    describe 输出描述这个密钥的文本。
+</span><span class='line'>    match 根据描述搜索密钥。
+</span><span class='line'>    destroy 清除与一个密钥相关的所有数据。
+</span><span class='line'>    request_key 搜索密钥。
+</span><span class='line'>    revoke 清除密钥数据并将密钥的状态改为 REVOKED。
+</span><span class='line'>    read 读取密钥数据。
+</span><span class='line'>    update 修改密钥。
+</span><span class='line'>  描述（Description）：一个描述密钥的可输出字符串。这个属性还可以用来执行搜索操作。
+</span><span class='line'>  访问控制信息（Access control information）：每个密钥有一个所有者 ID、一个 GID 和一个权限掩码，权限掩码表示如何响应用户级或内核级程序。权限掩码给四个可能的密钥访问者类型各分配 8 位：所有者、用户、组和其他。在这 8 位中，只定义了 6 位。可能的权限如下：
+</span><span class='line'>    View 允许权限持有者查看密钥属性。
+</span><span class='line'>    Read 允许权限持有者读取密钥并列出 keyring 的密钥。
+</span><span class='line'>    Write 允许权限持有者修改密钥或 keyring 的有效内容和修改链接的密钥。
+</span><span class='line'>    Search 允许权限持有者搜索 keyring 和寻找密钥。
+</span><span class='line'>    Link 允许权限持有者将特定的密钥或 keyring 链接到 keyring。
+</span><span class='line'>    Set Attribute 允许权限持有者设置密钥的 UID、GID 和权限掩码。
+</span><span class='line'>过期时间（Expiry Time）：密钥的生存期。密钥也可以是永久的。
+</span><span class='line'>有效内容（Payload）：实际的安全内容。可以通过 struct key_type 定义的操作用数据对有效内容进行实例化，还可以读取数据或修改数据。对于内核来说，有效内容仅仅是一组数据。
+</span><span class='line'>状态（State）：密钥可以处于以下状态：
+</span><span class='line'>    UNINSTANTIATED：已经创建了密钥，但是还没有附加任何数据。
+</span><span class='line'>    INSTANTIATED：密钥已经实例化并附加了数据；这是一个完整的 状态。
+</span><span class='line'>    NEGATIVE：这是一个临时状态，表示前面对用户空间的调用失败了。
+</span><span class='line'>    EXPIRED：表示密钥已经超过了预定义的生存期。
+</span><span class='line'>    REVOKED：一个用户空间操作将密钥转移到这个状态。
+</span><span class='line'>    DEAD：key_type 取消了注册。
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h4&gt;密钥类型&lt;/h4&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;有两种预定义的密钥类型：keyring 和 user。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;keyring 包含一组到其他密钥或 keyring 的链接。有六种标准的 keyring：
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>线程特有的
+</span><span class='line'>进程特有的
+</span><span class='line'>会话特有的
+</span><span class='line'>用户特有的会话
+</span><span class='line'>用户默认的会话
+</span><span class='line'>组特有的（还未实现）
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h5&gt;限额&lt;/h5&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;对于一个用户可以拥有的密钥和 keyring 的数量有限制（密钥数量限额），对于在密钥描述和有效内容中使用的信息量也有限制（密钥大小限额）。进程特有的和线程特有的 keyring 不在用户限额的范围内。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;只有前三个 keyring 被自动搜索，自动搜索会按照次序进行。第四种类型（用户特有的会话 keyring）不被直接搜索，但是，它通常会链接到一个会话特有的 keyring。登录进程（比如 PAM）将绑定到用户默认的会话 keyring，直到创建另一个会话为止。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;用户密钥由用户空间程序操作。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h3&gt;三个新的系统调用&lt;/h3&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;Linux 密钥保留服务提供三个新的系统调用，用来在用户空间中操作密钥。第一个是 add_key：
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>key_serial_t add_key(const char *type, const char *desc,
+</span><span class='line'>             const void *payload, size_t plen,
+</span><span class='line'>             key_serial_t ring);
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;add_key 系统调用用来创建类型为 type、长度为 plen 的密钥。密钥描述由 desc 定义，它的有效内容由 payload 指定。密钥链接到 keyring ring。密钥类型可以是 user 或 keyring。其他任何密钥类型必须已经通过内核服务向内核注册，然后才能使用。如果密钥是 keyring 类型的，有效内容就应该是 NULL，plen 应该是零。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;下一个新的系统调用是 request_key：
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>key_serial_t request_key(const char *type, const char *desc,
+</span><span class='line'>             const char *callout_info,
+</span><span class='line'>             key_serial_t dest_keyring);
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;request_key 系统调用搜索一个进程 keyring，寻找一个密钥。搜索密钥的基本算法见清单 3。
+</span><span class='line'>清单 3. request_key 算法
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>search_into_each_subscribed_keyrings {
+</span><span class='line'>    if (key is found) {
+</span><span class='line'>        return(found key);
+</span><span class='line'>    } else {
+</span><span class='line'>        if (callout_info is NULL) {
+</span><span class='line'>            return(ERROR);
+</span><span class='line'>        } else {
+</span><span class='line'>            Execute /sbin/request-key and pass callout_info as argument;
+</span><span class='line'>        }
+</span><span class='line'>    }
+</span><span class='line'>}
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;关于 request_key 算法的工作原理的详细信息，请参考 Documentation/keys-request-key.txt（参见 参考资料 中的链接）。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;最后，系统调用 keyctl 提供许多用来管理密钥的函数。可以根据传递给 keyctl 的第一个参数在密钥上执行各种操作。下面列出 keyctl 的一部分操作：
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>KEYCTL_DESCRIBE 描述一个密钥。
+</span><span class='line'>KEYCTL_READ 从一个密钥读取有效内容数据。
+</span><span class='line'>KEYCTL_UPDATE 更新指定的密钥。
+</span><span class='line'>KEYCTL_LINK 将一个密钥链接到一个 keyring。
+</span><span class='line'>KEYCTL_UNLINK 将密钥或 keyring 与另一个 keyring 的链接取消。
+</span><span class='line'>KEYCTL_JOIN_SESSION_KEYRING 将一个会话 keyring 替换为新的会话 keyring。
+</span><span class='line'>KEYCTL_REVOKE 取消一个密钥。
+</span><span class='line'>KEYCTL_CHOWN 修改密钥的所有者。
+</span><span class='line'>KEYCTL_SETPERM 修改密钥的权限掩码。
+</span><span class='line'>KEYCTL_CLEAR 清除一个 keyring。
+</span><span class='line'>KEYCTL_SEARCH 在一个 keyring 树中搜索密钥。
+</span><span class='line'>KEYCTL_INSTANTIATE 对部分构造好的密钥进行实例化。
+</span><span class='line'>KEYCTL_NEGATE 取消对部分构造好的密钥的实例化。
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;关于 keyctl 的原型和 keyctl 可以执行的其他操作的更多信息，请参考 Linux 手册页。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h4&gt;管理密钥的内核 API&lt;/h4&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;下面是几个用来管理密钥的最重要的 Linux 内核 API。要想了解更全面的信息，请下载并参考 Linux 密钥实现源代码文件（参见下面的 下载）。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;register_key_type 用来定义新的密钥类型。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;如果已经存在名称相同的密钥类型，那么 int register_key_type(struct key_type *type) 返回 EEXIT。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;unregister_key_type 用来取消密钥类型的注册：&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;pre&gt;&lt;code class=""&gt;    void unregister_key_type(struct key_type *type);
+</span><span class='line'>&lt;/code&gt;&lt;/pre&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;key_put 发布一个密钥：
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>void key_put(struct key *key);
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;request_key 搜索与给定的描述匹配的密钥：
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>struct key *request_key(const struct key_type *type,
+</span><span class='line'>                        const char *description,
+</span><span class='line'>                        const char *callout_string);
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;key_alloc 分配指定类型的密钥：
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>struct key *key_alloc(struct key_type *type, const char *desc,
+</span><span class='line'>                      uid_t uid, gid_t gid, struct task_struct *ctx,
+</span><span class='line'>                      key_perm_t perm, unsigned long flags);
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;key_instantiate_and_link 对密钥进行实例化并将它链接到目标 keyring：
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>int key_instantiate_and_link(struct key *key,  const void *data,
+</span><span class='line'>                             size_t datalen, struct key *keyring,
+</span><span class='line'>                             struct key *instkey);
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h4&gt;启用密钥服务&lt;/h4&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;因为 Linux 密钥保留服务仍然非常新，在默认情况下 Linux 内核中关闭了这个服务。要想启用密钥服务，必须使用 CONFIG_KEYS=y 选项对内核进行配置。可以在内核编译的 make *config 步骤中 Security options 下面找到这个选项。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;清单 4 给出在 Linux 内核中启用密钥服务的配置。
+</span><span class='line'>清单 4. 在 Linux 内核中启用密钥服务
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>".config" file ...
+</span><span class='line'>#
+</span><span class='line'># Security options
+</span><span class='line'>#
+</span><span class='line'>CONFIG_KEYS=y
+</span><span class='line'>CONFIG_KEYS_DEBUG_PROC_KEYS=y
+</span><span class='line'>CONFIG_SECURITY=y
+</span><span class='line'>CONFIG_SECURITY_NETWORK=y
+</span><span class='line'>CONFIG_SECURITY_CAPABILITIES=y
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;密钥的源代码被组织在目录 linux-2.6.x/security/keys 中。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;接下来，需要 下载并安装 keyutils 包。keyutils 包含 keyctl 命令，可以使用这个命令在密钥上执行各种操作。前面已经列出了 keyctl 的一部分操作。更多信息参见 Linux 手册页。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h4&gt;创建新的密钥类型&lt;/h4&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;学习 Linux 密钥保留服务最容易的方式就是进行实践。下面的示例使用 Linux 密钥保留服务创建一个新类型的密钥。如果还没有 下载示例程序， 现在就执行这个步骤。执行 make 来构建内核模块和用户级程序的二进制代码。这些代码已经在 Linux 内核版本 2.6.20 上测试过了。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;示例程序有两个组件：一个内核模块和一个用户空间程序。这个内核模块注册一个新的密钥类型。这个用户空间程序在预定义的 proc-entries 上执行 ioctl，这会导致对内核模块的调用。这个调用会产生一个新的密钥。然后，一个 “bash” shell 返回给用户，它带有新的会话 keyring 和链接到这个 keyring 的新类型的密钥。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;因为这个用户空间程序将执行 ioctl，内核模块必须注册 proc_ioctl() 函数来处理 ioctl 请求。所有 ioctl 通信都使用 /proc 接口来进行。清单 5 给出在内核模块中声明的一个新的密钥类型。
+</span><span class='line'>清单 5. 声明新的密钥类型
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>truct key_type new_key_type = {
+</span><span class='line'>    .name = "mykey",
+</span><span class='line'>    .instantiate = instantiate_key,
+</span><span class='line'>    .describe = key_desc,
+</span><span class='line'>    .destroy = key_destroy,
+</span><span class='line'>    .match = key_match,
+</span><span class='line'>;
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;然后，模块在它的 init 函数中调用 register_key_type() 来注册这个新密钥类型（名为 mykey）。当内核模块收到 ioctl 请求时，它首先调用 key_alloc() 来分配一个新的密钥，从而创建一个会话 keyring。在成功调用 key_alloc() 之后，调用 key_instantiate_and_link() 对密钥进行实例化。在创建并实例化会话 keyring 之后，为用户的会话创建密钥。同样，依次调用 key_alloc() 和 key_instantiate_and_link()。成功完成这些调用之后，用户空间会话就有了一个新密钥。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;示例程序中演示了所有这些步骤。&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;h4&gt;使用模块&lt;/h4&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;创建了新的密钥类型之后，我们来试用一下这个内核模块。模块中的一个基本操作是查看一个进程与哪些 keyring 相关联，以及这些 keyring 包含哪些密钥和其他 keyring。调用 keyctl show 就可以在树结构中显示密钥。清单 6 显示在运行程序之前密钥的状态。
+</span><span class='line'>清单 6. 查看进程的 keyring
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>root@phoenix set.5]# keyctl show
+</span><span class='line'>ession Keyring
+</span><span class='line'>      -3 --alswrv      0     0  keyring: _ses.1976
+</span><span class='line'>       2 --alswrv      0     0   \_ keyring: _uid.0
+</span><span class='line'>&lt;/code&gt;
+</span><span class='line'>清单 7 显示插入模块或者卸载模块或用户级程序的命令的输出。这些消息会放在一个系统日志文件中（通常是 /var/log/messages）。
+</span><span class='line'>清单 7. 插入内核模块
+</span><span class='line'>&lt;code&gt;
+</span><span class='line'>root@phoenix set.5]# insmod ./kernel.land/newkey.ko
+</span><span class='line'>oading the module ...
+</span><span class='line'>egistered "learning_key"
+</span><span class='line'>&lt;/code&gt;&lt;/p&gt;
+</span><span class='line'>
+</span><span class='line'>&lt;p&gt;接下来，执行用户级程序。
+</span><span class='line'>清单 8. 执行用户级程序</span></code></pre></td></tr></table></div></figure>
+    root@phoenix set.5]# ./user.land/session</p>
+
+<pre><code>n /var/log/message, you will see similar output
+nstalling session keyring:
+eyring allocated successfully.
+eyring instantiated and linked successfully.
+ew session keyring installed successfully.
+ey of new type allocated successfully.
+ew key type linked to current session.
+</code></pre>
+
+<pre><code>
+再看一下密钥的状态，见清单 9。
+清单 9. 运行用户级程序之后的密钥状态
+</code></pre>
+
+<pre><code>root@phoenix set.5]# keyctl show
+ession Keyring
+      -3 --alswrv      0     0  keyring: session.2621
+39044642 --alswrv      0     0   \_ mykey: New key type
+
+root@phoenix set.5]# cat /proc/keys
+0000001 I-----     1 perm 1f3f0000     0     0 keyring   _uid_ses.0: 1/4
+0000002 I-----     5 perm 1f3f0000     0     0 keyring   _uid.0: empty
+253c622 I--Q--     1 perm 3f3f0000     0     0 mykey   New key type: 0
+1a490da I--Q--     2 perm 3f3f0000     0     0 keyring   session.2621: 1/4
+3670439 I--Q--     2 perm 1f3f0000     0     0 keyring   _ses.1977: 1/4
+59d39b8 I--Q--     5 perm 1f3f0000     0     0 keyring   _ses.1976: 1/4
+a14f259 I--Q--     3 perm 1f3f0000     0     0 keyring   _ses.1978: 1/4
+root@phoenix set.5]# cat /proc/key-users
+   0:     8 7/7 5/100 136/10000
+  43:     2 2/2 2/100 56/10000
+  48:     2 2/2 2/100 56/10000
+  81:     2 2/2 2/100 56/10000
+  786:     4 4/4 4/100 113/10000
+
+"keyctl describe &lt;Key&gt;" command gives the description of key.
+
+[root@phoenix set.5]# keyctl describe -3
+       -3: alswrvalswrv------------     0     0 keyring: session.2621
+[root@phoenix set.5]# keyctl describe 39044642
+ 39044642: alswrvalswrv------------     0     0 mykey: New key type
+[avinesh@phoenix set.5]$ keyctl search -3 mykey "New key type"
+39044642
+[root@phoenix set.5]# exit
+exit
+Now back to our previous state  
+[root@phoenix set.5]# keyctl show
+Session Keyring
+       -3 --alswrv      0     0  keyring: _ses.1976
+        2 --alswrv      0     0   \_ keyring: _uid.0
+[root@phoenix set.5]# rmmod ./kernel.land/newkey.ko 
+Unloading the module.
+Unregistered "learning_key"
+</code></pre>
+
+<pre><code>
+#### 与密钥相关的 proc 文件
+
+/proc 中添加了两个文件来管理密钥：/proc/keys 和 /proc/key-users。我们来仔细看看这些文件。
+
+##### /proc/keys
+
+如果一个进程希望了解它可以查看哪些密钥，它可以通过读取 /proc/keys 获得这些信息。在配置内核时，必须启用这个文件，因为它允许任何用户列出密钥数据库。
+清单 10. /proc/keys 文件
+</code></pre>
+
+<pre><code>[root@phoenix set.5]# cat /proc/keys
+00000001 I-----  1     perm    1f3f0000      0    0    keyring    _uid_ses.0 : 1/4
+00000002 I-----  5     perm    1f3f0000      0    0    keyring    _uid.0     : empty
+13670439 I--Q--  2     perm    1f3f0000      0    0    keyring    _ses.1977  : 1/4
+159d39b8 I--Q--  6     perm    1f3f0000      0    0    keyring    _ses.1976  : 1/4
+3a14f259 I--Q--  3     perm    1f3f0000      0    0    keyring    _ses.1978  : 1/4
+[Serial][Flags][Usage][Expiry][Permissions][UID][GID][TypeName][Description] :[Summary]
+</code></pre>
+
+<pre><code>
+*Source: linux_kernel_source/security/keys/proc.c:proc_keys_show()
+
+在以上文件中看到的大多数字段来自 include/linux/key.h 中定义的 struct key。可能的标志值见清单 11。
+清单 11. struct key 字段可能的标志值
+</code></pre>
+
+<pre><code>I        Instantiated
+R        Revoked
+D        Dead
+Q        Contributes to user's quota
+U        Under construction by callback to user-space
+N        Negative key
+</code></pre>
+
+<pre><code>
+##### /proc/key-users
+
+清单 12 显示 /proc/key-users 文件。
+清单 12. /proc/key-users 文件
+</code></pre>
+
+<pre><code>[root@phoenix set.5]# cat /proc/key-users
+    0:     6 5/5 3/100 90/10000
+   43:     2 2/2 2/100 56/10000
+   48:     2 2/2 2/100 56/10000
+   81:     2 2/2 2/100 56/10000
+  786:     4 4/4 4/100 113/10000
+</code></pre>
+
+<pre><code>
+清单 13 给出每个字段的含义。
+清单 13. /proc/key-users 文件的字段
+</code></pre>
+
+<pre><code>&lt;UID&gt;            User ID
+&lt;usage&gt;          Usage count
+&lt;inst&gt;/&lt;keys&gt;    Total number of keys and number instantiated
+&lt;keys&gt;/&lt;max&gt;     Key count quota
+&lt;bytes&gt;&lt;max&gt;     Key size quota
+</code></pre>
+
+<p>```</p>
+
+<p>*Source: linux_kernel_source/security/keys/proc.c:proc_key_users_show()</p>
+
+<p>大多数字段是 security/keys/internal.h 中定义的 struct key_user 的字段。</p>
+
+<h4>结束语</h4>
+
+<p>Linux 密钥保留服务是一种新的机制，其用途是保存与安全相关的信息，让 Linux 内核可以快速地访问这些信息。这个服务仍然处于初级阶段，刚刚开始获得认可。OpenAFS 使用 Linux 密钥保留服务来实现进程身份验证组（PAG），NFSv4 和 MIT Kerberos 也使用它。Linux 密钥保留服务仍然在进行开发，以后可能会修改或改进。</p>
+
+<h4>下载资源</h4>
+
+<p>  使用 Linux 密钥保留服务的示例应用程序 (key.retention.services.zip | 4KB)</p>
+
+<h4>相关主题</h4>
+
+<ul>
+    <li>您可以参阅本文在 developerWorks 全球站点上的 <a href="http://www.ibm.com/developerworks/linux/library/l-key-retention.html?S_TACT=105AGX52&amp;S_CMP=cn-a-l" target="_blank">英文原文</a> 。</li>
+    <li>“<a href="http://www.ibm.com/developerworks/cn/linux/l-seclnx1.html">让 Linux 更安全</a>”（developerWorks，2004 年 7 月）是分三部分的文章，介绍了 Linux 安全性。</li>
+    <li>“<a href="http://www.ibm.com/developerworks/cn/linux/l-system-calls/">使用 Linux 系统调用的内核命令</a>”（developerWorks，2007 年 3 月）介绍了 Linux 系统调用，并解释了如何将系统调用从用户空间传递到内核。</li>
+    <li>阅读 <a href="http://lxr.linux.no/source/Documentation/keys.txt">Documentation/keys.txt</a>和
+        <a href="http://lxr.linux.no/source/Documentation/keys-request-key.txt">Documentation/keys-request-key.txt</a>，进一步了解 Linux 2.6 内核中密钥的概念和创建密钥的过程。</li>
+    <li><a href="http://lxr.linux.no/source/security/keys/">Linux key implementation sources</a> 是用来管理密钥的 Linux 内核 API。</li>
+    <li>David Howells 是 Linux 密钥保留服务的创建者。请参阅他在 2006 年渥太华 Linux 研讨会上 <a href="http://people.redhat.com/~dhowells/keys/keyrings-bof-ols2006.odp">讲话的幻灯片</a>。</li>
+    <li>“<a href="http://lwn.net/Articles/210502/">Kernel key management</a>” 提供了用来管理密钥的 Linux 内核 API 的更多信息。</li>
+    <li><a href="http://www.openafs.org/">OpenAFS</a> 使用 Linux 密钥保留服务实现它的进程身份验证组（PAG）。请查看 <a href="http://openafs.org/cgi-bin/cvsweb.cgi/openafs/src/afs/LINUX/osi_groups.c">源代码</a>。</li>
+    <li>下载 <a href="http://people.redhat.com/~dhowells/keyutils/">keyutils 包</a>，开始试用 Linux 密钥保留服务。</li>
+    <li>在 <a href="http://www.ibm.com/developerworks/cn/linux/">developerWorks Linux 专区</a> 中可以找到为 Linux 开发人员准备的更多参考资料。 </li>
+    <li>使用 <a href="http://www.ibm.com/developerworks/downloads/?S_TACT=105AGX52&amp;S_CMP=cn-a-l">IBM 试用软件</a> 构建您的下一个 Linux 开发项目，这些软件可以从 developerWorks 直接下载。 </li>
+</ul>
+
+
+
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[openssl常用命令，签名、非对称加解密]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2018/02/09/tools-openssl/"/>
+    <updated>2018-02-09T00:38:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2018/02/09/tools-openssl</id>
+    <content type="html"><![CDATA[<p><a href="http://blog.csdn.net/modianwutong/article/details/43059435">http://blog.csdn.net/modianwutong/article/details/43059435</a></p>
+
+<p><a href="https://www.cnblogs.com/gordon0918/p/5363466.html">https://www.cnblogs.com/gordon0918/p/5363466.html</a></p>
+
+<p><a href="https://stackoverflow.com/questions/5140425/openssl-command-line-to-verify-the-signature">https://stackoverflow.com/questions/5140425/openssl-command-line-to-verify-the-signature</a></p>
+
+<hr />
+
+<p>查看网站证书
+<code>
+    openssl s_client -showcerts -connect www.baidu.com:443
+</code></p>
+
+<h3>证书</h3>
+
+<p>  证书是一个经证书授权中心签过名的包含公钥及公钥拥有者信息的文件。证书授权中心（CA）对证书签名的过程即为证书的颁发过程。证书里面的公钥只属于某一个实体（网站，个人等），它的作用是防止一个实体伪装成另外一个实体。</p>
+
+<p> 证书可以保证非对称加密算法的合理性，假设A和B的通话过程如下：</p>
+
+<pre><code> A -------&gt; Hello (plain text) ---------&gt; B
+ A &lt;------- Hello (plain text) ---------- B
+ A &lt;------ B Send Certificate to A --- B
+ A ------- cipher text ------------------&gt; B
+ A &lt;------ cipher text ------------------- B
+  … …
+</code></pre>
+
+<p>  A在接受了B发过来的证书以后，A，B就可以使用密文进行通信了。</p>
+
+<p>  如果C想伪装成B，应该怎么做呢？我们想象下面的通话过程：
+<code>
+ A-------&gt; Hello (plain text) ---------&gt; C
+ A &lt;------ Hello (plain text) ----------- C
+ A &lt;------ C Send Certificate to A --- C
+</code></p>
+
+<p>  此时A没有怀疑C的身份，理所当然的接受了C的证书，并继续进行下面的通信</p>
+
+<pre><code> A------- cipher text ------------------&gt; C
+ A &lt;------ cipher text ------------------- C
+  … …
+</code></pre>
+
+<p>  这样的情况下A是没有办法发现C是假的，A的用户名，密码，甚至卡号等重要信息都有可能被C截获。如果A在通话过程中要求取得B的证书，并验证证书里面的名字，如果发现名字与B不符合，就可以发现对方不是B。验证B的名字通过后，再继续通信过程。</p>
+
+<p>  那么，如果证书是假的怎么办？或者证书被修改过怎么办？此时就要用到签名信息了。数字证书除了包含证书拥有者的名字和公钥外，还应包含颁发证书的机构名称，证书序列号和其它一些可选信息。最重要的是，它包含了证书颁发机构（Certification Authority，简称CA）的签名信息。</p>
+
+<p>  通过检查证书里面CA的签名信息，就知道这个证书的确是由该CA签发的，然后你就可以检查证书里面的证书拥有者的名字，检查通过后，就可以提取公钥，继续通信了。这样做的基础是，你信任该CA，认为该CA没有颁发错误的证书。</p>
+
+<p>  CA是第三方机构，被你信任，由它保证证书的确发给了应该得到证书的人。这里需要解释一下，CA也是一个实体，它也有自己的公钥和私钥，否则怎么做数字签名？它也有自己的证书，你可以去它的站点下载它的证书，来验证签名。</p>
+
+<p>  CA也是分级别的，最高级别的CA叫RootCA，低一级别的CA的证书由它来颁发和签名。这样我们信任RootCA，那些由RootCA签名过的证书的CA就可以来颁发证书给实体或其它CA了。那RootCA谁给签名呢？他们自己给自己签名，叫自签名。</p>
+
+<p>  现在常用的证书都是采用X.509格式的，这是一个国际标准的证书格式。任何遵循该标准的应用程序都可以读，写X509格式的证书。</p>
+
+<p>  下面是一个证书的例子：</p>
+
+<pre><code># openssl x509 -text -in test.crt
+Certificate:
+   Data:
+       Version: 3 (0x2)
+       Serial Number: 17209717939030827578 (0xeed53348d899a23a)
+   Signature Algorithm: sha1WithRSAEncryption                             // 签名算法
+       Issuer: C=AU, ST=Some-State, O=Internet Widgits Pty Ltd            // 证书颁发者信息
+       Validity
+           Not Before: Jan 14 07:01:20 2015 GMT                           // 证书的有效期
+           Not After : Feb 13 07:01:20 2015 GMT
+       Subject: C=AU, ST=Some-State, O=Internet Widgits Pty Ltd           // 证书拥有者信息
+       Subject Public Key Info:                                           //公钥信息
+           Public Key Algorithm: rsaEncryption
+                Public-Key: (512 bit)
+                Modulus:
+                   00:c5:63:8c:c8:32:b1:2e:15:58:a6:cd:22:f4:40:
+                   ef:53:8e:e7:fa:4e:fd:d5:d9:fe:69:a2:c2:5a:fc:
+                   20:4b:da:c9:17:49:35:4e:67:92:82:ec:4e:a7:a7:
+                   1a:66:3a:c5:36:2e:74:77:30:7a:dd:65:5f:03:9a:
+                   9b:2e:d0:b1:43
+                Exponent: 65537 (0x10001)
+       X509v3 extensions:                                                 //x509扩展信息
+           X509v3 Subject Key Identifier:
+               0E:DB:FE:E6:CF:FE:A6:C8:6D:38:06:A5:22:34:DA:82:A9:BE:42:B8
+           X509v3 Authority Key Identifier:
+               keyid:0E:DB:FE:E6:CF:FE:A6:C8:6D:38:06:A5:22:34:DA:82:A9:BE:42:B8
+           X509v3 Basic Constraints:
+               CA:TRUE
+   Signature Algorithm: sha1WithRSAEncryption
+        32:43:0c:e8:32:6f:30:10:c9:0f:a3:36:24:7c:a5:dc:da:8c:            // CA的签名
+        c4:90:69:90:de:b1:1b:19:8e:b1:a5:35:ce:2e:7a:05:69:94:
+        46:72:37:c2:2c:38:57:4a:0c:89:bc:90:95:03:af:f2:6f:a0:
+        3f:13:5f:f0:90:a7:2c:bf:75:ee
+</code></pre>
+
+<h3>算法</h3>
+
+<p>  加密算法分为两种：对称加密算法和非对称加密算法；</p>
+
+<h5>对称加密算法：即信息的发送方和接收方使用同一个密钥去加密和解密数据。它的最大优势是加/解密速度快，适合于对大数据量进行加密，但密钥管理困难。AES，DES等都是常用的对称加密算法；</h5>
+
+<h5>非对称加密算法：它需要使用不同的密钥来分别完成加密和解密操作，一个公开发布，即公开密钥，另一个由用户自己秘密保存，即私用密钥。信息发送者用公开密钥去加密，而信息接收者则用私用密钥去解密。公钥机制灵活，但加密和解密速度却比对称密钥加密慢得多。RSA，DSA等是常用的非对称加密算法；</h5>
+
+<p>  所以在实际的应用中，人们通常将两者结合在一起使用，例如，对称密钥加密系统用于存储大量数据信息，而公开密钥加密系统则用于加密密钥。</p>
+
+<p>  另外还有一种我们需要知道的加密算法，叫做摘要算法，英文名是messagedigest，用来把任何长度的明文以一定规则变成固定长度的一串字符。那么我们在对文件做签名的时候，通常都是先使用摘要算法，获得固定长度的一串字符，然后对这串字符进行签名。</p>
+
+<p>  Base64不是加密算法，它是编码方式，用来在ASCII码和二进制码之间进行转换。</p>
+
+<h3>RSA</h3>
+
+<p>  RSA是目前比较流行的非对称加密算法，所谓非对称，就是指该算法需要一对密钥，使用其中一个加密，则需要用另一个才能解密。下面简单介绍一下它的原理：</p>
+
+<p>  RSA的算法涉及三个参数，n、e1、e2。</p>
+
+<p>  其中，n是两个大质数p、q的积，n的二进制表示所占用的位数，就是所谓的密钥长度。</p>
+
+<p>  e1和e2是一对相关的值，e1可以任意取，但要求e1与(p-1）<em>(q-1）互质；再选择e2，要求(e2</em>e1) mod((p-1)*(q-1))=1。</p>
+
+<p>  (n，e1), (n，e2)就是密钥对。其中(n，e1)为公钥，(n，e2)为私钥。</p>
+
+<p>  RSA加解密的算法完全相同，设A为明文，B为密文，则：A=B<sup>e2</sup> mod n；B=A<sup>e1</sup> mod n；（公钥加密体制中，一般用公钥加密，私钥解密）</p>
+
+<p>  e1和e2可以互换使用，即：</p>
+
+<p>  A=B<sup>e1mod</sup> n；B=A<sup>e2</sup> mod n;</p>
+
+<p>  关于RSA加密算法的详细介绍可以参考百度百科；</p>
+
+<h3>协议</h3>
+
+<p>  SSL是Secure Sockets Layer（安全套接层协议）的缩写，可以在Internet上提供秘密性传输。Netscape公司在推出第一个Web浏览器的同时，提出了SSL协议标准。其目标是保证两个应用间通信的保密性和可靠性,可在服务器端和用户端同时实现支持。已经成为Internet上保密通讯的工业标准。</p>
+
+<p>  OpenSSL是一个强大的安全套接字层密码库，囊括主要的密码算法、常用的密钥和证书封装管理功能及SSL协议，并提供丰富的应用程序供测试或其它目的使用。</p>
+
+<p>  OpenSSL整个软件包大概可以分成三个主要的功能部分：SSL协议库、应用程序以及密码算法库。OpenSSL的目录结构自然也是围绕这三个功能部分进行规划的。</p>
+
+<p>  Openssl目前最新的稳定版本是1.0.2，可以在openssl的官网下载openssl-1.0.2的源代码。</p>
+
+<p>  Android中已经集成了openssl，源码目录在：external/openssl</p>
+
+<h3>工具</h3>
+
+<p>  RSA是目前最有影响力的公钥加密算法，它能抵抗到目前为止已知的绝大多数密码攻击。下面我们要介绍的工具将会主要涉及到秘钥的产生、管理，证书请求及证书的产生，数据加密、解密，算法签名及身份验证等；</p>
+
+<h4>genrsa</h4>
+
+<p>生成RSA私有密钥，用法如下：
+```
+    openssl genrsa [-outfilename] [-passout arg] [-aes128] [-aes192] [-aes256] [-des] [-des3] [-idea][-f4] [-3]
+    [-rand file(s)] [-engine id] [numbits]</p>
+
+<pre><code>Options：
+  -outfilename：将生成的私钥输出到指定文件，默认为标准输出；
+  -passoutarg：如果对生成的密钥使用加密算法的话，可以使用”-passout”选项指定密码来源，这里的arg可以是”pass:password”，”file:pathname”，”stdin”等；
+  -des|-des3|-idea：采用什么加密算法来加密生成的密钥，一般需要输入保护密码；
+  -f4|3：生成密钥过程中使用的公共组件，65537或3，默认使用65537；
+  numbits：密钥长度，必须是genrsa命令的最后一个参数，默认值是512；
+</code></pre>
+
+<pre><code>
+注意：genrsa生成的私钥默认是PEM编码格式；
+
+##### Example：
+
+1）生成私钥：
+</code></pre>
+
+<pre><code>openssl genrsa -out private.pem -3 -2048
+</code></pre>
+
+<pre><code>#### rsa
+
+RSA密钥管理工具，用法如下：
+</code></pre>
+
+<pre><code>openssl rsa [-informPEM|NET|DER] [-outform PEM|NET|DER] [-in filename] [-passin arg] [-outfilename] [-passout arg] [-sgckey] [-aes128] [-aes192] [-aes256] [-des] [-des3][-idea] [-text] [-noout] [-modulus] [-check] [-pubin] [-pubout]
+
+Options：
+  -informPEM|NET|DER：指定输入格式，可以是PEM，NET或DER格式；
+  -outformPEM|NET|DER：指定输出格式，可以是PEM，NET或DER格式；
+  -infilename：指定输入文件，如果是加密过的密钥，会要求你输入密码；
+  -outfilename：指定输出文件名称；
+  -passinarg：输入密钥的密码来源；
+  -passoutarg：输出密钥如果加密的话，该参数用于指定密码的来源；
+  -text：以只读方式输出密钥及组件信息；
+  -noout：不打印密钥文件；
+  -modulus：显示密钥的模数；
+  -pubin：默认从输入文件中读取私钥，如果该选项打开的话，就可以从输入文件中读取公钥；
+  -pubout：默认输出私钥，使用该选项的话，将会输出公钥，如果pubin打开的话，pubout也会被自动打开；另外使用该参数的话，可以由私钥导出公钥；
+  -check：检查RSA密钥是否被破坏；
+</code></pre>
+
+<pre><code>
+Example：
+
+1）去掉私钥的保护密码
+</code></pre>
+
+<pre><code>openssl rsa -in private.pem -out private_out.pem
+</code></pre>
+
+<pre><code>
+2）用DES3算法加密密钥，需要输入保护密码
+</code></pre>
+
+<pre><code>openssl rsa -in private.pem -des3 -out private_out.pem
+</code></pre>
+
+<pre><code>
+3）把私钥文件从PEM格式转换为DER格式
+</code></pre>
+
+<pre><code>openssl rsa -in private.pem -outform DER -out private.der
+</code></pre>
+
+<pre><code>
+4）打印私钥组件信息
+</code></pre>
+
+<pre><code>openssl rsa -in private.pem -text -noout
+</code></pre>
+
+<pre><code>
+5）导出公钥文件
+</code></pre>
+
+<pre><code>openssl rsa -in private.pem -out public.pem -pubout
+</code></pre>
+
+<pre><code>
+6）检查密钥文件的完整性
+</code></pre>
+
+<pre><code>openssl rsa -in private.pem -check -noout
+</code></pre>
+
+<pre><code>
+#### rsautil
+
+ 无论是使用公钥加密还是私钥加密，RSA每次能够加密的数据长度不能超过RSA密钥长度，并且根据具体的补齐方式不同输入的加密数据最大长度也不一样，而输出长度则总是跟RSA密钥长度相等。RSA不同的补齐方法对应的输入输入长度如下表
+</code></pre>
+
+<pre><code>数据补齐方式      输入数据长度      输出数据长度  参数字符串
+PKCS#1 v1.5     少于(密钥长度-11)字节   同密钥长度 -pkcs
+PKCS#1 OAEP     少于(密钥长度-11)字节   同密钥长度 -oaep
+PKCS#1 for SSLv23   少于(密钥长度-11)字节   同密钥长度 -ssl
+不使用补齐     同密钥长度     同密钥长度 -raw
+</code></pre>
+
+<pre><code>
+RSA工具指令，包含RSA算法签名，身份验证，加密/解密数据等功能，用法如下：
+</code></pre>
+
+<pre><code>openssl rsautl [-in file][-out file] [-inkey file] [-pubin] [-certin] [-sign] [-verify] [-encrypt][-decrypt] [-pkcs]
+[-ssl] [-raw] [-hexdump] [-asn1parse]
+
+Options：
+  -infile：指定输入文件；
+  -outfile：指定输出文件；
+  -inkeyfile：加密/解密数据时使用的密钥文件，缺省使用RSA私钥；
+  -pubin：如果设置该选项，则使用RSA公钥加密/解密数据；
+  -certin：指定使用证书文件加密/解密，证书中包含RSA公钥；
+  -sign：数据签名，需要指定RSA私钥；
+  -verify：数据验证；
+  -encrypt：数据加密；
+  -decrypt：数据解密；
+  -pkcs|-ssl|-raw：指定数据填充模式，分别代表：PKCS#1v1.5（缺省值），SSL v2填充模式或无填充。如果要签名，只能使用pkcs或raw选项；
+  -hexdump：用十六进制输出数据；
+  -asn1parse：按照ASN.1结构分析输出数据，详细可以查看asn1parse命令，和”-verify”选项一起使用威力强大；
+</code></pre>
+
+<pre><code>
+Example：
+
+1）公钥加密
+</code></pre>
+
+<pre><code>openssl rsautl -encrypt -in test.txt -out test.enc -inkey public.pem -pubin
+</code></pre>
+
+<pre><code>注意：如果使用证书加密的话，需要使用-certin选项，-inkey指定证书文件；
+
+2）私钥解密
+</code></pre>
+
+<pre><code>openssl rsautl -decrypt -in test.enc -out test.dec -inkey private.pem
+</code></pre>
+
+<pre><code>
+3）私钥签名
+</code></pre>
+
+<pre><code>openssl rsautl -sign -in test.txt -out test.sig -inkey private.pem
+</code></pre>
+
+<pre><code>
+4）公钥验证
+</code></pre>
+
+<pre><code>openssl rsautl -verify -in test.sig -out test.vfy -inkey public.pem -pubin
+</code></pre>
+
+<pre><code>注意：如果使用证书验证签名，需要使用-certin选项，-inkey指定证书文件；
+
+#### req
+
+创建和处理证书请求的工具，它还能建立自签名的证书，做RootCA用。用法如下：
+</code></pre>
+
+<pre><code>openssl req [-inform PEM|DER][-outform PEM|DER] [-in filename] [-passin arg] [-out filename] [-passout arg][-text] [-pubkey] [-noout] [-verify] [-modulus] [-new] [-rand file(s)] [-newkeyrsa:bits] [-newkey alg:file] [-nodes] [-key filename] [-keyform PEM|DER][-keyout filename] [-keygen_engine id] [-[digest]] [-config filename] [-subjarg] [-multivalue-rdn] [-x509] [-days n] [-set_serial n] [-asn1-kludge][-no-asn1-kludge] [-newhdr] [-extensions section] [-reqexts section] [-utf8][-nameopt] [-reqopt] [-subject] [-subj arg] [-batch] [-verbose]
+
+
+在创建证书请求（CSR）的过程中会要求用户输入一些必要的信息，包括位置、组织、邮箱等信息，可以把它们放在配置文件里，也可以放在命令行参数里；
+
+Options：
+  -text：以可读方式打印将CSR文件里的内容；
+  -noout：不要打印CSR文件的编码信息；
+  -pubkey：解析CSR文件里的公钥信息，并打印出来；
+  -modulus：解析CSR文件里的公钥模数，并打印出来；
+  -verify：检验请求文件的签名信息；
+  -new：创建新的CSR，它会要求用户输入一些必要信息。如果没有指定-key参数，将会生成新的私钥；
+  -newkeyarg：创建新的CSR和新的私钥，参数指示私钥算法等信息（类似rsa:1024）；
+  -keyfilename：指定私钥文件，该选项支持pkcs8格式的私钥；
+  -keyoutfilename：如果产生了新的私钥，则把私钥保存到指定文件；
+  -[digest]：指定证书的摘要算法，可以是sha1|md5等，默认使用哈希算法；
+  -configfilename：指定config文件，配置文件可以包含创建CSR所需的各种信息；
+  -x509：产生自签名的证书，而不是证书请求；
+  -days：证书的有效期，缺省是30天；
+  -subject：显示CSR的位置，组织等信息；
+  -subjarg：设置CSR的位置，组织等信息，格式：/C=AU/ST=Some-State/type0=value0
+</code></pre>
+
+<pre><code>
+
+关于配置文件的格式，可以参考openssl的在线帮助文档；
+
+
+Example：
+
+1）生成一个私钥，并使用该私钥产生证书请求
+</code></pre>
+
+<pre><code>openssl genrsa -out private.pem 1024
+
+openssl req -new -key private.pem -out req.pem
+</code></pre>
+
+<pre><code>如果加上-sha256，则使用sha256摘要算法；
+
+
+2）生成一个私钥，并使用该私钥产生证书请求，另一个方法
+</code></pre>
+
+<pre><code>openssl req -newkey rsa:2048 -keyout private.pem -out req.pem
+</code></pre>
+
+<pre><code>
+3）检测并验证证书请求
+</code></pre>
+
+<pre><code>openssl req -verify -in req.pem -text -noout
+</code></pre>
+
+<pre><code>
+4）制作自签名的根证书，使用已有私钥
+</code></pre>
+
+<pre><code>openssl req -new -x509 -key private.pem -sha256 -out rootca.crt
+</code></pre>
+
+<pre><code>
+5）制作自签名的根证书，创建新的私钥
+</code></pre>
+
+<pre><code>openssl req -newkey rsa:2048 -keyout private.pem -x509 -sha256 -out rootca.crt
+</code></pre>
+
+<pre><code>
+#### x509
+
+证书管理工具，可以用来显示证书的内容，证书格式转换，为证书请求签名等。用法如下：
+</code></pre>
+
+<pre><code>openssl x509 [-inform DER|PEM|NET][-outform DER|PEM|NET] [-keyform DER|PEM]
+
+[-CAform DER|PEM] [-CAkeyform DER|PEM][-in filename] [-out filename] [-serial] [-hash] [-subject_hash] [-issuer_hash][-ocspid] [-subject] [-issuer] [-nameopt option] [-email] [-ocsp_uri][-startdate] [-enddate] [-purpose] [-dates] [-checkend num] [-modulus][-pubkey] [-fingerprint] [-alias] [-noout] [-trustout] [-clrtrust] [-clrreject][-addtrust arg] [-addreject arg] [-setalias arg] [-days arg] [-set_serial n][-signkey filename] [-passin arg] [-x509toreq] [-req] [-CA filename] [-CAkeyfilename] [-CAcreateserial] [-CAserial filename] [-force_pubkey key] [-text][-certopt option] [-C] [-md2|-md5|-sha1|-mdc2] [-clrext] [-extfile filename][-extensions section] [-engine id]
+
+Options：
+
+由于x509的选项比较多，下面我们来分类介绍：
+
+1）输入/输出相关选项
+  -inform|-outformDER|PEM|NET：指定输入/输出文件的编码格式；
+  -in|-outfilename：指定输入/输出文件；
+  -md2|-md5|-sha1|-mdc2：指定摘要算法，默认使用哈希算法；
+
+2）显示选项
+  -text：以可读方式打印证书内容；
+  -pubkey：解析证书里面的公钥信息，并打印出来；
+  -modulus：解析证书里面的公钥模数信息，并打印出来；
+  -serial：显示证书的序列号；
+  -subject：显示证书拥有者的信息；
+  -issuer：显示证书颁发者的名字；
+  -email：显示邮箱信息；
+  -startdate|-enddate |-dates：显示证书有效期，起始和结束时间；
+  -fingerprint：显示DER格式证书的DER版本信息；
+  -C：以C语言源文件方式，输出证书；
+
+3）信任相关的选项
+  -purpose：显示证书用途；
+
+4）签名相关选项
+  -signkeyfilename：使用给定的私钥，对输入文件进行签名；如果输入文件是证书，那么它的颁发者就会被设置成其拥有者，其它项也会被设置成符合自签名特征的证书项；如果输入文件是证书请求，那么就会产生一个自签名的证书；
+  -days：证书有效期；
+  -x509toreq：把证书转换成证书请求，需要-signkey选项指定私钥；
+  -req：默认输入文件是一个证书，使用该选项的话，指示输入文件是一个证书请求；
+  -CAfilename：指定签名用的CA证书文件，该选项通常和-req一起用，对证书请求实施自签名；
+  -CAkeyfilename：指定CA的私钥文件，对证书进行签名；
+</code></pre>
+
+<pre><code>
+
+Examples：
+
+1）显示证书内容
+</code></pre>
+
+<pre><code>openssl x509 -in cert.pem –noout -text
+</code></pre>
+
+<pre><code>
+2）显示证书序列号
+</code></pre>
+
+<pre><code>openssl x509 -in cert.pem -noout -serial
+</code></pre>
+
+<pre><code>
+3）显示证书的subject信息
+</code></pre>
+
+<pre><code>openssl x509 -in cert.pem -noout -subject
+</code></pre>
+
+<pre><code>
+4）显示证书的fingerprint信息
+</code></pre>
+
+<pre><code>openssl x509 -in cert.pem -noout -fingerprint
+</code></pre>
+
+<pre><code>
+5）证书格式转换
+</code></pre>
+
+<pre><code>openssl x509 -in cert.pem -inform PEM -out cert.der -outform DER
+
+openssl x509 -in cert.der -inform DER -out cert.pem -outform PEM
+</code></pre>
+
+<pre><code>
+
+6）把证书转换为证书请求
+</code></pre>
+
+<pre><code>openssl x509 -x509toreq -in cert.pem -out cert.csr -signkey private.pem
+</code></pre>
+
+<pre><code>
+7）把证书请求转换为证书
+</code></pre>
+
+<pre><code>openssl x509 -req -in careq.pem -extfile openssl.cnf -extensions v3_ca -signkey key.pem -out cacert.pem
+</code></pre>
+
+<pre><code>
+8）从证书里面提取公钥
+</code></pre>
+
+<pre><code>openssl x509 -pubkey -in cert.pem &gt;pub.pem
+</code></pre>
+
+<pre><code>
+9）以C语言源文件方式输出证书，PEM格式转换为DER格式
+</code></pre>
+
+<pre><code>openssl x509 -in cert.pem -out cert.der -outform DER -C &gt; cert.c
+</code></pre>
+
+<pre><code>
+#### asn1parse
+
+asn1parse是一个诊断工具，可以解析ASN.1结构的密钥，证书等，用法如下：
+</code></pre>
+
+<pre><code>openssl asn1parse [-informPEM|DER] [-in filename] [-out filename] [-noout] [-offset number]
+[-length number] [-i] [-oid filename][-dump] [-dlimit num] [-strparse offset] [-genstr string]
+[-genconf file] [-strictpem]
+
+Options：
+  -i：以缩进方式显示ASN.1结构
+</code></pre>
+
+<pre><code>
+Example：
+
+1）解析文件：
+</code></pre>
+
+<pre><code>openssl asn1parse -in file.pem
+</code></pre>
+
+<pre><code>
+2）解析DER格式的文件
+</code></pre>
+
+<pre><code>openssl asn1parse -inform file.der -infile.der
+</code></pre>
+
+<pre><code>
+#### dgst
+
+摘要算法，用法如下：
+</code></pre>
+
+<pre><code>openssl dgst[-sha|-sha1|-mdc2|-ripemd160|-sha224|-sha256|-sha384|-sha512|-md2|-md4|-md5|-dss1][-c] [-d] [-hex] [-binary] [-r] [file...]
+
+所谓摘要算法，就是把任何长度的明文以一定规则变成固定长度的一串字符。
+
+Options：
+  -sha|-sha1 |-sha256 |-md5：算法名称；
+  -c：打印出哈希结果的时候用冒号来分隔开；
+  -d：详细打印出调试信息；
+  -hex：以十六进制输出哈希结果，默认值；
+  -binary：以二进制输出哈希结果；
+  file：要哈希的文件；
+</code></pre>
+
+<pre><code>
+
+Example：
+
+1）使用sha256摘要算法，并以二进制方式输出
+</code></pre>
+
+<pre><code>openssl dgst -sha256 -binary file.txt
+</code></pre>
+
+<pre><code>
+#### PEM 和 DER 格式
+
+ PEM和DER是两种不同的编码格式，PEM使用ASCII（base64）编码方式，PEM格式文件的第一行和最后一行指明文件内容，DER采用二进制编码格式；使用openssl工具生成的密钥或证书，默认使用PEM编码格式；
+
+### 实例
+
+#### Image签名
+
+高通平台支持bootimg签名和校验功能，下面我们先来看看它的签名脚本：
+</code></pre>
+
+<pre><code>define build-boot-image
+ mv -f $(1) $(1).nonsecure
+ openssl dgst -$(TARGET_SHA_TYPE) -binary $(1).nonsecure &gt;$(1).$(TARGET_SHA_TYPE)
+ openssl rsautl -sign -in $(1).$(TARGET_SHA_TYPE) -inkey$(PRODUCT_PRIVATE_KEY) -out $(1).sig
+ dd if=/dev/zero of=$(1).sig.padded bs=$(BOARD_KERNEL_PAGESIZE) count=1
+ dd if=$(1).sig of=$(1).sig.padded conv=notrunc
+ cat $(1).nonsecure $(1).sig.padded &gt; $(1).secure
+ rm -rf $(1).$(TARGET_SHA_TYPE) $(1).sig $(1).sig.padded
+ mv -f $(1).secure $(1)
+endef
+</code></pre>
+
+<pre><code>
+这里定义了一个build-boot-image宏，使用方法如下：
+</code></pre>
+
+<pre><code>$(INSTALLED_BOOTIMAGE_TARGET) :=$(PRODUCT_OUT)/boot.img
+INSTALLED_SEC_BOOTIMAGE_TARGET :=$(PRODUCT_OUT)/boot.img.secure
+$(INSTALLED_SEC_BOOTIMAGE_TARGET):$(INSTALLED_BOOTIMAGE_TARGET)
+   $(hide) $(callbuild-boot-image,$(INSTALLED_BOOTIMAGE_TARGET))
+</code></pre>
+
+<pre><code>
+上面就是对bootimg实施签名操作的脚本，build-boot-image宏做了什么事呢？
+
+1）对bootimg实施摘要算法
+</code></pre>
+
+<pre><code>openssl dgst -sha256 -binary boot.img.nonsecure &gt; boot.img.sha256
+</code></pre>
+
+<pre><code>2）制作签名
+</code></pre>
+
+<pre><code>openssl rsautl -sign -inboot.img.sha256 -inkey qcom.key -out boot.img.sig
+</code></pre>
+
+<pre><code>3）填充签名
+</code></pre>
+
+<pre><code>dd if=/dev/zero of=boot.img.sig.paddedbs=2048 count=1
+dd if=boot.img.sig of=boot.img.sig.paddedconv=notrunc
+</code></pre>
+
+<pre><code>生成好的签名已经保存到boot.img.sig.padded，文件大小是2048字节，用0填充；
+
+4）把签名打到image上，并删除中间文件
+</code></pre>
+
+<pre><code>cat boot.img.nonsecure boot.img.sig.padded &gt; boot.img.secure
+rm -rf $boot.img.sha256 boot.img.sigboot.img.sig.padded
+
+mv -f boot.img.secure boot.img
+</code></pre>
+
+<pre><code>
+Image签名完成，签名信息保存在image的最后2048字节，不足的都用0来填充；
+
+
+验证签名又是怎样的过程呢？前面用到了qcom.key，这个是高通提供的私钥，那么要验证签名，我们就需要用这个私钥制作的证书。验证过程是在LK里面完成的，所以我们还需要把证书转换为C源文件方式，方法很简单，用下面几条命令就可以了：
+</code></pre>
+
+<pre><code>openssl req -new -x509 -key qcom.key -days11324 -sha256 -out qcom.crt
+
+openssl x509 -inform PEM -in qcom.crt-outform DER -out qcom.der &gt; cert.c
+</code></pre>
+
+<pre><code>
+好了，cert.c就是以C源文件方式存储的证书，替换到LK里面相应的数组就可以了；
+
+
+#### 制作testkey
+
+ testkey是用来给apk签名的，保存在build/target/product/security目录下，testkey.pk8是私钥，
+
+testkey.x509.pem是证书，那么这个key和证书是如何生成的呢？README写的很清楚：
+</code></pre>
+
+<pre><code>development/tools/make_key testkey '/C=US/ST=California/L=MountainView/O=Android/OU=Android/
+ CN=Android/emailAddress=android@android.com'
+</code></pre>
+
+<pre><code>
+development/tools/make_key是制作testkey的脚本文件，我们看几条比较重要的命令吧：
+
+1）生成私钥
+</code></pre>
+
+<pre><code>openssl genrsa -f4 2048 | tee ${one}&gt; ${two}
+</code></pre>
+
+<pre><code>2）制作证书
+</code></pre>
+
+<pre><code>openssl req -new -x509 ${hash} -key${two} -out $1.x509.pem -days 10000 -subj "$2"
+</code></pre>
+
+<pre><code>3）制作pk8格式私钥
+</code></pre>
+
+<pre><code>openssl pkcs8 -in ${one} -topk8-outform DER -out $1.pk8 –nocrypt
+</code></pre>
+
+<pre><code>
+### Help
+
+ OpenSSL提供了非常丰富的帮助信息，如果对哪个命令或参数不了解，可以很方便的使用帮助来查看命令的详细用法；
+命令列表
+
+使用下面命令查看openssl支持的命令和算法列表：
+</code></pre>
+
+<pre><code>openssl [ list-standard-commands | list-message-digest-commands | list-cipher-commands | 
+          list-cipher-algorithms | list-message-digest-algorithms | list-public-key-algorithms]
+list-standard-commands：标准命令列表
+list-message-digest-commands：摘要命令列表
+list-cipher-commands：加密命令列表
+list-cipher-algorithms：加密算法列表
+list-message-digest-algorithms：摘要算法列表
+list-public-key-algorithms：公钥加密算法列表
+</code></pre>
+
+<p>```</p>
+
+<h3>获取帮助</h3>
+
+<p> 虽然openssl并不支持”-h”参数，使用”-h”参数，会出现类似” unknown option -h”的错误提示，但是openssl的帮助系统还是很nice的，在使用错误参数的情况下，会把命令的详细用法及参数解释列出来，因此，还是可以用”openssl command -h”的方式来获取帮助信息。</p>
+
+<p> 我们还可以使用类似”man genrsa”的方法，来查看openssl的帮助文档；</p>
+
+<p> 最后，我们还可以访问openssl的主页，里面有详细的帮助文档；</p>
+
+<h3>参考资料</h3>
+
+<p>openssl帮助文档：<a href="http://www.openssl.org/docs/">http://www.openssl.org/docs/</a></p>
+
+<p>openssl命令详解.pdf</p>
+
+<p>百度百科：openssl，RSA，X509；</p>
+
+<p>使用openssl命令剖析RSA私钥文件格式：<a href="http://blog.csdn.net/lucien_cc/article/details/18407451">http://blog.csdn.net/lucien_cc/article/details/18407451</a></p>
+
+<p>常用证书格式切换：<a href="http://blog.chinaunix.net/uid-20553497-id-2353867.html">http://blog.chinaunix.net/uid-20553497-id-2353867.html</a></p>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[内存屏障]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2018/02/04/mem-mb/"/>
+    <updated>2018-02-04T00:10:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2018/02/04/mem-mb</id>
+    <content type="html"><![CDATA[<p><a href="https://www.cnblogs.com/icanth/archive/2012/06/10/2544300.html">https://www.cnblogs.com/icanth/archive/2012/06/10/2544300.html</a></p>
+
+<h3>内存屏障(Memory Barriers)</h3>
+
+<p>一方面，CPU由于采用指令流水线和超流水线技术，可能导致CPU虽然顺序取指令、但有可能会出现“乱序”执行的情况，当然，对于” a++；b = f(a)；c = f”等存在依赖关系的指令，CPU则会在“b= f(a)”执行阶段之前被阻塞；另一方面，编译器也有可能将依赖关系很近“人为地”拉开距离以防止阻塞情况的发生，从而导致编译器乱序，如“a++ ；c = f；b = f(a)”。</p>
+
+<p>一个CPU对指令顺序提供如下保证：</p>
+
+<p>(1) On any given CPU, dependent memory accesses will be issued in order, with respect to itself.如Q = P; D = *Q;将保证其顺序执行</p>
+
+<p>(2) Overlapping loads and stores within a particular CPU will appear to be ordered within that CPU.重叠的Load和Store操作将保证顺序执行（目标地址相同的Load、Store），如：a = <em>X; </em>X = b;</p>
+
+<p>(3) It <em>must_not</em> be assumed that independent loads and stores will be issued in the order given.</p>
+
+<p>(4) It <em>must</em> be assumed that overlapping memory accesses may be merged or discarded.如<em>A = X; Y = </em>A; => STORE <em>A = X; Y = LOAD </em>A; / or STORE *A = Y = X;</p>
+
+<p>由此可见，无关的内存操作会被按随机顺序有效的得到执行,但是在CPU与CPU交互时或CPU与IO设备交互时, 这可能会成为问题. 我们需要一些手段来干预编译器和CPU, 使其限制指令顺序。内存屏障就是这样的干预手段. 他们能保证处于内存屏障两边的内存操作满足部分有序.(译注: 这里"部分有序"的意思是, 内存屏障之前的操作都会先于屏障之后的操作, 但是如果几个操作出现在屏障的同一边, 则不保证它们的顺序.)</p>
+
+<p>(1) 写(STORE)内存屏障。在写屏障之前的STORE操作将先于所有在写屏障之后的STORE操作。</p>
+
+<p>(2) 数据依赖屏障。两条Load指令，第二条Load指令依赖于第一条Load指令的结果，则数据依赖屏障保障第二条指令的目标地址将被更新。</p>
+
+<p>(3) 读(LOAD)内存屏障。读屏障包含数据依赖屏障的功能, 并且保证所有出现在屏障之前的LOAD操作都将先于所有出现在屏障之后的LOAD操作被系统中的其他组件所感知.</p>
+
+<p>(4) 通用内存屏障. 通用内存屏障保证所有出现在屏障之前的LOAD和STORE操作都将先于所有出现在屏障之后的LOAD和STORE操作被系统中的其他组件所感知.</p>
+
+<p>(5) LOCK操作.它的作用相当于一个单向渗透屏障.它保证所有出现在LOCK之后的内存操作都将在LOCK操作被系统中的其他组件所感知之后才能发生. 出现在LOCK之前的内存操作可能在LOCK完成之后才发生.LOCK操作总是跟UNLOCK操作配对出现.</p>
+
+<p>(6) UNLOCK操作。它保证所有出现在UNLOCK之前的内存操作都将在UNLOCK操作被系统中的其他组件所感知之前发生.</p>
+
+<p>LINUX对于x86而言，在为UP体系统架构下，调用barrier()进行通用内存屏障。在SMP体系架构下，若为64位CPU或支持mfence、lfence、sfence指令的32位CPU，则smp_mb()、smp_rmb()、smp_smb()对应通用内存屏障、写屏障和读屏障；而不支持mfence、lfence、sfence指令的32位CPU则smp_mb()、smp_rmb()、smp_smb()对应LOCK操作。源码请参见《内存屏障源码分析》一节。</p>
+
+<h4>内存屏障源码分析</h4>
+
+<p>/include/asm-generic/system.h：
+<code>
+    053 #ifdef CONFIG_SMP
+    054 #define smp_mb()        mb()
+    055 #define smp_rmb()       rmb()
+    056 #define smp_wmb()       wmb()
+    057 #else
+    058 #define smp_mb()        barrier()
+    059 #define smp_rmb()       barrier()
+    060 #define smp_wmb()       barrier()
+    061 #endif
+</code></p>
+
+<p>在x86 UP体系架构中，smp_mb、smp_rmb、smp_wmb被翻译成barrier：</p>
+
+<pre><code>    012 #define barrier() __asm__ __volatile__("": : :"memory")
+</code></pre>
+
+<p><code>__volatile</code>告诉编译器此条语句不进行任何优化，"&ldquo;: : :"memory&rdquo; 内存单元已被修改、需要重新读入。</p>
+
+<p>在x86 SMP体系架构中，smp_mb、smp_rmb、smp_wmb如下定义：</p>
+
+<p>/arch/x86/include/asm/system.h：</p>
+
+<pre><code>    352 /*
+    353  * Force strict CPU ordering.
+    354  * And yes, this is required on UP too when we're talking
+    355  * to devices.
+    356  */
+    357 #ifdef CONFIG_X86_32
+    358 /*
+    359  * Some non-Intel clones support out of order store. wmb() ceases to be a
+    360  * nop for these.
+    361  */
+    362 #define mb() alternative("lock; addl $0,0(%%esp)", "mfence", X86_FEATURE_XMM2)
+    363 #define rmb() alternative("lock; addl $0,0(%%esp)", "lfence", X86_FEATURE_XMM2)
+    364 #define wmb() alternative("lock; addl $0,0(%%esp)", "sfence", X86_FEATURE_XMM)
+    365 #else
+    366 #define mb()    asm volatile("mfence":::"memory")
+    367 #define rmb()   asm volatile("lfence":::"memory")
+    368 #define wmb()   asm volatile("sfence" ::: "memory")
+    369 #endif
+</code></pre>
+
+<p>362~364行针对x86的32位CPU，366~368行针对x86的64位CPU。</p>
+
+<p>在x86的64位CPU中，mb()宏实际为：</p>
+
+<pre><code>    asm volatile("sfence" ::: "memory")。
+</code></pre>
+
+<p>volatile告诉编译器严禁在此处汇编语句与其它语句重组优化，memory强制编译器假设RAM所有内存单元均被汇编指令修改，"sfence" ::: 表示在此插入一条串行化汇编指令sfence。</p>
+
+<p>mfence：串行化发生在mfence指令之前的读写操作</p>
+
+<p>lfence：串行化发生在mfence指令之前的读操作、但不影响写操作</p>
+
+<p>sfence：串行化发生在mfence指令之前的写操作、但不影响读操作</p>
+
+<h4>在x86的32位CPU中，mb()宏实际为：</h4>
+
+<pre><code>    mb() alternative("lock; addl $0,0(%%esp)", "mfence", X86_FEATURE_XMM2)
+</code></pre>
+
+<p>由于x86的32位CPU有可能不提供mfence、lfence、sfence三条汇编指令的支持，故在不支持mfence的指令中使用："lock; addl $0,0(%%esp)&ldquo;, "mfence"。lock表示将“addl $0,0(%%esp)”语句作为内存屏障。</p>
+
+<p>关于lock的实现：cpu上有一根pin #HLOCK连到北桥,lock前缀会在执行这条指令前先去拉这根pin，持续到这个指令结束时放开#HLOCK pin，在这期间，北桥会屏蔽掉一切外设以及AGP的内存操作。也就保证了这条指令的atomic。</p>
+
+<h4>参考资料</h4>
+
+<p>《memroy-barries.txt》，/Documentation/memory-barriers.txt</p>
+
+<p>《LINUX内核内存屏障》，<a href="http://blog.csdn.net/ljl1603/article/details/6793982">http://blog.csdn.net/ljl1603/article/details/6793982</a></p>
+]]></content>
+  </entry>
+  
+</feed>

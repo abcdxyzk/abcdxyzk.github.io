@@ -1,0 +1,238 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+
+  <title><![CDATA[Category: 2019~10 | kk Blog —— 通用基础]]></title>
+  <link href="http://abcdxyzk.github.io/blog/cats/2019~10/atom.xml" rel="self"/>
+  <link href="http://abcdxyzk.github.io/"/>
+  <updated>2023-01-24T19:27:19+08:00</updated>
+  <id>http://abcdxyzk.github.io/</id>
+  <author>
+    <name><![CDATA[kk]]></name>
+    
+  </author>
+  <generator uri="http://octopress.org/">Octopress</generator>
+
+  
+  <entry>
+    <title type="html"><![CDATA[X520-T1 Linux内核收包14Mpps]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2019/12/09/10Gb-recv/"/>
+    <updated>2019-12-09T14:56:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2019/12/09/10Gb-recv</id>
+    <content type="html"><![CDATA[<h3>目的</h3>
+
+<p>测试并优化Linux内核收包</p>
+
+<h3>ixgbe收包</h3>
+
+<p>前期设置：cpu和网卡队列一一绑定，irqbalance stop等。</p>
+
+<p>rx_ring->rx_buffer_info[]是收包用的循环队列。rx_ring中关于循环队列的一些重要变量：</p>
+
+<p>rx_ring->next_to_clean  网卡收到的下一个包放这里，所以要预先申请好内存
+rx_ring->next_to_alloc  下一个要申请内存的位置
+rx_ring->next_to_use    [next_to_clean, next_to_use)这个区间的内存是申请好的了，网卡可以直接用。
+            一般取值为[next_to_alloc - IXGBE_RX_BUFFER_WRITE, next_to_alloc], next_to_use 在ixgbe_alloc_rx_buffers里更新。</p>
+
+<p>假设收包队列为512，那么ixgbe初始化之后
+rx_ring->next_to_clean  = 0;
+rx_ring->next_to_use    = 511;
+rx_ring->next_to_alloc  = 511;</p>
+
+<p>这里刚好留了一个位置没申请内存，这个跟reuse有关，后面再看。</p>
+
+<p>初始化流程：
+ixgbe_up() -> ixgbe_configure() -> ixgbe_configure_rx() -> ixgbe_configure_rx_ring() -> ixgbe_alloc_rx_buffers(ring, ixgbe_desc_unused(ring))</p>
+
+<p>ixgbe_desc_unused 决定了预留一个位置。
+```
+    static inline u16 ixgbe_desc_unused(struct ixgbe_ring *ring)
+    {
+        u16 ntc = ring->next_to_clean;
+        u16 ntu = ring->next_to_use;</p>
+
+<pre><code>    return ((ntc &gt; ntu) ? 0 : ring-&gt;count) + ntc - ntu - 1; // 这里保留一个位置
+}
+</code></pre>
+
+<pre><code>
+#### 收包函数 ixgbe_clean_rx_irq 简化流程为
+
+1. 预先申请内存，为[next_to_use, next_to_clean)这段“没申请”内存的队列申请
+</code></pre>
+
+<pre><code>if (cleaned_count &gt;= IXGBE_RX_BUFFER_WRITE) {
+    ixgbe_alloc_rx_buffers(rx_ring, cleaned_count);
+    cleaned_count = 0;
+}
+</code></pre>
+
+<pre><code>
+2. 检查是否收到数据
+</code></pre>
+
+<pre><code>rx_desc = IXGBE_RX_DESC(rx_ring, rx_ring-&gt;next_to_clean);
+size = le16_to_cpu(rx_desc-&gt;wb.upper.length);
+if (!size)
+    break;
+</code></pre>
+
+<pre><code>
+3. 申请skb
+</code></pre>
+
+<pre><code>rx_buffer = ixgbe_get_rx_buffer(rx_ring, rx_desc, &amp;skb, size);
+if (skb)
+    ixgbe_add_rx_frag(rx_ring, rx_buffer, skb, size); // EOP 场景才到这里
+else
+    skb = ixgbe_build_skb(rx_ring, rx_buffer, rx_desc, size);
+</code></pre>
+
+<pre><code>
+4. reuse buffer
+</code></pre>
+
+<pre><code>ixgbe_put_rx_buffer(rx_ring, rx_buffer, skb);
+</code></pre>
+
+<pre><code>
+5. EOP
+</code></pre>
+
+<pre><code>if (ixgbe_is_non_eop(rx_ring, rx_desc, skb))
+    continue;
+</code></pre>
+
+<p>```</p>
+
+<h4>reuse buffer</h4>
+
+<p>先不看EOP、XDP, 流程就很简单，唯一问题是reuse buffer。</p>
+
+<p>其实在ixgbe初始化时rx_ring->rx_buffer_info队列上每个位置申请的内存都可以放两个包的，假设rx_ring->rx_buffer_info[0]上的空间为b1、b2。</p>
+
+<p>网卡收第一个包时，存在了b1，但b2没被使用，在ixgbe_put_rx_buffer()里将b2放到next_to_alloc里，所以前面初始化时至少要空一个位置。这时
+rx_ring->next_to_clean  = 1;
+rx_ring->next_to_use    = 511;
+rx_ring->next_to_alloc  = 0;</p>
+
+<p>b1、b2中间隔了510个包</p>
+
+<p>当收第512个包时，网卡把它存在了b2，这时b1如果被消费了（大概率事件），那么b1又是可以被reuse，再把b1放到next_to_alloc。这样在skb及时消费的情况下就不用再申请内存给网卡。</p>
+
+<h4>EOP</h4>
+
+<p>EOP = End of Packet</p>
+
+<p>如果收上来的数据没有EOP标志位，说明不是一个完整的包，要等后面的数据。
+一个包对应一个skb结构，第一块数据到的时候就申请了skb，下一个数据到来的时候不需要再申请skb。
+ixgbe做法是在ixgbe_is_non_eop()中将skb放到ntc=next_to_clean+1中的rx_ring->rx_buffer_info[ntc].skb = skb; 下一块数据到来时直接在ixgbe_get_rx_buffer()中取出这个skb，不需要再申请。之后收到的数据会依次放到skb_shinfo(skb)->frags[]中, 具体见ixgbe_add_rx_frag()。</p>
+
+<h4>XDP</h4>
+
+<p>XDP是在申请skb结构之前直接处理网卡收到的数据，如果要丢弃就不用申请skb了。</p>
+
+<p>较新的Linux内核或官网驱动ixgbe-5.6.5中包含该功能。</p>
+
+<h3>测试</h3>
+
+<h4>环境</h4>
+
+<p>ga-b250m-hd3
+I5-6500, 4核4线程
+X520-T1
+ubuntu 16.04, linux-image-4.15.0-XX
+主板设置只开启一核(直接丢包场景下增加核数处理能力线性增加)</p>
+
+<h4>netmap</h4>
+
+<p>netmap是一种网卡旁路方法，用netmap测试，只用一个cpu。
+1个cpu, 2GHz， 12.8Mpps   100%
+1个cpu, 3.6GHz，14.2Mpps  100%</p>
+
+<h4>模仿XDP丢包</h4>
+
+<p>ixgbe-5.6.5 的带了XDP功能, 在 ixgbe_run_xdp 直接 return ERR_PTR(-IXGBE_XDP_CONSUMED); 也就是全部丢包。
+1个cpu, 2GHz， 14.2Mpps   &lt;20% ?   用 ixgbe-5.3.8 加上XDP功能 cpu需要 93%
+1个cpu, 3.6GHz，14.2Mpps  &lt;10% ?   用 ixgbe-5.3.8 加上XDP功能 cpu需要 30%</p>
+
+<h4>pre_routing 丢包</h4>
+
+<p>1个cpu, 2GHz， 3.2Mpps   100%
+1个cpu, 3.6GHz，5.5Mpps  100%</p>
+
+<h4>local_in 丢包</h4>
+
+<p>1个cpu, 2GHz， 1.2Mpps   100%
+1个cpu, 3.6GHz，2.1Mpps  100%
+local_in比pre_routing多了路由查找，这个都太慢。</p>
+
+<h4>不处理</h4>
+
+<p>1个cpu, 2GHz， 1.2Mpps   100%
+1个cpu, 3.6GHz，2.1Mpps  100%</p>
+
+<h3>参考</h3>
+
+<p><a href="http://launchpadlibrarian.net/443052277/linux-source-4.15.0_4.15.0-65.74_all.deb">linux-source-4.15.0_4.15.0-65.74_all.deb</a></p>
+
+<p><a href="https://blog.csdn.net/one_clouder/article/details/52685249">二层报文发送之qdisc实现分析</a></p>
+
+<p><a href="https://www.cnblogs.com/ne-liqian/p/9294757.html">netmap配置</a></p>
+
+<p><a href="https://tqr.ink/2017/04/16/intel-82599-receive-packet/">基于82599网卡的二层网络数据包接收</a></p>
+
+<p><a href="https://tqr.ink/2017/05/01/intel-82599-transmit-packet/">基于82599网卡的二层网络数据包发送</a></p>
+
+<p><a href="https://www.ichenfu.com/2019/03/10/how-to-drop-10-million-packets-per-second/">如何在一秒之内丢弃1000万个网络数据包</a></p>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[X520-T1 Linux内核收发包14Mpps]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2019/10/31/10Gb-test/"/>
+    <updated>2019-10-31T10:56:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2019/10/31/10Gb-test</id>
+    <content type="html"><![CDATA[<h3>收包</h3>
+
+<pre><code>    ethtool -K enp3s0 gro off
+    PRE_ROUTING 丢包，14Mpps
+    LOCAL_IN 丢包，待优化
+</code></pre>
+
+<h3>发包(I7-7700k, no_trubo=1)</h3>
+
+<pre><code>    timer 8Mpps
+    timer+gso  tcp:11Mpps; udp:14Mpps,但是是IP分片的包
+    gso 需要关闭tso??  ethtool -K enp3s0 tso off gso off
+
+
+    kthread pfifo    14Mpps         cpu: 80%
+    kthread fq_codel 12~14Mpps      cpu: 100%
+    kthread noqueue  12Mpps         cpu: 100%
+
+
+    kthread pfifo static_skb    14Mpps  cpu: 40%
+    kthread fq_codel static_skb 14Mpps  cpu: 40%
+    kthread noqueue static_skb  12Mpps  cpu: 100%
+
+
+    kthread noqueue static_skb skb_list  14Mpps cpu: 20%
+                    1cpu: 9Mpps, cpu 100%
+                    2cpu: 14Mpps, cpu 60%
+
+
+    M.2 SSD 增加收包si 20%，发包10%
+    I5-6500 只能发送12.5Mpps, netmap也一样 ？？？
+</code></pre>
+
+<h3>转发</h3>
+
+<pre><code>    12Mpps 以上? 待测
+    把收到的包转发比申请一个包发出更优
+</code></pre>
+
+<p>细节待更新</p>
+]]></content>
+  </entry>
+  
+</feed>

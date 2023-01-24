@@ -1,0 +1,217 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+
+  <title><![CDATA[Category: kernel~fpu | kk Blog —— 通用基础]]></title>
+  <link href="http://abcdxyzk.github.io/blog/cats/kernel~fpu/atom.xml" rel="self"/>
+  <link href="http://abcdxyzk.github.io/"/>
+  <updated>2023-01-24T19:27:19+08:00</updated>
+  <id>http://abcdxyzk.github.io/</id>
+  <author>
+    <name><![CDATA[kk]]></name>
+    
+  </author>
+  <generator uri="http://octopress.org/">Octopress</generator>
+
+  
+  <entry>
+    <title type="html"><![CDATA[内核态使用FPU、MMX和XMM寄存器]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2018/01/08/kernel-fpu-2/"/>
+    <updated>2018-01-08T01:09:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2018/01/08/kernel-fpu-2</id>
+    <content type="html"><![CDATA[<p><a href="https://www.cnblogs.com/wz19860913/archive/2010/05/25/1742583.html">https://www.cnblogs.com/wz19860913/archive/2010/05/25/1742583.html</a></p>
+
+<h4>保存和加载FPU、MMX和XMM寄存器</h4>
+
+<p>  从Intel 80486DX开始，FPU（算术浮点单元）被集成到了CPU中，浮点算术功能用ESCAPE指令来执行，操纵CPU中的浮点寄存器集。显然，当一个进程正在使用ESCAPE指令，那么浮点寄存器的内容就属于它的硬件上下文。</p>
+
+<p>  为了加速多媒体程序的执行，Intel在微处理器中引入了新的指令集——MMX，MMX指令也作用于FPU的浮点寄存器。这样，MMX就不能和FPU指令混用，但是OS内核就可以忽略新的MMX指令集，因为保存浮点寄存器的功能代码也能够应用于MMX的状态。</p>
+
+<p>  MMX使用SIMD（单指令多数据）流水线，Pentium III增强了这种SIMD能力，引入SSE（Streaming SIMD Extensions）扩展。该功能增强了8个128位寄存器（XMM寄存器）的功能，这些寄存器不和FPU/MMX寄存器重叠，因此能够与FPU/MMX指令混用。</p>
+
+<p>  Pentium IV还引入了SSE2扩展，支持高精度浮点值，SSE2和SSE使用同一个XMM寄存器组。</p>
+
+<p>  80x86微处理器不在TSS中保存FPU、MMX和XMM寄存器的值，不过还是提供了一些支持，能够在需要时保存它们。cr0寄存器有一个TS（Task-Switching）标志位，每当执行硬件上下文切换时，TS置位，每当TS被置位后进程执行ESCAPE、MMX、SSE或SSE2指令，控制器就产生一个“Device not available”异常。这样，TS标志位就能够让OS内核只有在真正需要时才保存或恢复FPU、MMX和XMM寄存器。</p>
+
+<p>  假设进程A使用了数学协处理器，那么当进程A被切换出去的时候，内核设置TS并将浮点寄存器的内容保存到进程A的TSS中（原著这么写，但是应该是保存到进程A描述符的一个字段中，TSS是与CPU关联的，进程没有TSS）。</p>
+
+<p>  如果新进程B不使用数学协处理器，那么内核就不需要恢复浮点寄存器的内容，但是，一旦进程B执行FPU、MMX等指令，CPU就产生一个“Device not available”异常，相应的异常处理程序就会用保存在进程B中的相关值来恢复浮点寄存器。</p>
+
+<p>  处理FPU、MMX和XMM寄存器的数据结构存放在进程描述符的thread字段的i387子字段中（即thread.i387），由i387_union联合体描述，其格式如下：</p>
+
+<pre><code>    union i387_union {
+        struct i387_fsave_struct    fsave; /* 保存FPU、MMX寄存器的内容 */
+        struct i387_fxsave_struct   fxsave;/* 保存SSE和SSE2寄存器内容 */
+        struct i387_soft_struct     soft;  /* 由无数学协处理器的老式CPU模型使用 */
+    };
+</code></pre>
+
+<p>  此外，进程描述符中还包含了两个附加的标志：</p>
+
+<p>  thread_info结构中status字段的TS_USEDFPU标志，表示进程当前执行过程中是否使用过FPU、MMX和XMM寄存器。
+  task_struct结构的flags字段的PF_USED_MATH标志，表示thread.i387的内容是否有意义。</p>
+
+<p>  保存和加载FPU、MMX和XMM寄存器主要用到<strong>unlazy_fpu宏，该宏在</strong>switch_to函数中使用，下一篇会对其进行分析。</p>
+
+<h4>内核态使用FPU、MMX和XMM寄存器</h4>
+
+<p>  OS内核也可以使用FPU、MMX和XMM寄存器，当然，这么做的时候应该避免干扰用户态进程。因此，Linux使用如下方法来解决：</p>
+
+<p>  在内核使用协处理器之前，如果用户态进程使用了FPU（TS_USEDFPU标志为1），内核就要调用kernel_fpu_begin()函数，该函数里又调用save_init_fpu()来保存寄存器内容，然后重新设置cr0寄存器的TS标志。
+  使用完协处理器之后，内核调用kernel_fpu_end宏设置cr0寄存器的TS标志。
+  当用户态进程恢复执行时，math_state_restore()函数将恢复FPU、MMX和XMM寄存器的内容。</p>
+
+<p>  需要注意的是，如果当前用户态进程有在用数学协处理器时，kernel_fpu_begin()函数的执行时间比较长，甚至无法通过FPU、MMX或XMM达到加速的目的。因此，内核只在有限的场合使用FPU、MMX或XMM指令，比如移动或清除大内存区字段、计算校验和等。</p>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[linux 下的浮点运算]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2018/01/08/kernel-fpu-1/"/>
+    <updated>2018-01-08T00:54:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2018/01/08/kernel-fpu-1</id>
+    <content type="html"><![CDATA[<p><a href="http://blog.sina.com.cn/s/blog_6e32babb0101o9kf.html">linux 下的浮点运算</a></p>
+
+<ol>
+<li><p>intel 平台下，如果有浮点计算，都会用专门的浮点指令来执行。但是double/float 类型的加减乘除，gcc 是用的一般指令来做的，没有用浮点指令来做。</p></li>
+<li><p>还是intel 平台下，一个进程在被cpu调度到之后，运行的第一条浮点指令会触发“no deveice avaible”异常，从而导致执行相应的中断处理程序。后续的不再触发。这个中断处理程序中，一般会做的是，恢复/保存浮点运行相关的环境。如果该时间段内没有浮点操作，那么就不用恢复/保存浮点运行环境，从而减少开销。这也是为什么要设计成这样的原因。</p></li>
+<li><p>内核也可以执行浮点操作，只需要调用前后用 kernel_fpu_begin() and kernel_fpu_end() 括起来。但是有可能这个的开销已经超过了用浮点指令带来的便捷。所以内核应该尽量少用浮点操作。</p></li>
+</ol>
+
+
+<hr />
+
+<p><a href="http://www.lenky.info/archives/2012/10/2001/comment-page-1">Linux内核与浮点计算</a></p>
+
+<p>在Linux内核里无法直接进行浮点计算，这是从性能上的考虑，因为这样做可以省去在用户态与内核态之间进行切换时保存/恢复浮点寄存器 FPU的操作，当然，这到底可以提升多少性能我还不得而知，不过就目前而言，Linux内核的确就是这样做的。</p>
+
+<p>比如下面这个测试模块：
+<code>``
+    # Makefile
+    MDIR = $(shell pwd)
+    ifeq (, $(KSRC))
+        KSRC := /usr/src/linux-</code>uname -r`
+    endif</p>
+
+<pre><code>ifeq (, $(PROJECT_DIR))
+    PROJECT_DIR := $(PWD)/../
+endif
+
+module := float_test
+
+obj-m := $(module).o
+
+srcs =  $(wildcard, *.c)
+
+$(module)-objs := $(addsuffix .o, $(basename $(srcs)))
+
+EXTRA_CFLAGS += -g $(FLAG) -I$(PROJECT_DIR)/inc -I${SHAREDHDR} -I$(KERNELHDR) -O2 -D__KERNEL__ -DMODULE $(INCLUDE) -DEXPORT_SYMTAB
+
+TARGET = $(module).ko
+
+all:
+    make -C $(KSRC) M=$(MDIR) modules
+
+debug:
+    make EXTRA_FLAGS="${EXTRA_CFLAGS} -DDEBUG" -C $(KSRC) M=$(MDIR) modules
+
+clean:
+    make -C $(KSRC) M=$(MDIR) clean
+
+install: all
+    cp -f $(TARGET) $(INSTALL_DIR)
+</code></pre>
+
+<pre><code></code></pre>
+
+<pre><code>/**
+ * float_test.c
+ */
+#include &lt;linux/kernel.h&gt;
+#include &lt;linux/types.h&gt;
+#include &lt;linux/stddef.h&gt;
+#include &lt;linux/module.h&gt;
+#include &lt;linux/fs.h&gt;
+#include &lt;asm/desc.h&gt;
+
+static float float_test(float a, float b)
+{
+    return a/b;
+}
+
+static int __init test_module_init(void)
+{
+    float_test(1.0, 1.0);
+    return 0;
+}
+
+static void __exit test_module_fini(void)
+{
+
+    //Do Nothing
+    return;
+}
+
+module_init(test_module_init);
+module_exit(test_module_fini);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("lenky0401 at gmail dot com");
+</code></pre>
+
+<pre><code>
+编译它将得到如下错误提示：
+</code></pre>
+
+<pre><code>[root@localhost t]# make
+make -C /usr/src/linux-`uname -r` M=/home/gqk/t modules
+make[1]: Entering directory `/usr/src/linux-2.6.38.8'
+  CC [M]  /home/gqk/t/float_test.o
+/home/gqk/t/float_test.c: In function ‘float_test’:
+/home/gqk/t/float_test.c:12: error: SSE register return with SSE disabled
+make[2]: *** [/home/gqk/t/float_test.o] Error 1
+make[1]: *** [_module_/home/gqk/t] Error 2
+make[1]: Leaving directory `/usr/src/linux-2.6.38.8'
+make: *** [all] Error 2
+[root@localhost t]#
+
+[root@localhost t]# make V=1
+make -C /usr/src/linux-`uname -r` M=/home/gqk/t modules
+make[1]: Entering directory `/usr/src/linux-2.6.38.8'
+test -e include/generated/autoconf.h -a -e include/config/auto.conf || (        \
+    echo;                               \
+    echo "  ERROR: Kernel configuration is invalid.";       \
+    echo "         include/generated/autoconf.h or include/config/auto.conf are missing.";\
+    echo "         Run 'make oldconfig &amp;&amp; make prepare' on kernel src to fix it.";  \
+    echo;                               \
+    /bin/false)
+mkdir -p /home/gqk/t/.tmp_versions ; rm -f /home/gqk/t/.tmp_versions/*
+make -f scripts/Makefile.build obj=/home/gqk/t
+  gcc -Wp,-MD,/home/gqk/t/.float_test.o.d  -nostdinc -isystem /usr/lib/gcc/x86_64-redhat-linux/4.4.4/include -I/usr/src/linux-2.6.38.8/arch/x86/include -Iinclude  -include include/generated/autoconf.h -D__KERNEL__ -Wall -Wundef -Wstrict-prototypes -Wno-trigraphs -fno-strict-aliasing -fno-common -Werror-implicit-function-declaration -Wno-format-security -fno-delete-null-pointer-checks -O1 -m64 -mtune=generic -mno-red-zone -mcmodel=kernel -funit-at-a-time -maccumulate-outgoing-args -fstack-protector -DCONFIG_AS_CFI=1 -DCONFIG_AS_CFI_SIGNAL_FRAME=1 -DCONFIG_AS_CFI_SECTIONS=1 -DCONFIG_AS_FXSAVEQ=1 -pipe -Wno-sign-compare -fno-asynchronous-unwind-tables -mno-sse -mno-mmx -mno-sse2 -mno-3dnow -Wframe-larger-than=2048 -fno-omit-frame-pointer -fno-optimize-sibling-calls -g -Wdeclaration-after-statement -Wno-pointer-sign -fno-strict-overflow -fconserve-stack -DCC_HAVE_ASM_GOTO -g -I/home/gqk/t/..//inc -I -I -O2 -D__KERNEL__ -DMODULE -DEXPORT_SYMTAB  -DMODULE  -D"KBUILD_STR(s)=#s" -D"KBUILD_BASENAME=KBUILD_STR(float_test)"  -D"KBUILD_MODNAME=KBUILD_STR(float_test)" -c -o /home/gqk/t/.tmp_float_test.o /home/gqk/t/float_test.c
+/home/gqk/t/float_test.c: In function ‘float_test’:
+/home/gqk/t/float_test.c:12: error: SSE register return with SSE disabled
+make[2]: *** [/home/gqk/t/float_test.o] Error 1
+make[1]: *** [_module_/home/gqk/t] Error 2
+make[1]: Leaving directory `/usr/src/linux-2.6.38.8'
+make: *** [all] Error 2
+[root@localhost t]#
+</code></pre>
+
+<p>```</p>
+
+<p>注意到其中的gcc编译选项：-mno-sse -mno-mmx -mno-sse2，这几个选项是Linux内核编译模块时自动带上的，就是它们（具体就是-mno-sse）明确禁止了Linux内核无法使用浮点数。</p>
+
+<p>在Linux内核里很少会有使用浮点数的需求，即便是有也大多是通过变通的办法解决，在下面链接里有一些很好的扩展介绍，感兴趣的可以看看：</p>
+
+<p><a href="http://stackoverflow.com/questions/6397430/overhead-of-supporting-floating-point-arithmetic-inside-the-linux-kernel">http://stackoverflow.com/questions/6397430/overhead-of-supporting-floating-point-arithmetic-inside-the-linux-kernel</a></p>
+
+<p><a href="http://stackoverflow.com/questions/10212892/how-to-avoid-fpu-when-given-float-numbers">http://stackoverflow.com/questions/10212892/how-to-avoid-fpu-when-given-float-numbers</a></p>
+
+<p><a href="http://www.linuxsmiths.com/blog/?p=253">http://www.linuxsmiths.com/blog/?p=253</a></p>
+
+<hr />
+
+<p><a href="http://blog.csdn.net/vbskj/article/details/38408467">http://blog.csdn.net/vbskj/article/details/38408467</a></p>
+]]></content>
+  </entry>
+  
+</feed>

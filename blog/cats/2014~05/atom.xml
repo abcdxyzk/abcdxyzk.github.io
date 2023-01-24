@@ -1,0 +1,526 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+
+  <title><![CDATA[Category: 2014~05 | kk Blog —— 通用基础]]></title>
+  <link href="http://abcdxyzk.github.io/blog/cats/2014~05/atom.xml" rel="self"/>
+  <link href="http://abcdxyzk.github.io/"/>
+  <updated>2023-01-24T19:27:19+08:00</updated>
+  <id>http://abcdxyzk.github.io/</id>
+  <author>
+    <name><![CDATA[kk]]></name>
+    
+  </author>
+  <generator uri="http://octopress.org/">Octopress</generator>
+
+  
+  <entry>
+    <title type="html"><![CDATA[tsc时钟初始化]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2014/05/29/kernel-sched-tsc/"/>
+    <updated>2014-05-29T14:03:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2014/05/29/kernel-sched-tsc</id>
+    <content type="html"><![CDATA[<h5>tsc时钟源初始化</h5>
+
+<pre><code>    //    调用路径：time_init-&gt;tsc_init
+    //    函数任务：
+    //        1.矫正tsc，获取tsc频率，设置cpu频率等于tsc频率
+    //        2.初始化基于tsc的延迟函数
+    //        3.检查tsc的特性
+    //            3.1 tsc之间是否同步
+    //                3.1.1 如果tsc之间不同步，标记tsc不稳定，设置rating=0
+    //            3.2 tsc是否稳定
+    //        4.注册tsc时钟源设备
+</code></pre>
+
+<pre><code>    void __init tsc_init(void)
+    {
+        u64 lpj;
+        int cpu;
+
+        //矫正tsc，获取tsc频率
+        tsc_khz = x86_platform.calibrate_tsc();
+        //cpu频率等于tsc频率
+        cpu_khz = tsc_khz;
+        //计算辅助cycle到ns转换的辅助参数scale
+        for_each_possible_cpu(cpu)
+            set_cyc2ns_scale(cpu_khz, cpu);
+        //初始化基于tsc的延迟函数，ndely，udelay，mdelay
+        use_tsc_delay();
+        //检查cpu之间tsc是否同步
+        if (unsynchronized_tsc())
+            mark_tsc_unstable("TSCs unsynchronized");
+        //检查tsc是否可靠
+        check_system_tsc_reliable();
+        //注册tsc时钟源设备
+        init_tsc_clocksource();
+    }
+</code></pre>
+
+<h5>延迟函数ndelay，udelay，mdelay</h5>
+
+<p>通过tsc实现短延迟
+<code>
+    void use_tsc_delay(void)
+    {
+        //通过tsc进行短延迟
+        delay_fn = delay_tsc;
+    }
+</code></p>
+
+<h5>tsc延迟函数</h5>
+
+<p>通过rep_nop实现轮询时的短延迟，查询tsc时禁止内核抢占，确保不受不同cpu间影响。
+```
+    static void delay_tsc(unsigned long loops)
+    {
+        unsigned long bclock, now;
+        int cpu;
+        //短延迟，禁止内核抢占
+        preempt_disable();
+        //delay_tsc当前运行的cpu
+        cpu = smp_processor_id();
+        rdtsc_barrier();
+        rdtscl(bclock);
+        for (;;) {
+            rdtsc_barrier();
+            rdtscl(now);
+            if ((now - bclock) >= loops)
+                break;
+            //允许rt策略进程运行
+            preempt_enable();
+            //空操作
+            rep_nop();
+            preempt_disable();</p>
+
+<pre><code>        //delay_tsc在运行过程中，可能会迁移到不同的cpu
+        //tsc
+        if (unlikely(cpu != smp_processor_id())) {
+            loops -= (now - bclock);
+            cpu = smp_processor_id();
+            rdtsc_barrier();
+            rdtscl(bclock);
+        }
+    }
+    preempt_enable();
+}
+</code></pre>
+
+<pre><code>
+##### 检查tsc是否同步
+</code></pre>
+
+<pre><code>//    调用路径：tsc_init-&gt;unsynchronized_tsc
+//    检查办法：
+//        1.如果apic在多块板卡，则tsc不同步
+//        2.如果cpuid显示具有稳定的tsc，则tsc同步
+//        3.intel cpu的tsc都是同步的
+//        4.默认其他品牌的多核的tsc不同步
+</code></pre>
+
+<pre><code></code></pre>
+
+<pre><code>__cpuinit int unsynchronized_tsc(void)
+{
+    //如果apic分布在多块板卡上，tsc可能不同步
+    if (apic_is_clustered_box())
+        return 1;
+    //cpu具有稳定的tsc
+    if (boot_cpu_has(X86_FEATURE_CONSTANT_TSC))
+        return 0;
+    //intel cpu的tsc都是同步的
+    if (boot_cpu_data.x86_vendor != X86_VENDOR_INTEL) {
+        //非intel cpu，如果cpu个数&gt;1,则认为不同步
+        if (num_possible_cpus() &gt; 1)
+            tsc_unstable = 1;
+    }
+    return tsc_unstable;
+}
+</code></pre>
+
+<pre><code>
+##### 标记tsc不稳定
+</code></pre>
+
+<pre><code>//    调用路径：tsc_init-&gt;mark_tsc_unstable
+//    函数任务：
+//        1.如果tsc时钟已经注册，异步设置tsc的rating=0，标识其不稳定
+//        2.如果tsc时钟还未注册，同步设置tsc的rating=0，标识其不稳定
+</code></pre>
+
+<pre><code></code></pre>
+
+<pre><code>void mark_tsc_unstable(char *reason)
+{
+    if (!tsc_unstable) {
+        tsc_unstable = 1;
+        sched_clock_stable = 0;
+        //tsc已经注册，
+        if (clocksource_tsc.mult)
+        {
+            clocksource_mark_unstable(&amp;clocksource_tsc);
+        }
+        //如果tsc时钟源未注册，修改rating为最低，从而不会被当做最佳的时钟源
+        else {
+            clocksource_tsc.flags |= CLOCK_SOURCE_UNSTABLE;
+            clocksource_tsc.rating = 0;
+        }
+    }
+}
+</code></pre>
+
+<pre><code>
+##### 注册tsc时钟源
+</code></pre>
+
+<pre><code>//    函数任务：
+//        1.计算tsc的mult
+//        2.检查tsc是否稳定
+//            2.1 如果tsc不稳定，降低其rating，清除时钟源连续标志
+//        3.向系统注册tsc clocksource
+//    调用路径：tsc_init-&gt;init_tsc_clocksource
+</code></pre>
+
+<pre><code></code></pre>
+
+<pre><code>static void __init init_tsc_clocksource(void)
+{
+    // 计算tsc的mult
+    clocksource_tsc.mult = clocksource_khz2mult(tsc_khz,
+            clocksource_tsc.shift);
+    // 如果tsc的可靠性已经验证，则清除 必须验证 标记
+    if (tsc_clocksource_reliable)
+        clocksource_tsc.flags &amp;= ~CLOCK_SOURCE_MUST_VERIFY;
+
+    // 检查tsc是否稳定
+    // 在tsc_init前通过全局变量标记tsc是否稳定，可靠
+    if (check_tsc_unstable()) {
+        // 如果tsc不稳定，则降低rating最低，清除连续标记
+        clocksource_tsc.rating = 0;
+        clocksource_tsc.flags &amp;= ~CLOCK_SOURCE_IS_CONTINUOUS;
+    }
+    // 向系统注册tsc clocksource
+    clocksource_register(&amp;clocksource_tsc);
+}
+</code></pre>
+
+<p>```</p>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[TSC时间错误]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2014/05/29/debug-mark-tsc/"/>
+    <updated>2014-05-29T14:03:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2014/05/29/debug-mark-tsc</id>
+    <content type="html"><![CDATA[<p>arch/x86/kernel/tsc.c:<br/>
+  开机初始化会调用tsc_init() -> set_cyc2ns_scale() 设置per_cpu变量cyc2ns、cyc2ns_offset。以供后面shced_clock()->native_sched_clock()->__cycles_2_ns()调用。</p>
+
+<p>在cpufreq_tsc()中如果<br/>
+   //cpu具有稳定的tsc <br/>
+    if (boot_cpu_has(X86_FEATURE_CONSTANT_TSC)) <br/>
+        return 0;<br/>
+  所以一般不会注册time_cpufreq_notifier函数，也就不会再调用set_cyc2ns_scale。</p>
+
+<ul>
+<li>现象：top、ps出来的TIME和CPU的值非常异常。</li>
+</ul>
+
+
+<pre><code>    // 查看TSC寄存器的值
+    #include &lt;stdio.h&gt;
+
+    int main()
+    {
+            unsigned long low, high, val;
+            asm volatile("rdtsc": "=a" (low), "=d" (high));
+            val = ((low) | ((unsigned long)(high) &lt;&lt; 32));
+            printf("%lu\n", val);
+            return 0;
+    }
+</code></pre>
+
+<hr />
+
+<p><a href="https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=733043">https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=733043</a></p>
+
+<p>Xeon E5 has a bug, it doesn&rsquo;t reset TSC on warm reboot, just keep it instead.
+ see &ldquo;BT81. X X X No Fix TSC is Not Affected by Warm Reset&rdquo; <a href="http://www.intel.com/content/dam/www/public/us/en/documents/specification-updates/xeon-e5-family-spec-update.pdf">http://www.intel.com/content/dam/www/public/us/en/documents/specification-updates/xeon-e5-family-spec-update.pdf</a></p>
+
+<p> And also kernel 2.6.32 has a bug.<br/>
+ Xeon bug + kernel bug = hung after warm reboot (or kexec) after 208.5 days<br/>
+ since booting. So, administrators should shutdown it once at all, then<br/>
+ boot it again because &ldquo;shutdown -r&rdquo; causes hang up.</p>
+
+<p> Red Hat has released a fix for this as kernel 2.6.32-220, 2.6.32-279<br/>
+ and 2.6.32-358 series (RHEL6.x) <a href="https://access.redhat.com/site/solutions/433883">https://access.redhat.com/site/solutions/433883</a> (for detail subscriber only :-(</p>
+
+<p> Attached patch is based on upstream patch.<br/>
+ see <a href="http://kernel.opensuse.org/cgit/kernel/patch/?id=9993bc635d01a6ee7f6b833b4ee65ce7c06350b1">http://kernel.opensuse.org/cgit/kernel/patch/?id=9993bc635d01a6ee7f6b833b4ee65ce7c06350b1</a></p>
+
+<hr />
+
+<p>  Red Hat Enterprise Linux 6.1 (kernel-2.6.32-131.26.1.el6 and newer)<br/>
+  Red Hat Enterprise Linux 6.2 (kernel-2.6.32-220.4.2.el6 and newer)<br/>
+  Red Hat Enterprise Linux 6.3 (kernel-2.6.32-279 series)<br/>
+  Red Hat Enterprise Linux 6.4 (kernel-2.6.32-358 series)<br/>
+  Any Intel® Xeon® E5, Intel® Xeon® E5 v2, or Intel® Xeon® E7 v2 series processor</p>
+
+<hr />
+
+<p>From 9993bc635d01a6ee7f6b833b4ee65ce7c06350b1 Mon Sep 17 00:00:00 2001<br/>
+From: Salman Qazi &lt;<code>sqazi@google.com</code>><br/>
+Date: Sat, 10 Mar 2012 00:41:01 +0000<br/>
+Subject: sched/x86: Fix overflow in cyc2ns_offset</p>
+
+<p>When a machine boots up, the TSC generally gets reset.  However,
+when kexec is used to boot into a kernel, the TSC value would be
+carried over from the previous kernel.  The computation of
+cycns_offset in set_cyc2ns_scale is prone to an overflow, if the
+machine has been up more than 208 days prior to the kexec.  The
+overflow happens when we multiply *scale, even though there is
+enough room to store the final answer.</p>
+
+<p>We fix this issue by decomposing tsc_now into the quotient and
+remainder of division by CYC2NS_SCALE_FACTOR and then performing
+the multiplication separately on the two components.</p>
+
+<p>Refactor code to share the calculation with the previous
+fix in __cycles_2_ns().</p>
+
+<p>Signed-off-by: Salman Qazi &lt;<code>sqazi@google.com</code>><br/>
+Acked-by: John Stultz &lt;<code>john.stultz@linaro.org</code>><br/>
+Acked-by: Peter Zijlstra &lt;<code>a.p.zijlstra@chello.nl</code>><br/>
+Cc: Paul Turner &lt;<code>pjt@google.com</code>><br/>
+Cc: john stultz &lt;<code>johnstul@us.ibm.com</code>><br/>
+Link: <a href="http://lkml.kernel.org/r/20120310004027.19291.88460.stgit@dungbeetle.mtv.corp.google.com">http://lkml.kernel.org/r/20120310004027.19291.88460.stgit@dungbeetle.mtv.corp.google.com</a><br/>
+Signed-off-by: Ingo Molnar &lt;<code>mingo@elte.hu</code>></p>
+
+<hr />
+
+<p>patch： <a href="http://kernel.opensuse.org/cgit/kernel/patch/?id=9993bc635d01a6ee7f6b833b4ee65ce7c06350b1">http://kernel.opensuse.org/cgit/kernel/patch/?id=9993bc635d01a6ee7f6b833b4ee65ce7c06350b1</a></p>
+
+<pre><code>    diff --git a/arch/x86/include/asm/timer.h b/arch/x86/include/asm/timer.h
+    index 431793e..34baa0e 100644
+    --- a/arch/x86/include/asm/timer.h
+    +++ b/arch/x86/include/asm/timer.h
+    @@ -57,14 +57,10 @@ DECLARE_PER_CPU(unsigned long long, cyc2ns_offset);
+
+     static inline unsigned long long __cycles_2_ns(unsigned long long cyc)
+     {
+    -   unsigned long long quot;
+    -   unsigned long long rem;
+        int cpu = smp_processor_id();
+        unsigned long long ns = per_cpu(cyc2ns_offset, cpu);
+    -   quot = (cyc &gt;&gt; CYC2NS_SCALE_FACTOR);
+    -   rem = cyc &amp; ((1ULL &lt;&lt; CYC2NS_SCALE_FACTOR) - 1);
+    -   ns += quot * per_cpu(cyc2ns, cpu) +
+    -       ((rem * per_cpu(cyc2ns, cpu)) &gt;&gt; CYC2NS_SCALE_FACTOR);
+    +   ns += mult_frac(cyc, per_cpu(cyc2ns, cpu),
+    +           (1UL &lt;&lt; CYC2NS_SCALE_FACTOR));
+        return ns;
+     }
+
+    diff --git a/arch/x86/kernel/tsc.c b/arch/x86/kernel/tsc.c
+    index a62c201..183c592 100644
+    --- a/arch/x86/kernel/tsc.c
+    +++ b/arch/x86/kernel/tsc.c
+    @@ -620,7 +620,8 @@ static void set_cyc2ns_scale(unsigned long cpu_khz, int cpu)
+
+        if (cpu_khz) {
+            *scale = (NSEC_PER_MSEC &lt;&lt; CYC2NS_SCALE_FACTOR)/cpu_khz;
+    -       *offset = ns_now - (tsc_now * *scale &gt;&gt; CYC2NS_SCALE_FACTOR);
+    +       *offset = ns_now - mult_frac(tsc_now, *scale,
+    +                        (1UL &lt;&lt; CYC2NS_SCALE_FACTOR));
+        }
+
+        sched_clock_idle_wakeup_event(0);
+    diff --git a/include/linux/kernel.h b/include/linux/kernel.h
+    index e834342..d801acb 100644
+    --- a/include/linux/kernel.h
+    +++ b/include/linux/kernel.h
+    @@ -85,6 +85,19 @@
+     }                          \
+     )
+
+    +/*
+    + * Multiplies an integer by a fraction, while avoiding unnecessary
+    + * overflow or loss of precision.
+    + */
+    +#define mult_frac(x, numer, denom)(            \
+    +{                          \
+    +   typeof(x) quot = (x) / (denom);         \
+    +   typeof(x) rem  = (x) % (denom);         \
+    +   (quot * (numer)) + ((rem * (numer)) / (denom)); \
+    +}                          \
+    +)
+    +
+    +
+     #define _RET_IP_       (unsigned long)__builtin_return_address(0)
+     #define _THIS_IP_  ({ __label__ __here; __here: (unsigned long)&amp;&amp;__here; }) 
+</code></pre>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[mark problem]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2014/05/29/mark-base/"/>
+    <updated>2014-05-29T13:57:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2014/05/29/mark-base</id>
+    <content type="html"><![CDATA[<h4>C语言中宽字符和多字节字符 MB_CUR_MAX</h4>
+
+<p>stdlib.h<br/>
+MB_CUR_MAX 当前locale中多字节字符的最大字节数目<br/>
+如果把字符串当成多字节字符处理会慢很多<br/>
+sort命令的一些版本中会根据locale中的LANG来设置比较函数，如果没设置好会导致sort跑的很慢。</p>
+
+<h4>内核栈溢出</h4>
+
+<p>因为内核栈中栈底保存thread_info，所以如果内核栈溢出会破坏thread_info，这样当进程发生睡眠、中断、抢占等调度时就会出错。<br/>
+容易报try_to_wakeup+XXX错误，等等</p>
+
+<h4>定时器 timer 注意</h4>
+
+<p>如果mod_timer设置成马上执行，然后下面又是setup_timer。<br/>
+有可能的情况是：进入了中断执行过程，可是setup_timer又改变timer结构，导致继续执行时用到timer结构出错。</p>
+
+<h4>查看内核栈</h4>
+
+<p>用 echo t > /proc/sysrq-trigger 把内核栈整个打出来。<br/>
+可以看/proc/{pid}/wchan，里面是该进程阻塞位置的内核函数名，在所有办法都没戏的时候可以看它。</p>
+
+<h4>mark</h4>
+
+<p><a href="http://blog.donghao.org/2013/03/20/%E4%BF%AE%E5%A4%8Dext4%E6%97%A5%E5%BF%97%EF%BC%88jbd2%EF%BC%89bug/">修复ext4日志（jbd2）bug</a><br/>
+<a href="http://blog.donghao.org/2013/07/17/rhel6%E5%86%8D%E6%AC%A1%E5%8F%91%E7%8E%B0jbd2%E7%9A%84bug/">rhel6再次发现jbd2的bug</a><br/>
+<a href="http://blog.donghao.org/2013/08/28/rhel6-%E7%9A%84%E8%BD%AFraid%E9%97%AE%E9%A2%98/">rhel6 的软RAID问题</a><br/>
+<a href="kernel.taobao.org/index.php/Kernel_Documents/stable_pages">stable pages</a><br/>
+<a href="http://blog.donghao.org/2014/04/24/%E8%BF%BD%E8%B8%AAcpu%E8%B7%91%E6%BB%A1/">追踪CPU跑满</a></p>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[VirtualBox摄像头功能]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2014/05/28/vm-ex-packages/"/>
+    <updated>2014-05-28T21:44:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2014/05/28/vm-ex-packages</id>
+    <content type="html"><![CDATA[<h4>1、下载Oracle VM VirtualBox Extension Pack。下载网址如下：</h4>
+
+<p><a href="https://www.virtualbox.org/wiki/Downloads">https://www.virtualbox.org/wiki/Downloads</a></p>
+
+<h4>2、安装Oracle VM VirtualBox Extension Pack</h4>
+
+<p>安装外部扩展包很简单</p>
+
+<h5>第一：打开Oracle VirtualBox，在菜单栏中找到“管理”–>“全局设定”</h5>
+
+<h5>第二：打开“全局设定”，参考下图：</h5>
+
+<p><img src="/images/system/20140528.jpg" alt="" /></p>
+
+<h5>第三：“Extension Packages”中添加下载的Oracle VM VirtualBox Extension Pack，根据提示安装即可，</h5>
+
+<p>然后虚拟机就能用摄像头了</p>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[开机自动挂载硬盘]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2014/05/28/system-base-fstab/"/>
+    <updated>2014-05-28T21:42:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2014/05/28/system-base-fstab</id>
+    <content type="html"><![CDATA[<h4>一、Linux磁盘分区UUID的获取</h4>
+
+<pre><code>1、$ ls -l /dev/disk/by-uuid/
+2、$ blkid /dev/sdb1
+</code></pre>
+
+<h4>二、开机自动挂载</h4>
+
+<pre><code>vim /etc/fstab
+UUID=XXXX /XXXX ext4 defaults 0 0
+</code></pre>
+
+<hr />
+
+<p>我们在linux中常常用mount命令把硬盘分区或者光盘挂载到文件系统中。/etc/fstab就是在开机引导的时候自动挂载到linux的文件系统。
+在linux中/etc/fstab的数据项如下所示：
+<code>
+/dev/device   mountpoint   type   rules   dump   order
+设备名称        挂载点          分区类型   挂载选项     dump选项    fsck选项
+</code></p>
+
+<p>例如这是一个普通的/etc/fstab:
+<code>
+/dev/hda2     /                    ext3        defaults   0 1
+/dev/hda3     swap             swap      defaults   0 0
+/dev/hda5     /usr               ext3        defaults   0 0
+/dev/fdo        /mnt/flopy     ext3        noauto     0 0
+/dev/cdrom    /mnt/cdrom   iso9660  noauto,ro 0 0
+</code></p>
+
+<h4>(1)设备名称</h4>
+
+<p>/dev/device就是需要挂载的设备，/hda2就是第一个IDE插槽上的主硬盘的第二个分区。如果是第二个IDE插槽主硬盘的第三个分区，那就是/dev/hdc3，具体可以在linux下使用fdisk -l  查看。</p>
+
+<h4>(2)挂载点</h4>
+
+<p>mountpoint 就是挂载点。/、 /usr、 swap 都是系统安装时分区的默认挂载点。<br/>
+如果你要挂载一个新设备，你就要好好想想了，因为这个新设备将作为文件系统永久的一部分，需要根据FSSTND（文件系统标准），以及它的作用，用户需求来决定。比如你想把它做为一个共享资源，放在/home下面就是一个不错选择。</p>
+
+<h4>(3)分区类型</h4>
+
+<p>type 是指文件系统类型，下面列举几个常用的：
+<code>
+Linux file systems: ext2, ext3, jfs, reiserfs, reiser4, xfs, swap.
+Windows:
+vfat = FAT 32, FAT 16
+ntfs= NTFS
+Note: For NTFS rw ntfs-3g
+CD/DVD/iso: iso9660
+Network file systems:
+nfs: server:/shared_directory /mnt/nfs nfs &lt;options&gt; 0 0
+smb: //win_box/shared_folder /mnt/samba smbfs rw,credentials=/home/user_name/winbox-credentials.txt 0 0
+auto: The file system type (ext3, iso9660, etc) it detected automatically. Usually works. Used for removable devices (CD/DVD, Floppy drives, or USB/Flash drives) as the file system may vary on thesedevices.
+</code></p>
+
+<h4>(4)挂载选项</h4>
+
+<p>rules 是指挂载时的规则。下面列举几个常用的：
+<code>
+auto 开机自动挂载
+default 按照大多数永久文件系统的缺省值设置挂载定义
+noauto 开机不自动挂载
+nouser 只有超级用户可以挂载
+ro 按只读权限挂载
+rw 按可读可写权限挂载
+user 任何用户都可以挂载
+</code>
+请注意光驱和软驱只有在装有介质时才可以进行挂载，因此它是noauto</p>
+
+<h4>(5)dump选项</h4>
+
+<p>这一项为0，就表示从不备份。如果上次用dump备份，将显示备份至今的天数。</p>
+
+<h4>(6)fsck选项</h4>
+
+<p>order 指fsck（启动时fsck检查的顺序）。为0就表示不检查，（/）分区永远都是1，其它的分区只能从2开始，当数字相同就同时检查（但不能有两1）。<br/>
+如果我要把第二个IDE插槽主硬盘上的windows C 区挂到文件系统中，那么数据项是：
+<code>
+/dev/hdc1 /c vfat defaults 0 0
+(/c 是事先建立的文件夹，作为c盘的挂载点。)
+</code>
+当你修改了/etc/fstab后，一定要重新引导系统才会有效。<br/>
+fstab中存放了与分区有关的重要信息，其中每一行为一个分区记录，每一行又可分为六个部份，下面以/dev/hda7 / ext2 defaults 1 1为例逐个说明：</p>
+
+<ol>
+<li>第一项是您想要mount的储存装置的实体位置，如hdb或如上例的/dev/hda7。</li>
+<li>第二项就是您想要将其加入至哪个目录位置，如/home或如上例的/,这其实就是在安装时提示的挂入点。</li>
+<li>第三项就是所谓的local filesystem，其包含了以下格式：如ext、ext2、msdos、iso9660、nfs、swap等，或如上例的ext2，可以参见/prco/filesystems说明。</li>
+<li>第四项就是您mount时，所要设定的状态，如ro（只读）或如上例的defaults（包括了其它参数如rw、suid、exec、auto、nouser、async），可以参见「mount nfs」。</li>
+<li>第五项是提供DUMP功能，在系统DUMP时是否需要BACKUP的标志位，其内定值是0。</li>
+<li>第六项是设定此filesystem是否要在开机时做check的动作，除了root的filesystem其必要的check为1之外，其它皆可视需要设定，内定值是0。</li>
+</ol>
+
+]]></content>
+  </entry>
+  
+</feed>

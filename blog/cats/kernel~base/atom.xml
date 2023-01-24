@@ -1,0 +1,1052 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+
+  <title><![CDATA[Category: kernel~base | kk Blog —— 通用基础]]></title>
+  <link href="http://abcdxyzk.github.io/blog/cats/kernel~base/atom.xml" rel="self"/>
+  <link href="http://abcdxyzk.github.io/"/>
+  <updated>2023-01-24T19:27:19+08:00</updated>
+  <id>http://abcdxyzk.github.io/</id>
+  <author>
+    <name><![CDATA[kk]]></name>
+    
+  </author>
+  <generator uri="http://octopress.org/">Octopress</generator>
+
+  
+  <entry>
+    <title type="html"><![CDATA[SKB路由缓存与SOCK路由缓存]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2021/06/08/net-dst/"/>
+    <updated>2021-06-08T22:04:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2021/06/08/net-dst</id>
+    <content type="html"><![CDATA[<p><a href="https://www.2cto.com/kf/201805/745174.html">https://www.2cto.com/kf/201805/745174.html</a></p>
+
+<p>skb结构体中的成员 <code>_skb_refdst</code> 与sock结构体中成员sk_rx_dst（缓存入口路由）和sk_dst_cache（缓存出口路由）成员之间的交互操作。</p>
+
+<h3>SOCK入口路由与SKB路由缓存</h3>
+
+<p>内核在接收流程中，调用early_demux函数提前在IP层做established状态的sock查找，并负责将sock结构体成员sk_rx_dst的路由缓存赋值给skb成员<code>_skb_refdst</code>，对于UDP协议，先判断DST_NOCACHE标志，如果成立，增加dst引用计数，设置skb的dst；否则，调用skb_dst_set_noref直接进行设置。
+```
+    void udp_v4_early_demux(struct sk_buff *skb)
+    {
+        dst = READ_ONCE(sk->sk_rx_dst);</p>
+
+<pre><code>    if (dst)
+        dst = dst_check(dst, 0);
+    if (dst) {
+        /* DST_NOCACHE can not be used without taking a reference */
+        if (dst-&gt;flags &amp; DST_NOCACHE) {
+            if (likely(atomic_inc_not_zero(&amp;dst-&gt;__refcnt)))
+                skb_dst_set(skb, dst);
+        } else {
+            skb_dst_set_noref(skb, dst);
+        }
+    }
+}
+</code></pre>
+
+<pre><code>
+对于TCP协议，直接调用skb_dst_set_noref函数，将sock结构体成员sk_rx_dst缓存到skb结构体中。
+</code></pre>
+
+<pre><code>void tcp_v4_early_demux(struct sk_buff *skb)
+{
+    if (sk-&gt;sk_state != TCP_TIME_WAIT) {
+        struct dst_entry *dst = sk-&gt;sk_rx_dst;
+
+        if (dst)
+            dst = dst_check(dst, 0);
+        if (dst &amp;&amp;
+            inet_sk(sk)-&gt;rx_dst_ifindex == skb-&gt;skb_iif)
+            skb_dst_set_noref(skb, dst);
+    }
+}
+</code></pre>
+
+<pre><code>
+同样都为early_demux函数，都是从sk-&gt;sk_rx_dst获取路由缓存，tcp和udp的存在明显差别。TCP直接赋值，UDP需要先判断DST_NOCACHE标志。此情况是由UDP与TCP在sock中缓存dst时的处理不同造成的，TCP预先调用了dst_hold_safe函数，进行了DST_NOCACHE标志的判断处理，如未缓存则增加了引用计数。然而，UDP在缓存路由dst时，使用xchg函数，未判断也未增加引用计数，所以需要在后续判断处理。
+</code></pre>
+
+<pre><code>static inline bool dst_hold_safe(struct dst_entry *dst)
+{
+    if (dst-&gt;flags &amp; DST_NOCACHE)
+        return atomic_inc_not_zero(&amp;dst-&gt;__refcnt);
+    dst_hold(dst);
+}
+
+void inet_sk_rx_dst_set(struct sock *sk, const struct sk_buff *skb)
+{
+    struct dst_entry *dst = skb_dst(skb);
+
+    if (dst &amp;&amp; dst_hold_safe(dst)) {
+        sk-&gt;sk_rx_dst = dst;
+        inet_sk(sk)-&gt;rx_dst_ifindex = skb-&gt;skb_iif;
+    }
+}
+
+static void udp_sk_rx_dst_set(struct sock *sk, struct dst_entry *dst)
+{
+    struct dst_entry *old;
+
+    dst_hold(dst);
+    old = xchg(&amp;sk-&gt;sk_rx_dst, dst);
+    dst_release(old);
+}
+</code></pre>
+
+<pre><code>
+### SOCK出口路由与SKB路由缓存
+
+对于UDP协议客户端，其在connect时（UDP客户端connect不同于TCP，仅绑定通信端地址），查询路由，缓存到sock结构体的sk_dst_cache中。
+</code></pre>
+
+<pre><code>int ip4_datagram_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)
+{
+    rt = ip_route_connect(...);
+    sk_dst_set(sk, &amp;rt-&gt;dst);
+}
+</code></pre>
+
+<pre><code>
+之后，发送UDP数据包时，检查sock结构体中的出口路由是否有效，有效的话可不用再次查询路由表，在函数ip_make_skb中直接使用rt，并且调用skb_dst_set赋值给skb的`_skb_refdst`结构体，以便在发送过程中使用。
+
+对于UDP服务端，在首次发包检测到rt为空时，查询路由表得到出口路由，缓存在sock结构中，之后发包时rt有效，省去再次查询。
+</code></pre>
+
+<pre><code>struct sk_buff *__ip_make_skb(...)
+{
+    skb_dst_set(skb, &amp;rt-&gt;dst);
+}
+
+int udp_sendmsg(...)
+{
+    if (connected)
+        rt = (struct rtable *)sk_dst_check(sk, 0);
+    if (rt == NULL) {
+        rt = ip_route_output_flow(net, fl4, sk);
+        if (connected)
+            sk_dst_set(sk, dst_clone(&amp;rt-&gt;dst));
+    }
+
+    skb = ip_make_skb(sk, fl4, getfrag, msg-&gt;msg_iov, ulen,
+            sizeof(struct udphdr), &amp;ipc, &amp;rt,
+            msg-&gt;msg_flags);
+}
+</code></pre>
+
+<pre><code>
+IP层发送数据包时(调用ip_queue_xmit），检测sock结构中出口路由缓存，如果有效，设置到skb结构体中。否则重新进行出口路由查找。
+</code></pre>
+
+<pre><code>int ip_queue_xmit(struct sk_buff *skb, struct flowi *fl)
+{
+    rt = (struct rtable *)__sk_dst_check(sk, 0);
+    if (rt == NULL) {
+        rt = ip_route_output_ports(...);
+        sk_setup_caps(sk, &amp;rt-&gt;dst);
+    }
+    skb_dst_set_noref(skb, &amp;rt-&gt;dst);
+}
+</code></pre>
+
+<p>```</p>
+
+<p>内核版本</p>
+
+<p>linux-3.10.0</p>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[Linux内核的自旋锁]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2021/06/08/base-spin-lock/"/>
+    <updated>2021-06-08T15:42:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2021/06/08/base-spin-lock</id>
+    <content type="html"><![CDATA[<p><a href="http://www.wowotech.net/kernel_synchronization/460.html">http://www.wowotech.net/kernel_synchronization/460.html</a></p>
+
+<p> 自旋锁用于处理器之间的互斥，适合保护很短的临界区，并且不允许在临界区睡眠。申请自旋锁的时候，如果自旋锁被其他处理器占有，本处理器自旋等待（也称为忙等待）。</p>
+
+<p>进程、软中断和硬中断都可以使用自旋锁。</p>
+
+<h4>自旋锁的实现经历了3个阶段：</h4>
+
+<p>(1) 最早的自旋锁是无序竞争的，不保证先申请的进程先获得锁。</p>
+
+<p>(2) 第2个阶段是入场券自旋锁，进程按照申请锁的顺序排队，先申请的进程先获得锁。</p>
+
+<p>(3) 第3个阶段是MCS自旋锁。入场券自旋锁存在性能问题：所有申请锁的处理器在同一个变量上自旋等待，缓存同步的开销大，不适合处理器很多的系统。MCS自旋锁的策略是为每个处理器创建一个变量副本，每个处理器在自己的本地变量上自旋等待，解决了性能问题。</p>
+
+<p>入场券自旋锁和MCS自旋锁都属于排队自旋锁（queued spinlock），进程按照申请锁的顺序排队，先申请的进程先获得锁。</p>
+
+<h2>1. 数据结构</h2>
+
+<p>自旋锁的定义如下：</p>
+
+<pre><code>    include/linux/spinlock_types.h
+    typedef struct spinlock {
+        union {
+            struct raw_spinlock rlock;
+            ...
+        };
+    } spinlock_t;
+
+    typedef struct raw_spinlock {
+        arch_spinlock_t raw_lock;
+        ...
+    } raw_spinlock_t;
+</code></pre>
+
+<p>可以看到，数据类型spinlock对raw_spinlock做了封装，然后数据类型raw_spinlock对arch_spinlock_t做了封装，各种处理器架构需要自定义数据类型arch_spinlock_t。</p>
+
+<h4>spinlock和raw_spinlock（原始自旋锁）有什么关系？</h4>
+
+<p>Linux内核有一个实时内核分支（开启配置宏CONFIG_PREEMPT_RT）来支持硬实时特性，内核主线只支持软实时。</p>
+
+<p>对于没有打上实时内核补丁的内核，spinlock只是封装raw_spinlock，它们完全一样。如果打上实时内核补丁，那么spinlock使用实时互斥锁保护临界区，在临界区内可以被抢占和睡眠，但raw_spinlock还是自旋锁。</p>
+
+<p>目前主线版本还没有合并实时内核补丁，说不定哪天就会合并进来，为了使代码可以兼容实时内核，最好坚持3个原则：</p>
+
+<p>（1）尽可能使用spinlock。</p>
+
+<p>（2）绝对不允许被抢占和睡眠的地方，使用raw_spinlock，否则使用spinlock。</p>
+
+<p>（3）如果临界区足够小，使用raw_spinlock。</p>
+
+<h2>2. 使用方法</h2>
+
+<h4>定义并且初始化静态自旋锁的方法是：</h4>
+
+<pre><code>    DEFINE_SPINLOCK(x);
+</code></pre>
+
+<h4>在运行时动态初始化自旋锁的方法是：</h4>
+
+<pre><code>    spin_lock_init(x);
+</code></pre>
+
+<h4>申请自旋锁的函数是：</h4>
+
+<pre><code>    （1）void spin_lock(spinlock_t *lock); 申请自旋锁，如果锁被其他处理器占有，当前处理器自旋等待。
+    （2）`void spin_lock_bh(spinlock_t *lock);` 申请自旋锁，并且禁止当前处理器的软中断。
+    （3）`void spin_lock_irq(spinlock_t *lock);` 申请自旋锁，并且禁止当前处理器的硬中断。
+    （4）`spin_lock_irqsave(lock, flags);` 申请自旋锁，保存当前处理器的硬中断状态，并且禁止当前处理器的硬中断。
+    （5）`int spin_trylock(spinlock_t *lock);` 申请自旋锁，如果申请成功，返回1；如果锁被其他处理器占有，当前处理器不等待，立即返回0。
+</code></pre>
+
+<h4>释放自旋锁的函数是：</h4>
+
+<pre><code>    （1）void spin_unlock(spinlock_t *lock);
+    （2）void spin_unlock_bh(spinlock_t *lock); 释放自旋锁，并且开启当前处理器的软中断。
+    （3）void spin_unlock_irq(spinlock_t *lock); 释放自旋锁，并且开启当前处理器的硬中断。
+    （4）void spin_unlock_irqrestore(spinlock_t *lock, unsigned long flags); 释放自旋锁，并且恢复当前处理器的硬中断状态。
+</code></pre>
+
+<h4>定义并且初始化静态原始自旋锁的方法是：</h4>
+
+<pre><code>    DEFINE_RAW_SPINLOCK(x);
+</code></pre>
+
+<h4>在运行时动态初始化原始自旋锁的方法是：</h4>
+
+<pre><code>    raw_spin_lock_init (x);
+</code></pre>
+
+<h4>申请原始自旋锁的函数是：</h4>
+
+<pre><code>    （1）raw_spin_lock(lock) 申请原始自旋锁，如果锁被其他处理器占有，当前处理器自旋等待。
+    （2）raw_spin_lock_bh(lock) 申请原始自旋锁，并且禁止当前处理器的软中断。
+    （3）raw_spin_lock_irq(lock) 申请原始自旋锁，并且禁止当前处理器的硬中断。
+    （4）raw_spin_lock_irqsave(lock, flags) 申请原始自旋锁，保存当前处理器的硬中断状态，并且禁止当前处理器的硬中断。
+    （5）raw_spin_trylock(lock) 申请原始自旋锁，如果申请成功，返回1；如果锁被其他处理器占有，当前处理器不等待，立即返回0。
+</code></pre>
+
+<h4>释放原始自旋锁的函数是：</h4>
+
+<pre><code>    （1）raw_spin_unlock(lock)
+    （2）raw_spin_unlock_bh(lock) 释放原始自旋锁，并且开启当前处理器的软中断。
+    （3）raw_spin_unlock_irq(lock) 释放原始自旋锁，并且开启当前处理器的硬中断。
+    （4）raw_spin_unlock_irqrestore(lock, flags) 释放原始自旋锁，并且恢复当前处理器的硬中断状态。
+</code></pre>
+
+<h2>3. 入场券自旋锁</h2>
+
+<p>入场券自旋锁（ticket spinlock）的算法类似于银行柜台的排队叫号：</p>
+
+<pre><code>    （1）锁拥有排队号和服务号，服务号是当前占有锁的进程的排队号。
+    （2）每个进程申请锁的时候，首先申请一个排队号，然后轮询锁的服务号是否等于自己的排队号，如果等于，表示自己占有锁，可以进入临界区，否则继续轮询。
+    （3）当进程释放锁时，把服务号加一，下一个进程看到服务号等于自己的排队号，退出自旋，进入临界区。
+</code></pre>
+
+<p>ARM64架构定义的数据类型arch_spinlock_t如下所示：</p>
+
+<pre><code>    arch/arm64/include/asm/spinlock_types.h
+    typedef struct {
+    #ifdef __AARCH64EB__     /* 大端字节序（高位存放在低地址） */
+        u16 next;
+        u16 owner;
+    #else                    /* 小端字节序（低位存放在低地址） */
+        u16 owner;
+        u16 next;
+    #endif
+    } __aligned(4) arch_spinlock_t;
+</code></pre>
+
+<p>成员next是排队号，成员owner是服务号。</p>
+
+<p>在多处理器系统中，函数spin_lock()负责申请自旋锁，ARM64架构的代码如下所示：</p>
+
+<pre><code>    spin_lock() -&gt; raw_spin_lock() -&gt; _raw_spin_lock() -&gt; __raw_spin_lock()  -&gt; do_raw_spin_lock() -&gt; arch_spin_lock()
+
+    arch/arm64/include/asm/spinlock.h
+    static inline void arch_spin_lock(arch_spinlock_t *lock)
+    {
+        unsigned int tmp;
+        arch_spinlock_t lockval, newval;
+
+        asm volatile (
+        ARM64_LSE_ATOMIC_INSN (
+            /* LL/SC */
+            "   prfm    pstl1strm, %3\n"
+            "1:   ldaxr   %w0, %3\n"
+            "   add   %w1, %w0, %w5\n"
+            "   stxr   %w2, %w1, %3\n"
+            "   cbnz   %w2, 1b\n",
+            /* 大系统扩展的原子指令 */
+            "   mov   %w2, %w5\n"
+            "   ldadda   %w2, %w0, %3\n"
+            __nops(3)
+        )
+
+        /* 我们得到锁了吗？*/
+        eor   %w1, %w0, %w0, ror #16\n"
+        cbz   %w1, 3f\n"
+        sevl\n"
+        2:   wfe\n"
+        ldaxrh   %w2, %4\n"
+        eor   %w1, %w2, %w0, lsr #16\n"
+        cbnz   %w1, 2b\n"
+        /* 得到锁，临界区从这里开始*/
+        3:"
+        : "=&amp;r" (lockval), "=&amp;r" (newval), "=&amp;r" (tmp), "+Q" (*lock)
+        : "Q" (lock-&gt;owner), "I" (1 &lt;&lt; TICKET_SHIFT)
+        : "memory");
+</code></pre>
+
+<p>第6～18行代码，申请排队号，然后把自旋锁的排队号加1，这是一个原子操作，有两种实现方法：</p>
+
+<p>1）第9～13行代码，使用指令ldaxr（带有获取语义的独占加载）和stxr（独占存储）实现，指令ldaxr带有获取语义，后面的加载/存储指令必须在指令ldaxr完成之后开始执行。</p>
+
+<p>2）第15～16行代码，如果处理器支持大系统扩展，那么使用带有获取语义的原子加法指令ldadda实现，指令ldadda带有获取语义，后面的加载/存储指令必须在指令ldadda完成之后开始执行。</p>
+
+<p>第21～22行代码，如果服务号等于当前进程的排队号，进入临界区。</p>
+
+<p>第24～27行代码，如果服务号不等于当前进程的排队号，那么自旋等待。使用指令ldaxrh（带有获取语义的独占加载，h表示halfword，即2字节）读取服务号，指令ldaxrh带有获取语义，后面的加载/存储指令必须在指令ldaxrh完成之后开始执行。</p>
+
+<p>第23行代码，sevl（send event local）指令的功能是发送一个本地事件，避免错过其他处理器释放自旋锁时发送的事件。</p>
+
+<p>第24行代码，wfe（wait for event）指令的功能是使处理器进入低功耗状态，等待事件。</p>
+
+<p>函数spin_unlock()负责释放自旋锁，ARM64架构的代码如下所示：</p>
+
+<pre><code>    spin_unlock() -&gt; raw_spin_unlock() -&gt; _raw_spin_unlock() -&gt; __raw_spin_unlock()  -&gt; do_raw_spin_unlock() -&gt; arch_spin_unlock()
+
+    arch/arm64/include/asm/spinlock.h
+    static inline void arch_spin_unlock(arch_spinlock_t *lock)
+    {
+        unsigned long tmp;
+
+        asm volatile(ARM64_LSE_ATOMIC_INSN(
+        /* LL/SC */
+        "    ldrh   %w1, %0\n"
+        "    add   %w1, %w1, #1\n"
+        "    stlrh   %w1, %0",
+        /* 大多统扩展的原子指令 */
+        "    mov   %w1, #1\n"
+        "    staddlh   %w1, %0\n"
+        __nops(1))
+        : "=Q" (lock-&gt;owner), "=&amp;r" (tmp)
+        :
+        : "memory");
+    }
+</code></pre>
+
+<p>把自旋锁的服务号加1，有两种实现方法：</p>
+
+<p>（1）第7～9行代码，使用指令ldrh（加载，h表示halfword，即2字节）和stlrh（带有释放语义的存储）实现，指令stlrh带有释放语义，前面的加载/存储指令必须在指令stlrh开始执行之前执行完。因为一次只能有一个进程进入临界区，所以只有一个进程把自旋锁的服务号加1，不需要是原子操作。</p>
+
+<p>（2）第11～12行代码，如果处理器支持大系统扩展，那么使用带有释放语义的原子加法指令staddlh实现，指令staddlh带有释放语义，前面的加载/存储指令必须在指令staddlh开始执行之前执行完。</p>
+
+<p>在单处理器系统中，自旋锁是空的。</p>
+
+<pre><code>    include/linux/spinlock_types_up.h
+    typedef struct { } arch_spinlock_t;
+    函数spin_lock()只是禁止内核抢占。
+    spin_lock() -&gt; raw_spin_lock() -&gt; _raw_spin_lock()
+    include/linux/spinlock_api_up.h
+    #define _raw_spin_lock(lock)             __LOCK(lock)
+    #define __LOCK(lock) \
+      do { preempt_disable(); ___LOCK(lock); } while (0)
+    #define ___LOCK(lock) \
+      do { __acquire(lock); (void)(lock); } while (0)
+</code></pre>
+
+<h2>4. MCS自旋锁</h2>
+
+<p>入场券自旋锁存在性能问题：所有等待同一个自旋锁的处理器在同一个变量上自旋等待，申请或者释放锁的时候会修改锁，导致其他处理器存放自旋锁的缓存行失效，在拥有几百甚至几千个处理器的大型系统中，处理器申请自旋锁时竞争可能很激烈，缓存同步的开销很大，导致系统性能大幅度下降。</p>
+
+<p>MCS（MCS是“Mellor-Crummey”和“Scott”这两个发明人的名字的首字母缩写）自旋锁解决了这个缺点，它的策略是为每个处理器创建一个变量副本，每个处理器在申请自旋锁的时候在自己的本地变量上自旋等待，避免缓存同步的开销。</p>
+
+<h4>4.1.   传统的MCS自旋锁</h4>
+
+<p>传统的MCS自旋锁包含：</p>
+
+<p>（1）一个指针tail指向队列的尾部。</p>
+
+<p>（2）每个处理器对应一个队列节点，即mcs_lock_node结构体，其中成员next指向队列的下一个节点，成员locked指示锁是否被其他处理器占有，如果成员locked的值为1，表示锁被其他处理器占有。</p>
+
+<p>结构体的定义如下所示：</p>
+
+<pre><code>    typedef struct __mcs_lock_node {
+        struct __mcs_lock_node *next;
+        int locked;
+    } ____cacheline_aligned_in_smp mcs_lock_node;
+
+    typedef struct {
+        mcs_lock_node *tail;
+        mcs_lock_node nodes[NR_CPUS];/* NR_CPUS是处理器的数量 */
+    } spinlock_t;
+</code></pre>
+
+<p>其中<code>____cacheline_aligned_in_smp</code> 的作用是：在多处理器系统中，结构体的起始地址和长度都是一级缓存行长度的整数倍。</p>
+
+<p>当没有处理器占有或者等待自旋锁的时候，队列是空的，tail是空指针。</p>
+
+<p><img src="/images/kernel/20210608-1.png" alt="" /></p>
+
+<p>图 4.1 处理器0申请MCS自旋锁</p>
+
+<p>如图 4.1所示，当处理器0申请自旋锁的时候，执行原子交换操作，使tail指向处理器0的mcs_lock_node结构体，并且返回tail的旧值。tail的旧值是空指针，说明自旋锁处于空闲状态，那么处理器0获得自旋锁。</p>
+
+<p><img src="/images/kernel/20210608-2.png" alt="" /></p>
+
+<p>图 4.2 处理器1申请MCS自旋锁</p>
+
+<p>如图 4.2所示，当处理器0占有自旋锁的时候，处理器1申请自旋锁，执行原子交换操作，使tail指向处理器1的mcs_lock_node结构体，并且返回tail的旧值。tail的旧值是处理器0的mcs_lock_node结构体的地址，说明自旋锁被其他处理器占有，那么使处理器0的mcs_lock_node结构体的成员next指向处理器1的mcs_lock_node结构体，把处理器1的mcs_lock_node结构体的成员locked设置为1，然后处理器1在自己的mcs_lock_node结构体的成员locked上面自旋等待，等待成员locked的值变成0。</p>
+
+<p><img src="/images/kernel/20210608-3.png" alt="" /></p>
+
+<p>图 4.3 处理器0释放MCS自旋锁</p>
+
+<p>如图 4.3所示，处理器0释放自旋锁，发现自己的mcs_lock_node结构体的成员next不是空指针，说明有申请者正在等待锁，于是把下一个节点的成员locked设置为0，处理器1获得自旋锁。</p>
+
+<p>处理器1释放自旋锁，发现自己的mcs_lock_node结构体的成员next是空指针，说明自己是最后一个申请者，于是执行原子比较交换操作：如果tail指向自己的mcs_lock_node结构体，那么把tail设置为空指针。</p>
+
+<h4>4.2.   小巧的MCS自旋锁</h4>
+
+<p>传统的MCS自旋锁存在的缺陷是：结构体的长度太大，因为mcs_lock_node结构体的起始地址和长度都必须是一级缓存行长度的整数倍，所以MCS自旋锁的长度是（一级缓存行长度 + 处理器数量 * 一级缓存行长度），而入场券自旋锁的长度只有4字节。自旋锁被嵌入到内核的很多结构体中，如果自旋锁的长度增加，会导致这些结构体的长度增加。</p>
+
+<p>经过内核社区技术专家的努力，成功地把MCS自旋锁放进4个字节，实现了小巧的MCS自旋锁。自旋锁的定义如下所示：</p>
+
+<pre><code>    include/asm-generic/qspinlock_types.h
+
+    typedef struct qspinlock {
+        atomic_t  val;
+    } arch_spinlock_t;
+</code></pre>
+
+<p>另外，为每个处理器定义1个队列节点数组，如下所示：</p>
+
+<pre><code>    kernel/locking/qspinlock.c
+    #ifdef CONFIG_PARAVIRT_SPINLOCKS
+    #define MAX_NODES  8
+    #else
+    #define MAX_NODES  4
+    #endif
+    static DEFINE_PER_CPU_ALIGNED(struct mcs_spinlock, mcs_nodes[MAX_NODES]);
+</code></pre>
+
+<p>配置宏CONFIG_PARAVIRT_SPINLOCKS用来启用半虚拟化的自旋锁，给虚拟机使用，本文不考虑这种使用场景。每个处理器需要4个队列节点，原因如下：</p>
+
+<p>(1)       申请自旋锁的函数禁止内核抢占，所以进程在等待自旋锁的过程中不会被其他进程抢占。</p>
+
+<p>(2)       进程在等待自旋锁的过程中可能被软中断抢占，然后软中断等待另一个自旋锁。</p>
+
+<p>(3)       软中断在等待自旋锁的过程中可能被硬中断抢占，然后硬中断等待另一个自旋锁。</p>
+
+<p>(4)       硬中断在等待自旋锁的过程中可能被不可屏蔽中断抢占，然后不可屏蔽中断等待另一个自旋锁。</p>
+
+<p>综上所述，一个处理器最多同时等待4个自旋锁。</p>
+
+<p>和入场券自旋锁相比，MCS自旋锁增加的内存开销是数组mcs_nodes。</p>
+
+<p>队列节点的定义如下所示：</p>
+
+<pre><code>    kernel/locking/mcs_spinlock.h
+
+    struct mcs_spinlock {
+        struct mcs_spinlock *next;
+        int locked;
+        int count;
+    };
+</code></pre>
+
+<p>其中成员next指向队列的下一个节点；成员locked指示锁是否被前一个等待者占有，如果值为1，表示锁被前一个等待者占有；成员count是嵌套层数，也就是数组mcs_nodes已分配的数组项的数量。</p>
+
+<p>自旋锁的32个二进制位被划分成4个字段：</p>
+
+<p>(1)       locked字段，指示锁已经被占有，长度是一个字节，占用第0~7位。</p>
+
+<p>(2)       一个pending位，占用第8位，第1个等待自旋锁的处理器设置pending位。</p>
+
+<p>(3)       index字段，是数组索引，指示队列的尾部节点使用数组mcs_nodes的哪一项。</p>
+
+<p>(4)       cpu字段，存放队列的尾部节点的处理器编号，实际存储的值是处理器编号加上1，cpu字段减去1才是真实的处理器编号。</p>
+
+<p>index字段和cpu字段合起来称为tail字段，存放队列的尾部节点的信息，布局分两种情况：</p>
+
+<p>(1)       如果处理器的数量小于2的14次方，那么第9~15位没有使用，第16~17位是index字段，第18~31位是cpu字段。</p>
+
+<p>(2)       如果处理器的数量大于或等于2的14次方，那么第9~10位是index字段，第11~31位是cpu字段。</p>
+
+<p>把MCS自旋锁放进4个字节的关键是：存储处理器编号和数组索引，而不是存储尾部节点的地址。</p>
+
+<p>内核对MCS自旋锁做了优化：第1个等待自旋锁的处理器直接在锁自身上面自旋等待，不是在自己的mcs_spinlock结构体上自旋等待。这个优化带来的好处是：当锁被释放的时候，不需要访问mcs_spinlock结构体的缓存行，相当于减少了一次缓存没命中。后续的处理器在自己的mcs_spinlock结构体上面自旋等待，直到它们移动到队列的首部为止。</p>
+
+<p>自旋锁的pending位进一步扩展这个优化策略。第1个等待自旋锁的处理器简单地设置pending位，不需要使用自己的mcs_spinlock结构体。第2个处理器看到pending被设置，开始创建等待队列，在自己的mcs_spinlock结构体的locked字段上自旋等待。这种做法消除了两个等待者之间的缓存同步，而且第1个等待者没使用自己的mcs_spinlock结构体，减少了一次缓存行没命中。</p>
+
+<p>在多处理器系统中，申请MCS自旋锁的代码如下所示：</p>
+
+<pre><code>    spin_lock() -&gt; raw_spin_lock() -&gt; _raw_spin_lock() -&gt; __raw_spin_lock()  -&gt; do_raw_spin_lock() -&gt; arch_spin_lock()
+
+    include/asm-generic/qspinlock.h
+
+    #define arch_spin_lock(l)         queued_spin_lock(l)
+
+    static __always_inline void queued_spin_lock(struct qspinlock *lock)
+    {
+        u32 val;
+
+        val = atomic_cmpxchg_acquire(&amp;lock-&gt;val, 0, _Q_LOCKED_VAL);
+        if (likely(val == 0))
+            return;
+        ueued_spin_lock_slowpath(lock, val);
+</code></pre>
+
+<p>第7行代码，执行带有获取语义的原子比较交换操作，如果锁的值是0，那么把锁的locked字段设置为1。获取语义保证后面的加载/存储指令必须在函数atomic_cmpxchg_acquire()完成之后开始执行。函数atomic_cmpxchg_acquire()返回锁的旧值。</p>
+
+<p>第8~9行代码，如果锁的旧值是0，说明申请锁的时候锁处于空闲状态，那么成功地获得锁。</p>
+
+<p>第10行代码，如果锁的旧值不是0，说明锁不是处于空闲状态，那么执行申请自旋锁的慢速路径。</p>
+
+<p>申请MCS自旋锁的慢速路径如下所示：</p>
+
+<pre><code>    kernel/locking/qspinlock.c
+
+    void queued_spin_lock_slowpath(struct qspinlock *lock, u32 val)
+    {
+        struct mcs_spinlock *prev, *next, *node;
+        u32 new, old, tail;
+        int idx;
+
+        ...
+        if (val == _Q_PENDING_VAL) {
+            while ((val = atomic_read(&amp;lock-&gt;val)) == _Q_PENDING_VAL)
+            cpu_relax();
+        }
+
+        for (;;) {
+            if (val &amp; ~_Q_LOCKED_MASK)
+                goto queue;
+
+            new = _Q_LOCKED_VAL;
+            if (val == new)
+                new |= _Q_PENDING_VAL;
+
+            old = atomic_cmpxchg_acquire(&amp;lock-&gt;val, val, new);
+            if (old == val)
+                break;
+
+            val = old;
+        }
+
+        if (new == _Q_LOCKED_VAL)
+            return;
+
+        smp_cond_load_acquire(&amp;lock-&gt;val.counter, !(VAL &amp; _Q_LOCKED_MASK));
+
+        clear_pending_set_locked(lock);
+        return;
+
+    queue:
+        node = this_cpu_ptr(&amp;mcs_nodes[0]);
+        idx = node-&gt;count++;
+        tail = encode_tail(smp_processor_id(), idx);
+
+        node += idx;
+        node-&gt;locked = 0;
+        node-&gt;next = NULL;
+        ...
+
+        if (queued_spin_trylock(lock))
+            goto release;
+
+        old = xchg_tail(lock, tail);
+        next = NULL;
+
+        if (old &amp; _Q_TAIL_MASK) {
+            prev = decode_tail(old);
+            smp_read_barrier_depends();
+
+            WRITE_ONCE(prev-&gt;next, node);
+
+            ...
+            arch_mcs_spin_lock_contended(&amp;node-&gt;locked);
+
+            next = READ_ONCE(node-&gt;next);
+            if (next)
+                prefetchw(next);
+        }
+
+        ...
+        val = smp_cond_load_acquire(&amp;lock-&gt;val.counter, !(VAL &amp; _Q_LOCKED_PENDING_MASK));
+
+    locked:
+        for (;;) {
+            if ((val &amp; _Q_TAIL_MASK) != tail) {
+                set_locked(lock);
+                break;
+            }
+
+            old = atomic_cmpxchg_relaxed(&amp;lock-&gt;val, val, _Q_LOCKED_VAL);
+            if (old == val)
+                goto release;
+
+            val = old;
+        }
+
+        if (!next) {
+            while (!(next = READ_ONCE(node-&gt;next)))
+                cpu_relax();
+        }
+
+        arch_mcs_spin_unlock_contended(&amp;next-&gt;locked);
+        ...
+
+    release:
+        __this_cpu_dec(mcs_nodes[0].count);
+    }
+</code></pre>
+
+<p>第8~11行代码，如果锁的状态是pending，即{tail=0，pending=1，locked=0}，那么等待锁的状态变成locked，即{tail=0，pending=0，locked=1}。</p>
+
+<p>第14~15行代码，如果锁的tail字段不是0或者pending位是1，说明已经有处理器在等待自旋锁，那么跳转到标号queue，本处理器加入等待队列。</p>
+
+<p>第17~21行代码，如果锁处于locked状态，那么把锁的状态设置为locked &amp; pending，即{tail=0，pending=1，locked=1}；如果锁处于空闲状态（占有锁的处理器刚刚释放自旋锁），那么把锁的状态设置为locked。</p>
+
+<p>第28~29行代码，如果上一步锁的状态从空闲变成locked，那么成功地获得锁。</p>
+
+<p>第31行代码，等待占有锁的处理器释放自旋锁，即锁的locked字段变成0。</p>
+
+<p>第32行代码，成功地获得锁，把锁的状态从pending改成locked，即清除pending位，把locked字段设置为1。</p>
+
+<h5>从第2个等待自旋锁的处理器开始，需要加入等待队列，处理如下：</h5>
+
+<p>(1)       第37~43行代码，从本处理器的数组mcs_nodes分配一个数组项，然后初始化。</p>
+
+<p>(2)       第46~47行代码，如果锁处于空闲状态，那么获得锁。</p>
+
+<p>(3)       第49行代码，把自旋锁的tail字段设置为本处理器的队列节点的信息，并且返回前一个队列节点的信息。</p>
+
+<p>(4)       第52行代码，如果本处理器的队列节点不是队列首部，那么处理如下：</p>
+
+<p>1）第56行代码，把前一个队列节点的next字段设置为本处理器的队列节点的地址。</p>
+
+<p>2）第59行代码，本处理器在自己的队列节点的locked字段上面自旋等待，等待locked字段从0变成1，也就是等待本处理器的队列节点移动到队列首部。</p>
+
+<p>(5)       第67行代码，本处理器的队列节点移动到队列首部以后，在锁自身上面自旋等待，等待自旋锁的pending位和locked字段都变成0，也就是等待锁的状态变成空闲。</p>
+
+<p>(6)       锁的状态变成空闲以后，本处理器把锁的状态设置为locked，分两种情况：</p>
+
+<p>1）第71行代码，如果队列还有其他节点，即还有其他处理器在等待锁，那么处理如下：</p>
+
+<p>q第72行代码，把锁的locked字段设置为1。</p>
+
+<p>q第83~86行代码，等待下一个等待者设置本处理器的队列节点的next字段。</p>
+
+<p>q第88行代码，把下一个队列节点的locked字段设置为1。</p>
+
+<p>2）第76行代码，如果队列只有一个节点，即本处理器是唯一的等待者，那么把锁的tail字段设置为0，把locked字段设置为1。</p>
+
+<p>(7)       第92行代码，释放本处理器的队列节点。</p>
+
+<p>释放MCS自旋锁的代码如下所示：</p>
+
+<pre><code>    spin_unlock() -&gt; raw_spin_unlock() -&gt; _raw_spin_unlock() -&gt; __raw_spin_unlock()  -&gt; do_raw_spin_unlock() -&gt; arch_spin_unlock()
+
+    include/asm-generic/qspinlock.h
+    #define arch_spin_unlock(l)       queued_spin_unlock(l)
+
+    static __always_inline void queued_spin_unlock(struct qspinlock *lock)
+    {
+        (void)atomic_sub_return_release(_Q_LOCKED_VAL, &amp;lock-&gt;val);
+    }
+</code></pre>
+
+<p>第5行代码，执行带释放语义的原子减法操作，把锁的locked字段设置为0，释放语义保证前面的加载/存储指令在函数atomic_sub_return_release()开始执行之前执行完。</p>
+
+<p>MCS自旋锁的配置宏是CONFIG_ARCH_USE_QUEUED_SPINLOCKS 和CONFIG_QUEUED_SPINLOCKS，目前只有x86处理器架构使用MCS自旋锁，默认开启MCS自旋锁的配置宏，如下所示：</p>
+
+<pre><code>    arch/x86/kconfig
+
+    config X86
+        def_bool y
+        ...
+        select ARCH_USE_QUEUED_SPINLOCKS
+        ...
+
+
+    kernel/kconfig.locks
+
+    config ARCH_USE_QUEUED_SPINLOCKS
+        bool
+    config QUEUED_SPINLOCKS
+        def_bool y if ARCH_USE_QUEUED_SPINLOCKS
+        depends on SMP
+</code></pre>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[DKMS简介]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2020/09/21/kernel-dkms/"/>
+    <updated>2020-09-21T11:54:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2020/09/21/kernel-dkms</id>
+    <content type="html"><![CDATA[<p><a href="https://www.cnblogs.com/wwang/archive/2011/06/21/2085571.html">https://www.cnblogs.com/wwang/archive/2011/06/21/2085571.html</a></p>
+
+<p>DKMS全称是Dynamic Kernel Module Support，在内核版本变动之后可以自动重新生成新的模块。</p>
+
+<h4>安装</h4>
+
+<pre><code>    sudo apt-get install dkms
+</code></pre>
+
+<h4>流程</h4>
+
+<p><img src="/images/kernel/20200921.jpg" alt="" /></p>
+
+<p>DKMS主要的命令分别是add、build、install、uninstall和remove，另外，还可以执行"dkms status"查看目前DKMS系统维护的模块的状态。</p>
+
+<p>DKMS要求我们的代码目录必须以" <module>-<module-version>&ldquo;的格式命名。</p>
+
+<h4>命令</h4>
+
+<p>以hello-0.1为例，代码copy到"/usr/src/hello-0.1"</p>
+
+<pre><code>    # 添加
+    sudo dkms add -m hello -v 0.1
+
+    # 编译
+    sudo dkms build -m hello -v 0.1
+    生成模块路径： /var/lib/dkms/hello/0.1/*/*/module/
+
+    # 安装
+    sudo dkms install -m hello -v 0.1
+
+    # 移除
+    sudo dkms uninstall -m hello -v 0.1
+
+    # 彻底删除，会把/var/lib/dkms下彻底删除
+    sudo dkms remove -m hello -v 0.1 --all
+
+    # 以上的每个步骤查看执行后的状态
+    dkms status
+</code></pre>
+
+<h4>目录结构</h4>
+
+<pre><code>    /usr/src/hello-0.1/
+    ├── dkms.conf
+    ├── hello.c
+    └── Makefile
+</code></pre>
+
+<p>在Makefile中要使用变量$(KVERSION)指定内核版本号，这样我们在执行dkms时，就可以用“-k”选项来设定为哪个内核版本编译模块。</p>
+
+<h4>dkms.conf</h4>
+
+<pre><code>    PACKAGE_NAME="hello"
+    PACKAGE_VERSION="0.1"
+    CLEAN="make clean"
+    MAKE[0]="make all KVERSION=$kernelver"
+    BUILT_MODULE_NAME[0]="hello"
+    DEST_MODULE_LOCATION[0]="/updates"
+    AUTOINSTALL="yes"
+</code></pre>
+
+<p>PACKAGE_NAME和PACKAGE_VERSION和文件夹的命名是一致的。</p>
+
+<p>CLEAN的命令是每次build的时候第一条执行的动作。</p>
+
+<p>MAKE[0]用来设定编译的命令，一般情况下是不用设定的。在本例中，就可以把MAKE[0]这行删掉。但在下面这种情况下就需要设定了。比如，您的Makefile里有多个target，分别为all、debug、release等，不指定MAKE[0]时，编译会选择第一个target来执行，也就是make all，如果您想执行make release来编译，就需要在dkms.conf里明确设定。</p>
+
+<p>BUILD_MODULE_NAME[0]用来指定模块的名称，一般情况下也可以不设定。</p>
+
+<p>DEST_MODULE_LOCATION[0]用来设定模块安装的目的地址，本例是"/lib/module/$(KVERSION)/updates"。</p>
+
+<p>AUTOINSTALL=&ldquo;yes"表示在Linux引导之后DKMS会自动对这个模块执行Build和Install的动作，当然如果模块已经处于该状态的话，相应的动作是不用再执行的。</p>
+
+<h3>基于DKMS制作驱动程序的DEB安装包</h3>
+
+<p>制作DEB包依赖于dh-make，请首先执行 sudo apt-get install dh-make 安装。</p>
+
+<p>在模块处于"Built State"的条件下，执行 sudo dkms mkdeb -m hello -v 0.1 可以在目录“/var/lib/dkms/hello/0.1/deb”下生成deb包。</p>
+
+<p>DKMS还提供了mktarball和mkrpm来制作tarball和RPM安装包。</p>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[static_key 机制]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2020/09/21/kernel-static-key/"/>
+    <updated>2020-09-21T11:46:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2020/09/21/kernel-static-key</id>
+    <content type="html"><![CDATA[<p><a href="https://www.dazhuanlan.com/2019/10/10/5d9f4b6a20f82/">https://www.dazhuanlan.com/2019/10/10/5d9f4b6a20f82/</a></p>
+
+<p>简单来说，如果你对代码性能很敏感，而且大多数情况下分支路径是确定的，可以考虑使用static keys。static keys可以代替普通的变量进行分支判断，目的是用来优化频繁使用if-else判断的问题，这里涉及到指令分支预取的一下问题。简单地说，现代cpu都有预测功能，变量的判断有可能会造成硬件预测失败，影响流水线性能。虽然有likely和unlikely，但还是会有小概率的预测失败。</p>
+
+<h4>定义一个static_key</h4>
+
+<pre><code>    struct static_key key = STATIC_KEY_INIT_FALSE;
+</code></pre>
+
+<p>注意：这个key及其初始值必须是静态存在的，不能定义为局部变量或者使用动态分配的内存。通常为全局变量或者静态变量。 其中的STATIC_KEY_INIT_FALSE表示这个key的默认值为false，对应的分支默认不进入，如果是需要默认进入的，用STATIC_KEY_INIT_TRUE，这里如果不赋值，系统默认为STATIC_KEY_INIT_FALSE，在代码运行中不能再用STATIC_KEY_INIT_FALSE/STATIC_KEY_INIT_TRUE进行赋值。
+判断语句</p>
+
+<p>对于默认为false（STATIC_KEY_INIT_FALSE）的，使用</p>
+
+<pre><code>    if (static_key_false(&amp;key))
+        do unlikely code
+    else
+        do likely code
+</code></pre>
+
+<p>对于默认为true（STATIC_KEY_INIT_TRUE）的，使用</p>
+
+<pre><code>    if (static_key_true((&amp;static_key)))
+        do the likely work;
+    else
+        do unlikely work
+</code></pre>
+
+<h4>修改判断条件</h4>
+
+<p>使用static_key_slow_inc让分支条件变成true，使用static_key_slow_dec让分支条件变成false，与其初始的默认值无关。该接口是带计数的， 也就是：</p>
+
+<p>  初始值为STATIC_KEY_INIT_FALSE的，那么： static_key_slow_inc; static_key_slow_inc; static_key_slow_dec 那么 if (static_key_false((&amp;static_key)))对应的分支会进入，而再次static_key_slow_dec后，该分支就不再进入了。</p>
+
+<p>  初始值为STATIC_KEY_INIT_TRUE的，那么： static_key_slow_dec; static_key_slow_dec; static_key_slow_inc 那么 if (static_key_true((&amp;static_key)))对应的分支不会进入，而再次static_key_slow_inc后，该分支就进入了。</p>
+
+<h4>static-key的内核实现</h4>
+
+<p>static_key_false的实现：</p>
+
+<p>对X86场景其实现如下，其它架构下的实现类似。</p>
+
+<pre><code>    static __always_inline bool static_key_false(struct static_key *key)
+    {
+        return arch_static_branch(key);
+    }
+
+    static __always_inline bool arch_static_branch(struct static_key *key)
+    {
+        asm_volatile_goto("1:"
+            ".byte " __stringify(STATIC_KEY_INIT_NOP) "nt"
+            ".pushsection __jump_table,  "aw" nt"
+            _ASM_ALIGN "nt"
+            _ASM_PTR "1b, %l[l_yes], %c0 nt"
+            ".popsection nt"
+            : :  "i" (key) : : l_yes);
+        return false;
+    l_yes:
+        return true;
+    }
+</code></pre>
+
+<p>  其中的asm_volatile_goto宏 使用了asm goto，是gcc的特性，其允许在嵌入式汇编中jump到一个C语言的label，详见gcc的manual(<a href="https://gcc.gnu.org/onlinedocs/gcc/Extended-Asm.html">https://gcc.gnu.org/onlinedocs/gcc/Extended-Asm.html</a>)， 但是本处其作用只是将C语言的label “l_yes”传递到嵌入式汇编中。</p>
+
+<p>STATIC_KEY_INITIAL_NOP其实就是NOP指令</p>
+
+<p><code>.pushsection __jump_table</code> 是通知编译器，以下的内容写入到段 <code>__jump_table</code></p>
+
+<p><code>_ASM_PTR “1b, %l[l_yes], %c0</code> ，是往段<code>__jump_table</code>中写入label &ldquo;1b"、C label "l_yes"和输入参数<code>struct static_key *key</code>的地址，这些信息对应于struct jump_entry 中的code、target、key成员，在后续的处理中非常重要。</p>
+
+<p>.popsection表示以下的内容回到之前的段，其实多半就是.text段。</p>
+
+<p>可见，以上代码的作用就是：执行NOP指令后返回false，同时把NOP指令的地址、代码"return true"对应地址、<code>struct static_key *key</code>的地址写入到段<code>__jump_table</code>。由于固定返回为false且为always inline，编译器会把</p>
+
+<pre><code>    if (static_key_false((&amp;static_key)))
+        do the unlikely work;
+    else
+        do likely work
+</code></pre>
+
+<p>优化为：</p>
+
+<pre><code>    nop
+    do likely work
+    retq
+    l_yes:
+    do the unlikely work;
+</code></pre>
+
+<p>正常场景，就没有判断了。</p>
+
+<p>static_key_true的实现：</p>
+
+<pre><code>    static __always_inline bool static_key_true(struct static_key *key)
+    {
+        return !static_key_false(key);
+    }
+</code></pre>
+
+<p>执行static_key_slow_inc(&amp;key)后，底层通过gcc提供的goto功能，再结合c代码编写的动态修改内存功能，就可以让使用key的代码从执行false分支变成执行true分支。当然这个更改代价时比较昂贵的，不是所有的情况都适用。</p>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[KASLR 内核动态地址]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2020/01/07/KASLR/"/>
+    <updated>2020-01-07T11:23:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2020/01/07/KASLR</id>
+    <content type="html"><![CDATA[<p>/proc/kallsyms 和 /boot/System.map-xxx 一致需要修改 .config
+<code>
+    &lt; # CONFIG_RANDOMIZE_BASE is not set
+    ---
+    &gt; CONFIG_RANDOMIZE_BASE=y
+    &gt; CONFIG_X86_NEED_RELOCS=y
+    &gt; CONFIG_RANDOMIZE_MEMORY=y
+    &gt; CONFIG_RANDOMIZE_MEMORY_PHYSICAL_PADDING=0xa
+</code></p>
+
+<hr />
+
+<p><a href="http://www.wowotech.net/memory_management/441.html">http://www.wowotech.net/memory_management/441.html</a></p>
+
+<h3>引言</h3>
+
+<p>什么是KASLR？KASLR是kernel address space layout randomization的缩写，直译过来就是内核地址空间布局随机化。KASLR技术允许kernel image加载到VMALLOC区域的任何位置。当KASLR关闭的时候，kernel image都会映射到一个固定的链接地址。对于黑客来说是透明的，因此安全性得不到保证。KASLR技术可以让kernel image映射的地址相对于链接地址有个偏移。偏移地址可以通过dts设置。如果bootloader支持每次开机随机生成偏移数值，那么可以做到每次开机kernel image映射的虚拟地址都不一样。因此，对于开启KASLR的kernel来说，不同的产品的kernel image映射的地址几乎都不一样。因此在安全性上有一定的提升。</p>
+
+<p>注：文章代码分析基于linux-4.15，架构基于aarch64（ARM64）。</p>
+
+<h3>如何使用</h3>
+
+<p>打开KASLR功能非常简单，在支持KASLR的内核配置选项添加选项CONFIG_RANDOMIZE_BASE=y。同时还需要告知kernel映射的偏移地址，通过dts传递。在chosen节点下添加kaslr-seed属性。属性值就是偏移地址。另外command line不要带nokaslr，否则KASLR还是关闭。dts信息举例如下。顺便说一下，在dts中&lt;>符号中是一个32 bit的值。但是在ARM64平台，这里的kaslr-seed属性是一个特例，他就是一个64 bit的值。</p>
+
+<pre><code>    / {
+        chosen {
+            kaslr-seed = &lt;0x10000000&gt;;
+        };
+    }; 
+</code></pre>
+
+<h3>如何获取偏移</h3>
+
+<p>kaslr-seed属性的解析在kaslr_early_init函数完成。该函数根据输入参数dtb首地址（物理地址）解析dtb，找到偏移地址，最后返回。kaslr_early_init实现如下。</p>
+
+<pre><code>    u64 __init kaslr_early_init(u64 dt_phys)
+    {
+        void *fdt;
+        u64 seed, offset, mask, module_range;
+        const u8 *cmdline, *str;
+        int size;
+
+        early_fixmap_init();                                         /* 1 */
+        fdt = __fixmap_remap_fdt(dt_phys, &amp;size, PAGE_KERNEL);       /* 1 */
+
+        seed = get_kaslr_seed(fdt);                                  /* 2 */
+        if (!seed)
+            return 0;
+
+        cmdline = get_cmdline(fdt);
+        str = strstr(cmdline, "nokaslr");                            /* 3 */
+        if (str == cmdline || (str &gt; cmdline &amp;&amp; *(str - 1) == ' '))
+            return 0;
+
+        mask = ((1UL &lt;&lt; (VA_BITS - 2)) - 1) &amp; ~(SZ_2M - 1);          /* 4 */
+        offset = seed &amp; mask;
+
+        /* use the top 16 bits to randomize the linear region */
+        memstart_offset_seed = seed &gt;&gt; 48;                           /* 5 */
+
+        if ((((u64)_text + offset) &gt;&gt; SWAPPER_TABLE_SHIFT) !=
+            (((u64)_end + offset) &gt;&gt; SWAPPER_TABLE_SHIFT))
+            offset = round_down(offset, 1 &lt;&lt; SWAPPER_TABLE_SHIFT);   /* 6 */
+
+        return offset;
+    } 
+</code></pre>
+
+<p>由于dtb的地址是物理地址，因此第一步先为dtb区域建立映射。<br/>
+从dtb文件获取kaslr-seed属性的值。<br/>
+确保command line没有传递nokaslr参数，如果传递nokaslr则关闭KASLR。<br/>
+保证传递的偏移地址2M地址对齐，并且保证kernel位于VMALLOC区域大小的一半地址空间以下 (VA_BITS - 2)。当VA_BITS=48时，mask=0x0000_3fff_ffe0_0000。<br/>
+线性映射区地址也会随机化。<br/>
+kernel启动初期只有一个PUD页表，因此希望kernel映射在1G（1 &lt;&lt; SWAPPER_TABLE_SHIFT）大小范围内，这样就不用两个PUD页表。如果kernel加上偏移offset后不满足这点，自然要重新对齐。</p>
+
+<h3>如何创建映射</h3>
+
+<p>kernel启动初期在汇编阶段创建映射关系。代码位于head.S文件。在<code>__primary_switched</code>函数中会调用kaslr_early_init得到偏移地址。保存在x23寄存器中。然后重新创建kernel image的映射。</p>
+
+<pre><code>    __primary_switched:
+        tst x23, ~(MIN_KIMG_ALIGN - 1)  // already running randomized?
+        b.ne    0f
+        mov x0, x21                     // pass FDT address in x0
+        bl  kaslr_early_init            // parse FDT for KASLR options
+        cbz x0, 0f                      // KASLR disabled? just proceed
+        orr x23, x23, x0                // record KASLR offset
+        ldp x29, x30, [sp], #16         // we must enable KASLR, return
+        ret                             // to __primary_switch() 
+</code></pre>
+
+<p>创建映射的函数是<code>__create_page_tables</code>。</p>
+
+<pre><code>    __create_page_tables:
+        /*
+         * Map the kernel image.
+         */
+        adrp    x0, swapper_pg_dir
+        mov_q   x5, KIMAGE_VADDR + TEXT_OFFSET  // compile time __va(_text)
+        add x5, x5, x23                         // add KASLR displacement
+        create_pgd_entry x0, x5, x3, x6
+        adrp    x6, _end                        // runtime __pa(_end)
+        adrp    x3, _text                       // runtime __pa(_text)
+        sub x6, x6, x3                          // _end - _text
+        add x6, x6, x5                          // runtime __va(_end)
+        create_block_map x0, x7, x3, x5, x6
+</code></pre>
+
+<p>这段代码在我的另一篇文章《ARM64 Kernel Image Mapping的变化》已经有分析过，这里就略过了。注意第7行，kernel image映射的虚拟地址加上了一个偏移地址x23。还有一点需要说明，就是对重定位段进行重定位。这部分代码在arch/arm64/kernel/head.S文件<code>__relocate_kernel</code>函数实现。大概说下<code>__relocate_kernel</code>有什么用呢！例如链接脚本中常见的几个变量<em>text、</em>etext、<em>end。这几个你应该很熟悉，他们是一个地址并且他们的值是链接的时候确定下来，那么现在使能kaslr的情况下，代码中再访问</em>text的值就很明显不是运行时的虚拟地址，而是链接时候的值。因此，<code>__relocate_kernel</code>函数可以负责重定位这些变量。保证访问这些变量的值依然是正确的值。这部分涉及编译和链接，有兴趣的可以研究一下《程序员的自我修养》这本书（我不太熟悉）。</p>
+
+<h3>addr2line怎么办</h3>
+
+<p>KASLR在技术上增加了OS安全性，但是对于调试或许增加了些难度。何以见得呢？首先，我们知道编译kernel的时候链接地址和最终运行地址是不一样的，因此如果发生oops，栈的回溯信息中的函数地址其实都是运行地址。如果你使用过addr2line工具的话，应该不会陌生addr2line -e vmlinux 0xffffff8000080000这条命令获取某个地址在代码中的哪一行。那么现在问题是oops中的地址和链接地址有一个偏差，并且这个偏差随着bootloader传递的值而变化。现在摆在我们眼前的是addr2line工具还怎么用？下面就为你答疑解惑。kernel开机log中会打印Virtual kernel memory layout。举例如下。</p>
+
+<pre><code class="`">    Virtual kernel memory layout:
+      modules : 0xffffff8000000000 - 0xffffff8008000000   (   128 MB)
+      vmalloc : 0xffffff8008000000 - 0xffffffbebfff0000   (   250 GB)
+        .text : 0xffffff80ae280000 - 0xffffff80af2e0000   ( 16768 KB)
+      .rodata : 0xffffff80af300000 - 0xffffff80afb60000   (  8576 KB)
+        .init : 0xffffff80afb60000 - 0xffffff80b01e0000   (  6656 KB)
+        .data : 0xffffff80b01e0000 - 0xffffff80b044f200   (  2493 KB)
+         .bss : 0xffffff80b044f200 - 0xffffff80b0e18538   ( 10021 KB)
+      fixed   : 0xffffffbefe7fb000 - 0xffffffbefec00000   (  4116 KB)
+      PCI I/O : 0xffffffbefee00000 - 0xffffffbeffe00000   (    16 MB)
+      vmemmap : 0xffffffbf00000000 - 0xffffffc000000000   (     4 GB maximum)
+            0xffffffbf00000000 - 0xffffffbf03000000   (    48 MB actual)
+      memory  : 0xffffffc000000000 - 0xffffffc0c0000000   (  3072 MB)
+</code></pre>
+
+<p>注意看以上.text区域（kernel代码段）起始地址和结束地址是不是位于VMALLOC区域。如果发生oops，log中函数的地址必然是一个位于.text段的地址，假设是addr_run，但是链接地址应该是KIMAGE_VADDR + TEXT_OFFSET，这两个宏定义参考这篇文章《ARM64 Kernel Image Mapping的变化》。在这个例子中，KIMAGE_VADDR = 0xffffff8008000000，TEXT_OFFSET = 0x80000。addr2line工具使用的必须是链接地址，因此需要将addr_run转换成链接地址。公式很容易推导出来，addr_link = addr_run - .text_start + vmalloc_start + TEXT_OFFSET。在这个例子中就是addr_link = addr_run - 0xffffff80ae280000 + 0xffffff8008000000 + 0x80000。计算的addr_link就可以使用addr2line工具解析了。Have fun！</p>
+]]></content>
+  </entry>
+  
+</feed>
