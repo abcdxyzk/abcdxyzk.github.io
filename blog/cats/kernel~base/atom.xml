@@ -4,7 +4,7 @@
   <title><![CDATA[Category: kernel~base | kk Blog —— 通用基础]]></title>
   <link href="http://abcdxyzk.github.io/blog/cats/kernel~base/atom.xml" rel="self"/>
   <link href="http://abcdxyzk.github.io/"/>
-  <updated>2023-01-24T19:27:19+08:00</updated>
+  <updated>2024-03-13T12:10:10+08:00</updated>
   <id>http://abcdxyzk.github.io/</id>
   <author>
     <name><![CDATA[kk]]></name>
@@ -12,149 +12,6 @@
   </author>
   <generator uri="http://octopress.org/">Octopress</generator>
 
-  
-  <entry>
-    <title type="html"><![CDATA[SKB路由缓存与SOCK路由缓存]]></title>
-    <link href="http://abcdxyzk.github.io/blog/2021/06/08/net-dst/"/>
-    <updated>2021-06-08T22:04:00+08:00</updated>
-    <id>http://abcdxyzk.github.io/blog/2021/06/08/net-dst</id>
-    <content type="html"><![CDATA[<p><a href="https://www.2cto.com/kf/201805/745174.html">https://www.2cto.com/kf/201805/745174.html</a></p>
-
-<p>skb结构体中的成员 <code>_skb_refdst</code> 与sock结构体中成员sk_rx_dst（缓存入口路由）和sk_dst_cache（缓存出口路由）成员之间的交互操作。</p>
-
-<h3>SOCK入口路由与SKB路由缓存</h3>
-
-<p>内核在接收流程中，调用early_demux函数提前在IP层做established状态的sock查找，并负责将sock结构体成员sk_rx_dst的路由缓存赋值给skb成员<code>_skb_refdst</code>，对于UDP协议，先判断DST_NOCACHE标志，如果成立，增加dst引用计数，设置skb的dst；否则，调用skb_dst_set_noref直接进行设置。
-```
-    void udp_v4_early_demux(struct sk_buff *skb)
-    {
-        dst = READ_ONCE(sk->sk_rx_dst);</p>
-
-<pre><code>    if (dst)
-        dst = dst_check(dst, 0);
-    if (dst) {
-        /* DST_NOCACHE can not be used without taking a reference */
-        if (dst-&gt;flags &amp; DST_NOCACHE) {
-            if (likely(atomic_inc_not_zero(&amp;dst-&gt;__refcnt)))
-                skb_dst_set(skb, dst);
-        } else {
-            skb_dst_set_noref(skb, dst);
-        }
-    }
-}
-</code></pre>
-
-<pre><code>
-对于TCP协议，直接调用skb_dst_set_noref函数，将sock结构体成员sk_rx_dst缓存到skb结构体中。
-</code></pre>
-
-<pre><code>void tcp_v4_early_demux(struct sk_buff *skb)
-{
-    if (sk-&gt;sk_state != TCP_TIME_WAIT) {
-        struct dst_entry *dst = sk-&gt;sk_rx_dst;
-
-        if (dst)
-            dst = dst_check(dst, 0);
-        if (dst &amp;&amp;
-            inet_sk(sk)-&gt;rx_dst_ifindex == skb-&gt;skb_iif)
-            skb_dst_set_noref(skb, dst);
-    }
-}
-</code></pre>
-
-<pre><code>
-同样都为early_demux函数，都是从sk-&gt;sk_rx_dst获取路由缓存，tcp和udp的存在明显差别。TCP直接赋值，UDP需要先判断DST_NOCACHE标志。此情况是由UDP与TCP在sock中缓存dst时的处理不同造成的，TCP预先调用了dst_hold_safe函数，进行了DST_NOCACHE标志的判断处理，如未缓存则增加了引用计数。然而，UDP在缓存路由dst时，使用xchg函数，未判断也未增加引用计数，所以需要在后续判断处理。
-</code></pre>
-
-<pre><code>static inline bool dst_hold_safe(struct dst_entry *dst)
-{
-    if (dst-&gt;flags &amp; DST_NOCACHE)
-        return atomic_inc_not_zero(&amp;dst-&gt;__refcnt);
-    dst_hold(dst);
-}
-
-void inet_sk_rx_dst_set(struct sock *sk, const struct sk_buff *skb)
-{
-    struct dst_entry *dst = skb_dst(skb);
-
-    if (dst &amp;&amp; dst_hold_safe(dst)) {
-        sk-&gt;sk_rx_dst = dst;
-        inet_sk(sk)-&gt;rx_dst_ifindex = skb-&gt;skb_iif;
-    }
-}
-
-static void udp_sk_rx_dst_set(struct sock *sk, struct dst_entry *dst)
-{
-    struct dst_entry *old;
-
-    dst_hold(dst);
-    old = xchg(&amp;sk-&gt;sk_rx_dst, dst);
-    dst_release(old);
-}
-</code></pre>
-
-<pre><code>
-### SOCK出口路由与SKB路由缓存
-
-对于UDP协议客户端，其在connect时（UDP客户端connect不同于TCP，仅绑定通信端地址），查询路由，缓存到sock结构体的sk_dst_cache中。
-</code></pre>
-
-<pre><code>int ip4_datagram_connect(struct sock *sk, struct sockaddr *uaddr, int addr_len)
-{
-    rt = ip_route_connect(...);
-    sk_dst_set(sk, &amp;rt-&gt;dst);
-}
-</code></pre>
-
-<pre><code>
-之后，发送UDP数据包时，检查sock结构体中的出口路由是否有效，有效的话可不用再次查询路由表，在函数ip_make_skb中直接使用rt，并且调用skb_dst_set赋值给skb的`_skb_refdst`结构体，以便在发送过程中使用。
-
-对于UDP服务端，在首次发包检测到rt为空时，查询路由表得到出口路由，缓存在sock结构中，之后发包时rt有效，省去再次查询。
-</code></pre>
-
-<pre><code>struct sk_buff *__ip_make_skb(...)
-{
-    skb_dst_set(skb, &amp;rt-&gt;dst);
-}
-
-int udp_sendmsg(...)
-{
-    if (connected)
-        rt = (struct rtable *)sk_dst_check(sk, 0);
-    if (rt == NULL) {
-        rt = ip_route_output_flow(net, fl4, sk);
-        if (connected)
-            sk_dst_set(sk, dst_clone(&amp;rt-&gt;dst));
-    }
-
-    skb = ip_make_skb(sk, fl4, getfrag, msg-&gt;msg_iov, ulen,
-            sizeof(struct udphdr), &amp;ipc, &amp;rt,
-            msg-&gt;msg_flags);
-}
-</code></pre>
-
-<pre><code>
-IP层发送数据包时(调用ip_queue_xmit），检测sock结构中出口路由缓存，如果有效，设置到skb结构体中。否则重新进行出口路由查找。
-</code></pre>
-
-<pre><code>int ip_queue_xmit(struct sk_buff *skb, struct flowi *fl)
-{
-    rt = (struct rtable *)__sk_dst_check(sk, 0);
-    if (rt == NULL) {
-        rt = ip_route_output_ports(...);
-        sk_setup_caps(sk, &amp;rt-&gt;dst);
-    }
-    skb_dst_set_noref(skb, &amp;rt-&gt;dst);
-}
-</code></pre>
-
-<p>```</p>
-
-<p>内核版本</p>
-
-<p>linux-3.10.0</p>
-]]></content>
-  </entry>
   
   <entry>
     <title type="html"><![CDATA[Linux内核的自旋锁]]></title>
@@ -1046,6 +903,18 @@ kernel启动初期只有一个PUD页表，因此希望kernel映射在1G（1 &lt;
 </code></pre>
 
 <p>注意看以上.text区域（kernel代码段）起始地址和结束地址是不是位于VMALLOC区域。如果发生oops，log中函数的地址必然是一个位于.text段的地址，假设是addr_run，但是链接地址应该是KIMAGE_VADDR + TEXT_OFFSET，这两个宏定义参考这篇文章《ARM64 Kernel Image Mapping的变化》。在这个例子中，KIMAGE_VADDR = 0xffffff8008000000，TEXT_OFFSET = 0x80000。addr2line工具使用的必须是链接地址，因此需要将addr_run转换成链接地址。公式很容易推导出来，addr_link = addr_run - .text_start + vmalloc_start + TEXT_OFFSET。在这个例子中就是addr_link = addr_run - 0xffffff80ae280000 + 0xffffff8008000000 + 0x80000。计算的addr_link就可以使用addr2line工具解析了。Have fun！</p>
+]]></content>
+  </entry>
+  
+  <entry>
+    <title type="html"><![CDATA[获取 rip 寄存器]]></title>
+    <link href="http://abcdxyzk.github.io/blog/2019/06/05/this-ip/"/>
+    <updated>2019-06-05T10:28:00+08:00</updated>
+    <id>http://abcdxyzk.github.io/blog/2019/06/05/this-ip</id>
+    <content type="html"><![CDATA[<h4><em>THIS_IP</em></h4>
+
+<pre><code>    #define _THIS_IP_  ({ __label__ __here; __here: (unsigned long)&amp;&amp;__here; })
+</code></pre>
 ]]></content>
   </entry>
   
