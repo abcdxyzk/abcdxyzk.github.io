@@ -131,6 +131,269 @@ var ss360Config = {
       
   <header>
     
+      <h2 class="entry-title"><a href="/blog/2020/09/21/kernel-static-key/">static_key 机制</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2020-09-21T11:46:00+08:00'><span class='date'>2020-09-21</span> <span class='time'>11:46:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="https://www.dazhuanlan.com/2019/10/10/5d9f4b6a20f82/">https://www.dazhuanlan.com/2019/10/10/5d9f4b6a20f82/</a></p>
+
+<p>简单来说，如果你对代码性能很敏感，而且大多数情况下分支路径是确定的，可以考虑使用static keys。static keys可以代替普通的变量进行分支判断，目的是用来优化频繁使用if-else判断的问题，这里涉及到指令分支预取的一下问题。简单地说，现代cpu都有预测功能，变量的判断有可能会造成硬件预测失败，影响流水线性能。虽然有likely和unlikely，但还是会有小概率的预测失败。</p>
+
+<h4>定义一个static_key</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct static_key key = STATIC_KEY_INIT_FALSE;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>注意：这个key及其初始值必须是静态存在的，不能定义为局部变量或者使用动态分配的内存。通常为全局变量或者静态变量。 其中的STATIC_KEY_INIT_FALSE表示这个key的默认值为false，对应的分支默认不进入，如果是需要默认进入的，用STATIC_KEY_INIT_TRUE，这里如果不赋值，系统默认为STATIC_KEY_INIT_FALSE，在代码运行中不能再用STATIC_KEY_INIT_FALSE/STATIC_KEY_INIT_TRUE进行赋值。
+判断语句</p>
+
+<p>对于默认为false（STATIC_KEY_INIT_FALSE）的，使用</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (static_key_false(&key))
+</span><span class='line'>&#9;do unlikely code
+</span><span class='line'>else
+</span><span class='line'>&#9;do likely code</span></code></pre></td></tr></table></div></figure>
+
+
+<p>对于默认为true（STATIC_KEY_INIT_TRUE）的，使用</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (static_key_true((&static_key)))
+</span><span class='line'>&#9;do the likely work;
+</span><span class='line'>else
+</span><span class='line'>&#9;do unlikely work</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>修改判断条件</h4>
+
+<p>使用static_key_slow_inc让分支条件变成true，使用static_key_slow_dec让分支条件变成false，与其初始的默认值无关。该接口是带计数的， 也就是：</p>
+
+<p>  初始值为STATIC_KEY_INIT_FALSE的，那么： static_key_slow_inc; static_key_slow_inc; static_key_slow_dec 那么 if (static_key_false((&amp;static_key)))对应的分支会进入，而再次static_key_slow_dec后，该分支就不再进入了。</p>
+
+<p>  初始值为STATIC_KEY_INIT_TRUE的，那么： static_key_slow_dec; static_key_slow_dec; static_key_slow_inc 那么 if (static_key_true((&amp;static_key)))对应的分支不会进入，而再次static_key_slow_inc后，该分支就进入了。</p>
+
+<h4>static-key的内核实现</h4>
+
+<p>static_key_false的实现：</p>
+
+<p>对X86场景其实现如下，其它架构下的实现类似。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static __always_inline bool static_key_false(struct static_key *key)
+</span><span class='line'>{
+</span><span class='line'>&#9;return arch_static_branch(key);
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>static __always_inline bool arch_static_branch(struct static_key *key)
+</span><span class='line'>{
+</span><span class='line'>&#9;asm_volatile_goto("1:"
+</span><span class='line'>&#9;&#9;".byte " __stringify(STATIC_KEY_INIT_NOP) "nt"
+</span><span class='line'>&#9;&#9;".pushsection __jump_table,  "aw" nt"
+</span><span class='line'>&#9;&#9;_ASM_ALIGN "nt"
+</span><span class='line'>&#9;&#9;_ASM_PTR "1b, %l[l_yes], %c0 nt"
+</span><span class='line'>&#9;&#9;".popsection nt"
+</span><span class='line'>&#9;&#9;: :  "i" (key) : : l_yes);
+</span><span class='line'>&#9;return false;
+</span><span class='line'>l_yes:
+</span><span class='line'>&#9;return true;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  其中的asm_volatile_goto宏 使用了asm goto，是gcc的特性，其允许在嵌入式汇编中jump到一个C语言的label，详见gcc的manual(<a href="https://gcc.gnu.org/onlinedocs/gcc/Extended-Asm.html">https://gcc.gnu.org/onlinedocs/gcc/Extended-Asm.html</a>)， 但是本处其作用只是将C语言的label “l_yes”传递到嵌入式汇编中。</p>
+
+<p>STATIC_KEY_INITIAL_NOP其实就是NOP指令</p>
+
+<p><code>.pushsection __jump_table</code> 是通知编译器，以下的内容写入到段 <code>__jump_table</code></p>
+
+<p><code>_ASM_PTR “1b, %l[l_yes], %c0</code> ，是往段<code>__jump_table</code>中写入label &ldquo;1b"、C label "l_yes"和输入参数<code>struct static_key *key</code>的地址，这些信息对应于struct jump_entry 中的code、target、key成员，在后续的处理中非常重要。</p>
+
+<p>.popsection表示以下的内容回到之前的段，其实多半就是.text段。</p>
+
+<p>可见，以上代码的作用就是：执行NOP指令后返回false，同时把NOP指令的地址、代码"return true"对应地址、<code>struct static_key *key</code>的地址写入到段<code>__jump_table</code>。由于固定返回为false且为always inline，编译器会把</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (static_key_false((&static_key)))
+</span><span class='line'>&#9;do the unlikely work;
+</span><span class='line'>else
+</span><span class='line'>&#9;do likely work</span></code></pre></td></tr></table></div></figure>
+
+
+<p>优化为：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>nop
+</span><span class='line'>do likely work
+</span><span class='line'>retq
+</span><span class='line'>l_yes:
+</span><span class='line'>do the unlikely work;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>正常场景，就没有判断了。</p>
+
+<p>static_key_true的实现：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static __always_inline bool static_key_true(struct static_key *key)
+</span><span class='line'>{
+</span><span class='line'>&#9;return !static_key_false(key);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>执行static_key_slow_inc(&amp;key)后，底层通过gcc提供的goto功能，再结合c代码编写的动态修改内存功能，就可以让使用key的代码从执行false分支变成执行true分支。当然这个更改代价时比较昂贵的，不是所有的情况都适用。</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2020/09/20/tools-squid-cachemgr/">squid 开启cgi-bin/cachemgr.cgi</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2020-09-20T14:23:00+08:00'><span class='date'>2020-09-20</span> <span class='time'>14:23:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><h4>start</h4>
+
+<p><a href="/blog/2020/09/20/tools-apache2-cgi/">apache2 支持cgi</a></p>
+
+<p>(可选)<a href="/blog/2020/09/20/tools-apache2-auth/">apache2 开启认证</a></p>
+
+<p>sudo apt-get install squid-cgi</p>
+
+<p>文件就在 /usr/lib/cgi-bin/ 下面，和 apache2 目录一致，不需要cp</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>vim /etc/squid/cachemgr.conf
+</span><span class='line'>localhost
+</span><span class='line'>换成
+</span><span class='line'>localhost:port</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>vim /etc/squid/squid.conf
+</span><span class='line'>注释掉这两行
+</span><span class='line'>#http_access allow localhost manager
+</span><span class='line'>#http_access deny manager
+</span><span class='line'>添加这两行
+</span><span class='line'>acl manager proto cache_object
+</span><span class='line'>http_access allow manager</span></code></pre></td></tr></table></div></figure>
+
+
+<p>squid -k reconfigure</p>
+
+<h4>cachemgr_passwd</h4>
+
+<p>vim /etc/squid/squid.conf</p>
+
+<p>cachemgr_passwd none all # 所有用户开启所有权限</p>
+
+<p>// cachemgr_passwd 123456 all 不生效 ???</p>
+
+<p>squid -k reconfigure</p>
+
+<p>web 打开 <a href="http://ip/cgi-bin/cachemgr.cgi">http://ip/cgi-bin/cachemgr.cgi</a> 就能查看、操作一些squid功能了</p>
+
+<p>用户名：manager 或 空</p>
+
+<p>密码：空</p>
+
+<h4>ubuntu 18.04</h4>
+
+<p>18.04 的 squid 版本3.5.27-1ubuntu1.8 好像有问题，点击 Current Squid Configuration squid就重启。</p>
+
+<p>换成 16.04 的 3.5.12-1ubuntu7.13 就没问题了。</p>
+
+<p><a href="http://security.ubuntu.com/ubuntu/pool/main/s/squid3/squid_3.5.12-1ubuntu7.13_amd64.deb">http://security.ubuntu.com/ubuntu/pool/main/s/squid3/squid_3.5.12-1ubuntu7.13_amd64.deb</a></p>
+
+<p><a href="http://security.ubuntu.com/ubuntu/pool/universe/s/squid3/squid-cgi_3.5.12-1ubuntu7.13_amd64.deb">http://security.ubuntu.com/ubuntu/pool/universe/s/squid3/squid-cgi_3.5.12-1ubuntu7.13_amd64.deb</a></p>
+
+<p><a href="http://security.ubuntu.com/ubuntu/pool/main/s/squid3/squid-common_3.5.12-1ubuntu7.13_all.deb">http://security.ubuntu.com/ubuntu/pool/main/s/squid3/squid-common_3.5.12-1ubuntu7.13_all.deb</a></p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
       <h2 class="entry-title"><a href="/blog/2020/09/20/tools-apache2-cgi/">apache2 支持cgi</a></h2>
     
     
@@ -175,208 +438,6 @@ var ss360Config = {
 
     </article>
   
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2020/09/20/tools-apache2-auth/">apache2 访问认证</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2020-09-20T14:12:00+08:00'><span class='date'>2020-09-20</span> <span class='time'>14:12:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><h4>创建密码</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>htpasswd -c squid.pwd admin
-</span><span class='line'>
-</span><span class='line'>chown www-data:www-data squid.pwd</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>修改 /etc/apache2/apache2.conf</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>&lt;Location /cgi-bin/cachemgr.cgi&gt;
-</span><span class='line'>&#9;AuthType Basic
-</span><span class='line'>&#9;AuthName "admin"
-</span><span class='line'>&#9;AuthUserFile  /etc/squid/squid.pwd
-</span><span class='line'>&#9;require valid-user
-</span><span class='line'>&lt;/Location&gt;</span></code></pre></td></tr></table></div></figure>
-
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2020/09/10/kernel-tcp-new-syn-recv/">TCP_NEW_SYN_RECV</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2020-09-10T04:40:00+08:00'><span class='date'>2020-09-10</span> <span class='time'>04:40:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/commit/?id=10feb428a5045d5eb18a5d755fbb8f0cc9645626">https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/commit/?id=10feb428a5045d5eb18a5d755fbb8f0cc9645626</a></p>
-
-<p><a href="https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/commit/?id=d34ac51b76e8c7de6094cfb11780ef9c2b93469f">https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/commit/?id=d34ac51b76e8c7de6094cfb11780ef9c2b93469f</a></p>
-
-<p><a href="https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/commit/?id=4e9a578e5b6bdfa8b7fed7a41f28a86a7cffc85f">https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/commit/?id=4e9a578e5b6bdfa8b7fed7a41f28a86a7cffc85f</a></p>
-
-<p><a href="https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/commit/?id=079096f103faca2dd87342cca6f23d4b34da8871">https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/commit/?id=079096f103faca2dd87342cca6f23d4b34da8871</a></p>
-
-<p><a href="https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/commit/?id=2215089b224412bfb28c5ae823b2a5d4e28a49d7">https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/commit/?id=2215089b224412bfb28c5ae823b2a5d4e28a49d7</a></p>
-
-<p><a href="https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/commit/?id=26e3736090e1037ac929787df21c05497479b77f">https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/commit/?id=26e3736090e1037ac929787df21c05497479b77f</a></p>
-
-<p><a href="https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/commit/?id=85645bab57bfc6b0b43bb96a301c4ef83925c07d">https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/commit/?id=85645bab57bfc6b0b43bb96a301c4ef83925c07d</a></p>
-
-<p><a href="https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/commit/?id=a9407000038805e5215a49c0a50c9e2b2ff38220">https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/commit/?id=a9407000038805e5215a49c0a50c9e2b2ff38220</a></p>
-
-<p><a href="https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/commit/?id=8b5801477926a2b018afc84a53c0b8818843fe73">https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/commit/?id=8b5801477926a2b018afc84a53c0b8818843fe73</a></p>
-
-<p><a href="https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/commit/?id=a8399231f0b6e72bc140bcc4fecb0c622298a6bd">https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/commit/?id=a8399231f0b6e72bc140bcc4fecb0c622298a6bd</a></p>
-
-<p><a href="https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/commit/?id=caf3f2676aaad395903d24a54e22f8ac4bc4823d">https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/commit/?id=caf3f2676aaad395903d24a54e22f8ac4bc4823d</a></p>
-
-<p><a href="https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/commit/?id=4bdc3d66147b3a623b32216a45431d0cff005f50">https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/commit/?id=4bdc3d66147b3a623b32216a45431d0cff005f50</a></p>
-
-<p><a href="https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/commit/?id=c2f34a65a61cd1ace3b53c93e8b38d2f79f4ff0d">https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/commit/?id=c2f34a65a61cd1ace3b53c93e8b38d2f79f4ff0d</a></p>
-
-<p><a href="https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/commit/?id=f03f2e154f52fdaa982de7e2c386737679963dc9">https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/commit/?id=f03f2e154f52fdaa982de7e2c386737679963dc9</a></p>
-
-<p><a href="https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/commit/?id=fff1f3001cc58b5064a0f1154a7ac09b76f29c44">https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/commit/?id=fff1f3001cc58b5064a0f1154a7ac09b76f29c44</a></p>
-
-<p><a href="https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/commit/?id=aac065c50aba0c534a929aeb687eb68c58e523b8">https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/commit/?id=aac065c50aba0c534a929aeb687eb68c58e523b8</a></p>
-
-<p>结合以上patch，在 <a href="http://buildlogs.cdn.centos.org/c7.1708.u/kernel/20171204203818/3.10.0-693.11.1.el7.x86_64/kernel-3.10.0-693.11.1.el7.x86_64.rpm">kernel-3.10.0-693.11.1.el7.src.rpm</a> 内核上引入 TCP_NEW_SYN_RECV patch</p>
-
-<p>好处：mptcp和4.15.0的基本一样。</p>
-
-<p>不再需要spin_lock(listen_sk)，最大的互斥变成atomic。（去除atomic看 <a href="/blog/2018/09/28/kernel-sk_lookup/">tcp连接查找</a> ）</p>
-
-<h4>ipv6_addr_v4mapped</h4>
-
-<p>sk_ehashfn 被 ipv4, ipv6 共用，req hash 的时候可用的变量不多，用的是 ipv6_addr_v4mapped(&amp;sk->sk_v6_daddr) 判断是否mapped，所以原先的sk->sk_daddr = addr; sk->sk_rcv_saddr = addr; 换成下面两个函数。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static inline void sk_daddr_set(struct sock *sk, __be32 addr)
-</span><span class='line'>{
-</span><span class='line'>&#9;sk-&gt;sk_daddr = addr; /* alias of inet_daddr */
-</span><span class='line'>#if IS_ENABLED(CONFIG_IPV6)
-</span><span class='line'>&#9;ipv6_addr_set_v4mapped(addr, &sk-&gt;sk_v6_daddr);
-</span><span class='line'>#endif
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>static inline void sk_rcv_saddr_set(struct sock *sk, __be32 addr)
-</span><span class='line'>{
-</span><span class='line'>&#9;sk-&gt;sk_rcv_saddr = addr; /* alias of inet_rcv_saddr */
-</span><span class='line'>#if IS_ENABLED(CONFIG_IPV6)
-</span><span class='line'>&#9;ipv6_addr_set_v4mapped(addr, &sk-&gt;sk_v6_rcv_saddr);
-</span><span class='line'>#endif
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>ir_iif, ireq_net, ireq_state</h4>
-
-<p>ir_iif, ireq_net, ireq_state 需要在 req 创建时赋值，因为插入ehash表后的查找需要用到这些变量。</p>
-
-<h4>reqsk_put</h4>
-
-<p>原先部分reqsk_free需要换成reqsk_put，因为req已经和sk一样，靠自己的refcnt维护</p>
-
-<h4>backlog</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if (sk-&gt;sk_state == TCP_LISTEN) {
-</span><span class='line'>&#9;ret = tcp_v4_do_rcv(sk, skb);
-</span><span class='line'>&#9;goto put_and_return;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>listen_sk 的包要在tcp_v4_rcv里处理完，不能再加入listen_sk的backlog处理，因为req已经不在listen_sk->icsk_accept_queue.listen_opt.syn_table里，而backlog(=tcp_v4_do_rcv)又不会再lookup_sk，导致无法找到req。</p>
-
-<p>原来的处理是：按listen_sk的收到包的顺序处理，并且需要spin_lock。按照下面的顺序，即使syn、ack、GET包都在backlog里也能处理(GET包查不到req，能查到establish)。TCP_NEW_SYN_RECV 主要是优化调spin_lock(listen_sk)</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>tcp_v4_hnd_req() {
-</span><span class='line'>&#9;req = inet_csk_search_req()
-</span><span class='line'>
-</span><span class='line'>&#9;if (req)
-</span><span class='line'>&#9;&#9;return tcp_check_req()
-</span><span class='line'>
-</span><span class='line'>&#9;nsk = inet_lookup_established()
-</span><span class='line'>&#9;if (nsk && nsk-&gt;sk_state != TCP_TIME_WAIT)
-</span><span class='line'>&#9;&#9;return nsk;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-
-</div>
-  
-  
-
-
-    </article>
-  
   <div class="pagination">
     
       <a class="prev" href="/posts/96">&larr; Older</a>
@@ -391,7 +452,7 @@ var ss360Config = {
   
     <section>
 <h1>Categories
-<span class='right_span'>(891)</span>
+<span class='right_span'>(893)</span>
 
 </h1>
 <head>
@@ -476,8 +537,8 @@ if (!document.getElementById('assembly~base')) document.getElementById('aexp_ass
 if (!document.getElementById('assembly')) document.getElementById('aexp_assembly').style.visibility = 'hidden';
 if (!document.getElementById('assembly~win')) document.getElementById('aexp_assembly~win').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(190)</span></li>
-<div id='tools' class='catsub'><li><a href='/blog/cats/tools~apache2/?opendiv=tools'>apache2</a><a href='##' onmousedown=showDiv('tools~apache2') id='aexp_tools~apache2'><span class='exp_style' id='exp_tools~apache2'>[+]</span></a><span class='right_span'>8</span></li>
+<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(192)</span></li>
+<div id='tools' class='catsub'><li><a href='/blog/cats/tools~apache2/?opendiv=tools'>apache2</a><a href='##' onmousedown=showDiv('tools~apache2') id='aexp_tools~apache2'><span class='exp_style' id='exp_tools~apache2'>[+]</span></a><span class='right_span'>9</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~apache2')) document.getElementById('aexp_tools~apache2').style.visibility = 'hidden';
 </script>
@@ -521,7 +582,7 @@ if (!document.getElementById('tools~isal')) document.getElementById('aexp_tools~
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~mysql')) document.getElementById('aexp_tools~mysql').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/tools~nginx/?opendiv=tools'>nginx</a><a href='##' onmousedown=showDiv('tools~nginx') id='aexp_tools~nginx'><span class='exp_style' id='exp_tools~nginx'>[+]</span></a><span class='right_span'>17</span></li>
+<li><a href='/blog/cats/tools~nginx/?opendiv=tools'>nginx</a><a href='##' onmousedown=showDiv('tools~nginx') id='aexp_tools~nginx'><span class='exp_style' id='exp_tools~nginx'>[+]</span></a><span class='right_span'>18</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~nginx')) document.getElementById('aexp_tools~nginx').style.visibility = 'hidden';
 </script>
@@ -817,7 +878,7 @@ if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algo
 
 <section>
 <h1>Date Categories
-<span class='right_span'>(891)</span>
+<span class='right_span'>(893)</span>
 
 </h1>
 <head>
@@ -825,8 +886,9 @@ if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algo
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(11)</span></li>
-<div id='2024' class='catsub'><li><a href='/blog/cats/2024~03/?opendiv=2024'>2024-03</a><span class='right_span'>5</span></li>
+<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(13)</span></li>
+<div id='2024' class='catsub'><li><a href='/blog/cats/2024~04/?opendiv=2024'>2024-04</a><span class='right_span'>2</span></li>
+<li><a href='/blog/cats/2024~03/?opendiv=2024'>2024-03</a><span class='right_span'>5</span></li>
 <li><a href='/blog/cats/2024~02/?opendiv=2024'>2024-02</a><span class='right_span'>4</span></li>
 <li><a href='/blog/cats/2024~01/?opendiv=2024'>2024-01</a><span class='right_span'>2</span></li>
 </div><li class='catclass'><a href='/blog/cats/2023/'>2023</a><a href='##' onmousedown=showDiv('2023')><span class='exp_style' id='exp_2023'>[+]</span></a><span class='right_span'>(87)</span></li>
@@ -989,6 +1051,14 @@ if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algo
   <ul id="recent_posts">
     
       <li class="post">
+        <a href="/blog/2024/04/26/tools-apache2-tmp/">centos7下httpd服务对tmp目录操作</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2024/04/26/nginx-proxy-buffer/">nginx 禁用代理缓冲</a>
+      </li>
+    
+      <li class="post">
         <a href="/blog/2024/03/26/db9/">USB-Serial Controller D USB转串口驱动</a>
       </li>
     
@@ -1018,14 +1088,6 @@ if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algo
     
       <li class="post">
         <a href="/blog/2024/02/26/vim-syntax-off/">Vim 在处理长字符串时变得非常慢</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/02/26/lang-web-shuffle/">javascript随机打乱数组</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/01/06/lang-php-gd-random/">php的GD库,相同的字符串生成相同的二维码</a>
       </li>
     
   </ul>

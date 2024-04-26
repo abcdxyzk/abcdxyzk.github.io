@@ -131,6 +131,553 @@ var ss360Config = {
       
   <header>
     
+      <h2 class="entry-title"><a href="/blog/2015/01/03/kernel-irq-ksoftirqd/">关于ksoftirqd进程</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-01-03T15:01:00+08:00'><span class='date'>2015-01-03</span> <span class='time'>15:01:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p>blog.chinaunix.net/uid-20737871-id-1881243.html</p>
+
+<p>每个处理器都有一组辅助处理器软中断(和tasklet)的内核线程。当内核中出现大量软中断的时候，这些内核进程就会辅助处理它们。</p>
+
+<h4>引入ksoftirq内核线程的原因：</h4>
+
+<p>对于软中断，内核会选择在几个特殊时机进行处理。而在中断处理程序返回时处理是最常见的。软中断被触发的频率有时可能很高，更不利的是，处理函数有时还会 字形重复触发，那么就会导致用户空间进程无法获得足够的处理时间，因而处于饥饿状态。单纯的对重新触发的软中断采取不立即处理的策略，也无法让人接受。</p>
+
+<h4>最初的解决方案：</h4>
+
+<p>1）只要还有被触发并等待处理的软中断，本次执行就要负责处理，重新触发的软中断也在本次执行返回前被处理。这样做可以保证对内核的软中断采取即时处理的 方式，关键在于，对重新触发的软中断也会立即处理。当负载很高的时候，此时若有大量被触发的软中断，而它们本身又会重复触发。系统可能会一直处理软中断根 本不能完成其他任务。</p>
+
+<p>2）不处理重新触发的软中断。在从中断返回的时候，内核和平常一样，也会检查所有挂起的软中断并处理他们。但是，任何自行重新触发的软中断不会马上处理， 它们被放到下一个软中断执行时机去处理。而这个时机通常也就是下一次中断返回的时候。可是，在比较空闲的系统中，立即处理软中断才是比较好的做法。尽管它 能保证用户空间不处于饥饿状态，但它却让软中断忍受饥饿的痛苦，而根本没有好好利用闲置的系统资源。</p>
+
+<h4>改进：</h4>
+
+<p>最终在内核中实现的方案是不会立即处理处理重新触发的软中断。而作为改进，当大量软中断出现的时候，内核会唤醒一组内核线程来处理这些负载。这些线程在最 低的优先级上运行（nice值是19），这能避免它们跟其他重要的任务抢夺资源。但它们最终肯定会被执行，所以这个折中方案能够保证在软中断负担很中的时 候用户程序不会因为得不到处理时间处于饥饿状态。相应的，也能保证”过量“的软中断终究会得到处理。</p>
+
+<p>每个处理器都有一个这样的线程。所有线程的名字都叫做ksoftirq/n，区别在于n，它对应的是处理器的编号。在一个双CPU的机器上就有两个这样的 线程，分别叫做ksoftirqd/0和ksoftirqd/1。为了保证只要有空闲的处理器，它们就会处理软中断，所以给每个处理器都分配一个这样的线 程。一旦该线程被初始化，它就会执行类似下面这样的死循环：</p>
+
+<p>在kernel/softirq.c中</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int ksoftirqd(void * __bind_cpu)
+</span><span class='line'>{
+</span><span class='line'>&#9;set_user_nice(current, 19);
+</span><span class='line'>&#9;current-&gt;flags |= PF_NOFREEZE;
+</span><span class='line'>&#9;set_current_state(TASK_INTERRUPTIBLE);
+</span><span class='line'>&#9;while (!kthread_should_stop()) {
+</span><span class='line'>&#9;&#9;preempt_disable();
+</span><span class='line'>&#9;&#9;if (!local_softirq_pending()) {
+</span><span class='line'>&#9;&#9;&#9;preempt_enable_no_resched();
+</span><span class='line'>&#9;&#9;&#9;schedule();
+</span><span class='line'>&#9;&#9;&#9;preempt_disable();
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;__set_current_state(TASK_RUNNING);
+</span><span class='line'>&#9;&#9;while (local_softirq_pending()) {
+</span><span class='line'>&#9;&#9;&#9;/* Preempt disable stops cpu going offline.
+</span><span class='line'>&#9;&#9;&#9;&#9;If already offline, we'll be on wrong CPU:
+</span><span class='line'>&#9;&#9;&#9;&#9;don't process */
+</span><span class='line'>&#9;&#9;&#9;if (cpu_is_offline((long)__bind_cpu))
+</span><span class='line'>&#9;&#9;&#9;&#9;goto wait_to_die;
+</span><span class='line'>&#9;&#9;&#9;do_softirq();
+</span><span class='line'>&#9;&#9;&#9;preempt_enable_no_resched();
+</span><span class='line'>&#9;&#9;&#9;cond_resched();
+</span><span class='line'>&#9;&#9;&#9;preempt_disable();
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;preempt_enable();
+</span><span class='line'>&#9;&#9;set_current_state(TASK_INTERRUPTIBLE);
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;__set_current_state(TASK_RUNNING);
+</span><span class='line'>&#9;return 0;
+</span><span class='line'>wait_to_die:
+</span><span class='line'>&#9;preempt_enable();
+</span><span class='line'>&#9;/* Wait for kthread_stop */
+</span><span class='line'>&#9;set_current_state(TASK_INTERRUPTIBLE);
+</span><span class='line'>&#9;while (!kthread_should_stop()) {
+</span><span class='line'>&#9;&#9;schedule();
+</span><span class='line'>&#9;&#9;set_current_state(TASK_INTERRUPTIBLE);
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;__set_current_state(TASK_RUNNING);
+</span><span class='line'>&#9;return 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>只要有待处理的软中断(由softirq_pending()函数负责发现)，ksoftirq就会调用do_softirq去处理它们。通过重复执行这 样的操作，重新触发的软中断也会被执行。如果有必要，每次迭代后都会调用schedule()以便让更重要的进程得到处理机会。当所有需要执行的操作都完 成以后，该内核线程将自己设置为TASK_INTERRUPTIBLE状态，唤起调度程序选择其他可执行进程投入运行。</p>
+
+<p>只要do_softirq()函数发现已经执行过的内核线程重新触发了它自己，软中断内核线程就会被唤醒.</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2015/01/03/android-I9507V-kernel/">编译I9507V内核</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-01-03T14:52:00+08:00'><span class='date'>2015-01-03</span> <span class='time'>14:52:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p>源码地址 <a href="http://opensource.samsung.com/reception/receptionSub.do?method=sub&amp;sub=F&amp;searchValue=9507">http://opensource.samsung.com/reception/receptionSub.do?method=sub&amp;sub=F&amp;searchValue=9507</a></p>
+
+<p>好像三星android4.3版本后的bootloader会检测是否三星自编译内核，不是的会开机提示一下，不影响正常使用。</p>
+
+<p>按照README_Kernel.txt的做。</p>
+
+<p>内核中说明是用4.7编译器，但是4.7编译出来的装上去会挂，不知道为什么。<br/>
+但是换成4.6编译器就没问题。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>make VARIANT_DEFCONFIG=jftdd_eur_defconfig jf_defconfig SELINUX_DEFCONFIG=selinux_defconfig</span></code></pre></td></tr></table></div></figure>
+
+
+<p>最后作成boot.img</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>mkbootimg --kernel zImage --ramdisk boot.img-ramdisk.cpio.gz --base 80200000 --ramdisk_offset 1FF8000 --pagesize 2048 --cmdline "console=null androidboot.hardware=qcom user_debug=31 msm_rtb.filter=0x3F ehci-hcd.park=3 maxcpus=4" -o boot.img
+</span><span class='line'>
+</span><span class='line'>tar cf boot.img.tar boot.img
+</span><span class='line'>用odin3.10，选择AP项刷入</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>修改</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+<span class='line-number'>82</span>
+<span class='line-number'>83</span>
+<span class='line-number'>84</span>
+<span class='line-number'>85</span>
+<span class='line-number'>86</span>
+<span class='line-number'>87</span>
+<span class='line-number'>88</span>
+<span class='line-number'>89</span>
+<span class='line-number'>90</span>
+<span class='line-number'>91</span>
+<span class='line-number'>92</span>
+<span class='line-number'>93</span>
+<span class='line-number'>94</span>
+<span class='line-number'>95</span>
+<span class='line-number'>96</span>
+<span class='line-number'>97</span>
+<span class='line-number'>98</span>
+<span class='line-number'>99</span>
+<span class='line-number'>100</span>
+<span class='line-number'>101</span>
+<span class='line-number'>102</span>
+<span class='line-number'>103</span>
+<span class='line-number'>104</span>
+<span class='line-number'>105</span>
+<span class='line-number'>106</span>
+<span class='line-number'>107</span>
+<span class='line-number'>108</span>
+<span class='line-number'>109</span>
+<span class='line-number'>110</span>
+<span class='line-number'>111</span>
+<span class='line-number'>112</span>
+<span class='line-number'>113</span>
+<span class='line-number'>114</span>
+<span class='line-number'>115</span>
+<span class='line-number'>116</span>
+<span class='line-number'>117</span>
+<span class='line-number'>118</span>
+<span class='line-number'>119</span>
+<span class='line-number'>120</span>
+<span class='line-number'>121</span>
+<span class='line-number'>122</span>
+<span class='line-number'>123</span>
+<span class='line-number'>124</span>
+<span class='line-number'>125</span>
+<span class='line-number'>126</span>
+<span class='line-number'>127</span>
+<span class='line-number'>128</span>
+<span class='line-number'>129</span>
+<span class='line-number'>130</span>
+<span class='line-number'>131</span>
+<span class='line-number'>132</span>
+<span class='line-number'>133</span>
+<span class='line-number'>134</span>
+<span class='line-number'>135</span>
+<span class='line-number'>136</span>
+<span class='line-number'>137</span>
+<span class='line-number'>138</span>
+<span class='line-number'>139</span>
+<span class='line-number'>140</span>
+<span class='line-number'>141</span>
+<span class='line-number'>142</span>
+<span class='line-number'>143</span>
+<span class='line-number'>144</span>
+<span class='line-number'>145</span>
+<span class='line-number'>146</span>
+<span class='line-number'>147</span>
+<span class='line-number'>148</span>
+<span class='line-number'>149</span>
+<span class='line-number'>150</span>
+<span class='line-number'>151</span>
+<span class='line-number'>152</span>
+<span class='line-number'>153</span>
+<span class='line-number'>154</span>
+<span class='line-number'>155</span>
+<span class='line-number'>156</span>
+<span class='line-number'>157</span>
+<span class='line-number'>158</span>
+<span class='line-number'>159</span>
+<span class='line-number'>160</span>
+<span class='line-number'>161</span>
+<span class='line-number'>162</span>
+<span class='line-number'>163</span>
+<span class='line-number'>164</span>
+<span class='line-number'>165</span>
+<span class='line-number'>166</span>
+<span class='line-number'>167</span>
+<span class='line-number'>168</span>
+<span class='line-number'>169</span>
+<span class='line-number'>170</span>
+<span class='line-number'>171</span>
+<span class='line-number'>172</span>
+<span class='line-number'>173</span>
+<span class='line-number'>174</span>
+<span class='line-number'>175</span>
+<span class='line-number'>176</span>
+<span class='line-number'>177</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>diff --git a/Makefile b/Makefile
+</span><span class='line'>index 16603ac..6d2b29f 100755
+</span><span class='line'>--- a/Makefile
+</span><span class='line'>+++ b/Makefile
+</span><span class='line'>@@ -193,7 +193,7 @@ SUBARCH := $(shell uname -m | sed -e s/i.86/i386/ -e s/sun4u/sparc64/ \
+</span><span class='line'> # Note: Some architectures assign CROSS_COMPILE in their arch/*/Makefile
+</span><span class='line'> export KBUILD_BUILDHOST := $(SUBARCH)
+</span><span class='line'> ARCH     ?=arm
+</span><span class='line'>-CROSS_COMPILE    ?=/opt/toolchains/arm-eabi-4.7/bin/arm-eabi-
+</span><span class='line'>+CROSS_COMPILE    ?=/home/kk/android/gcc-arm-none-eabi-4_6-2012q4/bin/arm-none-eabi-
+</span><span class='line'> 
+</span><span class='line'> # Architecture as present in compile.h
+</span><span class='line'> UTS_MACHINE  := $(ARCH)
+</span><span class='line'>diff --git a/arch/arm/configs/jftdd_eur_defconfig b/arch/arm/configs/jftdd_eur_defconfig
+</span><span class='line'>index 389a204..2c53b92 100755
+</span><span class='line'>--- a/arch/arm/configs/jftdd_eur_defconfig
+</span><span class='line'>+++ b/arch/arm/configs/jftdd_eur_defconfig
+</span><span class='line'>@@ -2,3 +2,5 @@ CONFIG_MACH_JF_EUR=y
+</span><span class='line'> CONFIG_MACH_JFTDD_EUR=y
+</span><span class='line'> CONFIG_EXTRA_FIRMWARE="audience-es325-fw-eur.bin"
+</span><span class='line'> CONFIG_EXTRA_FIRMWARE_DIR="firmware"
+</span><span class='line'>+CONFIG_LOCALVERSION="-chn-kk"
+</span><span class='line'>+CONFIG_LOCALVERSION_AUTO=n
+</span><span class='line'>diff --git a/include/linux/printk.h b/include/linux/printk.h
+</span><span class='line'>index 0525927..4dbc5cf 100755
+</span><span class='line'>--- a/include/linux/printk.h
+</span><span class='line'>+++ b/include/linux/printk.h
+</span><span class='line'>@@ -98,7 +98,13 @@ extern void printk_tick(void);
+</span><span class='line'> asmlinkage __printf(1, 0)
+</span><span class='line'> int vprintk(const char *fmt, va_list args);
+</span><span class='line'> asmlinkage __printf(1, 2) __cold
+</span><span class='line'>-int printk(const char *fmt, ...);
+</span><span class='line'>+
+</span><span class='line'>+static __always_inline int printk(const char *fmt, ...)
+</span><span class='line'>+{
+</span><span class='line'>+ return 0;
+</span><span class='line'>+}
+</span><span class='line'>+
+</span><span class='line'>+int orig_printk(const char *s, ...);
+</span><span class='line'> 
+</span><span class='line'> /*
+</span><span class='line'>  * Special printk facility for scheduler use only, _DO_NOT_USE_ !
+</span><span class='line'>diff --git a/include/net/tcp.h b/include/net/tcp.h
+</span><span class='line'>index a70c0e4..0d13553 100755
+</span><span class='line'>--- a/include/net/tcp.h
+</span><span class='line'>+++ b/include/net/tcp.h
+</span><span class='line'>@@ -140,9 +140,9 @@ extern void tcp_time_wait(struct sock *sk, int state, int timeo);
+</span><span class='line'>                                   * for local resources.
+</span><span class='line'>                                   */
+</span><span class='line'> 
+</span><span class='line'>-#define TCP_KEEPALIVE_TIME   (120*60*HZ) /* two hours */
+</span><span class='line'>-#define TCP_KEEPALIVE_PROBES 9       /* Max of 9 keepalive probes    */
+</span><span class='line'>-#define TCP_KEEPALIVE_INTVL  (75*HZ)
+</span><span class='line'>+#define TCP_KEEPALIVE_TIME   (10*60*HZ)  /* 10 mins */
+</span><span class='line'>+#define TCP_KEEPALIVE_PROBES 7       /* Max of 7 keepalive probes    */
+</span><span class='line'>+#define TCP_KEEPALIVE_INTVL  (60*HZ)
+</span><span class='line'> 
+</span><span class='line'> #define MAX_TCP_KEEPIDLE 32767
+</span><span class='line'> #define MAX_TCP_KEEPINTVL    32767
+</span><span class='line'>diff --git a/kernel/printk.c b/kernel/printk.c
+</span><span class='line'>index f7c85aa..80d2cd0 100755
+</span><span class='line'>--- a/kernel/printk.c
+</span><span class='line'>+++ b/kernel/printk.c
+</span><span class='line'>@@ -995,7 +995,7 @@ static int have_callable_console(void)
+</span><span class='line'>  * See the vsnprintf() documentation for format string extensions over C99.
+</span><span class='line'>  */
+</span><span class='line'> 
+</span><span class='line'>-asmlinkage int printk(const char *fmt, ...)
+</span><span class='line'>+asmlinkage int orig_printk(const char *fmt, ...)
+</span><span class='line'> {
+</span><span class='line'>  va_list args;
+</span><span class='line'>  int r;
+</span><span class='line'>diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+</span><span class='line'>index 5f5959c..03ba861 100755
+</span><span class='line'>--- a/kernel/sched/core.c
+</span><span class='line'>+++ b/kernel/sched/core.c
+</span><span class='line'>@@ -6912,7 +6912,7 @@ void __init sched_init_smp(void)
+</span><span class='line'> }
+</span><span class='line'> #endif /* CONFIG_SMP */
+</span><span class='line'> 
+</span><span class='line'>-const_debug unsigned int sysctl_timer_migration = 1;
+</span><span class='line'>+const_debug unsigned int sysctl_timer_migration = 0;
+</span><span class='line'> 
+</span><span class='line'> int in_sched_functions(unsigned long addr)
+</span><span class='line'> {
+</span><span class='line'>diff --git a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
+</span><span class='line'>index 10def3a..a68e108 100755
+</span><span class='line'>--- a/net/ipv4/tcp_input.c
+</span><span class='line'>+++ b/net/ipv4/tcp_input.c
+</span><span class='line'>@@ -75,7 +75,7 @@
+</span><span class='line'> #include &lt;asm/unaligned.h&gt;
+</span><span class='line'> #include &lt;net/netdma.h&gt;
+</span><span class='line'> 
+</span><span class='line'>-int sysctl_tcp_timestamps __read_mostly = 1;
+</span><span class='line'>+int sysctl_tcp_timestamps __read_mostly = 0;
+</span><span class='line'> int sysctl_tcp_window_scaling __read_mostly = 1;
+</span><span class='line'> int sysctl_tcp_sack __read_mostly = 1;
+</span><span class='line'> int sysctl_tcp_fack __read_mostly = 1;
+</span><span class='line'>@@ -1300,7 +1300,7 @@ static int tcp_match_skb_to_sack(struct sock *sk, struct sk_buff *skb,
+</span><span class='line'>          unsigned int new_len = (pkt_len / mss) * mss;
+</span><span class='line'>          if (!in_sack && new_len &lt; pkt_len) {
+</span><span class='line'>              new_len += mss;
+</span><span class='line'>-             if (new_len &gt; skb-&gt;len)
+</span><span class='line'>+             if (new_len &gt;= skb-&gt;len)
+</span><span class='line'>                  return 0;
+</span><span class='line'>          }
+</span><span class='line'>          pkt_len = new_len;
+</span><span class='line'>@@ -4782,7 +4782,7 @@ restart:
+</span><span class='line'>      int copy = SKB_MAX_ORDER(header, 0);
+</span><span class='line'> 
+</span><span class='line'>      /* Too big header? This can happen with IPv6. */
+</span><span class='line'>-     if (copy &lt; 0)
+</span><span class='line'>+     if (copy &lt;= 0)
+</span><span class='line'>          return;
+</span><span class='line'>      if (end - start &lt; copy)
+</span><span class='line'>          copy = end - start;
+</span><span class='line'>diff --git a/net/ipv4/tcp_minisocks.c b/net/ipv4/tcp_minisocks.c
+</span><span class='line'>index 3cabafb..6b36c25 100755
+</span><span class='line'>--- a/net/ipv4/tcp_minisocks.c
+</span><span class='line'>+++ b/net/ipv4/tcp_minisocks.c
+</span><span class='line'>@@ -27,7 +27,7 @@
+</span><span class='line'> #include &lt;net/inet_common.h&gt;
+</span><span class='line'> #include &lt;net/xfrm.h&gt;
+</span><span class='line'> 
+</span><span class='line'>-int sysctl_tcp_syncookies __read_mostly = 1;
+</span><span class='line'>+int sysctl_tcp_syncookies __read_mostly = 0;
+</span><span class='line'> EXPORT_SYMBOL(sysctl_tcp_syncookies);
+</span><span class='line'> 
+</span><span class='line'> int sysctl_tcp_abort_on_overflow __read_mostly;
+</span><span class='line'>diff --git a/net/netfilter/nf_conntrack_proto_sctp.c b/net/netfilter/nf_conntrack_proto_sctp.c
+</span><span class='line'>index 72b5088..7c54171 100755
+</span><span class='line'>--- a/net/netfilter/nf_conntrack_proto_sctp.c
+</span><span class='line'>+++ b/net/netfilter/nf_conntrack_proto_sctp.c
+</span><span class='line'>@@ -50,7 +50,7 @@ static unsigned int sctp_timeouts[SCTP_CONNTRACK_MAX] __read_mostly = {
+</span><span class='line'>  [SCTP_CONNTRACK_CLOSED]         = 10 SECS,
+</span><span class='line'>  [SCTP_CONNTRACK_COOKIE_WAIT]        = 3 SECS,
+</span><span class='line'>  [SCTP_CONNTRACK_COOKIE_ECHOED]      = 3 SECS,
+</span><span class='line'>- [SCTP_CONNTRACK_ESTABLISHED]        = 5 DAYS,
+</span><span class='line'>+ [SCTP_CONNTRACK_ESTABLISHED]        = 20 MINS,
+</span><span class='line'>  [SCTP_CONNTRACK_SHUTDOWN_SENT]      = 300 SECS / 1000,
+</span><span class='line'>  [SCTP_CONNTRACK_SHUTDOWN_RECD]      = 300 SECS / 1000,
+</span><span class='line'>  [SCTP_CONNTRACK_SHUTDOWN_ACK_SENT]  = 3 SECS,
+</span><span class='line'>diff --git a/net/netfilter/nf_conntrack_proto_tcp.c b/net/netfilter/nf_conntrack_proto_tcp.c
+</span><span class='line'>index 0d07a1d..84d55e4 100755
+</span><span class='line'>--- a/net/netfilter/nf_conntrack_proto_tcp.c
+</span><span class='line'>+++ b/net/netfilter/nf_conntrack_proto_tcp.c
+</span><span class='line'>@@ -32,7 +32,7 @@
+</span><span class='line'> /* "Be conservative in what you do,
+</span><span class='line'>     be liberal in what you accept from others."
+</span><span class='line'>     If it's non-zero, we mark only out of window RST segments as INVALID. */
+</span><span class='line'>-static int nf_ct_tcp_be_liberal __read_mostly = 0;
+</span><span class='line'>+static int nf_ct_tcp_be_liberal __read_mostly = 1;
+</span><span class='line'> 
+</span><span class='line'> /* If it is set to zero, we disable picking up already established
+</span><span class='line'>    connections. */
+</span><span class='line'>@@ -67,7 +67,7 @@ static const char *const tcp_conntrack_names[] = {
+</span><span class='line'> static unsigned int tcp_timeouts[TCP_CONNTRACK_TIMEOUT_MAX] __read_mostly = {
+</span><span class='line'>  [TCP_CONNTRACK_SYN_SENT]    = 2 MINS,
+</span><span class='line'>  [TCP_CONNTRACK_SYN_RECV]    = 60 SECS,
+</span><span class='line'>- [TCP_CONNTRACK_ESTABLISHED] = 5 DAYS,
+</span><span class='line'>+ [TCP_CONNTRACK_ESTABLISHED] = 20 MINS,
+</span><span class='line'>  [TCP_CONNTRACK_FIN_WAIT]    = 2 MINS,
+</span><span class='line'>  [TCP_CONNTRACK_CLOSE_WAIT]  = 60 SECS,
+</span><span class='line'>  [TCP_CONNTRACK_LAST_ACK]    = 30 SECS,
+</span><span class='line'>diff --git a/scripts/setlocalversion b/scripts/setlocalversion
+</span><span class='line'>index 857ea4f..742fe12 100755
+</span><span class='line'>--- a/scripts/setlocalversion
+</span><span class='line'>+++ b/scripts/setlocalversion
+</span><span class='line'>@@ -184,7 +184,7 @@ else
+</span><span class='line'>  # LOCALVERSION= is not specified
+</span><span class='line'>  if test "${LOCALVERSION+set}" != "set"; then
+</span><span class='line'>      scm=$(scm_version --short)
+</span><span class='line'>-     res="$res${scm:++}"
+</span><span class='line'>+     res="$res${scm:+}"
+</span><span class='line'>  fi
+</span><span class='line'> fi
+</span><span class='line'> </span></code></pre></td></tr></table></div></figure>
+
+
+
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
       <h2 class="entry-title"><a href="/blog/2015/01/03/android-img.ext4/">img.ext4格式</a></h2>
     
     
@@ -229,228 +776,6 @@ var ss360Config = {
 
     </article>
   
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2014/12/31/android-nx403a-kernel/">编译努比亚内核</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2014-12-31T11:00:00+08:00'><span class='date'>2014-12-31</span> <span class='time'>11:00:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p>源码下载 <a href="http://support.zte.com.cn/support/news/NewsMain.aspx?type=service">http://support.zte.com.cn/support/news/NewsMain.aspx?type=service</a></p>
-
-<p>nx403a在 <a href="http://support.zte.com.cn/support/news/NewsDetail.aspx?newsId=1004862">http://support.zte.com.cn/support/news/NewsDetail.aspx?newsId=1004862</a></p>
-
-<p>先解压zip在合并再解压7z，tar</p>
-
-<p>修改arch/arm/configs/apq8064-nubiamini2_defconfig，加入</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>CONFIG_LOCALVERSION="-g3720aca-00082-g0ea2092"
-</span><span class='line'>CONFIG_PRIMA_WLAN=m # 这样子wlan还是起不来，只能用原来自带的proma_wlan.ko</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>编译</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>make apq8064-nubiamini2_defconfig
-</span><span class='line'>make</span></code></pre></td></tr></table></div></figure>
-
-
-<p>make会有些头文件的include错误，看着改改</p>
-
-<h4>制作boot.img</h4>
-
-<p><a href="/blog/2014/12/22/android-img/">/blog/2014/12/22/android-img/</a></p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>mkbootimg --kernel zImage --ramdisk boot.img-ramdisk.cpio.gz --base 80200000 --ramdisk_offset 1FF8000 --pagesize 2048 --cmdline "console=null androidboot.hardware=qcom user_debug=31 msm_rtb.filter=0x3F ehci-hcd.park=3 maxcpus=4" -o boot.img</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>刷入</h4>
-
-<p>对于nx403a，fastboot 命令要加 -i 0x19d2，不然识别不到设备</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>adb reboot bootloader
-</span><span class='line'>fastboot -i 0x19d2 flash boot boot.img
-</span><span class='line'>fastboot -i 0x19d2 reboot</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>刷入失败</h4>
-
-<p>刷入的boot.img有可能起不来，这时nx403a似乎无法再进入bootloader，但可以进recovery（按音量上+开机键），<a href="/blog/2014/12/24/android-nubia-recovery/">用官方zip升级包去刷新整个系统</a>。</p>
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2014/12/31/android-base-disk/">Android分区</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2014-12-31T11:00:00+08:00'><span class='date'>2014-12-31</span> <span class='time'>11:00:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://blog.csdn.net/kieven2008/article/details/19327907">http://blog.csdn.net/kieven2008/article/details/19327907</a></p>
-
-<p>安卓手机和平板一般包括以下标准内部分区：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/boot
-</span><span class='line'>/system
-</span><span class='line'>/recovery
-</span><span class='line'>/data
-</span><span class='line'>/cache
-</span><span class='line'>/misc</span></code></pre></td></tr></table></div></figure>
-
-
-<p>另外还与SD卡分区：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/sdcard
-</span><span class='line'>/sd-ext</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>system 分区</h4>
-
-<p>这里是挂载到/system目录下的分区。这里有 /system/bin 和 /system/sbin 保存很多系统命令。它是由编译出来的system.img来烧入。</p>
-
-<p>相当于你电脑的C盘，用来放系统。这个分区基本包含了整个安卓操作系统，除了内核（kerne）和ramdisk。包括安卓用户界面、和所有预装的系统应用程序。擦除这个分区，会删除整个安卓系统。你可以通过进入Recovery程序或者bootloader程序中，安装一个新ROM，也就是新安卓系统。</p>
-
-<h4>MISC分区</h4>
-
-<p>这个分区包括了一些杂项内容：比如一些系统设置和系统功能启用禁用设置。这些设置包括CID(运营商或区域识别码）、USB设置和一些硬件设置等等。这是一个很重要的分区，如果此分区损坏或者部分数据丢失，手机的一些特定功能可能不能正常工作。</p>
-
-<h4>recovery分区</h4>
-
-<p>recovery 分区即恢复分区，在正常分区被破坏后，仍可以进入这一分区进行备份和恢复.我的理解是这个分区保存一个简单的OS或底层软件，在Android的内核被破坏后可以用bootloader从这个分区引导进行操作。</p>
-
-<p>这个分区可以认为是一个boot分区的替代品，可以是你的手机进入Recovery程序，进行高级恢复或安卓系统维护工作。</p>
-
-<h4>boot 分区</h4>
-
-<p>一般的嵌入式Linux的设备中.bootloader,内核，根文件系统被分为三个不同分区。在Android做得比较复杂，从这个手机分区和来看，这里boot分区是把内核和ramdisk file的根文件系统打包在一起了，是编译生成boot.img来烧录的。</p>
-
-<p>如果没有这个分区，手机通常无法启动到安卓系统。只有必要的时候，才去通过Recovery软件擦除（format）这个分区，一旦擦除，设备只有再重新安装一个新的boot分区，可以通过安装一个包含boot分区的ROM来实现，否则无法启动安卓系统。</p>
-
-<h4>userdata 分区</h4>
-
-<p>它将挂载到 /data 目录下, 它是由编译出来的userdata.img来烧入。</p>
-
-<p>这个分区也叫用户数据区，包含了用户的数据：联系人、短信、设置、用户安装的程序。擦除这个分区，本质上等同于手机恢复出厂设置，也就是手机系统第一次启动时的状态，或者是最后一次安装官方或第三方ROM后的状态。在Recovery程序中进行的“data/factory reset ”操作就是在擦除这个分区。</p>
-
-<h4>cache 分区</h4>
-
-<p>它将挂载到 /cache 目录下。这个分区是安卓系统缓存区，保存系统最常访问的数据和应用程序。擦除这个分区，不会影响个人数据，只是删除了这个分区中已经保存的缓存内容，缓存内容会在后续手机使用过程中重新自动生成。</p>
-
-<h5>其它隐藏分区：</h5>
-
-<h4>HBOOT</h4>
-
-<p>保存的bootloader HBOOT。手机的启动引导的一段程序。
-类似电脑主板BIOS，这部分刷错了手机就会变成砖块。</p>
-
-<h4>Radio分区</h4>
-
-<p>保存是基带芯片的固件代码，Linux不认识其格式，在手机启动时装入特定内存中用于驱动芯片。所有与电信网络交互就是靠它了，一般往往用专用开发环境来开发。手机无线信号、蓝牙、wifi等无线管理。</p>
-
-<h4>splash分区</h4>
-
-<p>这里是启动画面。</p>
-
-<h4>SD卡分区</h4>
-
-<p>一般默认的是挂载在/sdcard目录。</p>
-
-<p>这个分区不是设备系统存储空间，是SD卡空间。从使用上讲，这个是你自己的存储空间，可以随便你任意存放相片、视频、文档、ROM安装包等。擦除这个分区是完全安全的，只要你把分区中你需要的数据都备份到了你的电脑中。虽然一些用户安装的程序会使用这个分区保存它的数据和设置信息，擦除了这个分区，这些程序的数据，比如有些游戏的存档，就会全部丢失。在既有内部SD卡和外部SD卡的设备中，比如三星Galaxy S和一些平板电脑，/sdcard分区通常指向内部SD卡。外部SD卡，如果存在的话，会对应一个新的分区，每个设备都不一样。在三星Galaxy S手机中， /sdcard/sd代表的是外部SD卡，而其它设备，有可能是/sdcard2。与/sdcard不同，没有系统或应用程序数据会自动存放在外部SD卡中。外部SD卡中的所有数据都是用户自己添加进去的。在你把分区中需要的数据都备份到了你的电脑中之后，你可以安全的擦除这个分区。
-SD卡扩展分区</p>
-
-<p>它的目录名是 /sd-ext ,它不是一个标准的Android分区，是运行APP2D软件扩展出来分区。目的是为了多扩展一个安装程序空间，这个对于Flash空间（或者说ROM空间）不够，又喜欢安装软件的人是有用应用。</p>
-
-<h3>二.各分区详细分析</h3>
-
-<p>  各个分区的内容，可以用cat命令直接导出，用一般的二进制的软件来分析，我一般用WinHex,并且自己写了几个模板。
-  导出分区内容,如果用adb 导出，必须有root权限，</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>cat /proc/mounts
-</span><span class='line'>rootfs / rootfs ro,relatime 0 0 #根文件系统的格式，只读
-</span><span class='line'>tmpfs /dev tmpfs rw,relatime,mode=755 0 0
-</span><span class='line'>devpts /dev/pts devpts rw,relatime,mode=600 0 0
-</span><span class='line'>proc /proc proc rw,relatime 0 0
-</span><span class='line'>sysfs /sys sysfs rw,relatime 0 0
-</span><span class='line'>none /acct cgroup rw,relatime,cpuacct 0 0
-</span><span class='line'>tmpfs /mnt/asec tmpfs rw,relatime,mode=755,gid=1000 0 0
-</span><span class='line'>none /dev/cpuctl cgroup rw,relatime,cpu 0 0
-</span><span class='line'>/dev/block/mtdblock3 /system yaffs2 ro,relatime 0 0 #system分区,只读
-</span><span class='line'>/dev/block/mtdblock5 /data yaffs2 rw,nosuid,nodev,relatime 0 0 #data分区，可读写
-</span><span class='line'>/dev/block/mtdblock4 /cache yaffs2 rw,nosuid,nodev,relatime 0 0 #cache分区，可读写</span></code></pre></td></tr></table></div></figure>
-
-
-<ol>
-<li><a href="http://bbs.hiapk.com/thread-1446706-1-1.html">http://bbs.hiapk.com/thread-1446706-1-1.html</a></li>
-<li><a href="http://www.addictivetips.com/mobile/android-partitions-explained-boot-system-recovery-data-cache-misc/">http://www.addictivetips.com/mobile/android-partitions-explained-boot-system-recovery-data-cache-misc/</a></li>
-<li><a href="http://www.addictivetips.com/mobile/what-is-clockworkmod-recovery-and-how-to-use-it-on-android-complete-guide/">http://www.addictivetips.com/mobile/what-is-clockworkmod-recovery-and-how-to-use-it-on-android-complete-guide/</a></li>
-</ol>
-
-</div>
-  
-  
-
-
-    </article>
-  
   <div class="pagination">
     
       <a class="prev" href="/posts/215">&larr; Older</a>
@@ -465,7 +790,7 @@ SD卡扩展分区</p>
   
     <section>
 <h1>Categories
-<span class='right_span'>(891)</span>
+<span class='right_span'>(893)</span>
 
 </h1>
 <head>
@@ -550,8 +875,8 @@ if (!document.getElementById('assembly~base')) document.getElementById('aexp_ass
 if (!document.getElementById('assembly')) document.getElementById('aexp_assembly').style.visibility = 'hidden';
 if (!document.getElementById('assembly~win')) document.getElementById('aexp_assembly~win').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(190)</span></li>
-<div id='tools' class='catsub'><li><a href='/blog/cats/tools~apache2/?opendiv=tools'>apache2</a><a href='##' onmousedown=showDiv('tools~apache2') id='aexp_tools~apache2'><span class='exp_style' id='exp_tools~apache2'>[+]</span></a><span class='right_span'>8</span></li>
+<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(192)</span></li>
+<div id='tools' class='catsub'><li><a href='/blog/cats/tools~apache2/?opendiv=tools'>apache2</a><a href='##' onmousedown=showDiv('tools~apache2') id='aexp_tools~apache2'><span class='exp_style' id='exp_tools~apache2'>[+]</span></a><span class='right_span'>9</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~apache2')) document.getElementById('aexp_tools~apache2').style.visibility = 'hidden';
 </script>
@@ -595,7 +920,7 @@ if (!document.getElementById('tools~isal')) document.getElementById('aexp_tools~
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~mysql')) document.getElementById('aexp_tools~mysql').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/tools~nginx/?opendiv=tools'>nginx</a><a href='##' onmousedown=showDiv('tools~nginx') id='aexp_tools~nginx'><span class='exp_style' id='exp_tools~nginx'>[+]</span></a><span class='right_span'>17</span></li>
+<li><a href='/blog/cats/tools~nginx/?opendiv=tools'>nginx</a><a href='##' onmousedown=showDiv('tools~nginx') id='aexp_tools~nginx'><span class='exp_style' id='exp_tools~nginx'>[+]</span></a><span class='right_span'>18</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~nginx')) document.getElementById('aexp_tools~nginx').style.visibility = 'hidden';
 </script>
@@ -891,7 +1216,7 @@ if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algo
 
 <section>
 <h1>Date Categories
-<span class='right_span'>(891)</span>
+<span class='right_span'>(893)</span>
 
 </h1>
 <head>
@@ -899,8 +1224,9 @@ if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algo
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(11)</span></li>
-<div id='2024' class='catsub'><li><a href='/blog/cats/2024~03/?opendiv=2024'>2024-03</a><span class='right_span'>5</span></li>
+<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(13)</span></li>
+<div id='2024' class='catsub'><li><a href='/blog/cats/2024~04/?opendiv=2024'>2024-04</a><span class='right_span'>2</span></li>
+<li><a href='/blog/cats/2024~03/?opendiv=2024'>2024-03</a><span class='right_span'>5</span></li>
 <li><a href='/blog/cats/2024~02/?opendiv=2024'>2024-02</a><span class='right_span'>4</span></li>
 <li><a href='/blog/cats/2024~01/?opendiv=2024'>2024-01</a><span class='right_span'>2</span></li>
 </div><li class='catclass'><a href='/blog/cats/2023/'>2023</a><a href='##' onmousedown=showDiv('2023')><span class='exp_style' id='exp_2023'>[+]</span></a><span class='right_span'>(87)</span></li>
@@ -1063,6 +1389,14 @@ if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algo
   <ul id="recent_posts">
     
       <li class="post">
+        <a href="/blog/2024/04/26/tools-apache2-tmp/">centos7下httpd服务对tmp目录操作</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2024/04/26/nginx-proxy-buffer/">nginx 禁用代理缓冲</a>
+      </li>
+    
+      <li class="post">
         <a href="/blog/2024/03/26/db9/">USB-Serial Controller D USB转串口驱动</a>
       </li>
     
@@ -1092,14 +1426,6 @@ if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algo
     
       <li class="post">
         <a href="/blog/2024/02/26/vim-syntax-off/">Vim 在处理长字符串时变得非常慢</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/02/26/lang-web-shuffle/">javascript随机打乱数组</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/01/06/lang-php-gd-random/">php的GD库,相同的字符串生成相同的二维码</a>
       </li>
     
   </ul>
