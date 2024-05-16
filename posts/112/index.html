@@ -131,7 +131,7 @@ var ss360Config = {
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2019/12/09/10Gb-recv/">X520-T1 Linux内核收包14Mpps</a></h2>
+      <h2 class="entry-title"><a href="/blog/2019/12/12/buy-cvm/">API购买CVM</a></h2>
     
     
       <p class="meta">
@@ -140,303 +140,16 @@ var ss360Config = {
 
 
 
-<time class='entry-date' datetime='2019-12-09T14:56:00+08:00'><span class='date'>2019-12-09</span> <span class='time'>14:56:00</span></time>
+<time class='entry-date' datetime='2019-12-12T17:26:00+08:00'><span class='date'>2019-12-12</span> <span class='time'>17:26:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><h3>目的</h3>
+  <div class="entry-content"><h4>CVM 添加辅助网卡并绑定多 IP</h4>
 
-<p>测试并优化Linux内核收包</p>
-
-<h3>ixgbe收包</h3>
-
-<p>前期设置：cpu和网卡队列一一绑定，service irqbalance stop等。</p>
-
-<p>rx_ring->rx_buffer_info[]是收包用的循环队列。rx_ring中关于循环队列的一些重要变量：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>rx_ring-&gt;next_to_clean    网卡收到的下一个包放这里，所以要预先申请好内存
-</span><span class='line'>rx_ring-&gt;next_to_alloc 下一个要申请内存的位置
-</span><span class='line'>rx_ring-&gt;next_to_use   [next_to_clean, next_to_use)这个区间的内存是申请好的了，网卡可以直接用。
-</span><span class='line'>&#9;&#9;&#9;一般取值为[next_to_alloc - IXGBE_RX_BUFFER_WRITE, next_to_alloc], next_to_use 在ixgbe_alloc_rx_buffers里更新。</span></code></pre></td></tr></table></div></figure>
-
-
-<p>假设收包队列为512，那么ixgbe初始化之后</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>rx_ring-&gt;next_to_clean    = 0;
-</span><span class='line'>rx_ring-&gt;next_to_use   = 511;
-</span><span class='line'>rx_ring-&gt;next_to_alloc = 511;</span></code></pre></td></tr></table></div></figure>
-
-
-<p>这里刚好留了一个位置没申请内存，这个跟reuse有关，后面再看。</p>
-
-<h4>初始化流程：</h4>
-
-<p>ixgbe_up() -> ixgbe_configure() -> ixgbe_configure_rx() -> ixgbe_configure_rx_ring() -> ixgbe_alloc_rx_buffers(ring, ixgbe_desc_unused(ring))</p>
-
-<p>ixgbe_desc_unused 决定了预留一个位置。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static inline u16 ixgbe_desc_unused(struct ixgbe_ring *ring)
-</span><span class='line'>{
-</span><span class='line'>&#9;u16 ntc = ring-&gt;next_to_clean;
-</span><span class='line'>&#9;u16 ntu = ring-&gt;next_to_use;
-</span><span class='line'>
-</span><span class='line'>&#9;return ((ntc &gt; ntu) ? 0 : ring-&gt;count) + ntc - ntu - 1; // 这里保留一个位置
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>收包函数 ixgbe_clean_rx_irq 简化流程为</h4>
-
-<ol>
-<li>预先申请内存，为[next_to_use, next_to_clean)这段“没申请”内存的队列申请</li>
-</ol>
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if (cleaned_count &gt;= IXGBE_RX_BUFFER_WRITE) {
-</span><span class='line'>&#9;ixgbe_alloc_rx_buffers(rx_ring, cleaned_count);
-</span><span class='line'>&#9;cleaned_count = 0;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<ol>
-<li>检查是否收到数据</li>
-</ol>
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>rx_desc = IXGBE_RX_DESC(rx_ring, rx_ring-&gt;next_to_clean);
-</span><span class='line'>size = le16_to_cpu(rx_desc-&gt;wb.upper.length);
-</span><span class='line'>if (!size)
-</span><span class='line'>&#9;break;</span></code></pre></td></tr></table></div></figure>
-
-
-<ol>
-<li>申请skb</li>
-</ol>
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>rx_buffer = ixgbe_get_rx_buffer(rx_ring, rx_desc, &skb, size);
-</span><span class='line'>if (skb)
-</span><span class='line'>&#9;ixgbe_add_rx_frag(rx_ring, rx_buffer, skb, size); // EOP 场景才到这里
-</span><span class='line'>else
-</span><span class='line'>&#9;skb = ixgbe_build_skb(rx_ring, rx_buffer, rx_desc, size);</span></code></pre></td></tr></table></div></figure>
-
-
-<ol>
-<li>reuse buffer</li>
-</ol>
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>ixgbe_put_rx_buffer(rx_ring, rx_buffer, skb);</span></code></pre></td></tr></table></div></figure>
-
-
-<ol>
-<li>EOP</li>
-</ol>
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if (ixgbe_is_non_eop(rx_ring, rx_desc, skb))
-</span><span class='line'>&#9;continue;</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>reuse buffer</h4>
-
-<p>先不看EOP、XDP, 流程就很简单，唯一问题是reuse buffer。</p>
-
-<p>其实在ixgbe初始化时rx_ring->rx_buffer_info队列上每个位置申请的内存都可以放两个包的，假设rx_ring->rx_buffer_info[0]上的空间为b1、b2。</p>
-
-<p>网卡收第一个包时，存在了b1，但b2没被使用，在ixgbe_put_rx_buffer()里将b2放到next_to_alloc里，所以前面初始化时至少要空一个位置。这时</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>rx_ring-&gt;next_to_clean    = 1;
-</span><span class='line'>rx_ring-&gt;next_to_use   = 511;
-</span><span class='line'>rx_ring-&gt;next_to_alloc = 0;</span></code></pre></td></tr></table></div></figure>
-
-
-<p>b1、b2中间隔了510个包</p>
-
-<p>当收第512个包时，网卡把它存在了b2，这时b1如果被消费了（大概率事件），那么b1又是可以被reuse，再把b1放到next_to_alloc。这样在skb及时消费的情况下就不用再申请内存给网卡。</p>
-
-<h4>EOP</h4>
-
-<p>EOP = End of Packet</p>
-
-<p>如果收上来的数据没有EOP标志位，说明不是一个完整的包，要等后面的数据。</p>
-
-<p>一个包对应一个skb结构，第一块数据到的时候就申请了skb，下一个数据到来的时候不需要再申请skb。</p>
-
-<p>ixgbe做法是在ixgbe_is_non_eop()中将skb放到ntc=next_to_clean+1中的rx_ring->rx_buffer_info[ntc].skb = skb; 下一块数据到来时直接在ixgbe_get_rx_buffer()中取出这个skb，不需要再申请。之后收到的数据会依次放到skb_shinfo(skb)->frags[]中, 具体见ixgbe_add_rx_frag()。</p>
-
-<h4>XDP</h4>
-
-<p>XDP是在申请skb结构之前直接处理网卡收到的数据，如果要丢弃就不用申请skb了。</p>
-
-<p>较新的Linux内核或官网驱动ixgbe-5.6.5中包含该功能。</p>
-
-<h3>测试</h3>
-
-<h4>环境</h4>
-
-<p>ga-b250m-hd3
-I5-6500, 4核4线程
-X520-T1
-ubuntu 16.04, linux-image-4.15.0-XX
-主板设置只开启一核(直接丢包场景下增加核数处理能力线性增加)</p>
-
-<h4>netmap</h4>
-
-<p>netmap是一种网卡旁路方法，用netmap测试，只用一个cpu。
-1个cpu, 2GHz， 12.8Mpps   100%
-1个cpu, 3.6GHz，14.2Mpps  100%</p>
-
-<h4>模仿XDP丢包</h4>
-
-<p>ixgbe-5.6.5 的带了XDP功能, 在 ixgbe_run_xdp 直接 return ERR_PTR(-IXGBE_XDP_CONSUMED); 也就是全部丢包。
-1个cpu, 2GHz， 14.2Mpps   &lt;20% ?   用 ixgbe-5.3.8 加上XDP功能 cpu需要 93%
-1个cpu, 3.6GHz，14.2Mpps  &lt;10% ?   用 ixgbe-5.3.8 加上XDP功能 cpu需要 30%</p>
-
-<h4>pre_routing 丢包</h4>
-
-<p>1个cpu, 2GHz， 3.2Mpps   100%
-1个cpu, 3.6GHz，5.5Mpps  100%</p>
-
-<h4>local_in 丢包</h4>
-
-<p>1个cpu, 2GHz， 1.2Mpps   100%
-1个cpu, 3.6GHz，2.1Mpps  100%
-local_in比pre_routing多了路由查找，这个都太慢。</p>
-
-<h4>不处理</h4>
-
-<p>1个cpu, 2GHz， 1.2Mpps   100%
-1个cpu, 3.6GHz，2.1Mpps  100%</p>
-
-<h3>参考</h3>
-
-<p><a href="http://launchpadlibrarian.net/443052277/linux-source-4.15.0_4.15.0-65.74_all.deb">linux-source-4.15.0_4.15.0-65.74_all.deb</a></p>
-
-<p><a href="https://blog.csdn.net/one_clouder/article/details/52685249">二层报文发送之qdisc实现分析</a></p>
-
-<p><a href="https://www.cnblogs.com/ne-liqian/p/9294757.html">netmap配置</a></p>
-
-<p><a href="https://tqr.ink/2017/04/16/intel-82599-receive-packet/">基于82599网卡的二层网络数据包接收</a></p>
-
-<p><a href="https://tqr.ink/2017/05/01/intel-82599-transmit-packet/">基于82599网卡的二层网络数据包发送</a></p>
-
-<p><a href="https://www.ichenfu.com/2019/03/10/how-to-drop-10-million-packets-per-second/">如何在一秒之内丢弃1000万个网络数据包</a></p>
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2019/12/09/10Gb-send/">X520-T1 Linux内核发包14Mpps</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2019-12-09T10:46:00+08:00'><span class='date'>2019-12-09</span> <span class='time'>10:46:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><h3>目的</h3>
-
-<p>测试并优化Linux内核发包</p>
-
-<h3>环境</h3>
-
-<p>ga-b250m-d3h
-I7-7700k, 4核8线程，no_trubo=1即最高4.2GHz
-X520-T1
-ubuntu 18.04, linux-image-4.15.0-XX</p>
-
-<h3>netmap</h3>
-
-<p>netmap是一种网卡旁路方法，用netmap测试，发包在 14.3Mpps, 单cpu 60%。测试命令</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>./build-apps/pkt-gen/pkt-gen -i enp3s0 -f tx -c 1 -p 1 -z -d 12.0.0.100:80</span></code></pre></td></tr></table></div></figure>
-
-
-<h3>Linux多线程发包</h3>
-
-<p>在模块中用kthread创建多线程，每个线程构造skb，然后调dev_queue_xmit(skb)。测试发现cpu全部100%，发包大多在12Mpps</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>&#9;&#9;tcp      udp
-</span><span class='line'>fq_codel  12.0Mpps/100%   12.8Mpps/100%
-</span><span class='line'>pfifo_fast    12.7Mpps/100%   14.0Mpps/100%
-</span><span class='line'>noqueue       12.0Mpps/100%   12.8Mpps/100%</span></code></pre></td></tr></table></div></figure>
-
-
-<h3>猜测可能优化点</h3>
-
-<ol>
-<li>qdisc流控</li>
-<li>skb的申请、释放</li>
-</ol>
-
-
-<h3>优化qdisc流控</h3>
-
-<p>qdisc流控可以简单看作把包存下，然后再发送出去。取消qdisc应该能减少一层消耗。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>dev_queue_xmit() -&gt; dev_hard_start_xmit() -&gt; xmit_one() -&gt; netdev_start_xmit() -&gt; __netdev_start_xmit()</span></code></pre></td></tr></table></div></figure>
-
-
-<p>将上面的代码copy到模块，就跳过了qdisc。其实noqueue也是这个流程，但为什么noqueue的pps、cpu都没提升呢？</p>
-
-<p>测试发现skb->xmit_more是关键，ixgbe中关于xmit_more的代码：</p>
+<p><a href="https://cloud.tencent.com/document/product/1199/44153">https://cloud.tencent.com/document/product/1199/44153</a></p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -446,31 +159,69 @@ ubuntu 18.04, linux-image-4.15.0-XX</p>
 <span class='line-number'>6</span>
 <span class='line-number'>7</span>
 <span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>    if (netif_xmit_stopped(txring_txq(tx_ring)) || !skb-&gt;xmit_more) {
-</span><span class='line'>            writel(i, tx_ring-&gt;tail);
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>$ vim /etc/network/interfaces   # 增加如下
 </span><span class='line'>
-</span><span class='line'>            /* we need this if more than one processor can write to our tail
-</span><span class='line'>             * at a time, it synchronizes IO on IA64/Altix systems
-</span><span class='line'>             */
-</span><span class='line'>            mmiowb();
-</span><span class='line'>    }</span></code></pre></td></tr></table></div></figure>
+</span><span class='line'>auto eth1
+</span><span class='line'>iface eth1 inet static
+</span><span class='line'>address   172.19.0.13
+</span><span class='line'>netmask 172.19.15.255
+</span><span class='line'>gateway 172.19.0.1
+</span><span class='line'>
+</span><span class='line'>$ ifconfig eth1 172.19.0.13/20
+</span><span class='line'>
+</span><span class='line'>$ find /proc/sys/net/ -name rp_filter -exec sh -c "echo 0 &gt; {} " \;
+</span><span class='line'>$ find /proc/sys/net/ -name rp_filter -exec cat {} \;</span></code></pre></td></tr></table></div></figure>
 
 
-<p>noqueue中没有设置xmit_more，但fq_codel,pfifo_fast等用到qdisc框架的都会设置xmit_more，qdisc是用skb->next将skb串起来，当skb->next != NULL时在dev_hard_start_xmit就会设置xmit_more=1。</p>
+<hr />
 
-<p>照此优化，在我们的模块中每次申请多个包，将他们用skb->next串起来再发送。优化后发包在14.2Mpps,每个cpu都60%。</p>
+<h2>python</h2>
 
-<h3>优化skb的申请、释放</h3>
+<p>代理设置
+export http_proxy=<a href="http://">http://</a></p>
 
-<p>每秒申请、释放14M的skb有点多。。。</p>
+<p>export https_proxy=<a href="http://">http://</a></p>
 
-<p>我们可以创建percpu的skb池，申请的时候从池子里拿，释放的时候放回池子。</p>
+<h4>SDK</h4>
 
-<ol>
-<li>怎么做到释放时放回池子？用skb->destructor指向我们的回调函数即可</li>
-<li>怎么做到不让Linux内核释放skb以及skb->data的空间？增加如下patch重新编译内核，设置skb池子里的skb->fclone = SKB_FCLONE_USER即可。</li>
-</ol>
+<h5>手动安装</h5>
 
+<p><a href="https://github.com/TencentCloud/tencentcloud-sdk-python">https://github.com/TencentCloud/tencentcloud-sdk-python</a></p>
+
+<p>git clone <a href="https://github.com/TencentCloud/tencentcloud-sdk-python.git">https://github.com/TencentCloud/tencentcloud-sdk-python.git</a></p>
+
+<p>python setup.py install</p>
+
+<h5>pip 安装</h5>
+
+<p>sudo apt-get install python-pip</p>
+
+<p>pip install tencentcloud-sdk-python</p>
+
+<p>请注意，如果同时有 python2 和 python3 环境， python3 环境需要使用 pip3 命令安装。</p>
+
+<h4>密钥</h4>
+
+<p><a href="https://console.cloud.tencent.com/cam/capi">https://console.cloud.tencent.com/cam/capi</a></p>
+
+<p>export TENCENTCLOUD_SECRET_ID=xx</p>
+
+<p>export TENCENTCLOUD_SECRET_KEY=xx</p>
+
+<h3>v2.0</h3>
+
+<p>方便被其他程序调用，例如网页实现购买</p>
+
+<p>cred = credential.Credential(&ldquo;your_id&rdquo;, &ldquo;your_key&rdquo;)
+中替换自己的ID，KEY</p>
+
+<p>用法: python CVM.py hk 1   会先查寻，如果个数>=n就不购买</p>
+
+<p>查看结果: cat show.log  API返回时一般还没分配IP，多调几次 python CVM.py hk 0 就有结果了</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -505,105 +256,320 @@ ubuntu 18.04, linux-image-4.15.0-XX</p>
 <span class='line-number'>31</span>
 <span class='line-number'>32</span>
 <span class='line-number'>33</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
-</span><span class='line'>index 2742528..cd240a9 100644
-</span><span class='line'>--- a/include/linux/skbuff.h
-</span><span class='line'>+++ b/include/linux/skbuff.h
-</span><span class='line'>@@ -532,6 +532,7 @@ enum {
-</span><span class='line'>  SKB_FCLONE_UNAVAILABLE, /* skb has no fclone (from head_cache) */
-</span><span class='line'>  SKB_FCLONE_ORIG,    /* orig skb (from fclone_cache) */
-</span><span class='line'>  SKB_FCLONE_CLONE,   /* companion fclone skb (from fclone_cache) */
-</span><span class='line'>+ SKB_FCLONE_USER,
-</span><span class='line'> };
-</span><span class='line'> 
-</span><span class='line'> enum {
-</span><span class='line'>diff --git a/net/core/skbuff.c b/net/core/skbuff.c
-</span><span class='line'>index cac95aa..b8fb200 100644
-</span><span class='line'>--- a/net/core/skbuff.c
-</span><span class='line'>+++ b/net/core/skbuff.c
-</span><span class='line'>@@ -585,6 +585,8 @@ static void kfree_skbmem(struct sk_buff *skb)
-</span><span class='line'>  case SKB_FCLONE_UNAVAILABLE:
-</span><span class='line'>      kmem_cache_free(skbuff_head_cache, skb);
-</span><span class='line'>      return;
-</span><span class='line'>+ case SKB_FCLONE_USER:
-</span><span class='line'>+     return;
-</span><span class='line'> 
-</span><span class='line'>  case SKB_FCLONE_ORIG:
-</span><span class='line'>      fclones = container_of(skb, struct sk_buff_fclones, skb1);
-</span><span class='line'>@@ -627,7 +629,7 @@ void skb_release_head_state(struct sk_buff *skb)
-</span><span class='line'> static void skb_release_all(struct sk_buff *skb)
-</span><span class='line'> {
-</span><span class='line'>  skb_release_head_state(skb);
-</span><span class='line'>- if (likely(skb-&gt;head))
-</span><span class='line'>+ if (likely(skb-&gt;head) && skb-&gt;fclone != SKB_FCLONE_USER)
-</span><span class='line'>      skb_release_data(skb);
-</span><span class='line'> }</span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+<span class='line-number'>82</span>
+<span class='line-number'>83</span>
+<span class='line-number'>84</span>
+<span class='line-number'>85</span>
+<span class='line-number'>86</span>
+<span class='line-number'>87</span>
+<span class='line-number'>88</span>
+<span class='line-number'>89</span>
+<span class='line-number'>90</span>
+<span class='line-number'>91</span>
+<span class='line-number'>92</span>
+<span class='line-number'>93</span>
+<span class='line-number'>94</span>
+<span class='line-number'>95</span>
+<span class='line-number'>96</span>
+<span class='line-number'>97</span>
+<span class='line-number'>98</span>
+<span class='line-number'>99</span>
+<span class='line-number'>100</span>
+<span class='line-number'>101</span>
+<span class='line-number'>102</span>
+<span class='line-number'>103</span>
+<span class='line-number'>104</span>
+<span class='line-number'>105</span>
+<span class='line-number'>106</span>
+<span class='line-number'>107</span>
+<span class='line-number'>108</span>
+<span class='line-number'>109</span>
+<span class='line-number'>110</span>
+<span class='line-number'>111</span>
+<span class='line-number'>112</span>
+<span class='line-number'>113</span>
+<span class='line-number'>114</span>
+<span class='line-number'>115</span>
+<span class='line-number'>116</span>
+<span class='line-number'>117</span>
+<span class='line-number'>118</span>
+<span class='line-number'>119</span>
+<span class='line-number'>120</span>
+<span class='line-number'>121</span>
+<span class='line-number'>122</span>
+<span class='line-number'>123</span>
+<span class='line-number'>124</span>
+<span class='line-number'>125</span>
+<span class='line-number'>126</span>
+<span class='line-number'>127</span>
+<span class='line-number'>128</span>
+<span class='line-number'>129</span>
+<span class='line-number'>130</span>
+<span class='line-number'>131</span>
+<span class='line-number'>132</span>
+<span class='line-number'>133</span>
+<span class='line-number'>134</span>
+<span class='line-number'>135</span>
+<span class='line-number'>136</span>
+<span class='line-number'>137</span>
+<span class='line-number'>138</span>
+<span class='line-number'>139</span>
+<span class='line-number'>140</span>
+<span class='line-number'>141</span>
+<span class='line-number'>142</span>
+<span class='line-number'>143</span>
+<span class='line-number'>144</span>
+<span class='line-number'>145</span>
+<span class='line-number'>146</span>
+<span class='line-number'>147</span>
+<span class='line-number'>148</span>
+<span class='line-number'>149</span>
+<span class='line-number'>150</span>
+<span class='line-number'>151</span>
+<span class='line-number'>152</span>
+<span class='line-number'>153</span>
+<span class='line-number'>154</span>
+<span class='line-number'>155</span>
+<span class='line-number'>156</span>
+<span class='line-number'>157</span>
+<span class='line-number'>158</span>
+<span class='line-number'>159</span>
+<span class='line-number'>160</span>
+<span class='line-number'>161</span>
+<span class='line-number'>162</span>
+<span class='line-number'>163</span>
+<span class='line-number'>164</span>
+<span class='line-number'>165</span>
+<span class='line-number'>166</span>
+<span class='line-number'>167</span>
+<span class='line-number'>168</span>
+<span class='line-number'>169</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'># -*- coding: utf-8 -*-
+</span><span class='line'>import os
+</span><span class='line'>import time
+</span><span class='line'>import logging
+</span><span class='line'>import sys
+</span><span class='line'>
+</span><span class='line'>handler = logging.FileHandler("all.log") #, encoding='utf-8')
+</span><span class='line'>handler.setFormatter(logging.Formatter(fmt='%(asctime)s %(process)d %(levelname)s %(message)s'))
+</span><span class='line'>log = logging.getLogger("QQ")
+</span><span class='line'>log.addHandler(handler)
+</span><span class='line'>log.setLevel(logging.INFO)
+</span><span class='line'>
+</span><span class='line'>handler = logging.FileHandler("show.log", mode='w')
+</span><span class='line'>handler.setFormatter(logging.Formatter(fmt='%(asctime)s %(message)s'))
+</span><span class='line'>log2 = logging.getLogger("QQQ")
+</span><span class='line'>log2.addHandler(handler)
+</span><span class='line'>log2.setLevel(logging.INFO)
+</span><span class='line'>
+</span><span class='line'>RZ = {
+</span><span class='line'>        "hk" : {
+</span><span class='line'>            "Region" : "ap-hongkong",
+</span><span class='line'>            "Zone" : ["ap-hongkong-2", "ap-hongkong-1"],
+</span><span class='line'>            "ImageId" : "img-3tdtc58k",
+</span><span class='line'>            "InstanceType" : ["S2.SMALL1", ],
+</span><span class='line'>            "ActionTime" : [1, 2, 3]
+</span><span class='line'>            },
+</span><span class='line'>        "gz" : {
+</span><span class='line'>            "Region" : "ap-guangzhou",
+</span><span class='line'>            "Zone" : ["ap-guangzhou-3", "ap-guangzhou-4"],
+</span><span class='line'>            "ImageId" : "img-822xs3s2",
+</span><span class='line'>            "InstanceType" : ["S2.SMALL1", ],
+</span><span class='line'>            "ActionTime" : [1, 2, 3]
+</span><span class='line'>            }
+</span><span class='line'>        }
+</span><span class='line'>
+</span><span class='line'>from tencentcloud.common import credential
+</span><span class='line'>from tencentcloud.common.exception.tencent_cloud_sdk_exception import TencentCloudSDKException
+</span><span class='line'># 导入对应产品模块的client models。
+</span><span class='line'>from tencentcloud.cvm.v20170312 import cvm_client, models
+</span><span class='line'>
+</span><span class='line'># 导入可选配置类
+</span><span class='line'>from tencentcloud.common.profile.client_profile import ClientProfile
+</span><span class='line'>from tencentcloud.common.profile.http_profile import HttpProfile
+</span><span class='line'>
+</span><span class='line'>def del_ins(client, ins):
+</span><span class='line'>    req = models.TerminateInstancesRequest()
+</span><span class='line'>
+</span><span class='line'>    params = '''{
+</span><span class='line'>        "InstanceIds" : [
+</span><span class='line'>            "%s"
+</span><span class='line'>        ]
+</span><span class='line'>    }''' % (ins)
+</span><span class='line'>    req.from_json_string(params)
+</span><span class='line'>
+</span><span class='line'>    resp = client.TerminateInstances(req)
+</span><span class='line'>    #print(resp.to_json_string(indent=2))
+</span><span class='line'>    log.error("%s" % req)
+</span><span class='line'>    log.error("%s" % resp)
+</span><span class='line'>
+</span><span class='line'>
+</span><span class='line'>def buy_ins(client, rz):
+</span><span class='line'>    req = models.RunInstancesRequest()
+</span><span class='line'>    endtime = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time()+3600*RZ[rz]["ActionTime"][0]-100))
+</span><span class='line'>
+</span><span class='line'>    params = '''{
+</span><span class='line'>        "Placement" : {
+</span><span class='line'>            "Zone" : "%s"
+</span><span class='line'>        },
+</span><span class='line'>        "ImageId" : "%s",
+</span><span class='line'>        "InstanceType" : "%s",
+</span><span class='line'>        "InstanceName" : "%s",
+</span><span class='line'>        "InstanceChargeType" : "POSTPAID_BY_HOUR",
+</span><span class='line'>        "InternetAccessible" : {
+</span><span class='line'>            "InternetChargeType" : "TRAFFIC_POSTPAID_BY_HOUR",
+</span><span class='line'>            "InternetMaxBandwidthOut" : 10
+</span><span class='line'>        },
+</span><span class='line'>        "LoginSettings" : {
+</span><span class='line'>            "Password" : "Dis@init3"
+</span><span class='line'>        },
+</span><span class='line'>        "EnhancedService" : {
+</span><span class='line'>            "SecurityService" : {
+</span><span class='line'>                "Enabled" : false
+</span><span class='line'>            },
+</span><span class='line'>            "MonitorService" : {
+</span><span class='line'>                "Enabled" : false
+</span><span class='line'>            }
+</span><span class='line'>        },
+</span><span class='line'>        "ActionTimer" : {
+</span><span class='line'>            "Externals" : {
+</span><span class='line'>            },
+</span><span class='line'>            "TimerAction" : "TerminateInstances",
+</span><span class='line'>            "ActionTime" : "%s"
+</span><span class='line'>        }
+</span><span class='line'>    }''' % (RZ[rz]["Zone"][0], RZ[rz]["ImageId"], RZ[rz]["InstanceType"][0], endtime, endtime)
+</span><span class='line'>
+</span><span class='line'>    req.from_json_string(params)
+</span><span class='line'>
+</span><span class='line'>    resp = client.RunInstances(req)
+</span><span class='line'>    #print(resp.to_json_string(indent=2))
+</span><span class='line'>    log.warning("%s" % req)
+</span><span class='line'>    log.warning("%s" % resp)
+</span><span class='line'>
+</span><span class='line'>
+</span><span class='line'>    count = len(resp.InstanceIdSet)
+</span><span class='line'>    log2.info("BUY %s count=%d" % (req.Placement.Zone, count))
+</span><span class='line'>    return count
+</span><span class='line'>
+</span><span class='line'>
+</span><span class='line'>def show_ins(client, rz):
+</span><span class='line'>    req = models.DescribeInstancesRequest()
+</span><span class='line'>
+</span><span class='line'>    respFilter = models.Filter()
+</span><span class='line'>    respFilter.Name = "zone"
+</span><span class='line'>    respFilter.Values = RZ[rz]["Zone"]
+</span><span class='line'>    req.Filters = [respFilter]
+</span><span class='line'>
+</span><span class='line'>    resp = client.DescribeInstances(req)
+</span><span class='line'>    #print(resp.to_json_string(indent=2))
+</span><span class='line'>    log.info("%s" % req)
+</span><span class='line'>    log.info("%s" % resp)
+</span><span class='line'>
+</span><span class='line'>    for ins in resp.InstanceSet:
+</span><span class='line'>        if ins.PublicIpAddresses and len(ins.PublicIpAddresses) &gt; 0:
+</span><span class='line'>            log2.info("%s &lt;/br&gt;%s %sMb/s %s &lt;/br&gt;&lt;/br&gt;" % (ins.PublicIpAddresses[0], ins.InstanceName, ins.InternetAccessible.InternetMaxBandwidthOut, ins.InstanceId))
+</span><span class='line'>        else:
+</span><span class='line'>            log2.info("%s &lt;/br&gt;%s %sMb/s %s &lt;/br&gt;&lt;/br&gt;" % ("null", ins.InstanceName, ins.InternetAccessible.InternetMaxBandwidthOut, ins.InstanceId))
+</span><span class='line'>    log2.info("SHOW zone=%s count=%d &lt;/br&gt;" % (RZ[rz]["Zone"], resp.TotalCount))
+</span><span class='line'>    return resp.TotalCount
+</span><span class='line'>
+</span><span class='line'>try:
+</span><span class='line'>    # 实例化一个认证对象，入参需要传入腾讯云账户secretId，secretKey
+</span><span class='line'>    #cred = credential.Credential(os.environ.get("TENCENTCLOUD_SECRET_ID"), os.environ.get("TENCENTCLOUD_SECRET_KEY"))
+</span><span class='line'>    # TODO
+</span><span class='line'>    cred = credential.Credential("your_id", "your_key")
+</span><span class='line'>
+</span><span class='line'>    # 实例化一个http选项，可选的，没有特殊需求可以跳过。
+</span><span class='line'>    httpProfile = HttpProfile()
+</span><span class='line'>    httpProfile.reqMethod = "GET"  # post请求(默认为post请求)
+</span><span class='line'>    httpProfile.reqTimeout = 30    # 请求超时时间，单位为秒(默认60秒)
+</span><span class='line'>    httpProfile.endpoint = "cvm.ap-guangzhou.tencentcloudapi.com"  # 指定接入地域域名(默认就近接入)
+</span><span class='line'>
+</span><span class='line'>    # 实例化一个client选项，可选的，没有特殊需求可以跳过。
+</span><span class='line'>    clientProfile = ClientProfile()
+</span><span class='line'>    clientProfile.signMethod = "TC3-HMAC-SHA256"  # 指定签名算法
+</span><span class='line'>    clientProfile.language = "en-US"
+</span><span class='line'>    clientProfile.httpProfile = httpProfile
+</span><span class='line'>
+</span><span class='line'>    rz = "hk"
+</span><span class='line'>    count = 0
+</span><span class='line'>    if len(sys.argv) &gt;= 2:
+</span><span class='line'>        rz = sys.argv[1]
+</span><span class='line'>
+</span><span class='line'>    if len(sys.argv) &gt;= 3:
+</span><span class='line'>        count = int(sys.argv[2])
+</span><span class='line'>
+</span><span class='line'>    if rz not in RZ:
+</span><span class='line'>        quit()
+</span><span class='line'>
+</span><span class='line'>    # 实例化要请求产品(以cvm为例)的client对象，clientProfile是可选的。
+</span><span class='line'>    client = cvm_client.CvmClient(cred, RZ[rz]["Region"], clientProfile)
+</span><span class='line'>
+</span><span class='line'>    if show_ins(client, rz) &lt; count:
+</span><span class='line'>        if buy_ins(client, rz) &gt; 0:
+</span><span class='line'>            show_ins(client, rz)
+</span><span class='line'>
+</span><span class='line'>    #del_ins(client, "")
+</span><span class='line'>
+</span><span class='line'>except TencentCloudSDKException as err:
+</span><span class='line'>    print(err)</span></code></pre></td></tr></table></div></figure>
 
 
-<p>优化后：
-单独优化skb申请释放：
-发送14.2Mpps 每个cpu 50%</p>
+<hr />
 
-<p>qdisc优化和skb申请释放优化：
-发送14.2Mpps 每个cpu 20%</p>
+<h3>v1.0</h3>
 
-<p>只用1个cpu：发送9.6Mpps, cpu 100%
-用2个cpu：发送14.2Mpps, 每个cpu 80%</p>
+<h4>查询</h4>
 
-<p>相比netmap单cpu 60%发送14.3Mpps, 两轮优化后还略差些，不过perf看热点已经在ixgbe里了</p>
-
-<h3>参考</h3>
-
-<p><a href="http://launchpadlibrarian.net/443052277/linux-source-4.15.0_4.15.0-65.74_all.deb">linux-source-4.15.0_4.15.0-65.74_all.deb</a></p>
-
-<p><a href="https://blog.csdn.net/one_clouder/article/details/52685249">二层报文发送之qdisc实现分析</a></p>
-
-<p><a href="https://www.cnblogs.com/ne-liqian/p/9294757.html">netmap配置</a></p>
-
-<p><a href="https://tqr.ink/2017/04/16/intel-82599-receive-packet/">基于82599网卡的二层网络数据包接收</a></p>
-
-<p><a href="https://tqr.ink/2017/05/01/intel-82599-transmit-packet/">基于82599网卡的二层网络数据包发送</a></p>
-
-<p><a href="https://www.ichenfu.com/2019/03/10/how-to-drop-10-million-packets-per-second/">如何在一秒之内丢弃1000万个网络数据包</a></p>
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2019/10/31/10Gb-test/">X520-T1 Linux内核收发包14Mpps</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2019-10-31T10:56:00+08:00'><span class='date'>2019-10-31</span> <span class='time'>10:56:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><h3>收包</h3>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>ethtool -K enp3s0 gro off
-</span><span class='line'>PRE_ROUTING 丢包，14Mpps
-</span><span class='line'>LOCAL_IN 丢包，待优化</span></code></pre></td></tr></table></div></figure>
-
-
-<h3>发包(I7-7700k, no_trubo=1)</h3>
+<p>来自SDK样例</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -627,39 +593,983 @@ ubuntu 18.04, linux-image-4.15.0-XX</p>
 <span class='line-number'>20</span>
 <span class='line-number'>21</span>
 <span class='line-number'>22</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>timer 8Mpps
-</span><span class='line'>timer+gso  tcp:11Mpps; udp:14Mpps,但是是IP分片的包
-</span><span class='line'>gso 需要关闭tso??  ethtool -K enp3s0 tso off gso off
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'># -*- coding: utf-8 -*-
+</span><span class='line'>import os
 </span><span class='line'>
+</span><span class='line'>from tencentcloud.common import credential
+</span><span class='line'>from tencentcloud.common.exception.tencent_cloud_sdk_exception import TencentCloudSDKException
+</span><span class='line'># 导入对应产品模块的client models。
+</span><span class='line'>from tencentcloud.cvm.v20170312 import cvm_client, models
 </span><span class='line'>
-</span><span class='line'>kthread pfifo    14Mpps           cpu: 80%
-</span><span class='line'>kthread fq_codel 12~14Mpps        cpu: 100%
-</span><span class='line'>kthread noqueue  12Mpps           cpu: 100%
+</span><span class='line'># 导入可选配置类
+</span><span class='line'>from tencentcloud.common.profile.client_profile import ClientProfile
+</span><span class='line'>from tencentcloud.common.profile.http_profile import HttpProfile
+</span><span class='line'>try:
+</span><span class='line'>    # 实例化一个认证对象，入参需要传入腾讯云账户secretId，secretKey
+</span><span class='line'>    cred = credential.Credential(
+</span><span class='line'>        os.environ.get("TENCENTCLOUD_SECRET_ID"),
+</span><span class='line'>        os.environ.get("TENCENTCLOUD_SECRET_KEY"))
 </span><span class='line'>
+</span><span class='line'>    # 实例化一个http选项，可选的，没有特殊需求可以跳过。
+</span><span class='line'>    httpProfile = HttpProfile()
+</span><span class='line'>    httpProfile.reqMethod = "GET"  # post请求(默认为post请求)
+</span><span class='line'>    httpProfile.reqTimeout = 30    # 请求超时时间，单位为秒(默认60秒)
+</span><span class='line'>    httpProfile.endpoint = "cvm.ap-guangzhou.tencentcloudapi.com"  # 指定接入地域域名(默认就近接入)
 </span><span class='line'>
-</span><span class='line'>kthread pfifo static_skb    14Mpps    cpu: 40%
-</span><span class='line'>kthread fq_codel static_skb 14Mpps    cpu: 40%
-</span><span class='line'>kthread noqueue static_skb  12Mpps    cpu: 100%
+</span><span class='line'>    # 实例化一个client选项，可选的，没有特殊需求可以跳过。
+</span><span class='line'>    clientProfile = ClientProfile()
+</span><span class='line'>    clientProfile.signMethod = "TC3-HMAC-SHA256"  # 指定签名算法
+</span><span class='line'>    clientProfile.language = "en-US"
+</span><span class='line'>    clientProfile.httpProfile = httpProfile
 </span><span class='line'>
+</span><span class='line'>    # 实例化要请求产品(以cvm为例)的client对象，clientProfile是可选的。
+</span><span class='line'>    client = cvm_client.CvmClient(cred, "ap-hongkong", clientProfile)
 </span><span class='line'>
-</span><span class='line'>kthread noqueue static_skb skb_list  14Mpps   cpu: 20%
-</span><span class='line'>&#9;&#9;&#9;&#9;1cpu: 9Mpps, cpu 100%
-</span><span class='line'>&#9;&#9;&#9;&#9;2cpu: 14Mpps, cpu 60%
+</span><span class='line'>    # 实例化一个cvm实例信息查询请求对象,每个接口都会对应一个request对象。
+</span><span class='line'>    req = models.DescribeInstancesRequest()
 </span><span class='line'>
+</span><span class='line'>    # 填充请求参数,这里request对象的成员变量即对应接口的入参。
+</span><span class='line'>    # 你可以通过官网接口文档或跳转到request对象的定义处查看请求参数的定义。
+</span><span class='line'>    respFilter = models.Filter()  # 创建Filter对象, 以zone的维度来查询cvm实例。
+</span><span class='line'>    respFilter.Name = "zone"
+</span><span class='line'>    respFilter.Values = ["ap-hongkong-1", "ap-hongkong-2"]
+</span><span class='line'>    req.Filters = [respFilter]  # Filters 是成员为Filter对象的列表
 </span><span class='line'>
-</span><span class='line'>M.2 SSD 增加收包si 20%，发包10%
-</span><span class='line'>I5-6500 只能发送12.5Mpps, netmap也一样 ？？？</span></code></pre></td></tr></table></div></figure>
+</span><span class='line'>    # 这里还支持以标准json格式的string来赋值请求参数的方式。下面的代码跟上面的参数赋值是等效的。
+</span><span class='line'>    params = '''{
+</span><span class='line'>        "Filters": [
+</span><span class='line'>            {
+</span><span class='line'>                "Name": "zone",
+</span><span class='line'>                "Values": ["ap-hongkong-1", "ap-hongkong-2"]
+</span><span class='line'>            }
+</span><span class='line'>        ]
+</span><span class='line'>    }'''
+</span><span class='line'>    req.from_json_string(params)
+</span><span class='line'>
+</span><span class='line'>    # 通过client对象调用DescribeInstances方法发起请求。注意请求方法名与请求对象是对应的。
+</span><span class='line'>    # 返回的resp是一个DescribeInstancesResponse类的实例，与请求对象对应。
+</span><span class='line'>    resp = client.DescribeInstances(req)
+</span><span class='line'>
+</span><span class='line'>    # 输出json格式的字符串回包
+</span><span class='line'>    print(resp.to_json_string(indent=2))
+</span><span class='line'>
+</span><span class='line'>except TencentCloudSDKException as err:
+</span><span class='line'>    print(err)</span></code></pre></td></tr></table></div></figure>
 
 
-<h3>转发</h3>
+<h4>购买 香港-1core-1GB-5Mbps-1小时后销毁</h4>
+
+<p>ImageId 换个公共的 或 自己制作一个</p>
+
+<p><a href="https://console.cloud.tencent.com/cvm/image?rid=5&amp;imageType=PUBLIC_IMAGE">https://console.cloud.tencent.com/cvm/image?rid=5&amp;imageType=PUBLIC_IMAGE</a></p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>12Mpps 以上? 待测
-</span><span class='line'>把收到的包转发比申请一个包发出更优</span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+<span class='line-number'>82</span>
+<span class='line-number'>83</span>
+<span class='line-number'>84</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'># -*- coding: utf-8 -*-
+</span><span class='line'>import os
+</span><span class='line'>import time
+</span><span class='line'>
+</span><span class='line'>from tencentcloud.common import credential
+</span><span class='line'>from tencentcloud.common.exception.tencent_cloud_sdk_exception import TencentCloudSDKException
+</span><span class='line'># 导入对应产品模块的client models。
+</span><span class='line'>from tencentcloud.cvm.v20170312 import cvm_client, models
+</span><span class='line'>
+</span><span class='line'># 导入可选配置类
+</span><span class='line'>from tencentcloud.common.profile.client_profile import ClientProfile
+</span><span class='line'>from tencentcloud.common.profile.http_profile import HttpProfile
+</span><span class='line'>try:
+</span><span class='line'>    # 实例化一个认证对象，入参需要传入腾讯云账户secretId，secretKey
+</span><span class='line'>    cred = credential.Credential(
+</span><span class='line'>        os.environ.get("TENCENTCLOUD_SECRET_ID"),
+</span><span class='line'>        os.environ.get("TENCENTCLOUD_SECRET_KEY"))
+</span><span class='line'>
+</span><span class='line'>    # 实例化一个http选项，可选的，没有特殊需求可以跳过。
+</span><span class='line'>    httpProfile = HttpProfile()
+</span><span class='line'>    httpProfile.reqMethod = "GET"  # post请求(默认为post请求)
+</span><span class='line'>    httpProfile.reqTimeout = 30    # 请求超时时间，单位为秒(默认60秒)
+</span><span class='line'>    httpProfile.endpoint = "cvm.ap-guangzhou.tencentcloudapi.com"  # 指定接入地域域名(默认就近接入)
+</span><span class='line'>
+</span><span class='line'>    # 实例化一个client选项，可选的，没有特殊需求可以跳过。
+</span><span class='line'>    clientProfile = ClientProfile()
+</span><span class='line'>    clientProfile.signMethod = "TC3-HMAC-SHA256"  # 指定签名算法
+</span><span class='line'>    clientProfile.language = "en-US"
+</span><span class='line'>    clientProfile.httpProfile = httpProfile
+</span><span class='line'>
+</span><span class='line'>    # 实例化要请求产品(以cvm为例)的client对象，clientProfile是可选的。
+</span><span class='line'>    client = cvm_client.CvmClient(cred, "ap-hongkong", clientProfile)
+</span><span class='line'>
+</span><span class='line'>    # 实例化一个cvm实例信息查询请求对象,每个接口都会对应一个request对象。
+</span><span class='line'>    req = models.RunInstancesRequest()
+</span><span class='line'>
+</span><span class='line'>    # 填充请求参数,这里request对象的成员变量即对应接口的入参。
+</span><span class='line'>    # 你可以通过官网接口文档或跳转到request对象的定义处查看请求参数的定义。
+</span><span class='line'>
+</span><span class='line'>    # 这里还支持以标准json格式的string来赋值请求参数的方式。下面的代码跟上面的参数赋值是等效的。
+</span><span class='line'>    params = '''{
+</span><span class='line'>        "Region" : "ap-hongkong",
+</span><span class='line'>        "Placement" : {
+</span><span class='line'>            "Zone" : "ap-hongkong-2"
+</span><span class='line'>        },
+</span><span class='line'>        "ImageId" : "img-7b63u5v2",
+</span><span class='line'>        "InstanceChargeType" : "POSTPAID_BY_HOUR",
+</span><span class='line'>        "InstanceType" : "S2.SMALL1",
+</span><span class='line'>        "InternetAccessible" : {
+</span><span class='line'>            "InternetChargeType" : "TRAFFIC_POSTPAID_BY_HOUR",
+</span><span class='line'>            "InternetMaxBandwidthOut" : 5
+</span><span class='line'>        },
+</span><span class='line'>        "LoginSettings" : {
+</span><span class='line'>            "Password" : "QAZwsx123"
+</span><span class='line'>        },
+</span><span class='line'>        "EnhancedService" : {
+</span><span class='line'>            "SecurityService" : {
+</span><span class='line'>                "Enabled" : false
+</span><span class='line'>            },
+</span><span class='line'>            "MonitorService" : {
+</span><span class='line'>                "Enabled" : false
+</span><span class='line'>            }
+</span><span class='line'>        },
+</span><span class='line'>        "ActionTimer" : {
+</span><span class='line'>            "Externals" : {
+</span><span class='line'>            },
+</span><span class='line'>            "TimerAction" : "TerminateInstances",
+</span><span class='line'>            "ActionTime" : "%s"
+</span><span class='line'>        }
+</span><span class='line'>    }''' % (time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time()+3300)))
+</span><span class='line'>
+</span><span class='line'>    req.from_json_string(params)
+</span><span class='line'>
+</span><span class='line'>    #print(req)
+</span><span class='line'>
+</span><span class='line'>    # 通过client对象调用DescribeInstances方法发起请求。注意请求方法名与请求对象是对应的。
+</span><span class='line'>    # 返回的resp是一个DescribeInstancesResponse类的实例，与请求对象对应。
+</span><span class='line'>    resp = client.RunInstances(req)
+</span><span class='line'>
+</span><span class='line'>    # 输出json格式的字符串回包
+</span><span class='line'>    print(resp.to_json_string(indent=2))
+</span><span class='line'>
+</span><span class='line'>except TencentCloudSDKException as err:
+</span><span class='line'>    print(err)</span></code></pre></td></tr></table></div></figure>
 
 
-<p>细节待更新</p>
+<h4>退还CVM</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'># -*- coding: utf-8 -*-
+</span><span class='line'>import os
+</span><span class='line'>
+</span><span class='line'>from tencentcloud.common import credential
+</span><span class='line'>from tencentcloud.common.exception.tencent_cloud_sdk_exception import TencentCloudSDKException
+</span><span class='line'># 导入对应产品模块的client models。
+</span><span class='line'>from tencentcloud.cvm.v20170312 import cvm_client, models
+</span><span class='line'>
+</span><span class='line'># 导入可选配置类
+</span><span class='line'>from tencentcloud.common.profile.client_profile import ClientProfile
+</span><span class='line'>from tencentcloud.common.profile.http_profile import HttpProfile
+</span><span class='line'>try:
+</span><span class='line'>    # 实例化一个认证对象，入参需要传入腾讯云账户secretId，secretKey
+</span><span class='line'>    cred = credential.Credential(
+</span><span class='line'>        os.environ.get("TENCENTCLOUD_SECRET_ID"),
+</span><span class='line'>        os.environ.get("TENCENTCLOUD_SECRET_KEY"))
+</span><span class='line'>
+</span><span class='line'>    # 实例化一个http选项，可选的，没有特殊需求可以跳过。
+</span><span class='line'>    httpProfile = HttpProfile()
+</span><span class='line'>    httpProfile.reqMethod = "GET"  # post请求(默认为post请求)
+</span><span class='line'>    httpProfile.reqTimeout = 30    # 请求超时时间，单位为秒(默认60秒)
+</span><span class='line'>    httpProfile.endpoint = "cvm.ap-guangzhou.tencentcloudapi.com"  # 指定接入地域域名(默认就近接入)
+</span><span class='line'>
+</span><span class='line'>    # 实例化一个client选项，可选的，没有特殊需求可以跳过。
+</span><span class='line'>    clientProfile = ClientProfile()
+</span><span class='line'>    clientProfile.signMethod = "TC3-HMAC-SHA256"  # 指定签名算法
+</span><span class='line'>    clientProfile.language = "en-US"
+</span><span class='line'>    clientProfile.httpProfile = httpProfile
+</span><span class='line'>
+</span><span class='line'>    # 实例化要请求产品(以cvm为例)的client对象，clientProfile是可选的。
+</span><span class='line'>    client = cvm_client.CvmClient(cred, "ap-hongkong", clientProfile)
+</span><span class='line'>
+</span><span class='line'>    # 实例化一个cvm实例信息查询请求对象,每个接口都会对应一个request对象。
+</span><span class='line'>    req = models.TerminateInstancesRequest()
+</span><span class='line'>
+</span><span class='line'>    # 填充请求参数,这里request对象的成员变量即对应接口的入参。
+</span><span class='line'>    params = '''{
+</span><span class='line'>        "InstanceIds" : [
+</span><span class='line'>            "ins-6y6yfpdw"
+</span><span class='line'>        ]
+</span><span class='line'>    }'''
+</span><span class='line'>    req.from_json_string(params)
+</span><span class='line'>
+</span><span class='line'>    #print(req)
+</span><span class='line'>    # 通过client对象调用DescribeInstances方法发起请求。注意请求方法名与请求对象是对应的。
+</span><span class='line'>    # 返回的resp是一个DescribeInstancesResponse类的实例，与请求对象对应。
+</span><span class='line'>    resp = client.TerminateInstances(req)
+</span><span class='line'>
+</span><span class='line'>    # 输出json格式的字符串回包
+</span><span class='line'>    print(resp.to_json_string(indent=2))
+</span><span class='line'>
+</span><span class='line'>except TencentCloudSDKException as err:
+</span><span class='line'>    print(err)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>phpSDK 已经更新，以下需要改</p>
+
+<h2>php</h2>
+
+<p>看 vendor/GuzzleHttp/Client.php 中 configureDefaults ，代理需要设置</p>
+
+<p>export HTTP_PROXY=tcp://xx</p>
+
+<p>export HTTPS_PROXY=tcp://xx</p>
+
+<p>或者安装 php-curl 就可以改用</p>
+
+<p>export http_proxy=<a href="http://">http://</a></p>
+
+<p>export https_proxy=<a href="http://">http://</a></p>
+
+<h4>SDK</h4>
+
+<p><a href="https://github.com/TencentCloud/tencentcloud-sdk-php">https://github.com/TencentCloud/tencentcloud-sdk-php</a></p>
+
+<p>git clone <a href="https://github.com/TencentCloud/tencentcloud-sdk-php.git">https://github.com/TencentCloud/tencentcloud-sdk-php.git</a></p>
+
+<h4>密钥</h4>
+
+<p><a href="https://console.cloud.tencent.com/cam/capi">https://console.cloud.tencent.com/cam/capi</a></p>
+
+<p>export TENCENTCLOUD_SECRET_ID=xx</p>
+
+<p>export TENCENTCLOUD_SECRET_KEY=xx</p>
+
+<h4>查询</h4>
+
+<p>来自SDK样例</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>&lt;?php
+</span><span class='line'>require_once '../../../TCloudAutoLoader.php';
+</span><span class='line'>// 导入对应产品模块的client
+</span><span class='line'>use TencentCloud\Cvm\V20170312\CvmClient;
+</span><span class='line'>// 导入要请求接口对应的Request类
+</span><span class='line'>use TencentCloud\Cvm\V20170312\Models\DescribeInstancesRequest;
+</span><span class='line'>use TencentCloud\Cvm\V20170312\Models\Filter;
+</span><span class='line'>use TencentCloud\Common\Exception\TencentCloudSDKException;
+</span><span class='line'>use TencentCloud\Common\Credential;
+</span><span class='line'>// 导入可选配置类
+</span><span class='line'>use TencentCloud\Common\Profile\ClientProfile;
+</span><span class='line'>use TencentCloud\Common\Profile\HttpProfile;
+</span><span class='line'>
+</span><span class='line'>try {
+</span><span class='line'>    // 实例化一个证书对象，入参需要传入腾讯云账户secretId，secretKey
+</span><span class='line'>    //$cred = new Credential("secretId", "secretKey");
+</span><span class='line'>    $cred = new Credential(getenv("TENCENTCLOUD_SECRET_ID"), getenv("TENCENTCLOUD_SECRET_KEY"));
+</span><span class='line'>
+</span><span class='line'>    // 实例化一个http选项，可选的，没有特殊需求可以跳过
+</span><span class='line'>    $httpProfile = new HttpProfile();
+</span><span class='line'>    $httpProfile-&gt;setReqMethod("GET");  // post请求(默认为post请求)
+</span><span class='line'>    $httpProfile-&gt;setReqTimeout(30);    // 请求超时时间，单位为秒(默认60秒)
+</span><span class='line'>    $httpProfile-&gt;setEndpoint("cvm.ap-guangzhou.tencentcloudapi.com");  // 指定接入地域域名(默认就近接入)
+</span><span class='line'>
+</span><span class='line'>    // 实例化一个client选项，可选的，没有特殊需求可以跳过
+</span><span class='line'>    $clientProfile = new ClientProfile();
+</span><span class='line'>    $clientProfile-&gt;setSignMethod("TC3-HMAC-SHA256");  // 指定签名算法(默认为HmacSHA256)
+</span><span class='line'>    $clientProfile-&gt;setHttpProfile($httpProfile);
+</span><span class='line'>
+</span><span class='line'>    // 实例化要请求产品(以cvm为例)的client对象,clientProfile是可选的
+</span><span class='line'>    $client = new CvmClient($cred, "ap-hongkong", $clientProfile);
+</span><span class='line'>
+</span><span class='line'>    // 实例化一个cvm实例信息查询请求对象,每个接口都会对应一个request对象。
+</span><span class='line'>    $req = new DescribeInstancesRequest();
+</span><span class='line'>
+</span><span class='line'>    // 填充请求参数,这里request对象的成员变量即对应接口的入参
+</span><span class='line'>    // 你可以通过官网接口文档或跳转到request对象的定义处查看请求参数的定义
+</span><span class='line'>    $respFilter = new Filter();  // 创建Filter对象, 以zone的维度来查询cvm实例
+</span><span class='line'>    $respFilter-&gt;Name = "zone";
+</span><span class='line'>    $respFilter-&gt;Values = ["ap-hongkong-1", "ap-hongkong-2"];
+</span><span class='line'>    $req-&gt;Filters = [$respFilter];  // Filters 是成员为Filter对象的列表
+</span><span class='line'>
+</span><span class='line'>    // 这里还支持以标准json格式的string来赋值请求参数的方式。下面的代码跟上面的参数赋值是等效的
+</span><span class='line'>    $params = [
+</span><span class='line'>        "Filters" =&gt; [
+</span><span class='line'>            [
+</span><span class='line'>                "Name" =&gt; "zone",
+</span><span class='line'>                "Values" =&gt; ["ap-hongkong-1", "ap-hongkong-2"]
+</span><span class='line'>            ]
+</span><span class='line'>        ]
+</span><span class='line'>    ];
+</span><span class='line'>    $req-&gt;fromJsonString(json_encode($params));
+</span><span class='line'>
+</span><span class='line'>    // 通过client对象调用DescribeInstances方法发起请求。注意请求方法名与请求对象是对应的
+</span><span class='line'>    // 返回的resp是一个DescribeInstancesResponse类的实例，与请求对象对应
+</span><span class='line'>    $resp = $client-&gt;DescribeInstances($req);
+</span><span class='line'>
+</span><span class='line'>    // 输出json格式的字符串回包
+</span><span class='line'>    print_r($resp-&gt;toJsonString());
+</span><span class='line'>}
+</span><span class='line'>catch(TencentCloudSDKException $e) {
+</span><span class='line'>    echo $e;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>购买 香港-1core-1GB-5Mbps-1小时后销毁</h4>
+
+<p>ImageId 换个公共的 或 自己制作一个</p>
+
+<p><a href="https://console.cloud.tencent.com/cvm/image?rid=5&amp;imageType=PUBLIC_IMAGE">https://console.cloud.tencent.com/cvm/image?rid=5&amp;imageType=PUBLIC_IMAGE</a></p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>&lt;?php
+</span><span class='line'>require_once '../../../TCloudAutoLoader.php';
+</span><span class='line'>// 导入对应产品模块的client
+</span><span class='line'>use TencentCloud\Cvm\V20170312\CvmClient;
+</span><span class='line'>// 导入要请求接口对应的Request类
+</span><span class='line'>use TencentCloud\Cvm\V20170312\Models\RunInstancesRequest;
+</span><span class='line'>use TencentCloud\Cvm\V20170312\Models\Filter;
+</span><span class='line'>use TencentCloud\Common\Exception\TencentCloudSDKException;
+</span><span class='line'>use TencentCloud\Common\Credential;
+</span><span class='line'>// 导入可选配置类
+</span><span class='line'>use TencentCloud\Common\Profile\ClientProfile;
+</span><span class='line'>use TencentCloud\Common\Profile\HttpProfile;
+</span><span class='line'>
+</span><span class='line'>try {
+</span><span class='line'>    // 实例化一个证书对象，入参需要传入腾讯云账户secretId，secretKey
+</span><span class='line'>    //$cred = new Credential("secretId", "secretKey");
+</span><span class='line'>    $cred = new Credential(getenv("TENCENTCLOUD_SECRET_ID"), getenv("TENCENTCLOUD_SECRET_KEY"));
+</span><span class='line'>
+</span><span class='line'>    // 实例化一个http选项，可选的，没有特殊需求可以跳过
+</span><span class='line'>    $httpProfile = new HttpProfile();
+</span><span class='line'>    $httpProfile-&gt;setReqMethod("GET");  // post请求(默认为post请求)
+</span><span class='line'>    $httpProfile-&gt;setReqTimeout(30);    // 请求超时时间，单位为秒(默认60秒)
+</span><span class='line'>    $httpProfile-&gt;setEndpoint("cvm.ap-guangzhou.tencentcloudapi.com");  // 指定接入地域域名(默认就近接入)
+</span><span class='line'>
+</span><span class='line'>    // 实例化一个client选项，可选的，没有特殊需求可以跳过
+</span><span class='line'>    $clientProfile = new ClientProfile();
+</span><span class='line'>    $clientProfile-&gt;setSignMethod("TC3-HMAC-SHA256");  // 指定签名算法(默认为HmacSHA256)
+</span><span class='line'>    $clientProfile-&gt;setHttpProfile($httpProfile);
+</span><span class='line'>
+</span><span class='line'>    // 实例化要请求产品(以cvm为例)的client对象,clientProfile是可选的
+</span><span class='line'>    $client = new CvmClient($cred, "ap-hongkong", $clientProfile);
+</span><span class='line'>
+</span><span class='line'>    // 实例化一个cvm实例信息查询请求对象,每个接口都会对应一个request对象。
+</span><span class='line'>    $req = new RunInstancesRequest();
+</span><span class='line'>
+</span><span class='line'>    // 填充请求参数,这里request对象的成员变量即对应接口的入参
+</span><span class='line'>    // 你可以通过官网接口文档或跳转到request对象的定义处查看请求参数的定义
+</span><span class='line'>    // 这里还支持以标准json格式的string来赋值请求参数的方式。下面的代码跟上面的参数赋值是等效的
+</span><span class='line'>    $params = [
+</span><span class='line'>        "Region" =&gt; "ap-hongkong",
+</span><span class='line'>        "Placement" =&gt; [
+</span><span class='line'>            "Zone" =&gt; "ap-hongkong-2"
+</span><span class='line'>        ],
+</span><span class='line'>        "ImageId" =&gt; "img-7b63u5v2",
+</span><span class='line'>        "InstanceChargeType" =&gt; "POSTPAID_BY_HOUR",
+</span><span class='line'>        "InstanceType" =&gt; "S2.SMALL1",
+</span><span class='line'>        "InternetAccessible" =&gt; [
+</span><span class='line'>            "InternetChargeType" =&gt; "TRAFFIC_POSTPAID_BY_HOUR",
+</span><span class='line'>            "InternetMaxBandwidthOut" =&gt; 5
+</span><span class='line'>        ],
+</span><span class='line'>        "LoginSettings" =&gt; [
+</span><span class='line'>            "Password" =&gt; "QAZwsx123"
+</span><span class='line'>        ],
+</span><span class='line'>        "EnhancedService" =&gt; [
+</span><span class='line'>            "SecurityService" =&gt; [
+</span><span class='line'>                "Enabled" =&gt; false
+</span><span class='line'>            ],
+</span><span class='line'>            "MonitorService" =&gt; [
+</span><span class='line'>                "Enabled" =&gt; false
+</span><span class='line'>            ]
+</span><span class='line'>        ],
+</span><span class='line'>        "ActionTimer" =&gt; [
+</span><span class='line'>            "Externals" =&gt; [
+</span><span class='line'>            ],
+</span><span class='line'>            "TimerAction" =&gt; "TerminateInstances",
+</span><span class='line'>            "ActionTime" =&gt; date('Y-m-d H:i:s', time()+3300),
+</span><span class='line'>        ]
+</span><span class='line'>    ];
+</span><span class='line'>    $req-&gt;fromJsonString(json_encode($params));
+</span><span class='line'>
+</span><span class='line'>    #var_dump($req);
+</span><span class='line'>    // 通过client对象调用DescribeInstances方法发起请求。注意请求方法名与请求对象是对应的
+</span><span class='line'>    // 返回的resp是一个DescribeInstancesResponse类的实例，与请求对象对应
+</span><span class='line'>    $resp = $client-&gt;RunInstances($req);
+</span><span class='line'>
+</span><span class='line'>    // 输出json格式的字符串回包
+</span><span class='line'>    print_r($resp-&gt;toJsonString());
+</span><span class='line'>}
+</span><span class='line'>catch(TencentCloudSDKException $e) {
+</span><span class='line'>    echo $e;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>退还CVM</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>&lt;?php
+</span><span class='line'>require_once '../../../TCloudAutoLoader.php';
+</span><span class='line'>// 导入对应产品模块的client
+</span><span class='line'>use TencentCloud\Cvm\V20170312\CvmClient;
+</span><span class='line'>// 导入要请求接口对应的Request类
+</span><span class='line'>use TencentCloud\Cvm\V20170312\Models\TerminateInstancesRequest;
+</span><span class='line'>use TencentCloud\Cvm\V20170312\Models\Filter;
+</span><span class='line'>use TencentCloud\Common\Exception\TencentCloudSDKException;
+</span><span class='line'>use TencentCloud\Common\Credential;
+</span><span class='line'>// 导入可选配置类
+</span><span class='line'>use TencentCloud\Common\Profile\ClientProfile;
+</span><span class='line'>use TencentCloud\Common\Profile\HttpProfile;
+</span><span class='line'>
+</span><span class='line'>try {
+</span><span class='line'>    // 实例化一个证书对象，入参需要传入腾讯云账户secretId，secretKey
+</span><span class='line'>    //$cred = new Credential("secretId", "secretKey");
+</span><span class='line'>    $cred = new Credential(getenv("TENCENTCLOUD_SECRET_ID"), getenv("TENCENTCLOUD_SECRET_KEY"));
+</span><span class='line'>
+</span><span class='line'>    // 实例化一个http选项，可选的，没有特殊需求可以跳过
+</span><span class='line'>    $httpProfile = new HttpProfile();
+</span><span class='line'>    $httpProfile-&gt;setReqMethod("GET");  // post请求(默认为post请求)
+</span><span class='line'>    $httpProfile-&gt;setReqTimeout(30);    // 请求超时时间，单位为秒(默认60秒)
+</span><span class='line'>    $httpProfile-&gt;setEndpoint("cvm.ap-guangzhou.tencentcloudapi.com");  // 指定接入地域域名(默认就近接入)
+</span><span class='line'>
+</span><span class='line'>    // 实例化一个client选项，可选的，没有特殊需求可以跳过
+</span><span class='line'>    $clientProfile = new ClientProfile();
+</span><span class='line'>    $clientProfile-&gt;setSignMethod("TC3-HMAC-SHA256");  // 指定签名算法(默认为HmacSHA256)
+</span><span class='line'>    $clientProfile-&gt;setHttpProfile($httpProfile);
+</span><span class='line'>
+</span><span class='line'>    // 实例化要请求产品(以cvm为例)的client对象,clientProfile是可选的
+</span><span class='line'>    $client = new CvmClient($cred, "ap-hongkong", $clientProfile);
+</span><span class='line'>
+</span><span class='line'>    // 实例化一个cvm实例信息查询请求对象,每个接口都会对应一个request对象。
+</span><span class='line'>    $req = new TerminateInstancesRequest();
+</span><span class='line'>
+</span><span class='line'>    // 填充请求参数,这里request对象的成员变量即对应接口的入参
+</span><span class='line'>    // 你可以通过官网接口文档或跳转到request对象的定义处查看请求参数的定义
+</span><span class='line'>    // 这里还支持以标准json格式的string来赋值请求参数的方式。下面的代码跟上面的参数赋值是等效的
+</span><span class='line'>    $params = [
+</span><span class='line'>        "InstanceIds" =&gt; [
+</span><span class='line'>            "ins-1rfi3vms"
+</span><span class='line'>        ]
+</span><span class='line'>    ];
+</span><span class='line'>    $req-&gt;fromJsonString(json_encode($params));
+</span><span class='line'>
+</span><span class='line'>    // 通过client对象调用DescribeInstances方法发起请求。注意请求方法名与请求对象是对应的
+</span><span class='line'>    // 返回的resp是一个DescribeInstancesResponse类的实例，与请求对象对应
+</span><span class='line'>    $resp = $client-&gt;TerminateInstances($req);
+</span><span class='line'>
+</span><span class='line'>    // 输出json格式的字符串回包
+</span><span class='line'>    print_r($resp-&gt;toJsonString());
+</span><span class='line'>}
+</span><span class='line'>catch(TencentCloudSDKException $e) {
+</span><span class='line'>    echo $e;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2019/12/12/debug-ubuntu-kdump/">ubuntu crash</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2019-12-12T12:55:00+08:00'><span class='date'>2019-12-12</span> <span class='time'>12:55:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="https://www.jianshu.com/p/3c92647140f7">https://www.jianshu.com/p/3c92647140f7</a></p>
+
+<p><a href="https://help.ubuntu.com/lts/serverguide/kernel-crash-dump.html">https://help.ubuntu.com/lts/serverguide/kernel-crash-dump.html</a></p>
+
+<h4>自己编译的内核会OOM，需要增大内存</h4>
+
+<p>If the dump does not work due to OOM (Out Of Memory) error, then try increasing the amount of reserved memory by editing</p>
+
+<p>/etc/default/grub.d/kdump-tools.cfg</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT crashkernel=384M-:256M"</span></code></pre></td></tr></table></div></figure>
+
+
+<p>run sudo update-grub and then reboot afterwards, and then test again.</p>
+
+<hr />
+
+<h4>安装</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>sudo apt-get install linux-crashdump</span></code></pre></td></tr></table></div></figure>
+
+
+<p>重启机器</p>
+
+<h4>需要启动下面的服务</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>$ service --status-all | grep ' k'
+</span><span class='line'>[ + ] kdump-tools
+</span><span class='line'>[ + ] kerneloops
+</span><span class='line'>[ + ] kexec
+</span><span class='line'>[ + ] kexec-load</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>查看kdump的状态</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>$ kdump-config show
+</span><span class='line'>DUMP_MODE:        kdump
+</span><span class='line'>USE_KDUMP:        1
+</span><span class='line'>KDUMP_SYSCTL:     kernel.panic_on_oops=1
+</span><span class='line'>KDUMP_COREDIR:    /var/crash
+</span><span class='line'>crashkernel addr: 0x21000000
+</span><span class='line'>   /var/lib/kdump/vmlinuz: symbolic link to /boot/vmlinuz-4.15.18
+</span><span class='line'>kdump initrd: 
+</span><span class='line'>   /var/lib/kdump/initrd.img: symbolic link to /var/lib/kdump/initrd.img-4.15.18
+</span><span class='line'>current state:    ready to kdump</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>验证</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>echo 1 &gt; /proc/sys/kernel/sysrq
+</span><span class='line'>echo c &gt; /proc/sysrq-trigger</span></code></pre></td></tr></table></div></figure>
+
+
+
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2019/12/12/debug-gdb-struct/">gdb struct</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2019-12-12T11:23:00+08:00'><span class='date'>2019-12-12</span> <span class='time'>11:23:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://bbs.chinaunix.net/thread-4101359-1-1.html">http://bbs.chinaunix.net/thread-4101359-1-1.html</a></p>
+
+<h4>查看结构体中成员的偏移</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>(gdb) p &((struct task_struct *)0)-&gt;prio
+</span><span class='line'>
+</span><span class='line'>(gdb) ptype struct malloc_chunk</span></code></pre></td></tr></table></div></figure>
+
 </div>
   
   
@@ -681,7 +1591,7 @@ ubuntu 18.04, linux-image-4.15.0-XX</p>
   
     <section>
 <h1>Categories
-<span class='right_span'>(893)</span>
+<span class='right_span'>(899)</span>
 
 </h1>
 <head>
@@ -712,7 +1622,7 @@ if (!document.getElementById('blog~octopress')) document.getElementById('aexp_bl
 if (!document.getElementById('blog')) document.getElementById('aexp_blog').style.visibility = 'hidden';
 if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ruby').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(135)</span></li>
+<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(136)</span></li>
 <div id='language' class='catsub'><li><a href='/blog/cats/language~c/?opendiv=language'>c</a><a href='##' onmousedown=showDiv('language~c') id='aexp_language~c'><span class='exp_style' id='exp_language~c'>[+]</span></a><span class='right_span'>32</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~c')) document.getElementById('aexp_language~c').style.visibility = 'hidden';
@@ -729,7 +1639,7 @@ if (!document.getElementById('language~java')) document.getElementById('aexp_lan
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~jsp')) document.getElementById('aexp_language~jsp').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/language~php/?opendiv=language'>php</a><a href='##' onmousedown=showDiv('language~php') id='aexp_language~php'><span class='exp_style' id='exp_language~php'>[+]</span></a><span class='right_span'>40</span></li>
+<li><a href='/blog/cats/language~php/?opendiv=language'>php</a><a href='##' onmousedown=showDiv('language~php') id='aexp_language~php'><span class='exp_style' id='exp_language~php'>[+]</span></a><span class='right_span'>41</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~php')) document.getElementById('aexp_language~php').style.visibility = 'hidden';
 </script>
@@ -766,7 +1676,7 @@ if (!document.getElementById('assembly~base')) document.getElementById('aexp_ass
 if (!document.getElementById('assembly')) document.getElementById('aexp_assembly').style.visibility = 'hidden';
 if (!document.getElementById('assembly~win')) document.getElementById('aexp_assembly~win').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(192)</span></li>
+<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(194)</span></li>
 <div id='tools' class='catsub'><li><a href='/blog/cats/tools~apache2/?opendiv=tools'>apache2</a><a href='##' onmousedown=showDiv('tools~apache2') id='aexp_tools~apache2'><span class='exp_style' id='exp_tools~apache2'>[+]</span></a><span class='right_span'>9</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~apache2')) document.getElementById('aexp_tools~apache2').style.visibility = 'hidden';
@@ -807,7 +1717,7 @@ if (!document.getElementById('tools~haproxy')) document.getElementById('aexp_too
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~isal')) document.getElementById('aexp_tools~isal').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/tools~mysql/?opendiv=tools'>mysql</a><a href='##' onmousedown=showDiv('tools~mysql') id='aexp_tools~mysql'><span class='exp_style' id='exp_tools~mysql'>[+]</span></a><span class='right_span'>28</span></li>
+<li><a href='/blog/cats/tools~mysql/?opendiv=tools'>mysql</a><a href='##' onmousedown=showDiv('tools~mysql') id='aexp_tools~mysql'><span class='exp_style' id='exp_tools~mysql'>[+]</span></a><span class='right_span'>29</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~mysql')) document.getElementById('aexp_tools~mysql').style.visibility = 'hidden';
 </script>
@@ -851,7 +1761,7 @@ if (!document.getElementById('tools~sqlmap')) document.getElementById('aexp_tool
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~sqlserver')) document.getElementById('aexp_tools~sqlserver').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/tools~squid/?opendiv=tools'>squid</a><a href='##' onmousedown=showDiv('tools~squid') id='aexp_tools~squid'><span class='exp_style' id='exp_tools~squid'>[+]</span></a><span class='right_span'>4</span></li>
+<li><a href='/blog/cats/tools~squid/?opendiv=tools'>squid</a><a href='##' onmousedown=showDiv('tools~squid') id='aexp_tools~squid'><span class='exp_style' id='exp_tools~squid'>[+]</span></a><span class='right_span'>5</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~squid')) document.getElementById('aexp_tools~squid').style.visibility = 'hidden';
 </script>
@@ -876,12 +1786,12 @@ if (!document.getElementById('tools~vim')) document.getElementById('aexp_tools~v
 if (!document.getElementById('tools')) document.getElementById('aexp_tools').style.visibility = 'hidden';
 if (!document.getElementById('tools~wxwork')) document.getElementById('aexp_tools~wxwork').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/system/'>system</a><a href='##' onmousedown=showDiv('system') id='aexp_system'><span class='exp_style' id='exp_system'>[+]</span></a><span class='right_span'>(105)</span></li>
+<li class='catclass'><a href='/blog/cats/system/'>system</a><a href='##' onmousedown=showDiv('system') id='aexp_system'><span class='exp_style' id='exp_system'>[+]</span></a><span class='right_span'>(107)</span></li>
 <div id='system' class='catsub'><li><a href='/blog/cats/system~base/?opendiv=system'>base</a><a href='##' onmousedown=showDiv('system~base') id='aexp_system~base'><span class='exp_style' id='exp_system~base'>[+]</span></a><span class='right_span'>23</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('system~base')) document.getElementById('aexp_system~base').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/system~centos/?opendiv=system'>centos</a><a href='##' onmousedown=showDiv('system~centos') id='aexp_system~centos'><span class='exp_style' id='exp_system~centos'>[+]</span></a><span class='right_span'>12</span></li>
+<li><a href='/blog/cats/system~centos/?opendiv=system'>centos</a><a href='##' onmousedown=showDiv('system~centos') id='aexp_system~centos'><span class='exp_style' id='exp_system~centos'>[+]</span></a><span class='right_span'>14</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('system~centos')) document.getElementById('aexp_system~centos').style.visibility = 'hidden';
 </script>
@@ -926,7 +1836,7 @@ if (!document.getElementById('system~namespace')) document.getElementById('aexp_
 if (!document.getElementById('system')) document.getElementById('aexp_system').style.visibility = 'hidden';
 if (!document.getElementById('system~ubuntu')) document.getElementById('aexp_system~ubuntu').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/kernel/'>kernel</a><a href='##' onmousedown=showDiv('kernel') id='aexp_kernel'><span class='exp_style' id='exp_kernel'>[+]</span></a><span class='right_span'>(273)</span></li>
+<li class='catclass'><a href='/blog/cats/kernel/'>kernel</a><a href='##' onmousedown=showDiv('kernel') id='aexp_kernel'><span class='exp_style' id='exp_kernel'>[+]</span></a><span class='right_span'>(274)</span></li>
 <div id='kernel' class='catsub'><li><a href='/blog/cats/kernel~10gb/?opendiv=kernel'>10gb</a><a href='##' onmousedown=showDiv('kernel~10gb') id='aexp_kernel~10gb'><span class='exp_style' id='exp_kernel~10gb'>[+]</span></a><span class='right_span'>7</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('kernel~10gb')) document.getElementById('aexp_kernel~10gb').style.visibility = 'hidden';
@@ -1094,9 +2004,13 @@ if (!document.getElementById('algorithm~ds')) document.getElementById('aexp_algo
 if (!document.getElementById('algorithm~game')) document.getElementById('aexp_algorithm~game').style.visibility = 'hidden';
 </script>
 <li><a href='/blog/cats/algorithm~tc/?opendiv=algorithm'>tc</a><a href='##' onmousedown=showDiv('algorithm~tc') id='aexp_algorithm~tc'><span class='exp_style' id='exp_algorithm~tc'>[+]</span></a><span class='right_span'>2</span></li>
+<script language='javascript' type='text/javascript'>
+if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algorithm~tc').style.visibility = 'hidden';
+</script>
+<li><a href='/blog/cats/lernel~ipsec/?opendiv=algorithm'>ipsec</a><a href='##' onmousedown=showDiv('algorithm~ipsec') id='aexp_algorithm~ipsec'><span class='exp_style' id='exp_algorithm~ipsec'>[+]</span></a><span class='right_span'>1</span></li>
 </div><script language='javascript' type='text/javascript'>
 if (!document.getElementById('algorithm')) document.getElementById('aexp_algorithm').style.visibility = 'hidden';
-if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algorithm~tc').style.visibility = 'hidden';
+if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_algorithm~ipsec').style.visibility = 'hidden';
 </script>
 
 </ul>
@@ -1107,7 +2021,7 @@ if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algo
 
 <section>
 <h1>Date Categories
-<span class='right_span'>(893)</span>
+<span class='right_span'>(899)</span>
 
 </h1>
 <head>
@@ -1115,8 +2029,9 @@ if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algo
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(13)</span></li>
-<div id='2024' class='catsub'><li><a href='/blog/cats/2024~04/?opendiv=2024'>2024-04</a><span class='right_span'>2</span></li>
+<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(19)</span></li>
+<div id='2024' class='catsub'><li><a href='/blog/cats/2024~05/?opendiv=2024'>2024-05</a><span class='right_span'>3</span></li>
+<li><a href='/blog/cats/2024~04/?opendiv=2024'>2024-04</a><span class='right_span'>5</span></li>
 <li><a href='/blog/cats/2024~03/?opendiv=2024'>2024-03</a><span class='right_span'>5</span></li>
 <li><a href='/blog/cats/2024~02/?opendiv=2024'>2024-02</a><span class='right_span'>4</span></li>
 <li><a href='/blog/cats/2024~01/?opendiv=2024'>2024-01</a><span class='right_span'>2</span></li>
@@ -1268,7 +2183,7 @@ if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algo
 <a style="font-size: 100%" href="/tags/lvs/">lvs(3)</a>
 <a style="font-size: 131%" href="/tags/mptcp/">mptcp(9)</a>
 <a style="font-size: 119%" href="/tags/nginx/">nginx(6)</a>
-<a style="font-size: 108%" href="/tags/squid/">squid(4)</a>
+<a style="font-size: 114%" href="/tags/squid/">squid(5)</a>
 <a style="font-size: 131%" href="/tags/vpn/">vpn(9)</a>
 <a style="font-size: 108%" href="/tags/shu-ju-cai-ji/">数据采集(4)</a>
 <a style="font-size: 141%" href="/tags/hui-bian/">汇编(13)</a>
@@ -1278,6 +2193,30 @@ if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algo
 <section>
   <h1>Recent Posts</h1>
   <ul id="recent_posts">
+    
+      <li class="post">
+        <a href="/blog/2024/05/16/lang-centos8-php8/">Centos8安装PHP8</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2024/05/16/centos8-kernel/">CentOS8 编译内核错误</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2024/05/11/centos8.5-install/">CentOS8.5 安装</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2024/04/30/mariadb/">centos 安装 MariaDB</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2024/04/29/strongswan-make/">ubuntu 编译strongswan</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2024/04/29/tools-squid-log/">squid 日志格式, 时间格式</a>
+      </li>
     
       <li class="post">
         <a href="/blog/2024/04/26/tools-apache2-tmp/">centos7下httpd服务对tmp目录操作</a>
@@ -1293,30 +2232,6 @@ if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algo
     
       <li class="post">
         <a href="/blog/2024/03/26/TH40W-E/">华汉维无线wifi温湿度TH40W-E</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/03/26/ups-winpower/">山特UPS软件Winpower</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/03/23/lang-ci-cache/">php ci 数据缓存</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/03/01/nginx-proxy/">nginx配置多个域名, http https共用配置</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/02/26/lang-web-FormData/">Ajax使用FormData上传文件</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/02/26/lang-web-pdf-view/">pdf预览 jquery.media.js</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/02/26/vim-syntax-off/">Vim 在处理长字符串时变得非常慢</a>
       </li>
     
   </ul>

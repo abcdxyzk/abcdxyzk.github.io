@@ -131,7 +131,7 @@ var ss360Config = {
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2016/08/31/command-pssh_pscp/">pssh、pscp命令</a></h2>
+      <h2 class="entry-title"><a href="/blog/2017/07/23/kernel-clock-6/">Linux时间子系统之六：高精度定时器（HRTIMER）的原理和实现</a></h2>
     
     
       <p class="meta">
@@ -140,46 +140,230 @@ var ss360Config = {
 
 
 
-<time class='entry-date' datetime='2016-08-31T00:20:00+08:00'><span class='date'>2016-08-31</span> <span class='time'>00:20:00</span></time>
+<time class='entry-date' datetime='2017-07-23T16:59:00+08:00'><span class='date'>2017-07-23</span> <span class='time'>16:59:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><p><a href="http://blog.csdn.net/kumu_linux/article/details/8562320">http://blog.csdn.net/kumu_linux/article/details/8562320</a></p>
+  <div class="entry-content"><p><a href="http://blog.csdn.net/DroidPhone/article/details/8074892">http://blog.csdn.net/DroidPhone/article/details/8074892</a></p>
 
-<p>pssh是一个python编写可以在多台服务器上执行命令的工具，同时支持拷贝文件，是同类工具中很出色的，类似pdsh，个人认为相对pdsh更为简便，使用必须在各个服务器上配置好密钥认证访问。</p>
+<p>上一篇文章，我介绍了传统的低分辨率定时器的实现原理。而随着内核的不断演进，大牛们已经对这种低分辨率定时器的精度不再满足，而且，硬件也在不断地发展，系统中的定时器硬件的精度也越来越高，这也给高分辨率定时器的出现创造了条件。内核从2.6.16开始加入了高精度定时器架构。在实现方式上，内核的高分辨率定时器的实现代码几乎没有借用低分辨率定时器的数据结构和代码，内核文档给出的解释主要有以下几点：</p>
 
-<p>项目地址： <a href="https://code.google.com/p/parallel-ssh/">https://code.google.com/p/parallel-ssh/</a></p>
+<p>低分辨率定时器的代码和jiffies的关系太过紧密，并且默认按32位进行设计，并且它的代码已经经过长时间的优化，目前的使用也是没有任何错误，如果硬要基于它来实现高分辨率定时器，势必会打破原有的时间轮概念，并且会引入一大堆#if&ndash;#else判断；</p>
 
-<p>PSSH provides parallel versions of OpenSSH and related tools. Included are pssh, pscp, prsync, pnuke, and pslurp. The project includes psshlib which can be used within custom applications. The source code is written in Python and can be cloned from:</p>
+<p>虽然大部分时间里，时间轮可以实现O(1)时间复杂度，但是当有进位发生时，不可预测的O(N)定时器级联迁移时间，这对于低分辨率定时器来说问题不大，可是它大大地影响了定时器的精度；</p>
 
-<p>git clone <a href="http://code.google.com/p/parallel-ssh/">http://code.google.com/p/parallel-ssh/</a></p>
+<p>低分辨率定时器几乎是为“超时”而设计的，并为此对它进行了大量的优化，对于这些以“超时”未目的而使用定时器，它们大多数期望在超时到来之前获得正确的结果，然后删除定时器，精确时间并不是它们主要的目的，例如网络通信、设备IO等等。</p>
 
-<p>PSSH is supported on Python 2.4 and greater (including Python 3.1 and greater). It was originally written and maintained by Brent N. Chun. Due to his busy schedule, Brent handed over maintenance to Andrew McNabb in October 2009.</p>
+<p>为此，内核为高精度定时器重新设计了一套软件架构，它可以为我们提供纳秒级的定时精度，以满足对精确时间有迫切需求的应用程序或内核驱动，例如多媒体应用，音频设备的驱动程序等等。以下的讨论用hrtimer(high resolution timer)表示高精度定时器。</p>
 
-<h4>下载安装</h4>
+<h4>1. 如何组织hrtimer？</h4>
 
-<h5>下载</h5>
+<p>我们知道，低分辨率定时器使用5个链表数组来组织timer_list结构，形成了著名的时间轮概念，对于高分辨率定时器，我们期望组织它们的数据结构至少具备以下条件：</p>
 
-<p>wget <a href="http://parallel-ssh.googlecode.com/files/pssh-2.3.1.tar.gz">http://parallel-ssh.googlecode.com/files/pssh-2.3.1.tar.gz</a></p>
+<pre><code>稳定而且快速的查找能力；
+快速地插入和删除定时器的能力；
+排序功能；
+</code></pre>
 
-<p>本地下载 <a href="/download/tools/pssh-2.3.1.tar.gz">pssh-2.3.1.tar.gz</a></p>
-
-<h5>安装</h5>
+<p>内核的开发者考察了多种数据结构，例如基数树、哈希表等等，最终他们选择了红黑树（rbtree）来组织hrtimer，红黑树已经以库的形式存在于内核中，并被成功地使用在内存管理子系统和文件系统中，随着系统的运行，hrtimer不停地被创建和销毁，新的hrtimer按顺序被插入到红黑树中，树的最左边的节点就是最快到期的定时器，内核用一个hrtimer结构来表示一个高精度定时器：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
 <span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>tar xf pssh-2.3.1.tar.gz  
-</span><span class='line'>cd pssh-2.3.1/  
-</span><span class='line'>python setup.py install  </span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct hrtimer {
+</span><span class='line'>&#9;struct timerqueue_node      node;
+</span><span class='line'>&#9;ktime_t             _softexpires;
+</span><span class='line'>&#9;enum hrtimer_restart        (*function)(struct hrtimer *);
+</span><span class='line'>&#9;struct hrtimer_clock_base   *base;
+</span><span class='line'>&#9;unsigned long           state;
+</span><span class='line'>&#9;&#9;......
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
 
 
-<h5>参数命令介绍</h5>
+<p>定时器的到期时间用ktime_t来表示，_softexpires字段记录了时间，定时器一旦到期，function字段指定的回调函数会被调用，该函数的返回值为一个枚举值，它决定了该hrtimer是否需要被重新激活：</p>
 
-<p>pssh   在多个主机上并行地运行命令</p>
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>enum hrtimer_restart {
+</span><span class='line'>&#9;HRTIMER_NORESTART,  /* Timer is not restarted */
+</span><span class='line'>&#9;HRTIMER_RESTART,    /* Timer must be restarted */
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>state字段用于表示hrtimer当前的状态，有几下几种位组合：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define HRTIMER_STATE_INACTIVE  0x00  // 定时器未激活
+</span><span class='line'>#define HRTIMER_STATE_ENQUEUED  0x01  // 定时器已经被排入红黑树中
+</span><span class='line'>#define HRTIMER_STATE_CALLBACK  0x02  // 定时器的回调函数正在被调用
+</span><span class='line'>#define HRTIMER_STATE_MIGRATE   0x04  // 定时器正在CPU之间做迁移</span></code></pre></td></tr></table></div></figure>
+
+
+<p>hrtimer的到期时间可以基于以下几种时间基准系统：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>enum  hrtimer_base_type {
+</span><span class='line'>&#9;HRTIMER_BASE_MONOTONIC,  // 单调递增的monotonic时间，不包含休眠时间
+</span><span class='line'>&#9;HRTIMER_BASE_REALTIME,   // 平常使用的墙上真实时间
+</span><span class='line'>&#9;HRTIMER_BASE_BOOTTIME,   // 单调递增的boottime，包含休眠时间
+</span><span class='line'>&#9;HRTIMER_MAX_CLOCK_BASES, // 用于后续数组的定义
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>和低分辨率定时器一样，处于效率和上锁的考虑，每个cpu单独管理属于自己的hrtimer，为此，专门定义了一个结构hrtimer_cpu_base：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct hrtimer_cpu_base {
+</span><span class='line'>&#9;&#9;......
+</span><span class='line'>&#9;struct hrtimer_clock_base   clock_base[HRTIMER_MAX_CLOCK_BASES];
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>其中，clock_base数组为每种时间基准系统都定义了一个hrtimer_clock_base结构，它的定义如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct hrtimer_clock_base {
+</span><span class='line'>&#9;struct hrtimer_cpu_base *cpu_base;  // 指向所属cpu的hrtimer_cpu_base结构
+</span><span class='line'>&#9;&#9;......
+</span><span class='line'>&#9;struct timerqueue_head  active;     // 红黑树，包含了所有使用该时间基准系统的hrtimer
+</span><span class='line'>&#9;ktime_t         resolution; // 时间基准系统的分辨率
+</span><span class='line'>&#9;ktime_t         (*get_time)(void); // 获取该基准系统的时间函数
+</span><span class='line'>&#9;ktime_t         softirq_time;// 当用jiffies
+</span><span class='line'>&#9;ktime_t         offset;      // 
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>active字段是一个timerqueue_head结构，它实际上是对rbtree的进一步封装：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct timerqueue_node {
+</span><span class='line'>&#9;struct rb_node node;  // 红黑树的节点
+</span><span class='line'>&#9;ktime_t expires;      // 该节点代表队hrtimer的到期时间，与hrtimer结构中的_softexpires稍有不同
+</span><span class='line'>};
+</span><span class='line'>
+</span><span class='line'>struct timerqueue_head {
+</span><span class='line'>&#9;struct rb_root head;          // 红黑树的根节点
+</span><span class='line'>&#9;struct timerqueue_node *next; // 该红黑树中最早到期的节点，也就是最左下的节点
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>timerqueue_head结构在红黑树的基础上，增加了一个next字段，用于保存树中最先到期的定时器节点，实际上就是树的最左下方的节点，有了next字段，当到期事件到来时，系统不必遍历整个红黑树，只要取出next字段对应的节点进行处理即可。timerqueue_node用于表示一个hrtimer节点，它在标准红黑树节点rb_node的基础上增加了expires字段，该字段和hrtimer中的<em>softexpires字段一起，设定了hrtimer的到期时间的一个范围，hrtimer可以在hrtimer.</em>softexpires至timerqueue_node.expires之间的任何时刻到期，我们也称timerqueue_node.expires为硬过期时间(hard)，意思很明显：到了此时刻，定时器一定会到期，有了这个范围可以选择，定时器系统可以让范围接近的多个定时器在同一时刻同时到期，这种设计可以降低进程频繁地被hrtimer进行唤醒。经过以上的讨论，我们可以得出以下的图示，它表明了每个cpu上的hrtimer是如何被组织在一起的：</p>
+
+<p><img src="/images/kernel/2017-07-23-5.png" alt="" /></p>
+
+<p>图 1.1  每个cpu的hrtimer组织结构</p>
+
+<p>总结一下：</p>
+
+<pre><code>每个cpu有一个hrtimer_cpu_base结构；
+hrtimer_cpu_base结构管理着3种不同的时间基准系统的hrtimer，分别是：实时时间，启动时间和单调时间；
+每种时间基准系统通过它的active字段（timerqueue_head结构指针），指向它们各自的红黑树；
+红黑树上，按到期时间进行排序，最先到期的hrtimer位于最左下的节点，并被记录在active.next字段中；
+3中时间基准的最先到期时间可能不同，所以，它们之中最先到期的时间被记录在hrtimer_cpu_base的expires_next字段中。
+</code></pre>
+
+<h4>2. hrtimer如何运转</h4>
+
+<p>hrtimer的实现需要一定的硬件基础，它的实现依赖于我们前几章介绍的timekeeper和clock_event_device，如果你对timekeeper和clock_event_device不了解请参考以下文章：Linux时间子系统之三：时间的维护者：timekeeper，Linux时间子系统之四：定时器的引擎：clock_event_device。hrtimer系统需要通过timekeeper获取当前的时间，计算与到期时间的差值，并根据该差值，设定该cpu的tick_device（clock_event_device）的下一次的到期时间，时间一到，在clock_event_device的事件回调函数中处理到期的hrtimer。现在你或许有疑问：前面在介绍clock_event_device时，我们知道，每个cpu有自己的tick_device，通常用于周期性地产生进程调度和时间统计的tick事件，这里又说要用tick_device调度hrtimer系统，通常cpu只有一个tick_device，那他们如何协调工作？这个问题也一度困扰着我，如果再加上NO_HZ配置带来tickless特性，你可能会更晕。这里我们先把这个疑问放下，我将在后面的章节中来讨论这个问题，现在我们只要先知道，一旦开启了hrtimer，tick_device所关联的clock_event_device的事件回调函数会被修改为：hrtimer_interrupt，并且会被设置成工作于CLOCK_EVT_MODE_ONESHOT单触发模式。</p>
+
+<h5>2.1  添加一个hrtimer</h5>
+
+<p>要添加一个hrtimer，系统提供了一些api供我们使用，首先我们需要定义一个hrtimer结构的实例，然后用hrtimer_init函数对它进行初始化，它的原型如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void hrtimer_init(struct hrtimer *timer, clockid_t which_clock,
+</span><span class='line'>&#9;&#9;&#9; enum hrtimer_mode mode);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>which_clock可以是CLOCK_REALTIME、CLOCK_MONOTONIC、CLOCK_BOOTTIME中的一种，mode则可以是相对时间HRTIMER_MODE_REL，也可以是绝对时间HRTIMER_MODE_ABS。设定回调函数：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>timer.function = hr_callback;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>如果定时器无需指定一个到期范围，可以在设定回调函数后直接使用hrtimer_start激活该定时器：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int hrtimer_start(struct hrtimer *timer, ktime_t tim,
+</span><span class='line'>&#9;&#9;&#9; const enum hrtimer_mode mode);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>如果需要指定到期范围，则可以使用hrtimer_start_range_ns激活定时器：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>hrtimer_start_range_ns(struct hrtimer *timer, ktime_t tim,
+</span><span class='line'>&#9;&#9;&#9;unsigned long range_ns, const enum hrtimer_mode mode);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>要取消一个hrtimer，使用hrtimer_cancel：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int hrtimer_cancel(struct hrtimer *timer);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>以下两个函数用于推后定时器的到期时间：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>extern u64
+</span><span class='line'>hrtimer_forward(struct hrtimer *timer, ktime_t now, ktime_t interval);
+</span><span class='line'>
+</span><span class='line'>/* Forward a hrtimer so it expires after the hrtimer's current now */
+</span><span class='line'>static inline u64 hrtimer_forward_now(struct hrtimer *timer,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;  ktime_t interval)
+</span><span class='line'>{
+</span><span class='line'>&#9;return hrtimer_forward(timer, timer-&gt;base-&gt;get_time(), interval);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>以下几个函数用于获取定时器的当前状态：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -195,23 +379,23 @@ var ss360Config = {
 <span class='line-number'>12</span>
 <span class='line-number'>13</span>
 <span class='line-number'>14</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>   -h 执行命令的远程主机列表  或者 -H user@ip:port  文件内容格式[user@]host[:port]
+</pre></td><td class='code'><pre><code class=''><span class='line'>static inline int hrtimer_active(const struct hrtimer *timer)
+</span><span class='line'>{
+</span><span class='line'>&#9;return timer-&gt;state != HRTIMER_STATE_INACTIVE;
+</span><span class='line'>}
 </span><span class='line'>
-</span><span class='line'>   -l 远程机器的用户名
+</span><span class='line'>static inline int hrtimer_is_queued(struct hrtimer *timer)
+</span><span class='line'>{
+</span><span class='line'>&#9;return timer-&gt;state & HRTIMER_STATE_ENQUEUED;
+</span><span class='line'>}
 </span><span class='line'>
-</span><span class='line'>   -P 执行时输出执行信息
-</span><span class='line'>   -p 一次最大允许多少连接
-</span><span class='line'>   -o 输出内容重定向到一个文件
-</span><span class='line'>   -e 执行错误重定向到一个文件
-</span><span class='line'>   -t 设置命令执行的超时时间
-</span><span class='line'>   -A 提示输入密码并且把密码传递给ssh
-</span><span class='line'>   -O 设置ssh参数的具体配置，参照ssh_config配置文件
-</span><span class='line'>   -x 传递多个SSH 命令，多个命令用空格分开，用引号括起来
-</span><span class='line'>   -X 同-x 但是一次只能传递一个命令
-</span><span class='line'>   -i 显示标准输出和标准错误在每台host执行完毕后</span></code></pre></td></tr></table></div></figure>
+</span><span class='line'>static inline int hrtimer_callback_running(struct hrtimer *timer)
+</span><span class='line'>{
+</span><span class='line'>&#9;return timer-&gt;state & HRTIMER_STATE_CALLBACK;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
-<h4>其他命令</h4>
+<p>hrtimer_init最终会进入__hrtimer_init函数，该函数的主要目的是初始化hrtimer的base字段，同时初始化作为红黑树的节点的node字段：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -220,109 +404,38 @@ var ss360Config = {
 <span class='line-number'>5</span>
 <span class='line-number'>6</span>
 <span class='line-number'>7</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>pscp     传输文件到多个hosts，类似scp
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void __hrtimer_init(struct hrtimer *timer, clockid_t clock_id,
+</span><span class='line'>&#9;&#9;&#9;   enum hrtimer_mode mode)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct hrtimer_cpu_base *cpu_base;
+</span><span class='line'>&#9;int base;
 </span><span class='line'>
-</span><span class='line'>pslurp   从多台远程机器拷贝文件到本地
+</span><span class='line'>&#9;memset(timer, 0, sizeof(struct hrtimer));
 </span><span class='line'>
-</span><span class='line'>pnuke    并行在远程主机杀进程
+</span><span class='line'>&#9;cpu_base = &__raw_get_cpu_var(hrtimer_bases);
 </span><span class='line'>
-</span><span class='line'>prsync   使用rsync协议从本地计算机同步到远程主机</span></code></pre></td></tr></table></div></figure>
+</span><span class='line'>&#9;if (clock_id == CLOCK_REALTIME && mode != HRTIMER_MODE_ABS)
+</span><span class='line'>&#9;&#9;clock_id = CLOCK_MONOTONIC;
+</span><span class='line'>
+</span><span class='line'>&#9;base = hrtimer_clockid_to_base(clock_id);
+</span><span class='line'>&#9;timer-&gt;base = &cpu_base-&gt;clock_base[base];
+</span><span class='line'>&#9;timerqueue_init(&timer-&gt;node);
+</span><span class='line'>&#9;&#9;......
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
-<h4>实例</h4>
-
-<h5>pssh</h5>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>$ pssh -h ip.txt -l root chkconfig --level 2345 snmpd on  
-</span><span class='line'>[1] 10:59:29 [SUCCESS] ... ...  
-</span><span class='line'>[2] 10:59:29 [SUCCESS] ... ...  
-</span><span class='line'>[3] 10:59:29 [SUCCESS] ... ...  
-</span><span class='line'>... ...  </span></code></pre></td></tr></table></div></figure>
-
-
-<h5>pscp</h5>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>$ pscp -h ip.txt -l root /etc/snmp/snmpd.conf /etc/snmp/snmpd.conf  
-</span><span class='line'>[1] 11:00:42 [SUCCESS] ... ...  
-</span><span class='line'>[2] 11:00:42 [SUCCESS] ... ...  
-</span><span class='line'>[3] 11:00:42 [SUCCESS] ... ...  
-</span><span class='line'>... ...  </span></code></pre></td></tr></table></div></figure>
-
-
-
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2016/05/21/kernel-irq-bh/">linux 中断下半部</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2016-05-21T10:40:00+08:00'><span class='date'>2016-05-21</span> <span class='time'>10:40:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://blog.chinaunix.net/uid-24203478-id-3111803.html">http://blog.chinaunix.net/uid-24203478-id-3111803.html</a></p>
-
-<p>与Linux中断息息相关的一个重要概念是Linux中断分为两个半部：上半部（tophalf）和下半部(bottom half)。上半部的功能是"登记中断"，当一个中断发生时，它进行相应地硬件读写后就把中断例程的下半部挂到该设备的下半部执行队列中去。因此，上半部执行的速度就会很快，可以服务更多的中断请求。但是，仅有"登记中断"是远远不够的，因为中断的事件可能很复杂。因此，Linux引入了一个下半部，来完成中断事件的绝大多数使命。下半部和上半部最大的不同是下半部是可中断的，而上半部是不可中断的，下半部几乎做了中断处理程序所有的事情，而且可以被新的中断打断！下半部则相对来说并不是非常紧急的，通常还是比较耗时的，因此由系统自行安排运行时机，不在中断服务上下文中执行。</p>
-
-<h4>在Linux2.6的内核中存在三种不同形式的下半部实现机制：软中断，tasklet和工作队列。</h4>
-
-<p>Tasklet基于Linux softirq，其使用相当简单，我们只需要定义tasklet及其处理函数并将二者关联：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>void my_tasklet_func(unsigned long); //定义一个处理函数：
-</span><span class='line'>DECLARE_TASKLET(my_tasklet,my_tasklet_func,data); //定义一个tasklet结构my_tasklet，与my_tasklet_func(data)函数相关联</span></code></pre></td></tr></table></div></figure>
-
-
-<p>然后，在需要调度tasklet的时候引用一个简单的API就能使系统在适当的时候进行调度运行：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>tasklet_schedule(&my_tasklet);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>此外，Linux还提供了另外一些其它的控制tasklet调度与运行的API：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>DECLARE_TASKLET_DISABLED(name,function,data); //与DECLARE_TASKLET类似，但等待tasklet被使能
-</span><span class='line'>tasklet_enable(struct tasklet_struct *); //使能tasklet
-</span><span class='line'>tasklet_disble(struct tasklet_struct *); //禁用tasklet
-</span><span class='line'>tasklet_init(struct tasklet_struct *,void (*func)(unsigned long),unsigned long); //类似DECLARE_TASKLET()
-</span><span class='line'>tasklet_kill(struct tasklet_struct *); // 清除指定tasklet的可调度位，即不允许调度该tasklet</span></code></pre></td></tr></table></div></figure>
-
-
-<p>我们先来看一个tasklet的运行实例，这个实例没有任何实际意义，仅仅为了演示。它的功能是：在globalvar被写入一次后，就调度一个tasklet，函数中输出"tasklet is executing"：</p>
+<p>hrtimer_start和hrtimer_start_range_ns最终会把实际的工作交由__hrtimer_start_range_ns来完成：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -347,36 +460,73 @@ var ss360Config = {
 <span class='line-number'>21</span>
 <span class='line-number'>22</span>
 <span class='line-number'>23</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>//定义与绑定tasklet函数
-</span><span class='line'>void test_tasklet_action(unsigned long t);
-</span><span class='line'>DECLARE_TASKLET(test_tasklet, test_tasklet_action, 0);
-</span><span class='line'>
-</span><span class='line'>void test_tasklet_action(unsigned long t)
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int __hrtimer_start_range_ns(struct hrtimer *timer, ktime_t tim,
+</span><span class='line'>&#9;&#9;unsigned long delta_ns, const enum hrtimer_mode mode,
+</span><span class='line'>&#9;&#9;int wakeup)
 </span><span class='line'>{
-</span><span class='line'>&#9;printk("tasklet is executing\n");
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>...
-</span><span class='line'>
-</span><span class='line'>ssize_t globalvar_write(struct file *filp, const char *buf, size_t len, loff_t *off)
-</span><span class='line'>{
-</span><span class='line'>&#9;...
-</span><span class='line'>&#9;if (copy_from_user(&global_var, buf, sizeof(int)))
-</span><span class='line'>&#9;{
-</span><span class='line'>&#9;&#9;return - EFAULT;
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;//调度tasklet执行
-</span><span class='line'>&#9;tasklet_schedule(&test_tasklet);
-</span><span class='line'>&#9;return sizeof(int);
+</span><span class='line'>&#9;......        
+</span><span class='line'>&#9;/* 取得hrtimer_clock_base指针 */
+</span><span class='line'>&#9;base = lock_hrtimer_base(timer, &flags); 
+</span><span class='line'>&#9;/* 如果已经在红黑树中，先移除它: */
+</span><span class='line'>&#9;ret = remove_hrtimer(timer, base); ......
+</span><span class='line'>&#9;/* 如果是相对时间，则需要加上当前时间，因为内部是使用绝对时间 */
+</span><span class='line'>&#9;if (mode & HRTIMER_MODE_REL) {
+</span><span class='line'>&#9;&#9;&#9;tim = ktime_add_safe(tim, new_base-&gt;get_time());
+</span><span class='line'>&#9;&#9;&#9;......
+</span><span class='line'>&#9;} 
+</span><span class='line'>&#9;/* 设置到期的时间范围 */
+</span><span class='line'>&#9;hrtimer_set_expires_range_ns(timer, tim, delta_ns);
+</span><span class='line'>&#9;...... 
+</span><span class='line'>&#9;/* 把hrtime按到期时间排序，加入到对应时间基准系统的红黑树中 */
+</span><span class='line'>&#9;/* 如果该定时器的是最早到期的，将会返回true */
+</span><span class='line'>&#9;leftmost = enqueue_hrtimer(timer, new_base);
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9;* Only allow reprogramming if the new base is on this CPU.
+</span><span class='line'>&#9;* (it might still be on another CPU if the timer was pending)
+</span><span class='line'>&#9;*
+</span><span class='line'>&#9;* XXX send_remote_softirq() ? 
+</span><span class='line'>&#9;* 定时器比之前的到期时间要早，所以需要重新对tick_device进行编程，重新设定的的到期时间 
+</span><span class='line'>&#9;*/
+</span><span class='line'>&#9;if (leftmost && new_base-&gt;cpu_base == &__get_cpu_var(hrtimer_bases))
+</span><span class='line'>&#9;&#9;&#9;hrtimer_enqueue_reprogram(timer, new_base, wakeup);
+</span><span class='line'>&#9;unlock_hrtimer_base(timer, &flags);
+</span><span class='line'>&#9;return ret;
 </span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
-<p>下半部分的任务就是执行与中断处理密切相关但中断处理程序本身不执行的工作。</p>
+<h5>2.2 hrtimer的到期处理</h5>
 
-<h4>在Linux2.6的内核中存在三种不同形式的下半部实现机制：软中断，tasklet和工作队列。</h4>
+<p>高精度定时器系统有3个入口可以对到期定时器进行处理，它们分别是：</p>
 
-<p>下面将比较三种机制的差别与联系。</p>
+<pre><code>没有切换到高精度模式时，在每个jiffie的tick事件中断中进行查询和处理；
+在HRTIMER_SOFTIRQ软中断中进行查询和处理；
+切换到高精度模式后，在每个clock_event_device的到期事件中断中进行查询和处理；
+</code></pre>
+
+<p>低精度模式  因为系统并不是一开始就会支持高精度模式，而是在系统启动后的某个阶段，等待所有的条件都满足后，才会切换到高精度模式，当系统还没有切换到高精度模式时，所有的高精度定时器运行在低精度模式下，在每个jiffie的tick事件中断中进行到期定时器的查询和处理，显然这时候的精度和低分辨率定时器是一样的（HZ级别）。低精度模式下，每个tick事件中断中，hrtimer_run_queues函数会被调用，由它完成定时器的到期处理。hrtimer_run_queues首先判断目前高精度模式是否已经启用，如果已经切换到了高精度模式，什么也不做，直接返回：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void hrtimer_run_queues(void)
+</span><span class='line'>{
+</span><span class='line'>
+</span><span class='line'>&#9;if (hrtimer_hres_active())
+</span><span class='line'>&#9;&#9;return;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>如果hrtimer_hres_active返回false，说明目前处于低精度模式下，则继续处理，它用一个for循环遍历各个时间基准系统，查询每个hrtimer_clock_base对应红黑树的左下节点，判断它的时间是否到期，如果到期，通过__run_hrtimer函数，对到期定时器进行处理，包括：调用定时器的回调函数、从红黑树中移除该定时器、根据回调函数的返回值决定是否重新启动该定时器等等：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -394,25 +544,506 @@ var ss360Config = {
 <span class='line-number'>14</span>
 <span class='line-number'>15</span>
 <span class='line-number'>16</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>软中断:    1、软中断是在编译期间静态分配的。
-</span><span class='line'>           2、最多可以有32个软中断。
-</span><span class='line'>           3、软中断不会抢占另外一个软中断，唯一可以抢占软中断的是中断处理程序。
-</span><span class='line'>           4、可以并发运行在多个CPU上（即使同一类型的也可以）。所以软中断必须设计为可重入的函数（允许多个CPU同时操作），
-</span><span class='line'>              因此也需要使用自旋锁来保护其数据结构。
-</span><span class='line'>           5、目前只有两个子系直接使用软中断：网络和SCSI。
-</span><span class='line'>           6、执行时间有：从硬件中断代码返回时、在ksoftirqd内核线程中和某些显示检查并执行软中断的代码中。
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>for (index = 0; index &lt; HRTIMER_MAX_CLOCK_BASES; index++) {
+</span><span class='line'>&#9;base = &cpu_base-&gt;clock_base[index];
+</span><span class='line'>&#9;if (!timerqueue_getnext(&base-&gt;active))
+</span><span class='line'>&#9;&#9;continue;
 </span><span class='line'>
-</span><span class='line'>tasklet:   1、tasklet是使用两类软中断实现的：HI_SOFTIRQ和TASKLET_SOFTIRQ。
-</span><span class='line'>           2、可以动态增加减少，没有数量限制。
-</span><span class='line'>           3、同一类tasklet不能并发执行。
-</span><span class='line'>           4、不同类型可以并发执行。
-</span><span class='line'>           5、大部分情况使用tasklet。
+</span><span class='line'>&#9;if (gettime) {
+</span><span class='line'>&#9;&#9;hrtimer_get_softirq_time(cpu_base);
+</span><span class='line'>&#9;&#9;gettime = 0;
+</span><span class='line'>&#9;}
 </span><span class='line'>
-</span><span class='line'>工作队列:  1、由内核线程去执行，换句话说总在进程上下文执行。
-</span><span class='line'>           2、可以睡眠，阻塞。</span></code></pre></td></tr></table></div></figure>
+</span><span class='line'>&#9;raw_spin_lock(&cpu_base-&gt;lock);
+</span><span class='line'>
+</span><span class='line'>&#9;while ((node = timerqueue_getnext(&base-&gt;active))) {
+</span><span class='line'>&#9;&#9;struct hrtimer *timer;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;timer = container_of(node, struct hrtimer, node);
+</span><span class='line'>&#9;&#9;if (base-&gt;softirq_time.tv64 &lt;=
+</span><span class='line'>&#9;&#9;&#9;&#9;hrtimer_get_expires_tv64(timer))
+</span><span class='line'>&#9;&#9;&#9;break;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;__run_hrtimer(timer, &base-&gt;softirq_time);
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;raw_spin_unlock(&cpu_base-&gt;lock);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
+<p>上面的timerqueue_getnext函数返回红黑树中的左下节点，之所以可以在while循环中使用该函数，是因为__run_hrtimer会在移除旧的左下节点时，新的左下节点会被更新到base->active->next字段中，使得循环可以继续执行，直到没有新的到期定时器为止。</p>
 
+<p>高精度模式  切换到高精度模式后，原来给cpu提供tick事件的tick_device（clock_event_device）会被高精度定时器系统接管，它的中断事件回调函数被设置为hrtimer_interrupt，红黑树中最左下的节点的定时器的到期时间被编程到该clock_event_device中，这样每次clock_event_device的中断意味着至少有一个高精度定时器到期。另外，当timekeeper系统中的时间需要修正，或者clock_event_device的到期事件时间被重新编程时，系统会发出HRTIMER_SOFTIRQ软中断，软中断的处理函数run_hrtimer_softirq最终也会调用hrtimer_interrupt函数对到期定时器进行处理，所以在这里我们只要讨论hrtimer_interrupt函数的实现即可。</p>
+
+<p>hrtimer_interrupt函数的前半部分和低精度模式下的hrtimer_run_queues函数完成相同的事情：它用一个for循环遍历各个时间基准系统，查询每个hrtimer_clock_base对应红黑树的左下节点，判断它的时间是否到期，如果到期，通过__run_hrtimer函数，对到期定时器进行处理，所以我们只讨论后半部分，在处理完所有到期定时器后，下一个到期定时器的到期时间保存在变量expires_next中，接下来的工作就是把这个到期时间编程到tick_device中：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void hrtimer_interrupt(struct clock_event_device *dev)
+</span><span class='line'>{
+</span><span class='line'>&#9;&#9;......
+</span><span class='line'>&#9;for (i = 0; i &lt; HRTIMER_MAX_CLOCK_BASES; i++) {
+</span><span class='line'>&#9;&#9;&#9;&#9;......
+</span><span class='line'>&#9;&#9;while ((node = timerqueue_getnext(&base-&gt;active))) {
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;......
+</span><span class='line'>&#9;&#9;&#9;if (basenow.tv64 &lt; hrtimer_get_softexpires_tv64(timer)) {
+</span><span class='line'>&#9;&#9;&#9;&#9;ktime_t expires;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;&#9;expires = ktime_sub(hrtimer_get_expires(timer),
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9;base-&gt;offset);
+</span><span class='line'>&#9;&#9;&#9;&#9;if (expires.tv64 &lt; expires_next.tv64)
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;expires_next = expires;
+</span><span class='line'>&#9;&#9;&#9;&#9;break;
+</span><span class='line'>&#9;&#9;&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;__run_hrtimer(timer, &basenow);
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;/* 
+</span><span class='line'>&#9; * Store the new expiry value so the migration code can verify 
+</span><span class='line'>&#9; * against it. 
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;cpu_base-&gt;expires_next = expires_next;
+</span><span class='line'>&#9;raw_spin_unlock(&cpu_base-&gt;lock);
+</span><span class='line'>
+</span><span class='line'>&#9;/* Reprogramming necessary ? */
+</span><span class='line'>&#9;if (expires_next.tv64 == KTIME_MAX ||
+</span><span class='line'>&#9;&#9;!tick_program_event(expires_next, 0)) {
+</span><span class='line'>&#9;&#9;cpu_base-&gt;hang_detected = 0;
+</span><span class='line'>&#9;&#9;return;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>如果这时的tick_program_event返回了非0值，表示过期时间已经在当前时间的前面，这通常由以下原因造成：
+</span><span class='line'>
+</span><span class='line'>&#9;系统正在被调试跟踪，导致时间在走，程序不走；
+</span><span class='line'>&#9;定时器的回调函数花了太长的时间；
+</span><span class='line'>&#9;系统运行在虚拟机中，而虚拟机被调度导致停止运行；
+</span><span class='line'>
+</span><span class='line'>为了避免这些情况的发生，接下来系统提供3次机会，重新执行前面的循环，处理到期的定时器：
+</span><span class='line'>
+</span><span class='line'>
+</span><span class='line'>&#9;raw_spin_lock(&cpu_base-&gt;lock);
+</span><span class='line'>&#9;now = hrtimer_update_base(cpu_base);
+</span><span class='line'>&#9;cpu_base-&gt;nr_retries++;
+</span><span class='line'>&#9;if (++retries &lt; 3)
+</span><span class='line'>&#9;&#9;goto retry;
+</span><span class='line'>
+</span><span class='line'>如果3次循环后还无法完成到期处理，系统不再循环，转为计算本次总循环的时间，
+</span><span class='line'>然后把tick_device的到期时间强制设置为当前时间加上本次的总循环时间，不过推后的时间被限制在100ms以内：
+</span><span class='line'>
+</span><span class='line'>
+</span><span class='line'>&#9;delta = ktime_sub(now, entry_time);
+</span><span class='line'>&#9;if (delta.tv64 &gt; cpu_base-&gt;max_hang_time.tv64)
+</span><span class='line'>&#9;&#9;cpu_base-&gt;max_hang_time = delta;
+</span><span class='line'>&#9;/* 
+</span><span class='line'>&#9; * Limit it to a sensible value as we enforce a longer 
+</span><span class='line'>&#9; * delay. Give the CPU at least 100ms to catch up. 
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;if (delta.tv64 &gt; 100 * NSEC_PER_MSEC)
+</span><span class='line'>&#9;&#9;expires_next = ktime_add_ns(now, 100 * NSEC_PER_MSEC);
+</span><span class='line'>&#9;else
+</span><span class='line'>&#9;&#9;expires_next = ktime_add(now, delta);
+</span><span class='line'>&#9;tick_program_event(expires_next, 1);
+</span><span class='line'>&#9;printk_once(KERN_WARNING "hrtimer: interrupt took %llu ns\n",
+</span><span class='line'>&#9;&#9;&#9;ktime_to_ns(delta));
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>3. 切换到高精度模式</h4>
+
+<p>上面提到，尽管内核配置成支持高精度定时器，但并不是一开始就工作于高精度模式，系统在启动的开始阶段，还是按照传统的模式在运行：tick_device按HZ频率定期地产生tick事件，这时的hrtimer工作在低分辨率模式，到期事件在每个tick事件中断中由hrtimer_run_queues函数处理，同时，在低分辨率定时器（时间轮）的软件中断TIMER_SOFTIRQ中，hrtimer_run_pending会被调用，系统在这个函数中判断系统的条件是否满足切换到高精度模式，如果条件满足，则会切换至高分辨率模式，另外提一下，NO_HZ模式也是在该函数中判断并切换。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void hrtimer_run_pending(void)
+</span><span class='line'>{
+</span><span class='line'>&#9;if (hrtimer_hres_active())
+</span><span class='line'>&#9;&#9;return;
+</span><span class='line'>&#9;&#9;......
+</span><span class='line'>&#9;if (tick_check_oneshot_change(!hrtimer_is_hres_enabled()))
+</span><span class='line'>&#9;&#9;hrtimer_switch_to_hres();
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>因为不管系统是否工作于高精度模式，每个TIMER_SOFTIRQ期间，该函数都会被调用，所以函数一开始先用hrtimer_hres_active判断目前高精度模式是否已经激活，如果已经激活，则说明之前的调用中已经切换了工作模式，不必再次切换，直接返回。hrtimer_hres_active很简单：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>DEFINE_PER_CPU(struct hrtimer_cpu_base, hrtimer_bases) = {
+</span><span class='line'>&#9;&#9;......
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>static inline int hrtimer_hres_active(void)
+</span><span class='line'>{
+</span><span class='line'>&#9;return __this_cpu_read(hrtimer_bases.hres_active);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>hrtimer_run_pending函数接着通过tick_check_oneshot_change判断系统是否可以切换到高精度模式，</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int tick_check_oneshot_change(int allow_nohz)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct tick_sched *ts = &__get_cpu_var(tick_cpu_sched);
+</span><span class='line'>
+</span><span class='line'>&#9;if (!test_and_clear_bit(0, &ts-&gt;check_clocks))
+</span><span class='line'>&#9;&#9;return 0;
+</span><span class='line'>
+</span><span class='line'>&#9;if (ts-&gt;nohz_mode != NOHZ_MODE_INACTIVE)
+</span><span class='line'>&#9;&#9;return 0;
+</span><span class='line'>
+</span><span class='line'>&#9;if (!timekeeping_valid_for_hres() || !tick_is_oneshot_available())
+</span><span class='line'>&#9;&#9;return 0;
+</span><span class='line'>
+</span><span class='line'>&#9;if (!allow_nohz)
+</span><span class='line'>&#9;&#9;return 1;
+</span><span class='line'>
+</span><span class='line'>&#9;tick_nohz_switch_to_nohz();
+</span><span class='line'>&#9;return 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>函数的一开始先判断check_clock标志的第0位是否被置位，如果没有置位，说明系统中没有注册符合要求的时钟事件设备，函数直接返回，check_clock标志由clocksource和clock_event_device系统的notify系统置位，当系统中有更高精度的clocksource被注册和选择后，或者有更精确的支持CLOCK_EVT_MODE_ONESHOT模式的clock_event_device被注册时，通过它们的notify函数，check_clock标志的第0为会置位。</p>
+
+<p>如果tick_sched结构中的nohz_mode字段不是NOHZ_MODE_INACTIVE，表明系统已经切换到其它模式，直接返回。nohz_mode的取值有3种：</p>
+
+<pre><code>NOHZ_MODE_INACTIVE    // 未启用NO_HZ模式
+NOHZ_MODE_LOWRES      // 启用NO_HZ模式，hrtimer工作于低精度模式下
+NOHZ_MODE_HIGHRES     // 启用NO_HZ模式，hrtimer工作于高精度模式下
+</code></pre>
+
+<p>接下来的timerkeeping_valid_for_hres判断timekeeper系统是否支持高精度模式，tick_is_oneshot_available判断tick_device是否支持CLOCK_EVT_MODE_ONESHOT模式。如果都满足要求，则继续往下判断。allow_nohz是函数的参数，为true表明可以切换到NOHZ_MODE_LOWRES 模式，函数将进入tick_nohz_switch_to_nohz，切换至NOHZ_MODE_LOWRES 模式，这里我们传入的allow_nohz是表达式：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>(!hrtimer_is_hres_enabled())</span></code></pre></td></tr></table></div></figure>
+
+
+<p>所以当系统不允许高精度模式时，将会在tick_check_oneshot_change函数内，通过tick_nohz_switch_to_nohz切换至NOHZ_MODE_LOWRES 模式，如果系统允许高精度模式，传入的allow_nohz参数为false，tick_check_oneshot_change函数返回1，回到上面的hrtimer_run_pending函数，hrtimer_switch_to_hres函数将会被调用，已完成切换到NOHZ_MODE_HIGHRES高精度模式。好啦，真正的切换函数找到了，我们看一看它如何切换：</p>
+
+<p>首先，它通过hrtimer_cpu_base中的hres_active字段判断该cpu是否已经切换至高精度模式，如果是则直接返回：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int hrtimer_switch_to_hres(void)
+</span><span class='line'>{
+</span><span class='line'>&#9;int i, cpu = smp_processor_id();
+</span><span class='line'>&#9;struct hrtimer_cpu_base *base = &per_cpu(hrtimer_bases, cpu);
+</span><span class='line'>&#9;unsigned long flags;
+</span><span class='line'>
+</span><span class='line'>&#9;if (base-&gt;hres_active)
+</span><span class='line'>&#9;&#9;return 1;
+</span><span class='line'>
+</span><span class='line'>接着，通过tick_init_highres函数接管tick_device关联的clock_event_device：
+</span><span class='line'>
+</span><span class='line'>&#9;local_irq_save(flags);
+</span><span class='line'>
+</span><span class='line'>&#9;if (tick_init_highres()) {
+</span><span class='line'>&#9;&#9;local_irq_restore(flags);
+</span><span class='line'>&#9;&#9;printk(KERN_WARNING "Could not switch to high resolution "
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;"mode on CPU %d\n", cpu);
+</span><span class='line'>&#9;&#9;return 0;
+</span><span class='line'>&#9;}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>tick_init_highres函数把tick_device切换到CLOCK_EVT_FEAT_ONESHOT模式，同时把clock_event_device的回调handler设置为hrtimer_interrupt，这样设置以后，tick_device的中断回调将由hrtimer_interrupt接管，hrtimer_interrupt在上面已经讨论过，它将完成高精度定时器的调度和到期处理。</p>
+
+<p>接着，设置hres_active标志，以表明高精度模式已经切换，然后把3个时间基准系统的resolution字段设为KTIME_HIGH_RES：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>&#9;base-&gt;hres_active = 1;
+</span><span class='line'>&#9;for (i = 0; i &lt; HRTIMER_MAX_CLOCK_BASES; i++)
+</span><span class='line'>&#9;&#9;base-&gt;clock_base[i].resolution = KTIME_HIGH_RES;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>最后，因为tick_device被高精度定时器接管，它将不会再提供原有的tick事件机制，所以需要由高精度定时器系统模拟一个tick事件设备，继续为系统提供tick事件能力，这个工作由tick_setup_sched_timer函数完成。因为刚刚完成切换，tick_device的到期时间并没有被正确地设置为下一个到期定时器的时间，这里使用retrigger_next_event函数，传入参数NULL，使得tick_device立刻产生到期中断，hrtimer_interrupt被调用一次，然后下一个到期的定时器的时间会编程到tick_device中，从而完成了到高精度模式的切换：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>&#9;tick_setup_sched_timer();
+</span><span class='line'>&#9;/* "Retrigger" the interrupt to get things going */
+</span><span class='line'>&#9;retrigger_next_event(NULL);
+</span><span class='line'>&#9;local_irq_restore(flags);
+</span><span class='line'>&#9;return 1;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>整个切换过程可以用下图表示：</p>
+
+<p><img src="/images/kernel/2017-07-23-6.png" alt="" /></p>
+
+<p>图3.1  低精度模式切换至高精度模式</p>
+
+<h4>4. 模拟tick事件</h4>
+
+<p>根据上一节的讨论，当系统切换到高精度模式后，tick_device被高精度定时器系统接管，不再定期地产生tick事件，我们知道，到目前的版本为止（V3.4），内核还没有彻底废除jiffies机制，系统还是依赖定期到来的tick事件，供进程调度系统和时间更新等操作，大量存在的低精度定时器也仍然依赖于jiffies的计数，所以，尽管tick_device被接管，高精度定时器系统还是要想办法继续提供定期的tick事件。为了达到这一目的，内核使用了一个取巧的办法：既然高精度模式已经启用，可以定义一个hrtimer，把它的到期时间设定为一个jiffy的时间，当这个hrtimer到期时，在这个hrtimer的到期回调函数中，进行和原来的tick_device同样的操作，然后把该hrtimer的到期时间顺延一个jiffy周期，如此反复循环，完美地模拟了原有tick_device的功能。下面我们看看具体点代码是如何实现的。</p>
+
+<p>在kernel/time/tick-sched.c中，内核定义了一个per_cpu全局变量：tick_cpu_sched，从而为每个cpu提供了一个tick_sched结构， 该结构主要用于管理NO_HZ配置下的tickless处理，因为模拟tick事件与tickless有很强的相关性，所以高精度定时器系统也利用了该结构的以下字段，用于完成模拟tick事件的操作：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct tick_sched {
+</span><span class='line'>&#9;struct hrtimer          sched_timer;
+</span><span class='line'>&#9;unsigned long           check_clocks;
+</span><span class='line'>&#9;enum tick_nohz_mode     nohz_mode;
+</span><span class='line'>&#9;&#9;......
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>sched_timer就是要用于模拟tick事件的hrtimer，check_clock上面几节已经讨论过，用于notify系统通知hrtimer系统需要检查是否切换到高精度模式，nohz_mode则用于表示当前的工作模式。</p>
+
+<p>上一节提到，用于切换至高精度模式的函数是hrtimer_switch_to_hres，在它的最后，调用了函数tick_setup_sched_timer，该函数的作用就是设置一个用于模拟tick事件的hrtimer：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void tick_setup_sched_timer(void)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct tick_sched *ts = &__get_cpu_var(tick_cpu_sched);
+</span><span class='line'>&#9;ktime_t now = ktime_get();
+</span><span class='line'>
+</span><span class='line'>&#9;/* 
+</span><span class='line'>&#9; * Emulate tick processing via per-CPU hrtimers: 
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;hrtimer_init(&ts-&gt;sched_timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
+</span><span class='line'>&#9;ts-&gt;sched_timer.function = tick_sched_timer;
+</span><span class='line'>
+</span><span class='line'>&#9;/* Get the next period (per cpu) */
+</span><span class='line'>&#9;hrtimer_set_expires(&ts-&gt;sched_timer, tick_init_jiffy_update());
+</span><span class='line'>
+</span><span class='line'>&#9;for (;;) {
+</span><span class='line'>&#9;&#9;hrtimer_forward(&ts-&gt;sched_timer, now, tick_period);
+</span><span class='line'>&#9;&#9;hrtimer_start_expires(&ts-&gt;sched_timer,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;  HRTIMER_MODE_ABS_PINNED);
+</span><span class='line'>&#9;&#9;/* Check, if the timer was already in the past */
+</span><span class='line'>&#9;&#9;if (hrtimer_active(&ts-&gt;sched_timer))
+</span><span class='line'>&#9;&#9;&#9;break;
+</span><span class='line'>&#9;&#9;now = ktime_get();
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>#ifdef CONFIG_NO_HZ
+</span><span class='line'>&#9;if (tick_nohz_enabled)
+</span><span class='line'>&#9;&#9;ts-&gt;nohz_mode = NOHZ_MODE_HIGHRES;
+</span><span class='line'>#endif
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>该函数首先初始化该cpu所属的tick_sched结构中sched_timer字段，把该hrtimer的回调函数设置为tick_sched_timer，然后把它的到期时间设定为下一个jiffy时刻，返回前把工作模式设置为NOHZ_MODE_HIGHRES，表明是利用高精度模式实现NO_HZ。</p>
+
+<p>接着我们关注一下hrtimer的回调函数tick_sched_timer，我们知道，系统中的jiffies计数，时间更新等是全局操作，在smp系统中，只有一个cpu负责该工作，所以在tick_sched_timer的一开始，先判断当前cpu是否负责更新jiffies和时间，如果是，则执行更新操作：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static enum hrtimer_restart tick_sched_timer(struct hrtimer *timer)
+</span><span class='line'>{
+</span><span class='line'>&#9;&#9;......
+</span><span class='line'>
+</span><span class='line'>#ifdef CONFIG_NO_HZ
+</span><span class='line'>&#9;if (unlikely(tick_do_timer_cpu == TICK_DO_TIMER_NONE))
+</span><span class='line'>&#9;&#9;tick_do_timer_cpu = cpu;
+</span><span class='line'>#endif
+</span><span class='line'>
+</span><span class='line'>&#9;/* Check, if the jiffies need an update */
+</span><span class='line'>&#9;if (tick_do_timer_cpu == cpu)
+</span><span class='line'>&#9;&#9;tick_do_update_jiffies64(now);
+</span><span class='line'>
+</span><span class='line'>然后，利用regs指针确保当前是在中断上下文中，然后调用update_process_timer：
+</span><span class='line'>
+</span><span class='line'>&#9;if (regs) {
+</span><span class='line'>&#9;&#9;&#9;&#9;   ......
+</span><span class='line'>&#9;&#9;update_process_times(user_mode(regs));
+</span><span class='line'>&#9;&#9;......
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>最后，把hrtimer的到期时间推进一个tick周期，返回HRTIMER_RESTART表明该hrtimer需要再次启动，以便产生下一个tick事件。
+</span><span class='line'>
+</span><span class='line'>&#9;hrtimer_forward(timer, now, tick_period);
+</span><span class='line'>
+</span><span class='line'>&#9;return HRTIMER_RESTART;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>关于update_process_times，如果你你感兴趣，回看一下本系列关于clock_event_device的那一章：Linux时间子系统之四：定时器的引擎：clock_event_device中的第5小节，对比一下模拟tick事件的hrtimer的回调函数tick_sched_timer和切换前tick_device的回调函数tick_handle_periodic，它们是如此地相像，实际上，它们几乎完成了一样的工作。</p>
 </div>
   
   
@@ -425,7 +1056,7 @@ var ss360Config = {
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2016/05/11/debug-gdb-thread/">gdb线程</a></h2>
+      <h2 class="entry-title"><a href="/blog/2017/07/23/kernel-clock-5/">Linux时间子系统之五：低分辨率定时器的原理和实现</a></h2>
     
     
       <p class="meta">
@@ -434,26 +1065,1144 @@ var ss360Config = {
 
 
 
-<time class='entry-date' datetime='2016-05-11T20:10:00+08:00'><span class='date'>2016-05-11</span> <span class='time'>20:10:00</span></time>
+<time class='entry-date' datetime='2017-07-23T16:38:00+08:00'><span class='date'>2017-07-23</span> <span class='time'>16:38:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><p>GDB多线程调试的基本命令。</p>
+  <div class="entry-content"><p><a href="http://blog.csdn.net/DroidPhone/article/details/8051405">http://blog.csdn.net/DroidPhone/article/details/8051405</a></p>
 
-<p>info threads 显示当前可调试的所有线程，每个线程会有一个GDB为其分配的ID，后面操作线程的时候会用到这个ID。 前面有*的是当前调试的线程。</p>
+<p>利用定时器，我们可以设定在未来的某一时刻，触发一个特定的事件。所谓低分辨率定时器，是指这种定时器的计时单位基于jiffies值的计数，也就是说，它的精度只有1/HZ，假如你的内核配置的HZ是1000，那意味着系统中的低分辨率定时器的精度就是1ms。早期的内核版本中，内核并不支持高精度定时器，理所当然只能使用这种低分辨率定时器，我们有时候把这种基于HZ的定时器机制成为时间轮：time wheel。虽然后来出现了高分辨率定时器，但它只是内核的一个可选配置项，所以直到目前最新的内核版本，这种低分辨率定时器依然被大量地使用着。</p>
 
-<p>thread ID 切换当前调试的线程为指定ID的线程。</p>
+<h4>1. 定时器的使用方法</h4>
 
-<p>break thread_test.c:123 thread all 在所有线程中相应的行上设置断点</p>
+<p>在讨论定时器的实现原理之前，我们先看看如何使用定时器。要在内核编程中使用定时器，首先我们要定义一个time_list结构，该结构在include/Linux/timer.h中定义：</p>
 
-<p>thread apply ID1 ID2 command 让一个或者多个线程执行GDB命令command。</p>
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct timer_list {
+</span><span class='line'>&#9;/* 
+</span><span class='line'>&#9; * All fields that change during normal runtime grouped to the 
+</span><span class='line'>&#9; * same cacheline 
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;struct list_head entry;
+</span><span class='line'>&#9;unsigned long expires;
+</span><span class='line'>&#9;struct tvec_base *base;
+</span><span class='line'>
+</span><span class='line'>&#9;void (*function)(unsigned long);
+</span><span class='line'>&#9;unsigned long data;
+</span><span class='line'>
+</span><span class='line'>&#9;int slack;
+</span><span class='line'>&#9;&#9;......
+</span><span class='line'>};
+</span><span class='line'>
+</span><span class='line'>entry  字段用于把一组定时器组成一个链表，至于内核如何对定时器进行分组，我们会在后面进行解释。
+</span><span class='line'>
+</span><span class='line'>expires  字段指出了该定时器的到期时刻，也就是期望定时器到期时刻的jiffies计数值。
+</span><span class='line'>
+</span><span class='line'>base  每个cpu拥有一个自己的用于管理定时器的tvec_base结构，该字段指向该定时器所属的cpu所对应tvec_base结构。
+</span><span class='line'>
+</span><span class='line'>function  字段是一个函数指针，定时器到期时，系统将会调用该回调函数，用于响应该定时器的到期事件。
+</span><span class='line'>
+</span><span class='line'>data  该字段用于上述回调函数的参数。
+</span><span class='line'>
+</span><span class='line'>slack  对有些对到期时间精度不太敏感的定时器，到期时刻允许适当地延迟一小段时间，该字段用于计算每次延迟的HZ数。</span></code></pre></td></tr></table></div></figure>
 
-<p>thread apply all command 让所有被调试线程执行GDB命令command。</p>
 
-<p>set scheduler-locking off|on|step 估计是实际使用过多线程调试的人都可以发现，在使用step或者continue命令调试当前被调试线程的时候，其他线程也是同时执行的，怎么只让被调试程序执行呢？通过这个命令就可以实现这个需求。off 不锁定任何线程，也就是所有线程都执行，这是默认值。 on 只有当前被调试程序会执行。 step 在单步的时候，除了next过一个函数的情况(熟悉情况的人可能知道，这其实是一个设置断点然后continue的行为)以外，只有当前线程会执行。</p>
+<p>要定义一个timer_list，我们可以使用静态和动态两种办法，静态方法使用DEFINE_TIMER宏：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define DEFINE_TIMER(_name, _function, _expires, _data)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>该宏将得到一个名字为<em>name，并分别用</em>function,<em>expires,</em>data参数填充timer_list的相关字段。</p>
+
+<p>如果要使用动态的方法，则可以自己声明一个timer_list结构，然后手动初始化它的各个字段：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct timer_list timer;
+</span><span class='line'>......
+</span><span class='line'>init_timer(&timer);
+</span><span class='line'>timer.function = _function;
+</span><span class='line'>timer.expires = _expires;
+</span><span class='line'>timer.data = _data;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>要激活一个定时器，我们只要调用add_timer即可：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>add_timer(&timer);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>要修改定时器的到期时间，我们只要调用mod_timer即可：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>mod_timer(&timer, jiffies+50);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>要移除一个定时器，我们只要调用del_timer即可：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>del_timer(&timer);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>定时器系统还提供了以下这些API供我们使用：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void add_timer_on(struct timer_list *timer, int cpu);  // 在指定的cpu上添加定时器
+</span><span class='line'>int mod_timer_pending(struct timer_list *timer, unsigned long expires);  //  只有当timer已经处在激活状态时，才修改timer的到期时刻
+</span><span class='line'>int mod_timer_pinned(struct timer_list *timer, unsigned long expires);  //  当
+</span><span class='line'>void set_timer_slack(struct timer_list *time, int slack_hz);  //  设定timer允许的到期时刻的最大延迟，用于对精度不敏感的定时器
+</span><span class='line'>int del_timer_sync(struct timer_list *timer);  //  如果该timer正在被处理中，则等待timer处理完成才移除该timer</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>2. 定时器的软件架构</h4>
+
+<p>低分辨率定时器是基于HZ来实现的，也就是说，每个tick周期，都有可能有定时器到期，关于tick如何产生，请参考：Linux时间子系统之四：定时器的引擎：clock_event_device。系统中有可能有成百上千个定时器，难道在每个tick中断中遍历一下所有的定时器，检查它们是否到期？内核当然不会使用这么笨的办法，它使用了一个更聪明的办法：按定时器的到期时间对定时器进行分组。因为目前的多核处理器使用越来越广泛，连智能手机的处理器动不动就是4核心，内核对多核处理器有较好的支持，低分辨率定时器在实现时也充分地考虑了多核处理器的支持和优化。为了较好地利用cache line，也为了避免cpu之间的互锁，内核为多核处理器中的每个cpu单独分配了管理定时器的相关数据结构和资源，每个cpu独立地管理属于自己的定时器。</p>
+
+<h5>2.1  定时器的分组</h5>
+
+<p>首先，内核为每个cpu定义了一个tvec_base结构指针：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static DEFINE_PER_CPU(struct tvec_base *, tvec_bases) = &boot_tvec_bases;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>tvec_base结构的定义如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct tvec_base {
+</span><span class='line'>&#9;spinlock_t lock;
+</span><span class='line'>&#9;struct timer_list *running_timer;
+</span><span class='line'>&#9;unsigned long timer_jiffies;
+</span><span class='line'>&#9;unsigned long next_timer;
+</span><span class='line'>&#9;struct tvec_root tv1;
+</span><span class='line'>&#9;struct tvec tv2;
+</span><span class='line'>&#9;struct tvec tv3;
+</span><span class='line'>&#9;struct tvec tv4;
+</span><span class='line'>&#9;struct tvec tv5;
+</span><span class='line'>} ____cacheline_aligned;
+</span><span class='line'>
+</span><span class='line'>running_timer  该字段指向当前cpu正在处理的定时器所对应的timer_list结构。
+</span><span class='line'>
+</span><span class='line'>timer_jiffies  该字段表示当前cpu定时器所经历过的jiffies数，大多数情况下，该值和jiffies计数值相等，当cpu的idle状态连续持续了多个jiffies时间时，当退出idle状态时，jiffies计数值就会大于该字段，在接下来的tick中断后，定时器系统会让该字段的值追赶上jiffies值。
+</span><span class='line'>
+</span><span class='line'>next_timer  该字段指向该cpu下一个即将到期的定时器。
+</span><span class='line'>
+</span><span class='line'>tv1--tv5  这5个字段用于对定时器进行分组，实际上，tv1--tv5都是一个链表数组，其中tv1的数组大小为TVR_SIZE， tv2 tv3 tv4 tv5的数组大小为TVN_SIZE，根据CONFIG_BASE_SMALL配置项的不同，它们有不同的大小：</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define TVN_BITS (CONFIG_BASE_SMALL ? 4 : 6)
+</span><span class='line'>#define TVR_BITS (CONFIG_BASE_SMALL ? 6 : 8)
+</span><span class='line'>#define TVN_SIZE (1 &lt;&lt; TVN_BITS)
+</span><span class='line'>#define TVR_SIZE (1 &lt;&lt; TVR_BITS)
+</span><span class='line'>#define TVN_MASK (TVN_SIZE - 1)
+</span><span class='line'>#define TVR_MASK (TVR_SIZE - 1)
+</span><span class='line'>
+</span><span class='line'>struct tvec {
+</span><span class='line'>&#9;struct list_head vec[TVN_SIZE];
+</span><span class='line'>};
+</span><span class='line'>
+</span><span class='line'>struct tvec_root {
+</span><span class='line'>&#9;struct list_head vec[TVR_SIZE];
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>默认情况下，没有使能CONFIG_BASE_SMALL，TVR_SIZE的大小是256，TVN_SIZE的大小则是64，当需要节省内存空间时，也可以使能CONFIG_BASE_SMALL，这时TVR_SIZE的大小是64，TVN_SIZE的大小则是16，以下的讨论我都是基于没有使能CONFIG_BASE_SMALL的情况。当有一个新的定时器要加入时，系统根据定时器到期的jiffies值和timer_jiffies字段的差值来决定该定时器被放入tv1至tv5中的哪一个数组中，最终，系统中所有的定时器的组织结构如下图所示：</p>
+
+<p><img src="/images/kernel/2017-07-23-4.png" alt="" /></p>
+
+<p>图 2.1.1  定时器在系统中的组织结构</p>
+
+<h5>2.2  定时器的添加</h5>
+
+<p>要加入一个新的定时器，我们可以通过api函数add_timer或mod_timer来完成，最终的工作会交由internal_add_timer函数来处理。该函数按以下步骤进行处理：</p>
+
+<p>计算定时器到期时间和所属cpu的tvec_base结构中的timer_jiffies字段的差值，记为idx；</p>
+
+<p>根据idx的值，选择该定时器应该被放到tv1&ndash;tv5中的哪一个链表数组中，可以认为tv1-tv5分别占据一个32位数的不同比特位，tv1占据最低的8位，tv2占据紧接着的6位，然后tv3再占位，以此类推，最高的6位分配给tv5。最终的选择规则如下表所示：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>链表数组     idx范围
+</span><span class='line'>tv1   0-255(2^8)
+</span><span class='line'>tv2   256--16383(2^14)
+</span><span class='line'>tv3   16384--1048575(2^20)
+</span><span class='line'>tv4   1048576--67108863(2^26)
+</span><span class='line'>tv5   67108864--4294967295(2^32)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>确定链表数组后，接着要确定把该定时器放入数组中的哪一个链表中，如果时间差idx小于256，按规则要放入tv1中，因为tv1包含了256个链表，所以可以简单地使用timer_list.expires的低8位作为数组的索引下标，把定时器链接到tv1中相应的链表中即可。如果时间差idx的值在256&ndash;18383之间，则需要把定时器放入tv2中，同样的，使用timer_list.expires的8&ndash;14位作为数组的索引下标，把定时器链接到tv2中相应的链表中,。定时器要加入tv3 tv4 tv5使用同样的原理。经过这样分组后的定时器，在后续的tick事件中，系统可以很方便地定位并取出相应的到期定时器进行处理。以上的讨论都体现在internal_add_timer的代码中：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void internal_add_timer(struct tvec_base *base, struct timer_list *timer)
+</span><span class='line'>{
+</span><span class='line'>&#9;unsigned long expires = timer-&gt;expires;
+</span><span class='line'>&#9;unsigned long idx = expires - base-&gt;timer_jiffies;
+</span><span class='line'>&#9;struct list_head *vec;
+</span><span class='line'>
+</span><span class='line'>&#9;if (idx &lt; TVR_SIZE) {
+</span><span class='line'>&#9;&#9;int i = expires & TVR_MASK;
+</span><span class='line'>&#9;&#9;vec = base-&gt;tv1.vec + i;
+</span><span class='line'>&#9;} else if (idx &lt; 1 &lt;&lt; (TVR_BITS + TVN_BITS)) {
+</span><span class='line'>&#9;&#9;int i = (expires &gt;&gt; TVR_BITS) & TVN_MASK;
+</span><span class='line'>&#9;&#9;vec = base-&gt;tv2.vec + i;
+</span><span class='line'>&#9;} else if (idx &lt; 1 &lt;&lt; (TVR_BITS + 2 * TVN_BITS)) {
+</span><span class='line'>&#9;&#9;int i = (expires &gt;&gt; (TVR_BITS + TVN_BITS)) & TVN_MASK;
+</span><span class='line'>&#9;&#9;vec = base-&gt;tv3.vec + i;
+</span><span class='line'>&#9;} else if (idx &lt; 1 &lt;&lt; (TVR_BITS + 3 * TVN_BITS)) {
+</span><span class='line'>&#9;&#9;int i = (expires &gt;&gt; (TVR_BITS + 2 * TVN_BITS)) & TVN_MASK;
+</span><span class='line'>&#9;&#9;vec = base-&gt;tv4.vec + i;
+</span><span class='line'>&#9;} else if ((signed long) idx &lt; 0) {
+</span><span class='line'>&#9;&#9;&#9;&#9;......
+</span><span class='line'>&#9;} else {
+</span><span class='line'>&#9;&#9;&#9;&#9;......
+</span><span class='line'>&#9;&#9;i = (expires &gt;&gt; (TVR_BITS + 3 * TVN_BITS)) & TVN_MASK;
+</span><span class='line'>&#9;&#9;vec = base-&gt;tv5.vec + i;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;list_add_tail(&timer-&gt;entry, vec);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>2.2  定时器的到期处理</h5>
+
+<p>经过2.1节的处理后，系统中的定时器按到期时间有规律地放置在tv1&ndash;tv5各个链表数组中，其中tv1中放置着在接下来的256个jiffies即将到期的定时器列表，需要注意的是，并不是tv1.vec[0]中放置着马上到期的定时器列表，tv1.vec[1]中放置着将在jiffies+1到期的定时器列表。因为base.timer_jiffies的值一直在随着系统的运行而动态地增加，原则上是每个tick事件会加1，base.timer_jiffies代表者该cpu定时器系统当前时刻，定时器也是动态地加入头256个链表tv1中，按2.1节的讨论，定时器加入tv1中使用的下标索引是定时器到期时间expires的低8位，所以假设当前的base.timer_jiffies值是0x34567826，则马上到期的定时器是在tv1.vec[0x26]中，如果这时候系统加入一个在jiffies值0x34567828到期的定时器，他将会加入到tv1.vec[0x28]中，运行两个tick后，base.timer_jiffies的值会变为0x34567828，很显然，在每次tick事件中，定时器系统只要以base.timer_jiffies的低8位作为索引，取出tv1中相应的链表，里面正好包含了所有在该jiffies值到期的定时器列表。</p>
+
+<p>那什么时候处理tv2&ndash;tv5中的定时器？每当base.timer_jiffies的低8位为0值时，这表明base.timer_jiffies的第8-13位有进位发生，这6位正好代表着tv2，这时只要按base.timer_jiffies的第8-13位的值作为下标，移出tv2中对应的定时器链表，然后用internal_add_timer把它们从新加入到定时器系统中来，因为这些定时器一定会在接下来的256个tick期间到期，所以它们肯定会被加入到tv1数组中，这样就完成了tv2往tv1迁移的过程。同样地，当base.timer_jiffies的第8-13位为0时，这表明base.timer_jiffies的第14-19位有进位发生，这6位正好代表着tv3，按base.timer_jiffies的第14-19位的值作为下标，移出tv3中对应的定时器链表，然后用internal_add_timer把它们从新加入到定时器系统中来，显然它们会被加入到tv2中，从而完成tv3到tv2的迁移，tv4，tv5的处理可以以此作类推。具体迁移的代码如下，参数index为事先计算好的高一级tv的需要迁移的数组索引：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int cascade(struct tvec_base *base, struct tvec *tv, int index)
+</span><span class='line'>{
+</span><span class='line'>&#9;/* cascade all the timers from tv up one level */
+</span><span class='line'>&#9;struct timer_list *timer, *tmp;
+</span><span class='line'>&#9;struct list_head tv_list;
+</span><span class='line'>
+</span><span class='line'>&#9;list_replace_init(tv-&gt;vec + index, &tv_list);  //  移除需要迁移的链表
+</span><span class='line'>
+</span><span class='line'>&#9;/* 
+</span><span class='line'>&#9; * We are removing _all_ timers from the list, so we 
+</span><span class='line'>&#9; * don't have to detach them individually. 
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;list_for_each_entry_safe(timer, tmp, &tv_list, entry) {
+</span><span class='line'>&#9;&#9;BUG_ON(tbase_get_base(timer-&gt;base) != base);
+</span><span class='line'>&#9;&#9;&#9;&#9;//  重新加入到定时器系统中，实际上将会迁移到下一级的tv数组中
+</span><span class='line'>&#9;&#9;internal_add_timer(base, timer);  
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;return index;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>每个tick事件到来时，内核会在tick定时中断处理期间激活定时器软中断：TIMER_SOFTIRQ，关于软件中断，请参考另一篇博文：Linux中断（interrupt）子系统之五：软件中断（softIRQ。TIMER_SOFTIRQ的执行函数是<code>__run_timers</code>，它实现了本节讨论的逻辑，取出tv1中到期的定时器，执行定时器的回调函数，由此可见，低分辨率定时器的回调函数是执行在软件中断上下文中的，这点在写定时器的回调函数时需要注意。<code>__run_timers</code>的代码如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static inline void __run_timers(struct tvec_base *base)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct timer_list *timer;
+</span><span class='line'>
+</span><span class='line'>&#9;spin_lock_irq(&base-&gt;lock);
+</span><span class='line'>&#9;&#9;/* 同步jiffies，在NO_HZ情况下，base-&gt;timer_jiffies可能落后不止一个tick  */
+</span><span class='line'>&#9;while (time_after_eq(jiffies, base-&gt;timer_jiffies)) {  
+</span><span class='line'>&#9;&#9;struct list_head work_list;
+</span><span class='line'>&#9;&#9;struct list_head *head = &work_list;
+</span><span class='line'>&#9;&#9;&#9;&#9;/*  计算到期定时器链表在tv1中的索引  */
+</span><span class='line'>&#9;&#9;int index = base-&gt;timer_jiffies & TVR_MASK;  
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;/* 
+</span><span class='line'>&#9;&#9; * /*  tv2--tv5定时器列表迁移处理  */
+</span><span class='line'>&#9;&#9; */
+</span><span class='line'>&#9;&#9;if (!index &&
+</span><span class='line'>&#9;&#9;&#9;(!cascade(base, &base-&gt;tv2, INDEX(0))) &&              
+</span><span class='line'>&#9;&#9;&#9;&#9;(!cascade(base, &base-&gt;tv3, INDEX(1))) &&      
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;!cascade(base, &base-&gt;tv4, INDEX(2)))  
+</span><span class='line'>&#9;&#9;&#9;cascade(base, &base-&gt;tv5, INDEX(3));  
+</span><span class='line'>&#9;&#9;&#9;&#9;/*  该cpu定时器系统运行时间递增一个tick  */                 
+</span><span class='line'>&#9;&#9;++base-&gt;timer_jiffies;  
+</span><span class='line'>&#9;&#9;&#9;&#9;/*  取出到期的定时器链表  */                                       
+</span><span class='line'>&#9;&#9;list_replace_init(base-&gt;tv1.vec + index, &work_list);
+</span><span class='line'>&#9;&#9;&#9;&#9;/*  遍历所有的到期定时器  */          
+</span><span class='line'>&#9;&#9;while (!list_empty(head)) {                                    
+</span><span class='line'>&#9;&#9;&#9;void (*fn)(unsigned long);
+</span><span class='line'>&#9;&#9;&#9;unsigned long data;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;timer = list_first_entry(head, struct timer_list,entry);
+</span><span class='line'>&#9;&#9;&#9;fn = timer-&gt;function;
+</span><span class='line'>&#9;&#9;&#9;data = timer-&gt;data;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;timer_stats_account_timer(timer);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;base-&gt;running_timer = timer;    /*  标记正在处理的定时器  */
+</span><span class='line'>&#9;&#9;&#9;detach_timer(timer, 1);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;spin_unlock_irq(&base-&gt;lock);
+</span><span class='line'>&#9;&#9;&#9;call_timer_fn(timer, fn, data);  /*  调用定时器的回调函数  */
+</span><span class='line'>&#9;&#9;&#9;spin_lock_irq(&base-&gt;lock);
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;base-&gt;running_timer = NULL;
+</span><span class='line'>&#9;spin_unlock_irq(&base-&gt;lock);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>通过上面的讨论，我们可以发现，内核的低分辨率定时器的实现非常精妙，既实现了大量定时器的管理，又实现了快速的O(1)查找到期定时器的能力，利用巧妙的数组结构，使得只需在间隔256个tick时间才处理一次迁移操作，5个数组就好比是5个齿轮，它们随着base->timer_jifffies的增长而不停地转动，每次只需处理第一个齿轮的某一个齿节，低一级的齿轮转动一圈，高一级的齿轮转动一个齿，同时自动把即将到期的定时器迁移到上一个齿轮中，所以低分辨率定时器通常又被叫做时间轮：time wheel。事实上，它的实现是一个很好的空间换时间软件算法。</p>
+
+<h4>3. 定时器软件中断</h4>
+
+<p>系统初始化时，start_kernel会调用定时器系统的初始化函数init_timers：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void __init init_timers(void)
+</span><span class='line'>{      
+</span><span class='line'>&#9;int err = timer_cpu_notify(&timers_nb, (unsigned long)CPU_UP_PREPARE, 
+</span><span class='line'>&#9;&#9;&#9;&#9;(void *)(long)smp_processor_id());
+</span><span class='line'>
+</span><span class='line'>&#9;init_timer_stats();
+</span><span class='line'>
+</span><span class='line'>&#9;BUG_ON(err != NOTIFY_OK);
+</span><span class='line'>&#9;register_cpu_notifier(&timers_nb);  /* 注册cpu notify，以便在hotplug时在cpu之间进行定时器的迁移 */
+</span><span class='line'>&#9;open_softirq(TIMER_SOFTIRQ, run_timer_softirq);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>可见，open_softirq把run_timer_softirq注册为TIMER_SOFTIRQ的处理函数，另外，当cpu的每个tick事件到来时，在事件处理中断中，update_process_times会被调用，该函数会进一步调用run_local_timers，run_local_timers会触发TIMER_SOFTIRQ软中断：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void run_local_timers(void)
+</span><span class='line'>{
+</span><span class='line'>&#9;hrtimer_run_queues();
+</span><span class='line'>&#9;raise_softirq(TIMER_SOFTIRQ);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>TIMER_SOFTIRQ的处理函数是run_timer_softirq：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void run_timer_softirq(struct softirq_action *h)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct tvec_base *base = __this_cpu_read(tvec_bases);
+</span><span class='line'>
+</span><span class='line'>&#9;hrtimer_run_pending();
+</span><span class='line'>
+</span><span class='line'>&#9;if (time_after_eq(jiffies, base-&gt;timer_jiffies))
+</span><span class='line'>&#9;&#9;__run_timers(base);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>好啦，终于看到<code>__run_timers</code>函数了，2.2节已经介绍过，正是这个函数完成了对到期定时器的处理工作，也完成了时间轮的不停转动。</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2017/07/23/kernel-clock-4/">Linux时间子系统之四：定时器的引擎：clock_event_device</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2017-07-23T14:04:00+08:00'><span class='date'>2017-07-23</span> <span class='time'>14:04:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://blog.csdn.net/DroidPhone/article/details/8017604">http://blog.csdn.net/DroidPhone/article/details/8017604</a></p>
+
+<p>早期的内核版本中，进程的调度基于一个称之为tick的时钟滴答，通常使用时钟中断来定时地产生tick信号，每次tick定时中断都会进行进程的统计和调度，并对tick进行计数，记录在一个jiffies变量中，定时器的设计也是基于jiffies。这时候的内核代码中，几乎所有关于时钟的操作都是在machine级的代码中实现，很多公共的代码要在每个平台上重复实现。随后，随着通用时钟框架的引入，内核需要支持高精度的定时器，为此，通用时间框架为定时器硬件定义了一个标准的接口：clock_event_device，machine级的代码只要按这个标准接口实现相应的硬件控制功能，剩下的与平台无关的特性则统一由通用时间框架层来实现。</p>
+
+<h4>1. 时钟事件软件架构</h4>
+
+<p>本系列文章的第一节中，我们曾经讨论了时钟源设备：clocksource，现在又来一个时钟事件设备：clock_event_device，它们有何区别？看名字，好像都是给系统提供时钟的设备，实际上，clocksource不能被编程，没有产生事件的能力，它主要被用于timekeeper来实现对真实时间进行精确的统计，而clock_event_device则是可编程的，它可以工作在周期触发或单次触发模式，系统可以对它进行编程，以确定下一次事件触发的时间，clock_event_device主要用于实现普通定时器和高精度定时器，同时也用于产生tick事件，供给进程调度子系统使用。时钟事件设备与通用时间框架中的其他模块的关系如下图所示：</p>
+
+<p><img src="/images/kernel/2017-07-23-2.png" alt="" /></p>
+
+<p>与clocksource一样，系统中可以存在多个clock_event_device，系统会根据它们的精度和能力，选择合适的clock_event_device对系统提供时钟事件服务。在smp系统中，为了减少处理器间的通信开销，基本上每个cpu都会具备一个属于自己的本地clock_event_device，独立地为该cpu提供时钟事件服务，smp中的每个cpu基于本地的clock_event_device，建立自己的tick_device，普通定时器和高精度定时器。</p>
+
+<p>在软件架构上看，clock_event_device被分为了两层，与硬件相关的被放在了machine层，而与硬件无关的通用代码则被集中到了通用时间框架层，这符合内核对软件的设计需求，平台的开发者只需实现平台相关的接口即可，无需关注复杂的上层时间框架。</p>
+
+<p>tick_device是基于clock_event_device的进一步封装，用于代替原有的时钟滴答中断，给内核提供tick事件，以完成进程的调度和进程信息统计，负载平衡和时间更新等操作。</p>
+
+<h4>2. 时钟事件设备相关数据结构</h4>
+
+<h5>2.1  struct clock_event_device</h5>
+
+<p>时钟事件设备的核心数据结构是clock_event_device结构，它代表着一个时钟硬件设备，该设备就好像是一个具有事件触发能力（通常就是指中断）的clocksource，它不停地计数，当计数值达到预先编程设定的数值那一刻，会引发一个时钟事件中断，继而触发该设备的事件处理回调函数，以完成对时钟事件的处理。clock_event_device结构的定义如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct clock_event_device {
+</span><span class='line'>&#9;void            (*event_handler)(struct clock_event_device *);
+</span><span class='line'>&#9;int         (*set_next_event)(unsigned long evt,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;  struct clock_event_device *);
+</span><span class='line'>&#9;int         (*set_next_ktime)(ktime_t expires,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;  struct clock_event_device *);
+</span><span class='line'>&#9;ktime_t         next_event;
+</span><span class='line'>&#9;u64         max_delta_ns;
+</span><span class='line'>&#9;u64         min_delta_ns;
+</span><span class='line'>&#9;u32         mult;
+</span><span class='line'>&#9;u32         shift;
+</span><span class='line'>&#9;enum clock_event_mode   mode;
+</span><span class='line'>&#9;unsigned int        features;
+</span><span class='line'>&#9;unsigned long       retries;
+</span><span class='line'>
+</span><span class='line'>&#9;void            (*broadcast)(const struct cpumask *mask);
+</span><span class='line'>&#9;void            (*set_mode)(enum clock_event_mode mode,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;struct clock_event_device *);
+</span><span class='line'>&#9;unsigned long       min_delta_ticks;
+</span><span class='line'>&#9;unsigned long       max_delta_ticks;
+</span><span class='line'>
+</span><span class='line'>&#9;const char      *name;
+</span><span class='line'>&#9;int         rating;
+</span><span class='line'>&#9;int         irq;
+</span><span class='line'>&#9;const struct cpumask    *cpumask;
+</span><span class='line'>&#9;struct list_head    list;
+</span><span class='line'>} ____cacheline_aligned;
+</span><span class='line'>
+</span><span class='line'>event_handler  该字段是一个回调函数指针，通常由通用框架层设置，在时间中断到来时，machine底层的的中断服务程序会调用该回调，框架层利用该回调实现对时钟事件的处理。
+</span><span class='line'>
+</span><span class='line'>set_next_event  设置下一次时间触发的时间，使用类似于clocksource的cycle计数值（离现在的cycle差值）作为参数。
+</span><span class='line'>
+</span><span class='line'>set_next_ktime  设置下一次时间触发的时间，直接使用ktime时间作为参数。
+</span><span class='line'>
+</span><span class='line'>max_delta_ns  可设置的最大时间差，单位是纳秒。
+</span><span class='line'>
+</span><span class='line'>min_delta_ns  可设置的最小时间差，单位是纳秒。
+</span><span class='line'>
+</span><span class='line'>mult shift  与clocksource中的类似，只不过是用于把纳秒转换为cycle。
+</span><span class='line'>
+</span><span class='line'>mode  该时钟事件设备的工作模式，两种主要的工作模式分别是：
+</span><span class='line'>&#9;CLOCK_EVT_MODE_PERIODIC  周期触发模式，设置后按给定的周期不停地触发事件；
+</span><span class='line'>&#9;CLOCK_EVT_MODE_ONESHOT  单次触发模式，只在设置好的触发时刻触发一次；
+</span><span class='line'>
+</span><span class='line'>set_mode  函数指针，用于设置时钟事件设备的工作模式。
+</span><span class='line'>
+</span><span class='line'>rating  表示该设备的精度等级。
+</span><span class='line'>
+</span><span class='line'>list  系统中注册的时钟事件设备用该字段挂在全局链表变量clockevent_devices上。</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>2.2 全局变量clockevent_devices</h5>
+
+<p>系统中所有注册的clock_event_device都会挂在该链表下面，它在kernel/time/clockevents.c中定义：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static LIST_HEAD(clockevent_devices);</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>2.3 全局变量clockevents_chain</h5>
+
+<p>通用时间框架初始化时会注册一个通知链（NOTIFIER），当系统中的时钟时间设备的状态发生变化时，利用该通知链通知系统的其它模块。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* Notification for clock events */
+</span><span class='line'>static RAW_NOTIFIER_HEAD(clockevents_chain);</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>3. clock_event_device的初始化和注册</h4>
+
+<p>每一个machine，都要定义一个自己的machine_desc结构，该结构定义了该machine的一些最基本的特性，其中需要设定一个sys_timer结构指针，machine级的代码负责定义sys_timer结构，sys_timer的声明很简单：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct sys_timer {
+</span><span class='line'>&#9;void            (*init)(void);
+</span><span class='line'>&#9;void            (*suspend)(void);
+</span><span class='line'>&#9;void            (*resume)(void);
+</span><span class='line'>#ifdef CONFIG_ARCH_USES_GETTIMEOFFSET
+</span><span class='line'>&#9;unsigned long       (*offset)(void);
+</span><span class='line'>#endif
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>通常，我们至少要定义它的init字段，系统初始化阶段，该init回调会被调用，该init回调函数的主要作用就是完成系统中的clocksource和clock_event_device的硬件初始化工作，以samsung的exynos4为例，在V3.4内核的代码树中，machine_desc的定义如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>MACHINE_START(SMDK4412, "SMDK4412")
+</span><span class='line'>&#9;/* Maintainer: Kukjin Kim &lt;kgene.kim@samsung.com&gt; */
+</span><span class='line'>&#9;/* Maintainer: Changhwan Youn &lt;chaos.youn@samsung.com&gt; */
+</span><span class='line'>&#9;.atag_offset    = 0x100,
+</span><span class='line'>&#9;.init_irq   = exynos4_init_irq,
+</span><span class='line'>&#9;.map_io     = smdk4x12_map_io,
+</span><span class='line'>&#9;.handle_irq = gic_handle_irq,
+</span><span class='line'>&#9;.init_machine   = smdk4x12_machine_init,
+</span><span class='line'>&#9;.timer      = &exynos4_timer,
+</span><span class='line'>&#9;.restart    = exynos4_restart,
+</span><span class='line'>MACHINE_END</span></code></pre></td></tr></table></div></figure>
+
+
+<p>定义的sys_timer是exynos4_timer，它的定义和init回调定义如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void __init exynos4_timer_init(void)
+</span><span class='line'>{
+</span><span class='line'>&#9;if (soc_is_exynos4210())
+</span><span class='line'>&#9;&#9;mct_int_type = MCT_INT_SPI;
+</span><span class='line'>&#9;else
+</span><span class='line'>&#9;&#9;mct_int_type = MCT_INT_PPI;
+</span><span class='line'>
+</span><span class='line'>&#9;exynos4_timer_resources();
+</span><span class='line'>&#9;exynos4_clocksource_init();
+</span><span class='line'>&#9;exynos4_clockevent_init();
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>struct sys_timer exynos4_timer = {
+</span><span class='line'>&#9;.init       = exynos4_timer_init,
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>exynos4_clockevent_init函数显然是初始化和注册clock_event_device的合适时机，在这里，它注册了一个rating为250的clock_event_device，并把它指定给cpu0：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static struct clock_event_device mct_comp_device = {
+</span><span class='line'>&#9;.name       = "mct-comp",
+</span><span class='line'>&#9;.features       = CLOCK_EVT_FEAT_PERIODIC | CLOCK_EVT_FEAT_ONESHOT,
+</span><span class='line'>&#9;.rating     = 250,
+</span><span class='line'>&#9;.set_next_event = exynos4_comp_set_next_event,
+</span><span class='line'>&#9;.set_mode   = exynos4_comp_set_mode,
+</span><span class='line'>};
+</span><span class='line'>......
+</span><span class='line'>static void exynos4_clockevent_init(void)
+</span><span class='line'>{
+</span><span class='line'>&#9;clockevents_calc_mult_shift(&mct_comp_device, clk_rate, 5);
+</span><span class='line'>&#9;&#9;......
+</span><span class='line'>&#9;mct_comp_device.cpumask = cpumask_of(0);
+</span><span class='line'>&#9;clockevents_register_device(&mct_comp_device);
+</span><span class='line'>
+</span><span class='line'>&#9;setup_irq(EXYNOS4_IRQ_MCT_G0, &mct_comp_event_irq);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>因为这个阶段其它cpu核尚未开始工作，所以该clock_event_device也只是在启动阶段给系统提供服务，实际上，因为exynos4是一个smp系统，具备2-4个cpu核心，前面说过，smp系统中，通常会使用各个cpu的本地定时器来为每个cpu单独提供时钟事件服务，继续翻阅代码，在系统初始化的后段，kernel_init会被调用，它会调用smp_prepare_cpus，其中会调用percpu_timer_setup函数，在arch/arm/kernel/smp.c中，为每个cpu定义了一个clock_event_device：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* 
+</span><span class='line'> * Timer (local or broadcast) support 
+</span><span class='line'> */
+</span><span class='line'>static DEFINE_PER_CPU(struct clock_event_device, percpu_clockevent);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>percpu_timer_setup最终会调用exynos4_local_timer_setup函数完成对本地clock_event_device的初始化工作：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int __cpuinit exynos4_local_timer_setup(struct clock_event_device *evt)
+</span><span class='line'>{
+</span><span class='line'>&#9;......
+</span><span class='line'>&#9;evt-&gt;name = mevt-&gt;name;
+</span><span class='line'>&#9;evt-&gt;cpumask = cpumask_of(cpu);
+</span><span class='line'>&#9;evt-&gt;set_next_event = exynos4_tick_set_next_event;
+</span><span class='line'>&#9;evt-&gt;set_mode = exynos4_tick_set_mode;
+</span><span class='line'>&#9;evt-&gt;features = CLOCK_EVT_FEAT_PERIODIC | CLOCK_EVT_FEAT_ONESHOT;
+</span><span class='line'>&#9;evt-&gt;rating = 450;
+</span><span class='line'>
+</span><span class='line'>&#9;clockevents_calc_mult_shift(evt, clk_rate / (TICK_BASE_CNT + 1), 5);
+</span><span class='line'>&#9;......
+</span><span class='line'>&#9;clockevents_register_device(evt);
+</span><span class='line'>&#9;......
+</span><span class='line'>&#9;enable_percpu_irq(EXYNOS_IRQ_MCT_LOCALTIMER, 0);
+</span><span class='line'>&#9;......
+</span><span class='line'>&#9;return 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>由此可见，每个cpu的本地clock_event_device的rating是450，比启动阶段的250要高，显然，之前注册给cpu0的精度要高，系统会用本地clock_event_device替换掉原来分配给cpu0的clock_event_device，至于怎么替换？我们先停一停，到这里我们一直在讨论machine级别的初始化和注册，让我们回过头来，看看框架层的初始化。在继续之前，让我们看看整个clock_event_device的初始化的调用序列图：</p>
+
+<p><img src="/images/kernel/2017-07-23-3.png" alt="" /></p>
+
+<p>图3.1  clock_event_device的系统初始化</p>
+
+<p>由上面的图示可以看出，框架层的初始化步骤很简单，又start_kernel开始，调用tick_init，它位于kernel/time/tick-common.c中，也只是简单地调用clockevents_register_notifier，同时把类型为notifier_block的tick_notifier作为参数传入，回看2.3节，clockevents_register_notifier注册了一个通知链，这样，当系统中的clock_event_device状态发生变化时（新增，删除，挂起，唤醒等等），tick_notifier中的notifier_call字段中设定的回调函数tick_notify就会被调用。接下来start_kernel调用了time_init函数，该函数通常定义在体系相关的代码中，正如前面所讨论的一样，它主要完成machine级别对时钟系统的初始化工作，最终通过clockevents_register_device注册系统中的时钟事件设备，把每个时钟时间设备挂在clockevent_device全局链表上，最后通过clockevent_do_notify触发框架层事先注册好的通知链，其实就是调用了tick_notify函数，我们主要关注CLOCK_EVT_NOTIFY_ADD通知，其它通知请自行参考代码，下面是tick_notify的简化版本：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int tick_notify(struct notifier_block *nb, unsigned long reason,
+</span><span class='line'>&#9;&#9;&#9;&#9;   void *dev)
+</span><span class='line'>{
+</span><span class='line'>&#9;switch (reason) {
+</span><span class='line'>
+</span><span class='line'>&#9;case CLOCK_EVT_NOTIFY_ADD:
+</span><span class='line'>&#9;&#9;return tick_check_new_device(dev);
+</span><span class='line'>
+</span><span class='line'>&#9;case CLOCK_EVT_NOTIFY_BROADCAST_ON:
+</span><span class='line'>&#9;case CLOCK_EVT_NOTIFY_BROADCAST_OFF:
+</span><span class='line'>&#9;case CLOCK_EVT_NOTIFY_BROADCAST_FORCE:
+</span><span class='line'>&#9;&#9;&#9;......
+</span><span class='line'>&#9;case CLOCK_EVT_NOTIFY_BROADCAST_ENTER:
+</span><span class='line'>&#9;case CLOCK_EVT_NOTIFY_BROADCAST_EXIT:
+</span><span class='line'>&#9;&#9;&#9;......
+</span><span class='line'>&#9;case CLOCK_EVT_NOTIFY_CPU_DYING:
+</span><span class='line'>&#9;&#9;&#9;......
+</span><span class='line'>&#9;case CLOCK_EVT_NOTIFY_CPU_DEAD:
+</span><span class='line'>&#9;&#9;&#9;......
+</span><span class='line'>&#9;case CLOCK_EVT_NOTIFY_SUSPEND:
+</span><span class='line'>&#9;&#9;&#9;......
+</span><span class='line'>&#9;case CLOCK_EVT_NOTIFY_RESUME:
+</span><span class='line'>&#9;&#9;&#9;......
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;return NOTIFY_OK;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>可见，对于新注册的clock_event_device，会发出CLOCK_EVT_NOTIFY_ADD通知，最终会进入函数：tick_check_new_device，这个函数比对当前cpu所使用的与新注册的clock_event_device之间的特性，如果认为新的clock_event_device更好，则会进行切换工作。下一节将会详细的讨论该函数。到这里，每个cpu已经有了自己的clock_event_device，在这以后，框架层的代码会根据内核的配置项（CONFIG_NO_HZ、CONFIG_HIGH_RES_TIMERS），对注册的clock_event_device进行不同的设置，从而为系统的tick和高精度定时器提供服务，这些内容我们留在本系列的后续文章进行讨论。</p>
+
+<h4>4. tick_device</h4>
+
+<p>当内核没有配置成支持高精度定时器时，系统的tick由tick_device产生，tick_device其实是clock_event_device的简单封装，它内嵌了一个clock_event_device指针和它的工作模式：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct tick_device {
+</span><span class='line'>&#9;struct clock_event_device *evtdev;
+</span><span class='line'>&#9;enum tick_device_mode mode;
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>在kernel/time/tick-common.c中，定义了一个per-cpu的tick_device全局变量，tick_cpu_device：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* 
+</span><span class='line'> * Tick devices 
+</span><span class='line'> */
+</span><span class='line'>DEFINE_PER_CPU(struct tick_device, tick_cpu_device);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>前面曾经说过，当machine的代码为每个cpu注册clock_event_device时，通知回调函数tick_notify会被调用，进而进入tick_check_new_device函数，下面让我们看看该函数如何工作，首先，该函数先判断注册的clock_event_device是否可用于本cpu，然后从per-cpu变量中取出本cpu的tick_device：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int tick_check_new_device(struct clock_event_device *newdev)
+</span><span class='line'>{
+</span><span class='line'>&#9;&#9;......
+</span><span class='line'>&#9;cpu = smp_processor_id();
+</span><span class='line'>&#9;if (!cpumask_test_cpu(cpu, newdev-&gt;cpumask))
+</span><span class='line'>&#9;&#9;goto out_bc;
+</span><span class='line'>
+</span><span class='line'>&#9;td = &per_cpu(tick_cpu_device, cpu);
+</span><span class='line'>&#9;curdev = td-&gt;evtdev;
+</span><span class='line'>
+</span><span class='line'>如果不是本地clock_event_device，会做进一步的判断：如果不能把irq绑定到本cpu，则放弃处理，如果本cpu已经有了一个本地clock_event_device，也放弃处理：
+</span><span class='line'>
+</span><span class='line'>&#9;if (!cpumask_equal(newdev-&gt;cpumask, cpumask_of(cpu))) {
+</span><span class='line'>&#9;&#9;&#9;   ......
+</span><span class='line'>&#9;&#9;if (!irq_can_set_affinity(newdev-&gt;irq))
+</span><span class='line'>&#9;&#9;&#9;goto out_bc;
+</span><span class='line'>&#9;&#9;&#9;   ......
+</span><span class='line'>&#9;&#9;if (curdev && cpumask_equal(curdev-&gt;cpumask, cpumask_of(cpu)))
+</span><span class='line'>&#9;&#9;&#9;goto out_bc;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>反之，如果本cpu已经有了一个clock_event_device，则根据是否支持单触发模式和它的rating值，决定是否替换原来旧的clock_event_device：
+</span><span class='line'>
+</span><span class='line'>&#9;if (curdev) {
+</span><span class='line'>&#9;&#9;if ((curdev-&gt;features & CLOCK_EVT_FEAT_ONESHOT) &&
+</span><span class='line'>&#9;&#9;&#9;!(newdev-&gt;features & CLOCK_EVT_FEAT_ONESHOT))
+</span><span class='line'>&#9;&#9;&#9;goto out_bc;  // 新的不支持单触发，但旧的支持，所以不能替换
+</span><span class='line'>&#9;&#9;if (curdev-&gt;rating &gt;= newdev-&gt;rating)
+</span><span class='line'>&#9;&#9;&#9;goto out_bc;  // 旧的比新的精度高，不能替换
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>在这些判断都通过之后，说明或者来cpu还没有绑定tick_device，或者是新的更好，需要替换：
+</span><span class='line'>
+</span><span class='line'>&#9;if (tick_is_broadcast_device(curdev)) {
+</span><span class='line'>&#9;&#9;clockevents_shutdown(curdev);
+</span><span class='line'>&#9;&#9;curdev = NULL;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;clockevents_exchange_device(curdev, newdev);
+</span><span class='line'>&#9;tick_setup_device(td, newdev, cpu, cpumask_of(cpu));</span></code></pre></td></tr></table></div></figure>
+
+
+<p>上面的tick_setup_device函数负责重新绑定当前cpu的tick_device和新注册的clock_event_device，如果发现是当前cpu第一次注册tick_device，就把它设置为TICKDEV_MODE_PERIODIC模式，如果是替换旧的tick_device，则根据新的tick_device的特性，设置为TICKDEV_MODE_PERIODIC或TICKDEV_MODE_ONESHOT模式。可见，在系统的启动阶段，tick_device是工作在周期触发模式的，直到框架层在合适的时机，才会开启单触发模式，以便支持NO_HZ和HRTIMER。</p>
+
+<h4>5. tick事件的处理&ndash;最简单的情况</h4>
+
+<p>clock_event_device最基本的应用就是实现tick_device，然后给系统定期地产生tick事件，通用时间框架对clock_event_device和tick_device的处理相当复杂，因为涉及配置项：CONFIG_NO_HZ和CONFIG_HIGH_RES_TIMERS的组合，两个配置项就有4种组合，这四种组合的处理都有所不同，所以这里我先只讨论最简单的情况：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>CONFIG_NO_HZ == 0;
+</span><span class='line'>CONFIG_HIGH_RES_TIMERS == 0;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>在这种配置模式下，我们回到上一节的tick_setup_device函数的最后：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (td-&gt;mode == TICKDEV_MODE_PERIODIC)
+</span><span class='line'>&#9;tick_setup_periodic(newdev, 0);
+</span><span class='line'>else
+</span><span class='line'>&#9;tick_setup_oneshot(newdev, handler, next_event);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>因为启动期间，第一个注册的tick_device必然工作在TICKDEV_MODE_PERIODIC模式，所以tick_setup_periodic会设置clock_event_device的事件回调字段event_handler为tick_handle_periodic，工作一段时间后，就算有新的支持TICKDEV_MODE_ONESHOT模式的clock_event_device需要替换，再次进入tick_setup_device函数，tick_setup_oneshot的handler参数也是之前设置的tick_handle_periodic函数，所以我们考察tick_handle_periodic即可：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void tick_handle_periodic(struct clock_event_device *dev)
+</span><span class='line'>{
+</span><span class='line'>&#9;int cpu = smp_processor_id();
+</span><span class='line'>&#9;ktime_t next;
+</span><span class='line'>
+</span><span class='line'>&#9;tick_periodic(cpu);
+</span><span class='line'>
+</span><span class='line'>&#9;if (dev-&gt;mode != CLOCK_EVT_MODE_ONESHOT)
+</span><span class='line'>&#9;&#9;return;
+</span><span class='line'>
+</span><span class='line'>&#9;next = ktime_add(dev-&gt;next_event, tick_period);
+</span><span class='line'>&#9;for (;;) {
+</span><span class='line'>&#9;&#9;if (!clockevents_program_event(dev, next, false))
+</span><span class='line'>&#9;&#9;&#9;return;
+</span><span class='line'>&#9;&#9;if (timekeeping_valid_for_hres())
+</span><span class='line'>&#9;&#9;&#9;tick_periodic(cpu);
+</span><span class='line'>&#9;&#9;next = ktime_add(next, tick_period);
+</span><span class='line'>&#9;}
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>该函数首先调用tick_periodic函数，完成tick事件的所有处理，如果是周期触发模式，处理结束，如果工作在单触发模式，则计算并设置下一次的触发时刻，这里用了一个循环，是为了防止当该函数被调用时，clock_event_device中的计时实际上已经经过了不止一个tick周期，这时候，tick_periodic可能被多次调用，使得jiffies和时间可以被正确地更新。tick_periodic的代码如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void tick_periodic(int cpu)
+</span><span class='line'>{
+</span><span class='line'>&#9;if (tick_do_timer_cpu == cpu) {
+</span><span class='line'>&#9;&#9;write_seqlock(&xtime_lock);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;/* Keep track of the next tick event */
+</span><span class='line'>&#9;&#9;tick_next_period = ktime_add(tick_next_period, tick_period);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;do_timer(1);
+</span><span class='line'>&#9;&#9;write_sequnlock(&xtime_lock);
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;update_process_times(user_mode(get_irq_regs()));
+</span><span class='line'>&#9;profile_tick(CPU_PROFILING);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>如果当前cpu负责更新时间，则通过do_timer进行以下操作：</p>
+
+<pre><code>更新jiffies_64变量；
+更新墙上时钟；
+每10个tick，更新一次cpu的负载信息；
+</code></pre>
+
+<p>调用update_peocess_times，完成以下事情：</p>
+
+<pre><code>更新进程的时间统计信息；
+触发TIMER_SOFTIRQ软件中断，以便系统处理传统的低分辨率定时器；
+检查rcu的callback；
+通过scheduler_tick触发调度系统进行进程统计和调度工作；
+</code></pre>
 </div>
   
   
@@ -475,7 +2224,7 @@ var ss360Config = {
   
     <section>
 <h1>Categories
-<span class='right_span'>(893)</span>
+<span class='right_span'>(899)</span>
 
 </h1>
 <head>
@@ -506,7 +2255,7 @@ if (!document.getElementById('blog~octopress')) document.getElementById('aexp_bl
 if (!document.getElementById('blog')) document.getElementById('aexp_blog').style.visibility = 'hidden';
 if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ruby').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(135)</span></li>
+<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(136)</span></li>
 <div id='language' class='catsub'><li><a href='/blog/cats/language~c/?opendiv=language'>c</a><a href='##' onmousedown=showDiv('language~c') id='aexp_language~c'><span class='exp_style' id='exp_language~c'>[+]</span></a><span class='right_span'>32</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~c')) document.getElementById('aexp_language~c').style.visibility = 'hidden';
@@ -523,7 +2272,7 @@ if (!document.getElementById('language~java')) document.getElementById('aexp_lan
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~jsp')) document.getElementById('aexp_language~jsp').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/language~php/?opendiv=language'>php</a><a href='##' onmousedown=showDiv('language~php') id='aexp_language~php'><span class='exp_style' id='exp_language~php'>[+]</span></a><span class='right_span'>40</span></li>
+<li><a href='/blog/cats/language~php/?opendiv=language'>php</a><a href='##' onmousedown=showDiv('language~php') id='aexp_language~php'><span class='exp_style' id='exp_language~php'>[+]</span></a><span class='right_span'>41</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~php')) document.getElementById('aexp_language~php').style.visibility = 'hidden';
 </script>
@@ -560,7 +2309,7 @@ if (!document.getElementById('assembly~base')) document.getElementById('aexp_ass
 if (!document.getElementById('assembly')) document.getElementById('aexp_assembly').style.visibility = 'hidden';
 if (!document.getElementById('assembly~win')) document.getElementById('aexp_assembly~win').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(192)</span></li>
+<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(194)</span></li>
 <div id='tools' class='catsub'><li><a href='/blog/cats/tools~apache2/?opendiv=tools'>apache2</a><a href='##' onmousedown=showDiv('tools~apache2') id='aexp_tools~apache2'><span class='exp_style' id='exp_tools~apache2'>[+]</span></a><span class='right_span'>9</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~apache2')) document.getElementById('aexp_tools~apache2').style.visibility = 'hidden';
@@ -601,7 +2350,7 @@ if (!document.getElementById('tools~haproxy')) document.getElementById('aexp_too
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~isal')) document.getElementById('aexp_tools~isal').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/tools~mysql/?opendiv=tools'>mysql</a><a href='##' onmousedown=showDiv('tools~mysql') id='aexp_tools~mysql'><span class='exp_style' id='exp_tools~mysql'>[+]</span></a><span class='right_span'>28</span></li>
+<li><a href='/blog/cats/tools~mysql/?opendiv=tools'>mysql</a><a href='##' onmousedown=showDiv('tools~mysql') id='aexp_tools~mysql'><span class='exp_style' id='exp_tools~mysql'>[+]</span></a><span class='right_span'>29</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~mysql')) document.getElementById('aexp_tools~mysql').style.visibility = 'hidden';
 </script>
@@ -645,7 +2394,7 @@ if (!document.getElementById('tools~sqlmap')) document.getElementById('aexp_tool
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~sqlserver')) document.getElementById('aexp_tools~sqlserver').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/tools~squid/?opendiv=tools'>squid</a><a href='##' onmousedown=showDiv('tools~squid') id='aexp_tools~squid'><span class='exp_style' id='exp_tools~squid'>[+]</span></a><span class='right_span'>4</span></li>
+<li><a href='/blog/cats/tools~squid/?opendiv=tools'>squid</a><a href='##' onmousedown=showDiv('tools~squid') id='aexp_tools~squid'><span class='exp_style' id='exp_tools~squid'>[+]</span></a><span class='right_span'>5</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~squid')) document.getElementById('aexp_tools~squid').style.visibility = 'hidden';
 </script>
@@ -670,12 +2419,12 @@ if (!document.getElementById('tools~vim')) document.getElementById('aexp_tools~v
 if (!document.getElementById('tools')) document.getElementById('aexp_tools').style.visibility = 'hidden';
 if (!document.getElementById('tools~wxwork')) document.getElementById('aexp_tools~wxwork').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/system/'>system</a><a href='##' onmousedown=showDiv('system') id='aexp_system'><span class='exp_style' id='exp_system'>[+]</span></a><span class='right_span'>(105)</span></li>
+<li class='catclass'><a href='/blog/cats/system/'>system</a><a href='##' onmousedown=showDiv('system') id='aexp_system'><span class='exp_style' id='exp_system'>[+]</span></a><span class='right_span'>(107)</span></li>
 <div id='system' class='catsub'><li><a href='/blog/cats/system~base/?opendiv=system'>base</a><a href='##' onmousedown=showDiv('system~base') id='aexp_system~base'><span class='exp_style' id='exp_system~base'>[+]</span></a><span class='right_span'>23</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('system~base')) document.getElementById('aexp_system~base').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/system~centos/?opendiv=system'>centos</a><a href='##' onmousedown=showDiv('system~centos') id='aexp_system~centos'><span class='exp_style' id='exp_system~centos'>[+]</span></a><span class='right_span'>12</span></li>
+<li><a href='/blog/cats/system~centos/?opendiv=system'>centos</a><a href='##' onmousedown=showDiv('system~centos') id='aexp_system~centos'><span class='exp_style' id='exp_system~centos'>[+]</span></a><span class='right_span'>14</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('system~centos')) document.getElementById('aexp_system~centos').style.visibility = 'hidden';
 </script>
@@ -720,7 +2469,7 @@ if (!document.getElementById('system~namespace')) document.getElementById('aexp_
 if (!document.getElementById('system')) document.getElementById('aexp_system').style.visibility = 'hidden';
 if (!document.getElementById('system~ubuntu')) document.getElementById('aexp_system~ubuntu').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/kernel/'>kernel</a><a href='##' onmousedown=showDiv('kernel') id='aexp_kernel'><span class='exp_style' id='exp_kernel'>[+]</span></a><span class='right_span'>(273)</span></li>
+<li class='catclass'><a href='/blog/cats/kernel/'>kernel</a><a href='##' onmousedown=showDiv('kernel') id='aexp_kernel'><span class='exp_style' id='exp_kernel'>[+]</span></a><span class='right_span'>(274)</span></li>
 <div id='kernel' class='catsub'><li><a href='/blog/cats/kernel~10gb/?opendiv=kernel'>10gb</a><a href='##' onmousedown=showDiv('kernel~10gb') id='aexp_kernel~10gb'><span class='exp_style' id='exp_kernel~10gb'>[+]</span></a><span class='right_span'>7</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('kernel~10gb')) document.getElementById('aexp_kernel~10gb').style.visibility = 'hidden';
@@ -888,9 +2637,13 @@ if (!document.getElementById('algorithm~ds')) document.getElementById('aexp_algo
 if (!document.getElementById('algorithm~game')) document.getElementById('aexp_algorithm~game').style.visibility = 'hidden';
 </script>
 <li><a href='/blog/cats/algorithm~tc/?opendiv=algorithm'>tc</a><a href='##' onmousedown=showDiv('algorithm~tc') id='aexp_algorithm~tc'><span class='exp_style' id='exp_algorithm~tc'>[+]</span></a><span class='right_span'>2</span></li>
+<script language='javascript' type='text/javascript'>
+if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algorithm~tc').style.visibility = 'hidden';
+</script>
+<li><a href='/blog/cats/lernel~ipsec/?opendiv=algorithm'>ipsec</a><a href='##' onmousedown=showDiv('algorithm~ipsec') id='aexp_algorithm~ipsec'><span class='exp_style' id='exp_algorithm~ipsec'>[+]</span></a><span class='right_span'>1</span></li>
 </div><script language='javascript' type='text/javascript'>
 if (!document.getElementById('algorithm')) document.getElementById('aexp_algorithm').style.visibility = 'hidden';
-if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algorithm~tc').style.visibility = 'hidden';
+if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_algorithm~ipsec').style.visibility = 'hidden';
 </script>
 
 </ul>
@@ -901,7 +2654,7 @@ if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algo
 
 <section>
 <h1>Date Categories
-<span class='right_span'>(893)</span>
+<span class='right_span'>(899)</span>
 
 </h1>
 <head>
@@ -909,8 +2662,9 @@ if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algo
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(13)</span></li>
-<div id='2024' class='catsub'><li><a href='/blog/cats/2024~04/?opendiv=2024'>2024-04</a><span class='right_span'>2</span></li>
+<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(19)</span></li>
+<div id='2024' class='catsub'><li><a href='/blog/cats/2024~05/?opendiv=2024'>2024-05</a><span class='right_span'>3</span></li>
+<li><a href='/blog/cats/2024~04/?opendiv=2024'>2024-04</a><span class='right_span'>5</span></li>
 <li><a href='/blog/cats/2024~03/?opendiv=2024'>2024-03</a><span class='right_span'>5</span></li>
 <li><a href='/blog/cats/2024~02/?opendiv=2024'>2024-02</a><span class='right_span'>4</span></li>
 <li><a href='/blog/cats/2024~01/?opendiv=2024'>2024-01</a><span class='right_span'>2</span></li>
@@ -1062,7 +2816,7 @@ if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algo
 <a style="font-size: 100%" href="/tags/lvs/">lvs(3)</a>
 <a style="font-size: 131%" href="/tags/mptcp/">mptcp(9)</a>
 <a style="font-size: 119%" href="/tags/nginx/">nginx(6)</a>
-<a style="font-size: 108%" href="/tags/squid/">squid(4)</a>
+<a style="font-size: 114%" href="/tags/squid/">squid(5)</a>
 <a style="font-size: 131%" href="/tags/vpn/">vpn(9)</a>
 <a style="font-size: 108%" href="/tags/shu-ju-cai-ji/">数据采集(4)</a>
 <a style="font-size: 141%" href="/tags/hui-bian/">汇编(13)</a>
@@ -1072,6 +2826,30 @@ if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algo
 <section>
   <h1>Recent Posts</h1>
   <ul id="recent_posts">
+    
+      <li class="post">
+        <a href="/blog/2024/05/16/lang-centos8-php8/">Centos8安装PHP8</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2024/05/16/centos8-kernel/">CentOS8 编译内核错误</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2024/05/11/centos8.5-install/">CentOS8.5 安装</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2024/04/30/mariadb/">centos 安装 MariaDB</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2024/04/29/strongswan-make/">ubuntu 编译strongswan</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2024/04/29/tools-squid-log/">squid 日志格式, 时间格式</a>
+      </li>
     
       <li class="post">
         <a href="/blog/2024/04/26/tools-apache2-tmp/">centos7下httpd服务对tmp目录操作</a>
@@ -1087,30 +2865,6 @@ if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algo
     
       <li class="post">
         <a href="/blog/2024/03/26/TH40W-E/">华汉维无线wifi温湿度TH40W-E</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/03/26/ups-winpower/">山特UPS软件Winpower</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/03/23/lang-ci-cache/">php ci 数据缓存</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/03/01/nginx-proxy/">nginx配置多个域名, http https共用配置</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/02/26/lang-web-FormData/">Ajax使用FormData上传文件</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/02/26/lang-web-pdf-view/">pdf预览 jquery.media.js</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/02/26/vim-syntax-off/">Vim 在处理长字符串时变得非常慢</a>
       </li>
     
   </ul>

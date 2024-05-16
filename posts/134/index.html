@@ -131,7 +131,7 @@ var ss360Config = {
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2018/01/08/kernel-fpu-1/">linux 下的浮点运算</a></h2>
+      <h2 class="entry-title"><a href="/blog/2018/02/04/mem-mb/">内存屏障</a></h2>
     
     
       <p class="meta">
@@ -140,29 +140,282 @@ var ss360Config = {
 
 
 
-<time class='entry-date' datetime='2018-01-08T00:54:00+08:00'><span class='date'>2018-01-08</span> <span class='time'>00:54:00</span></time>
+<time class='entry-date' datetime='2018-02-04T00:10:00+08:00'><span class='date'>2018-02-04</span> <span class='time'>00:10:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><p><a href="http://blog.sina.com.cn/s/blog_6e32babb0101o9kf.html">linux 下的浮点运算</a></p>
+  <div class="entry-content"><p><a href="https://www.cnblogs.com/icanth/archive/2012/06/10/2544300.html">https://www.cnblogs.com/icanth/archive/2012/06/10/2544300.html</a></p>
 
-<ol>
-<li><p>intel 平台下，如果有浮点计算，都会用专门的浮点指令来执行。但是double/float 类型的加减乘除，gcc 是用的一般指令来做的，没有用浮点指令来做。</p></li>
-<li><p>还是intel 平台下，一个进程在被cpu调度到之后，运行的第一条浮点指令会触发“no deveice avaible”异常，从而导致执行相应的中断处理程序。后续的不再触发。这个中断处理程序中，一般会做的是，恢复/保存浮点运行相关的环境。如果该时间段内没有浮点操作，那么就不用恢复/保存浮点运行环境，从而减少开销。这也是为什么要设计成这样的原因。</p></li>
-<li><p>内核也可以执行浮点操作，只需要调用前后用 kernel_fpu_begin() and kernel_fpu_end() 括起来。但是有可能这个的开销已经超过了用浮点指令带来的便捷。所以内核应该尽量少用浮点操作。</p></li>
-</ol>
+<h3>内存屏障(Memory Barriers)</h3>
+
+<p>一方面，CPU由于采用指令流水线和超流水线技术，可能导致CPU虽然顺序取指令、但有可能会出现“乱序”执行的情况，当然，对于” a++；b = f(a)；c = f”等存在依赖关系的指令，CPU则会在“b= f(a)”执行阶段之前被阻塞；另一方面，编译器也有可能将依赖关系很近“人为地”拉开距离以防止阻塞情况的发生，从而导致编译器乱序，如“a++ ；c = f；b = f(a)”。</p>
+
+<p>一个CPU对指令顺序提供如下保证：</p>
+
+<p>(1) On any given CPU, dependent memory accesses will be issued in order, with respect to itself.如Q = P; D = *Q;将保证其顺序执行</p>
+
+<p>(2) Overlapping loads and stores within a particular CPU will appear to be ordered within that CPU.重叠的Load和Store操作将保证顺序执行（目标地址相同的Load、Store），如：a = <em>X; </em>X = b;</p>
+
+<p>(3) It <em>must_not</em> be assumed that independent loads and stores will be issued in the order given.</p>
+
+<p>(4) It <em>must</em> be assumed that overlapping memory accesses may be merged or discarded.如<em>A = X; Y = </em>A; => STORE <em>A = X; Y = LOAD </em>A; / or STORE *A = Y = X;</p>
+
+<p>由此可见，无关的内存操作会被按随机顺序有效的得到执行,但是在CPU与CPU交互时或CPU与IO设备交互时, 这可能会成为问题. 我们需要一些手段来干预编译器和CPU, 使其限制指令顺序。内存屏障就是这样的干预手段. 他们能保证处于内存屏障两边的内存操作满足部分有序.(译注: 这里"部分有序"的意思是, 内存屏障之前的操作都会先于屏障之后的操作, 但是如果几个操作出现在屏障的同一边, 则不保证它们的顺序.)</p>
+
+<p>(1) 写(STORE)内存屏障。在写屏障之前的STORE操作将先于所有在写屏障之后的STORE操作。</p>
+
+<p>(2) 数据依赖屏障。两条Load指令，第二条Load指令依赖于第一条Load指令的结果，则数据依赖屏障保障第二条指令的目标地址将被更新。</p>
+
+<p>(3) 读(LOAD)内存屏障。读屏障包含数据依赖屏障的功能, 并且保证所有出现在屏障之前的LOAD操作都将先于所有出现在屏障之后的LOAD操作被系统中的其他组件所感知.</p>
+
+<p>(4) 通用内存屏障. 通用内存屏障保证所有出现在屏障之前的LOAD和STORE操作都将先于所有出现在屏障之后的LOAD和STORE操作被系统中的其他组件所感知.</p>
+
+<p>(5) LOCK操作.它的作用相当于一个单向渗透屏障.它保证所有出现在LOCK之后的内存操作都将在LOCK操作被系统中的其他组件所感知之后才能发生. 出现在LOCK之前的内存操作可能在LOCK完成之后才发生.LOCK操作总是跟UNLOCK操作配对出现.</p>
+
+<p>(6) UNLOCK操作。它保证所有出现在UNLOCK之前的内存操作都将在UNLOCK操作被系统中的其他组件所感知之前发生.</p>
+
+<p>LINUX对于x86而言，在为UP体系统架构下，调用barrier()进行通用内存屏障。在SMP体系架构下，若为64位CPU或支持mfence、lfence、sfence指令的32位CPU，则smp_mb()、smp_rmb()、smp_smb()对应通用内存屏障、写屏障和读屏障；而不支持mfence、lfence、sfence指令的32位CPU则smp_mb()、smp_rmb()、smp_smb()对应LOCK操作。源码请参见《内存屏障源码分析》一节。</p>
+
+<h4>内存屏障源码分析</h4>
+
+<p>/include/asm-generic/system.h：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>053 #ifdef CONFIG_SMP
+</span><span class='line'>054 #define smp_mb()        mb()
+</span><span class='line'>055 #define smp_rmb()       rmb()
+</span><span class='line'>056 #define smp_wmb()       wmb()
+</span><span class='line'>057 #else
+</span><span class='line'>058 #define smp_mb()        barrier()
+</span><span class='line'>059 #define smp_rmb()       barrier()
+</span><span class='line'>060 #define smp_wmb()       barrier()
+</span><span class='line'>061 #endif</span></code></pre></td></tr></table></div></figure>
 
 
-<hr />
+<p>在x86 UP体系架构中，smp_mb、smp_rmb、smp_wmb被翻译成barrier：</p>
 
-<p><a href="http://www.lenky.info/archives/2012/10/2001/comment-page-1">Linux内核与浮点计算</a></p>
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>012 #define barrier() __asm__ __volatile__("": : :"memory")</span></code></pre></td></tr></table></div></figure>
 
-<p>在Linux内核里无法直接进行浮点计算，这是从性能上的考虑，因为这样做可以省去在用户态与内核态之间进行切换时保存/恢复浮点寄存器 FPU的操作，当然，这到底可以提升多少性能我还不得而知，不过就目前而言，Linux内核的确就是这样做的。</p>
 
-<p>比如下面这个测试模块：</p>
+<p><code>__volatile</code>告诉编译器此条语句不进行任何优化，"&ldquo;: : :"memory&rdquo; 内存单元已被修改、需要重新读入。</p>
+
+<p>在x86 SMP体系架构中，smp_mb、smp_rmb、smp_wmb如下定义：</p>
+
+<p>/arch/x86/include/asm/system.h：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>352 /*
+</span><span class='line'>353  * Force strict CPU ordering.
+</span><span class='line'>354  * And yes, this is required on UP too when we're talking
+</span><span class='line'>355  * to devices.
+</span><span class='line'>356  */
+</span><span class='line'>357 #ifdef CONFIG_X86_32
+</span><span class='line'>358 /*
+</span><span class='line'>359  * Some non-Intel clones support out of order store. wmb() ceases to be a
+</span><span class='line'>360  * nop for these.
+</span><span class='line'>361  */
+</span><span class='line'>362 #define mb() alternative("lock; addl $0,0(%%esp)", "mfence", X86_FEATURE_XMM2)
+</span><span class='line'>363 #define rmb() alternative("lock; addl $0,0(%%esp)", "lfence", X86_FEATURE_XMM2)
+</span><span class='line'>364 #define wmb() alternative("lock; addl $0,0(%%esp)", "sfence", X86_FEATURE_XMM)
+</span><span class='line'>365 #else
+</span><span class='line'>366 #define mb()    asm volatile("mfence":::"memory")
+</span><span class='line'>367 #define rmb()   asm volatile("lfence":::"memory")
+</span><span class='line'>368 #define wmb()   asm volatile("sfence" ::: "memory")
+</span><span class='line'>369 #endif</span></code></pre></td></tr></table></div></figure>
+
+
+<p>362~364行针对x86的32位CPU，366~368行针对x86的64位CPU。</p>
+
+<p>在x86的64位CPU中，mb()宏实际为：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>asm volatile("sfence" ::: "memory")。</span></code></pre></td></tr></table></div></figure>
+
+
+<p>volatile告诉编译器严禁在此处汇编语句与其它语句重组优化，memory强制编译器假设RAM所有内存单元均被汇编指令修改，"sfence" ::: 表示在此插入一条串行化汇编指令sfence。</p>
+
+<p>mfence：串行化发生在mfence指令之前的读写操作</p>
+
+<p>lfence：串行化发生在mfence指令之前的读操作、但不影响写操作</p>
+
+<p>sfence：串行化发生在mfence指令之前的写操作、但不影响读操作</p>
+
+<h4>在x86的32位CPU中，mb()宏实际为：</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>mb() alternative("lock; addl $0,0(%%esp)", "mfence", X86_FEATURE_XMM2)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>由于x86的32位CPU有可能不提供mfence、lfence、sfence三条汇编指令的支持，故在不支持mfence的指令中使用："lock; addl $0,0(%%esp)&ldquo;, "mfence"。lock表示将“addl $0,0(%%esp)”语句作为内存屏障。</p>
+
+<p>关于lock的实现：cpu上有一根pin #HLOCK连到北桥,lock前缀会在执行这条指令前先去拉这根pin，持续到这个指令结束时放开#HLOCK pin，在这期间，北桥会屏蔽掉一切外设以及AGP的内存操作。也就保证了这条指令的atomic。</p>
+
+<h4>参考资料</h4>
+
+<p>《memroy-barries.txt》，/Documentation/memory-barriers.txt</p>
+
+<p>《LINUX内核内存屏障》，<a href="http://blog.csdn.net/ljl1603/article/details/6793982">http://blog.csdn.net/ljl1603/article/details/6793982</a></p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2018/02/03/kernel-net-synack/">SYN-ACK 重传</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2018-02-03T23:01:00+08:00'><span class='date'>2018-02-03</span> <span class='time'>23:01:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><h3>fastopen synack 重传</h3>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int tcp_conn_request(struct request_sock_ops *rsk_ops,
+</span><span class='line'>&#9;&#9;&#9;const struct tcp_request_sock_ops *af_ops,
+</span><span class='line'>&#9;&#9;&#9;struct sock *sk, struct sk_buff *skb)
+</span><span class='line'>{
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;fastopen = !want_cookie &&
+</span><span class='line'>&#9;&#9;&#9;tcp_try_fastopen(sk, skb, req, &foc, dst);
+</span><span class='line'>&#9;...</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>bool tcp_try_fastopen(struct sock *sk, struct sk_buff *skb,
+</span><span class='line'>&#9;&#9;&#9;struct request_sock *req,
+</span><span class='line'>&#9;&#9;&#9;struct tcp_fastopen_cookie *foc,
+</span><span class='line'>&#9;&#9;&#9;struct dst_entry *dst)
+</span><span class='line'>{
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;if (tcp_fastopen_create_child(sk, skb, dst, req)) {
+</span><span class='line'>&#9;...
+</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static bool tcp_fastopen_create_child(struct sock *sk,
+</span><span class='line'>&#9;&#9;&#9;&#9;struct sk_buff *skb,
+</span><span class='line'>&#9;&#9;&#9;&#9;struct dst_entry *dst,
+</span><span class='line'>&#9;&#9;&#9;&#9;struct request_sock *req)
+</span><span class='line'>{
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;child = inet_csk(sk)-&gt;icsk_af_ops-&gt;syn_recv_sock(sk, skb, req, NULL);
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;inet_csk_reset_xmit_timer(child, ICSK_TIME_RETRANS,
+</span><span class='line'>&#9;&#9;&#9;&#9;TCP_TIMEOUT_INIT, TCP_RTO_MAX);
+</span><span class='line'>&#9;...
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void tcp_retransmit_timer(struct sock *sk)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>&#9;struct inet_connection_sock *icsk = inet_csk(sk);
+</span><span class='line'>
+</span><span class='line'>&#9;if (tp-&gt;fastopen_rsk) {
+</span><span class='line'>&#9;&#9;WARN_ON_ONCE(sk-&gt;sk_state != TCP_SYN_RECV &&
+</span><span class='line'>&#9;&#9;&#9;sk-&gt;sk_state != TCP_FIN_WAIT1);
+</span><span class='line'>&#9;&#9;tcp_fastopen_synack_timer(sk);
+</span><span class='line'>&#9;&#9;/* Before we receive ACK to our SYN-ACK don't retransmit
+</span><span class='line'>&#9;&#9; * anything else (e.g., data or FIN segments).
+</span><span class='line'>&#9;&#9; */
+</span><span class='line'>&#9;&#9;return;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;...</span></code></pre></td></tr></table></div></figure>
+
+
+
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -192,117 +445,47 @@ var ss360Config = {
 <span class='line-number'>26</span>
 <span class='line-number'>27</span>
 <span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'># Makefile
-</span><span class='line'>MDIR = $(shell pwd)
-</span><span class='line'>ifeq (, $(KSRC))
-</span><span class='line'>&#9;KSRC := /usr/src/linux-`uname -r`
-</span><span class='line'>endif
-</span><span class='line'>
-</span><span class='line'>ifeq (, $(PROJECT_DIR))
-</span><span class='line'>&#9;PROJECT_DIR := $(PWD)/../
-</span><span class='line'>endif
-</span><span class='line'>
-</span><span class='line'>module := float_test
-</span><span class='line'>
-</span><span class='line'>obj-m := $(module).o
-</span><span class='line'>
-</span><span class='line'>srcs =  $(wildcard, *.c)
-</span><span class='line'>
-</span><span class='line'>$(module)-objs := $(addsuffix .o, $(basename $(srcs)))
-</span><span class='line'>
-</span><span class='line'>EXTRA_CFLAGS += -g $(FLAG) -I$(PROJECT_DIR)/inc -I${SHAREDHDR} -I$(KERNELHDR) -O2 -D__KERNEL__ -DMODULE $(INCLUDE) -DEXPORT_SYMTAB
-</span><span class='line'>
-</span><span class='line'>TARGET = $(module).ko
-</span><span class='line'>
-</span><span class='line'>all:
-</span><span class='line'>&#9;make -C $(KSRC) M=$(MDIR) modules
-</span><span class='line'>
-</span><span class='line'>debug:
-</span><span class='line'>&#9;make EXTRA_FLAGS="${EXTRA_CFLAGS} -DDEBUG" -C $(KSRC) M=$(MDIR) modules
-</span><span class='line'>
-</span><span class='line'>clean:
-</span><span class='line'>&#9;make -C $(KSRC) M=$(MDIR) clean
-</span><span class='line'>
-</span><span class='line'>install: all
-</span><span class='line'>&#9;cp -f $(TARGET) $(INSTALL_DIR)</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/**
-</span><span class='line'> * float_test.c
+</pre></td><td class='code'><pre><code class=''><span class='line'>/*
+</span><span class='line'> *      Timer for Fast Open socket to retransmit SYNACK. Note that the
+</span><span class='line'> *      sk here is the child socket, not the parent (listener) socket.
 </span><span class='line'> */
-</span><span class='line'>#include &lt;linux/kernel.h&gt;
-</span><span class='line'>#include &lt;linux/types.h&gt;
-</span><span class='line'>#include &lt;linux/stddef.h&gt;
-</span><span class='line'>#include &lt;linux/module.h&gt;
-</span><span class='line'>#include &lt;linux/fs.h&gt;
-</span><span class='line'>#include &lt;asm/desc.h&gt;
-</span><span class='line'>
-</span><span class='line'>static float float_test(float a, float b)
+</span><span class='line'>static void tcp_fastopen_synack_timer(struct sock *sk)
 </span><span class='line'>{
-</span><span class='line'>&#9;return a/b;
-</span><span class='line'>}
+</span><span class='line'>&#9;struct inet_connection_sock *icsk = inet_csk(sk);
+</span><span class='line'>&#9;int max_retries = icsk-&gt;icsk_syn_retries ? :
+</span><span class='line'>&#9;&#9;sysctl_tcp_synack_retries + 1; /* add one more retry for fastopen */
+</span><span class='line'>&#9;struct request_sock *req;
 </span><span class='line'>
-</span><span class='line'>static int __init test_module_init(void)
-</span><span class='line'>{
-</span><span class='line'>&#9;float_test(1.0, 1.0);
-</span><span class='line'>&#9;return 0;
-</span><span class='line'>}
+</span><span class='line'>&#9;req = tcp_sk(sk)-&gt;fastopen_rsk;
+</span><span class='line'>&#9;req-&gt;rsk_ops-&gt;syn_ack_timeout(sk, req);
 </span><span class='line'>
-</span><span class='line'>static void __exit test_module_fini(void)
-</span><span class='line'>{
-</span><span class='line'>
-</span><span class='line'>&#9;//Do Nothing
-</span><span class='line'>&#9;return;
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>module_init(test_module_init);
-</span><span class='line'>module_exit(test_module_fini);
-</span><span class='line'>
-</span><span class='line'>MODULE_LICENSE("GPL");
-</span><span class='line'>MODULE_AUTHOR("lenky0401 at gmail dot com");</span></code></pre></td></tr></table></div></figure>
+</span><span class='line'>&#9;if (req-&gt;num_timeout &gt;= max_retries) {
+</span><span class='line'>&#9;&#9;tcp_write_err(sk);
+</span><span class='line'>&#9;&#9;return;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;/* XXX (TFO) - Unlike regular SYN-ACK retransmit, we ignore error
+</span><span class='line'>&#9; * returned from rtx_syn_ack() to make it more persistent like
+</span><span class='line'>&#9; * regular retransmit because if the child socket has been accepted
+</span><span class='line'>&#9; * it's not good to give up too easily.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;inet_rtx_syn_ack(sk, req);
+</span><span class='line'>&#9;req-&gt;num_timeout++;
+</span><span class='line'>&#9;inet_csk_reset_xmit_timer(sk, ICSK_TIME_RETRANS,
+</span><span class='line'>&#9;&#9;TCP_TIMEOUT_INIT &lt;&lt; req-&gt;num_timeout, TCP_RTO_MAX);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
-<p>编译它将得到如下错误提示：</p>
+<hr />
+
+<p><a href="http://blog.csdn.net/u011130578/article/details/44954891">http://blog.csdn.net/u011130578/article/details/44954891</a></p>
+
+<h4>1 Why</h4>
+
+<p>TCP服务器在收到SYN请求后发送SYN|ACK响应，然后等待对端的ACK到来以完成三次握手。如果没有收到ACK，TCP应该重传SYN|ACK，这个功能由SYN-ACK定时器完成。由于SYN|ACK发送后并没有放入发送队列中，故重传时必须重新构建SYN|ACK报文。</p>
+
+<h4>2 When</h4>
+
+<p>TCP在发送SYN|ACK响应后设置SYN-ACK定时器：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -324,193 +507,29 @@ var ss360Config = {
 <span class='line-number'>18</span>
 <span class='line-number'>19</span>
 <span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>[root@localhost t]# make
-</span><span class='line'>make -C /usr/src/linux-`uname -r` M=/home/gqk/t modules
-</span><span class='line'>make[1]: Entering directory `/usr/src/linux-2.6.38.8'
-</span><span class='line'>  CC [M]  /home/gqk/t/float_test.o
-</span><span class='line'>/home/gqk/t/float_test.c: In function ‘float_test’:
-</span><span class='line'>/home/gqk/t/float_test.c:12: error: SSE register return with SSE disabled
-</span><span class='line'>make[2]: *** [/home/gqk/t/float_test.o] Error 1
-</span><span class='line'>make[1]: *** [_module_/home/gqk/t] Error 2
-</span><span class='line'>make[1]: Leaving directory `/usr/src/linux-2.6.38.8'
-</span><span class='line'>make: *** [all] Error 2
-</span><span class='line'>[root@localhost t]#
-</span><span class='line'>
-</span><span class='line'>[root@localhost t]# make V=1
-</span><span class='line'>make -C /usr/src/linux-`uname -r` M=/home/gqk/t modules
-</span><span class='line'>make[1]: Entering directory `/usr/src/linux-2.6.38.8'
-</span><span class='line'>test -e include/generated/autoconf.h -a -e include/config/auto.conf || (        \
-</span><span class='line'>&#9;echo;                               \
-</span><span class='line'>&#9;echo "  ERROR: Kernel configuration is invalid.";       \
-</span><span class='line'>&#9;echo "         include/generated/autoconf.h or include/config/auto.conf are missing.";\
-</span><span class='line'>&#9;echo "         Run 'make oldconfig && make prepare' on kernel src to fix it.";  \
-</span><span class='line'>&#9;echo;                               \
-</span><span class='line'>&#9;/bin/false)
-</span><span class='line'>mkdir -p /home/gqk/t/.tmp_versions ; rm -f /home/gqk/t/.tmp_versions/*
-</span><span class='line'>make -f scripts/Makefile.build obj=/home/gqk/t
-</span><span class='line'>  gcc -Wp,-MD,/home/gqk/t/.float_test.o.d  -nostdinc -isystem /usr/lib/gcc/x86_64-redhat-linux/4.4.4/include -I/usr/src/linux-2.6.38.8/arch/x86/include -Iinclude  -include include/generated/autoconf.h -D__KERNEL__ -Wall -Wundef -Wstrict-prototypes -Wno-trigraphs -fno-strict-aliasing -fno-common -Werror-implicit-function-declaration -Wno-format-security -fno-delete-null-pointer-checks -O1 -m64 -mtune=generic -mno-red-zone -mcmodel=kernel -funit-at-a-time -maccumulate-outgoing-args -fstack-protector -DCONFIG_AS_CFI=1 -DCONFIG_AS_CFI_SIGNAL_FRAME=1 -DCONFIG_AS_CFI_SECTIONS=1 -DCONFIG_AS_FXSAVEQ=1 -pipe -Wno-sign-compare -fno-asynchronous-unwind-tables -mno-sse -mno-mmx -mno-sse2 -mno-3dnow -Wframe-larger-than=2048 -fno-omit-frame-pointer -fno-optimize-sibling-calls -g -Wdeclaration-after-statement -Wno-pointer-sign -fno-strict-overflow -fconserve-stack -DCC_HAVE_ASM_GOTO -g -I/home/gqk/t/..//inc -I -I -O2 -D__KERNEL__ -DMODULE -DEXPORT_SYMTAB  -DMODULE  -D"KBUILD_STR(s)=#s" -D"KBUILD_BASENAME=KBUILD_STR(float_test)"  -D"KBUILD_MODNAME=KBUILD_STR(float_test)" -c -o /home/gqk/t/.tmp_float_test.o /home/gqk/t/float_test.c
-</span><span class='line'>/home/gqk/t/float_test.c: In function ‘float_test’:
-</span><span class='line'>/home/gqk/t/float_test.c:12: error: SSE register return with SSE disabled
-</span><span class='line'>make[2]: *** [/home/gqk/t/float_test.o] Error 1
-</span><span class='line'>make[1]: *** [_module_/home/gqk/t] Error 2
-</span><span class='line'>make[1]: Leaving directory `/usr/src/linux-2.6.38.8'
-</span><span class='line'>make: *** [all] Error 2
-</span><span class='line'>[root@localhost t]#</span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>1465 int tcp_v4_conn_request(struct sock *sk, struct sk_buff *skb)
+</span><span class='line'>1466 {
+</span><span class='line'>...
+</span><span class='line'>1598     skb_synack = tcp_make_synack(sk, dst, req,
+</span><span class='line'>1599         fastopen_cookie_present(&valid_foc) ? &valid_foc : NULL);　//构建SYN|ACK
+</span><span class='line'>1600
+</span><span class='line'>1601     if (skb_synack) {
+</span><span class='line'>1602         __tcp_v4_send_check(skb_synack, ireq-&gt;loc_addr, ireq-&gt;rmt_addr);
+</span><span class='line'>1603         skb_set_queue_mapping(skb_synack, skb_get_queue_mapping(skb));
+</span><span class='line'>1604     } else
+</span><span class='line'>1605         goto drop_and_free;
+</span><span class='line'>1606
+</span><span class='line'>1607     if (likely(!do_fastopen)) {
+</span><span class='line'>1608         int err;
+</span><span class='line'>1609         err = ip_build_and_send_pkt(skb_synack, sk, ireq-&gt;loc_addr,
+</span><span class='line'>1610              ireq-&gt;rmt_addr, ireq-&gt;opt);　//发送SYN|ACK
+</span><span class='line'>...
+</span><span class='line'>1617         /* Add the request_sock to the SYN table */
+</span><span class='line'>1618         inet_csk_reqsk_queue_hash_add(sk, req, TCP_TIMEOUT_INIT);　//将requese sock加入到SYN表中，并设置SYN-ACK定时器
+</span><span class='line'>...</span></code></pre></td></tr></table></div></figure>
 
 
-<p>注意到其中的gcc编译选项：-mno-sse -mno-mmx -mno-sse2，这几个选项是Linux内核编译模块时自动带上的，就是它们（具体就是-mno-sse）明确禁止了Linux内核无法使用浮点数。</p>
-
-<p>在Linux内核里很少会有使用浮点数的需求，即便是有也大多是通过变通的办法解决，在下面链接里有一些很好的扩展介绍，感兴趣的可以看看：</p>
-
-<p><a href="http://stackoverflow.com/questions/6397430/overhead-of-supporting-floating-point-arithmetic-inside-the-linux-kernel">http://stackoverflow.com/questions/6397430/overhead-of-supporting-floating-point-arithmetic-inside-the-linux-kernel</a></p>
-
-<p><a href="http://stackoverflow.com/questions/10212892/how-to-avoid-fpu-when-given-float-numbers">http://stackoverflow.com/questions/10212892/how-to-avoid-fpu-when-given-float-numbers</a></p>
-
-<p><a href="http://www.linuxsmiths.com/blog/?p=253">http://www.linuxsmiths.com/blog/?p=253</a></p>
-
-<hr />
-
-<p><a href="http://blog.csdn.net/vbskj/article/details/38408467">http://blog.csdn.net/vbskj/article/details/38408467</a></p>
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2018/01/04/lang-c-format/">c scanf/fscanf 的%n和%[]使用方法</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2018-01-04T02:51:00+08:00'><span class='date'>2018-01-04</span> <span class='time'>02:51:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://blog.csdn.net/wesweeky/article/details/6439777">http://blog.csdn.net/wesweeky/article/details/6439777</a></p>
-
-<h4>一、</h4>
-
-<p>%n说明符输出有效字符数量，%n在scanf和printf中都可使用。与%n相对应的形参是一个int类型的指针，%n不影响scanf和printf的返回值。例如：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>scanf("%d %d%n", &i, &j, &k);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>如果输入434 6434，则k等于8，而scanf的返回值仍然为2。又如：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>scanf("%c%n", &ch, &k);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>输入“sbcdefdg”后，k等于1，而不是8，因为%c只取一个字符，%n输出的是有效字符数量。</p>
-
-<p>%n用在printf函数里，表示输出的字符数量，例如：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>printf("i=%d, j=%d/n%n", i, j, &k);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>在i=343、j=123的情况下，k=12，同时%n不影响printf的返回值，其返回值仍然为12，而不是14。</p>
-
-<h4>二、</h4>
-
-<p>众所周之，scanf以空白字符为定界符，但如果输入的字符串是以其它字符为定界符的，那怎么办？[]就是专门处理这个问题的转换说明符。[]转换说明符可以通过两种方式产生结果字符集，如果第一个[字符右边没有抑扬符（^），那么处于[]之间的字符就是结果字符集，不在其中的可输入字符都作为定界符；如果左边[符号紧靠一个抑扬符（^），那么意义相反，^和]之间的字符是定界符，其余可输入字符是结果字符集。</p>
-
-<p>在使用[]说明符之前，得先明白两个概念：一是扫描列表。扫描列表（scanlist）指的是包含在[和]两个字符之间除紧靠左边[字符的抑扬符之外的字符，例如：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>scanf("%[abcd]", ptr);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>abcd组成扫描列表。二是扫描字符集（scanset）。扫描字符集指的是结果字符集，例如上面的例子，结果字符集就是abcd。如果输入一个字符串“cbadkjf”，那么ptr得到的字符串是cbad，kjf三个字符都属于定界符，输入到k字符时输入字符串被截断，kjf三个字符被留在stdin里面。如果带有抑扬符，例如：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>scanf("%[^abcd]", ptr);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>扫描列表仍然是abcd，但扫描字符集是除abcd外的可输入字符。如果输入字符串“jksferakjjdf”，ptr得到的字符串是“jksfer”。如果想限制输入字符串的字符数量，可以象s说明符那样，在[]前面使用位域，例如：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>scanf("%10[^abcd]", ptr);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>这样结果字符串最多只能包含10个字符（除'/0'字符外）。</p>
-
-<p>[符号可以作为扫描列表中的一个成员，但]字符除紧贴最左边的[字符或抑扬符两种情况外，其余情况下都不会被看作扫描列表的成员。例如“%[]abcd]”或者“%[^]abcd]”，上述两种情况下]字符属于扫描列表的成员，但如果是“%[ab]cd]”，中间的]字符不会被看作扫描列表的成员，而且输入输出的结果会是乱七八糟的。</p>
-
-<p>对于减号-，只有在紧贴[字符或抑扬字符以及作为扫描列表最后一个成员时，-字符才会被视为扫描列表的成员。c标准把其余情况规定为编译器相关的。大多数编译器把这种情况的减号定义为连字符，例如：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>scanf("%[a-zA-Z]", ptr);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>那么扫描列表由大小写各26个字母组成。少数编译器仍旧把这种情况下的减号视为扫描列表成员。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>fscanf(fd,"%*[^/n]/n"); // %*是虚读，没有存，只是让指针跳过了这个变量！</span></code></pre></td></tr></table></div></figure>
-
-
-
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2018/01/04/kernel-net-sk-lock/">sk 的锁，spin_lock_bh、lock_sock</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2018-01-04T02:20:00+08:00'><span class='date'>2018-01-04</span> <span class='time'>02:20:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><h4>一、修改sk的锁 sk_lock.slock</h4>
-
-<p>tcp协议栈对struct sock <em>sk有两把锁，第一把是sk_lock.slock，第二把则是sk_lock.owned。sk_lock.slock用于获取struct sock </em>sk对象的成员的修改权限；sk_lock.owned用于区分当前是进程上下文或是软中断上下文，为进程上下文时sk_lock.owned会被置1，中断上下文为0。</p>
-
-<p>如果是要对sk修改，首先是必须拿锁sk_lock.slock，其后是判断当前是软中断或是进程上下文，如果是进程上下文，那么一般也不能修改sk</p>
-
-<p>中断上下文可以用下面的锁，也就是下面的锁只有 spin_lock</p>
+<p>inet_csk_reqsk_queue_hash_add函数：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -518,23 +537,151 @@ var ss360Config = {
 <span class='line-number'>4</span>
 <span class='line-number'>5</span>
 <span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/* BH context may only use the following locking interface. */
-</span><span class='line'>#define bh_lock_sock(__sk)      spin_lock(&((__sk)-&gt;sk_lock.slock))
-</span><span class='line'>#define bh_lock_sock_nested(__sk) \
-</span><span class='line'>&#9;&#9;&#9;&#9;spin_lock_nested(&((__sk)-&gt;sk_lock.slock), \
-</span><span class='line'>&#9;&#9;&#9;&#9;SINGLE_DEPTH_NESTING)
-</span><span class='line'>#define bh_unlock_sock(__sk)    spin_unlock(&((__sk)-&gt;sk_lock.slock))</span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>521 void inet_csk_reqsk_queue_hash_add(struct sock *sk, struct request_sock *req,
+</span><span class='line'>522                    unsigned long timeout)
+</span><span class='line'>523 {
+</span><span class='line'>524     struct inet_connection_sock *icsk = inet_csk(sk);
+</span><span class='line'>525     struct listen_sock *lopt = icsk-&gt;icsk_accept_queue.listen_opt;
+</span><span class='line'>526     const u32 h = inet_synq_hash(inet_rsk(req)-&gt;rmt_addr, inet_rsk(req)-&gt;rmt_port,
+</span><span class='line'>527                      lopt-&gt;hash_rnd, lopt-&gt;nr_table_entries);
+</span><span class='line'>528
+</span><span class='line'>529     reqsk_queue_hash_req(&icsk-&gt;icsk_accept_queue, h, req, timeout);　//将request_sock放入syn_table中并记录超时时间
+</span><span class='line'>530     inet_csk_reqsk_queue_added(sk, timeout);　//设置SYN-ACK定时器
+</span><span class='line'>531 }</span></code></pre></td></tr></table></div></figure>
 
 
-<p>非中断上下文可以直接用 spin_lock_bh(&amp;((sk)->sk_lock.slock))</p>
-
-<p>获得sk_lock.slock 锁后还要判断 sock_owned_by_user(sk), 如果被进程上下文占用也一般不能操作sk</p>
+<p>reqsk_queue_hash_req函数会记录request_sock的超时时间：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#define sock_owned_by_user(sk)  ((sk)-&gt;sk_lock.owned)</span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>262 static inline void reqsk_queue_hash_req(struct request_sock_queue *queue,
+</span><span class='line'>263                     u32 hash, struct request_sock *req,
+</span><span class='line'>264                     unsigned long timeout)
+</span><span class='line'>265 {
+</span><span class='line'>266     struct listen_sock *lopt = queue-&gt;listen_opt;
+</span><span class='line'>267
+</span><span class='line'>268     req-&gt;expires = jiffies + timeout;　//超时时间
+</span><span class='line'>269     req-&gt;num_retrans = 0;
+</span><span class='line'>270     req-&gt;num_timeout = 0;
+</span><span class='line'>271     req-&gt;sk = NULL;
+</span><span class='line'>272     req-&gt;dl_next = lopt-&gt;syn_table[hash];
+</span><span class='line'>273
+</span><span class='line'>274     write_lock(&queue-&gt;syn_wait_lock);
+</span><span class='line'>275     lopt-&gt;syn_table[hash] = req;
+</span><span class='line'>276     write_unlock(&queue-&gt;syn_wait_lock);
+</span><span class='line'>277 }</span></code></pre></td></tr></table></div></figure>
 
 
-<h4>二、进程上下文获取sk</h4>
+<p>inet_csk_reqsk_queue_added函数为整个syn_table设置一个SYN-ACK定时器：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>280 static inline void inet_csk_reqsk_queue_added(struct sock *sk,
+</span><span class='line'>281                           const unsigned long timeout)
+</span><span class='line'>282 {
+</span><span class='line'>283     if (reqsk_queue_added(&inet_csk(sk)-&gt;icsk_accept_queue) == 0) //如果添加request sock之前syn_table为空
+</span><span class='line'>284         inet_csk_reset_keepalive_timer(sk, timeout);//设置SYN-ACK定时器
+</span><span class='line'>285 }</span></code></pre></td></tr></table></div></figure>
+
+
+<p>inet_csk_reset_keepalive_timer函数真正设置定时器：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>404 void inet_csk_reset_keepalive_timer(struct sock *sk, unsigned long len)
+</span><span class='line'>405 {
+</span><span class='line'>406     sk_reset_timer(sk, &sk-&gt;sk_timer, jiffies + len);
+</span><span class='line'>407 }</span></code></pre></td></tr></table></div></figure>
+
+
+<p>SYN-ACK定时器的超时时间为TCP_TIMEOUT_INIT（1秒）。</p>
+
+<h4>3 What</h4>
+
+<p>SYN-ACK定时器的结构为sk->sk_timer，其超时函数为tcp_keepalive_timer：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>558 static void tcp_keepalive_timer (unsigned long data)
+</span><span class='line'>559 {
+</span><span class='line'>560     struct sock *sk = (struct sock *) data;
+</span><span class='line'>561     struct inet_connection_sock *icsk = inet_csk(sk);
+</span><span class='line'>562     struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>563     u32 elapsed;
+</span><span class='line'>564
+</span><span class='line'>565     /* Only process if socket is not in use. */
+</span><span class='line'>566     bh_lock_sock(sk);
+</span><span class='line'>567     if (sock_owned_by_user(sk)) {
+</span><span class='line'>568         /* Try again later. */
+</span><span class='line'>569         inet_csk_reset_keepalive_timer (sk, HZ/20);
+</span><span class='line'>570         goto out;
+</span><span class='line'>571     }
+</span><span class='line'>572
+</span><span class='line'>573     if (sk-&gt;sk_state == TCP_LISTEN) {　//如果是SYN-ACK定时器超时则判断为真
+</span><span class='line'>574         tcp_synack_timer(sk);　//SYN-ACK定时器超时函数
+</span><span class='line'>575         goto out;
+</span><span class='line'>576     }
+</span><span class='line'>...</span></code></pre></td></tr></table></div></figure>
+
+
+<p>tcp_synack_timer函数：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>534 static void tcp_synack_timer(struct sock *sk)
+</span><span class='line'>535 {
+</span><span class='line'>536     inet_csk_reqsk_queue_prune(sk, TCP_SYNQ_INTERVAL,
+</span><span class='line'>537                    TCP_TIMEOUT_INIT, TCP_RTO_MAX);
+</span><span class='line'>538 }</span></code></pre></td></tr></table></div></figure>
+
+
+<p>inet_csk_reqsk_queue_prune函数：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -580,53 +727,308 @@ var ss360Config = {
 <span class='line-number'>42</span>
 <span class='line-number'>43</span>
 <span class='line-number'>44</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static inline void lock_sock(struct sock *sk)
-</span><span class='line'>{
-</span><span class='line'>&#9;lock_sock_nested(sk, 0);
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>void lock_sock_nested(struct sock *sk, int subclass)
-</span><span class='line'>{
-</span><span class='line'>&#9;might_sleep();
-</span><span class='line'>
-</span><span class='line'>&#9;// 先获取 sk_lock.slock 锁
-</span><span class='line'>&#9;spin_lock_bh(&sk-&gt;sk_lock.slock);
-</span><span class='line'>&#9;// 如果有进程占用sk，则调__lock_sock等待占用sk的进程结束
-</span><span class='line'>&#9;if (sk-&gt;sk_lock.owned)
-</span><span class='line'>&#9;&#9;__lock_sock(sk);
-</span><span class='line'>
-</span><span class='line'>&#9;// 此时占用sk的进程结束了，但前进程就可以占用sk
-</span><span class='line'>&#9;sk-&gt;sk_lock.owned = 1;
-</span><span class='line'>&#9;// 进程占用sk时不占 sk_lock.slock
-</span><span class='line'>&#9;spin_unlock(&sk-&gt;sk_lock.slock);
-</span><span class='line'>
-</span><span class='line'>&#9;/*
-</span><span class='line'>&#9; * The sk_lock has mutex_lock() semantics here:
-</span><span class='line'>&#9; */
-</span><span class='line'>&#9;mutex_acquire(&sk-&gt;sk_lock.dep_map, subclass, 0, _RET_IP_);
-</span><span class='line'>&#9;local_bh_enable();
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>static void __lock_sock(struct sock *sk)
-</span><span class='line'>&#9;__releases(&sk-&gt;sk_lock.slock)
-</span><span class='line'>&#9;__acquires(&sk-&gt;sk_lock.slock)
-</span><span class='line'>{
-</span><span class='line'>&#9;DEFINE_WAIT(wait);
-</span><span class='line'>
-</span><span class='line'>&#9;for (;;) {
-</span><span class='line'>&#9;&#9;prepare_to_wait_exclusive(&sk-&gt;sk_lock.wq, &wait,
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;TASK_UNINTERRUPTIBLE);
-</span><span class='line'>&#9;&#9;spin_unlock_bh(&sk-&gt;sk_lock.slock);
-</span><span class='line'>&#9;&#9;schedule();
-</span><span class='line'>&#9;&#9;spin_lock_bh(&sk-&gt;sk_lock.slock);
-</span><span class='line'>&#9;&#9;if (!sock_owned_by_user(sk))
-</span><span class='line'>&#9;&#9;&#9;break;
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;finish_wait(&sk-&gt;sk_lock.wq, &wait);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>570 void inet_csk_reqsk_queue_prune(struct sock *parent,
+</span><span class='line'>571                 const unsigned long interval,
+</span><span class='line'>572                 const unsigned long timeout,
+</span><span class='line'>573                 const unsigned long max_rto)
+</span><span class='line'>574 {
+</span><span class='line'>575     struct inet_connection_sock *icsk = inet_csk(parent);
+</span><span class='line'>576     struct request_sock_queue *queue = &icsk-&gt;icsk_accept_queue;
+</span><span class='line'>577     struct listen_sock *lopt = queue-&gt;listen_opt;
+</span><span class='line'>578     int max_retries = icsk-&gt;icsk_syn_retries ? : sysctl_tcp_synack_retries;
+</span><span class='line'>579     int thresh = max_retries;
+</span><span class='line'>580     unsigned long now = jiffies;
+</span><span class='line'>581     struct request_sock **reqp, *req;
+</span><span class='line'>582     int i, budget;
+</span><span class='line'>583
+</span><span class='line'>584     if (lopt == NULL || lopt-&gt;qlen == 0)
+</span><span class='line'>585         return;
+</span><span class='line'>...
+</span><span class='line'>604     if (lopt-&gt;qlen&gt;&gt;(lopt-&gt;max_qlen_log-1)) {
+</span><span class='line'>605         int young = (lopt-&gt;qlen_young&lt;&lt;1);
+</span><span class='line'>606
+</span><span class='line'>607         while (thresh &gt; 2) {
+</span><span class='line'>608             if (lopt-&gt;qlen &lt; young)
+</span><span class='line'>609                 break;
+</span><span class='line'>610             thresh--;
+</span><span class='line'>611             young &lt;&lt;= 1;
+</span><span class='line'>612         }
+</span><span class='line'>613     }
+</span><span class='line'>614
+</span><span class='line'>615     if (queue-&gt;rskq_defer_accept)    //需要等待数据到来再唤醒应用进程
+</span><span class='line'>616         max_retries = queue-&gt;rskq_defer_accept;
+</span><span class='line'>617
+</span><span class='line'>618     budget = 2 * (lopt-&gt;nr_table_entries / (timeout / interval));
+</span><span class='line'>619     i = lopt-&gt;clock_hand;
+</span><span class='line'>620
+</span><span class='line'>621     do {　　//遍历SYN table
+</span><span class='line'>622         reqp=&lopt-&gt;syn_table[i];
+</span><span class='line'>623         while ((req = *reqp) != NULL) {
+</span><span class='line'>624             if (time_after_eq(now, req-&gt;expires)) {　//超时
+</span><span class='line'>625                 int expire = 0, resend = 0;
+</span><span class='line'>626
+</span><span class='line'>627                 syn_ack_recalc(req, thresh, max_retries,
+</span><span class='line'>628                            queue-&gt;rskq_defer_accept,
+</span><span class='line'>629                            &expire, &resend);     //计算request sock是否过期以及是否需要重发SYN|ACK
+</span><span class='line'>630                 req-&gt;rsk_ops-&gt;syn_ack_timeout(parent, req);　//调用tcp_syn_ack_timeout更新信息数据库
+</span><span class='line'>631                 if (!expire &&  //request socket没有超时
+</span><span class='line'>632                     (!resend ||
+</span><span class='line'>633                      !inet_rtx_syn_ack(parent, req) || 　//重传SYN-ACK
+</span><span class='line'>634                      inet_rsk(req)-&gt;acked)) {
+</span><span class='line'>635                     unsigned long timeo;
+</span><span class='line'>636
+</span><span class='line'>637                     if (req-&gt;num_timeout++ == 0)
+</span><span class='line'>638                         lopt-&gt;qlen_young--;
+</span><span class='line'>639                     timeo = min(timeout &lt;&lt; req-&gt;num_timeout,
+</span><span class='line'>640                             max_rto);
+</span><span class='line'>641                     req-&gt;expires = now + timeo;  //更新request_sock超时时间
+</span><span class='line'>642                     reqp = &req-&gt;dl_next;
+</span><span class='line'>643                     continue;
+</span><span class='line'>644                 }
+</span><span class='line'>645
+</span><span class='line'>646                 /* Drop this request */
+</span><span class='line'>647                 inet_csk_reqsk_queue_unlink(parent, req, reqp);　
+</span><span class='line'>648                 reqsk_queue_removed(queue, req);
+</span><span class='line'>649                 reqsk_free(req);
+</span><span class='line'>650                 continue;
+</span><span class='line'>651             }
+</span><span class='line'>652             reqp = &req-&gt;dl_next;
+</span><span class='line'>653         }
+</span><span class='line'>654
+</span><span class='line'>655         i = (i + 1) & (lopt-&gt;nr_table_entries - 1);
+</span><span class='line'>656
+</span><span class='line'>657     } while (--budget &gt; 0);
+</span><span class='line'>658
+</span><span class='line'>659     lopt-&gt;clock_hand = i;
+</span><span class='line'>660
+</span><span class='line'>661     if (lopt-&gt;qlen)　//syn_table中还有成员
+</span><span class='line'>662         inet_csk_reset_keepalive_timer(parent, interval);　//继续设置定时器，超时
+</span><span class='line'>663 }</span></code></pre></td></tr></table></div></figure>
+
+
+<p>604-611：当syn_table中剩余空间比较小时，需要减小最大重试次数，以便使旧的request_sock能够更快消亡，从而新的request_sock能够更多的被接受</p>
+
+<p>647-649：将超时的request_sock移出syn_table并释放，即丢弃其对应的连接</p>
+
+<p>631-642：全部满足下列条件就不删除request_sock而只是更新超时时间：<br/>
+（1）request_sock没有超时<br/>
+（2）下列3个条件之一成立<br/>
+     1）不需要重传SYN|ACK<br/>
+     2）重传SYN|ACK成功<br/>
+     3）应用进程使用TCP_DEFER_ACCEPT socket选项意图使数据到来时listen socket再唤醒进程，当ACK到来但没有数据时</p>
+
+<p>syn_ack_recalc函数来确定request_sock是否超时以及是否需要重传SYN|ACK：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>539 static inline void syn_ack_recalc(struct request_sock *req, const int thresh,
+</span><span class='line'>540                   const int max_retries,
+</span><span class='line'>541                   const u8 rskq_defer_accept,
+</span><span class='line'>542                   int *expire, int *resend)
+</span><span class='line'>543 {
+</span><span class='line'>544     if (!rskq_defer_accept) {    //不需要等待数据到来再调用accept系统调用
+</span><span class='line'>545         *expire = req-&gt;num_timeout &gt;= thresh;    //超时次数达到限制则超时
+</span><span class='line'>546         *resend = 1;    //重传SYN|ACK
+</span><span class='line'>547         return;
+</span><span class='line'>548     }
+</span><span class='line'>549     *expire = req-&gt;num_timeout &gt;= thresh &&    //超时次数达到限制
+</span><span class='line'>550           (!inet_rsk(req)-&gt;acked || req-&gt;num_timeout &gt;= max_retries);    //ACK没有到来或超时次数达到最高上限
+</span><span class='line'>551     /*
+</span><span class='line'>552      * Do not resend while waiting for data after ACK,
+</span><span class='line'>553      * start to resend on end of deferring period to give
+</span><span class='line'>554      * last chance for data or ACK to create established socket.
+</span><span class='line'>555      */
+</span><span class='line'>556     *resend = !inet_rsk(req)-&gt;acked || //ACK没有到来
+</span><span class='line'>557           req-&gt;num_timeout &gt;= rskq_defer_accept - 1;    //超时次数超过或即将达到应用进程的限制，赶快重传SYN|ACK以便给对端最后一个机会建立连接
+</span><span class='line'>558 }</span></code></pre></td></tr></table></div></figure>
+
+
+<p>综上，SYN|ACK定时器超时时重传SYN|ACK的条件是下列条件全部成立：<br/>
+（1）request_sock超时<br/>
+（2）request_sock的超时次数达到限制<br/>
+（3）下列条件之一成立：<br/>
+    1）应用进程没有使用TCP_DEFER_ACCEPT socket选项来延迟accept request_sock的时间<br/>
+    2）应用进程使用TCP_DEFER_ACCEPT socket选项设置了超时次数限制，但ACK没有到来或，超时次数达到最高限制且超时次数超过或即将达到应用进程的限制</p>
+
+<p>SYN|ACK的重传是由inet_rtx_syn_ack函数完成的：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>560 int inet_rtx_syn_ack(struct sock *parent, struct request_sock *req)
+</span><span class='line'>561 {
+</span><span class='line'>562     int err = req-&gt;rsk_ops-&gt;rtx_syn_ack(parent, req);    //指向tcp_v4_rtx_synack或tcp_v6_rtx_synack
+</span><span class='line'>563
+</span><span class='line'>564     if (!err)
+</span><span class='line'>565         req-&gt;num_retrans++;
+</span><span class='line'>566     return err;
+</span><span class='line'>567 }</span></code></pre></td></tr></table></div></figure>
+
+
+<p>tcp_v4_rtx_synack函数：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>870 static int tcp_v4_rtx_synack(struct sock *sk, struct request_sock *req)
+</span><span class='line'>871 {
+</span><span class='line'>872     int res = tcp_v4_send_synack(sk, NULL, req, 0, false); //构建并发送SYN-ACK
+</span><span class='line'>873
+</span><span class='line'>874     if (!res)
+</span><span class='line'>875         TCP_INC_STATS_BH(sock_net(sk), TCP_MIB_RETRANSSEGS);
+</span><span class='line'>876     return res;
+</span><span class='line'>877 }</span></code></pre></td></tr></table></div></figure>
 
 
 
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2018/01/25/kernel-net-fastopen/">TCP Fast Open(TFO), tcp_fastopen</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2018-01-25T03:25:00+08:00'><span class='date'>2018-01-25</span> <span class='time'>03:25:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="https://www.2cto.com/kf/201701/586043.html">https://www.2cto.com/kf/201701/586043.html</a></p>
+
+<p><a href="http://blog.csdn.net/u011130578/article/details/44515165">http://blog.csdn.net/u011130578/article/details/44515165</a></p>
+
+<p><a href="http://blog.sina.com.cn/s/blog_583f42f101011veh.html">http://blog.sina.com.cn/s/blog_583f42f101011veh.html</a></p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define TFO_CLIENT_ENABLE       1
+</span><span class='line'>#define TFO_SERVER_ENABLE       2
+</span><span class='line'>#define TFO_CLIENT_NO_COOKIE    4       /* Data in SYN w/o cookie option */
+</span><span class='line'>
+</span><span class='line'>/* Process SYN data but skip cookie validation */
+</span><span class='line'>#define TFO_SERVER_COOKIE_NOT_CHKED     0x100 // 收到cookie也不检查
+</span><span class='line'>/* Accept SYN data w/o any cookie option */
+</span><span class='line'>#define TFO_SERVER_COOKIE_NOT_REQD      0x200 // 不需要cookie需要data就能创建fastopen child，默认情况下syn的data会被忽略
+</span><span class='line'>
+</span><span class='line'>/* Force enable TFO on all listeners, i.e., not requiring the
+</span><span class='line'> * TCP_FASTOPEN socket option. SOCKOPT1/2 determine how to set max_qlen.
+</span><span class='line'> */
+</span><span class='line'>#define TFO_SERVER_WO_SOCKOPT1  0x400     // 调listen后不需要再调setsockopt就开启fastopen
+</span><span class='line'>#define TFO_SERVER_WO_SOCKOPT2  0x800     // 调listen后不需要再调setsockopt就开启fastopen，backlog=TFO_SERVER_WO_SOCKOPT2&gt;&gt;16
+</span><span class='line'>/* Always create TFO child sockets on a TFO listener even when
+</span><span class='line'> * cookie/data not present. (For testing purpose!)
+</span><span class='line'> */
+</span><span class='line'>#define TFO_SERVER_ALWAYS       0x1000        // 不需要cookie也不需要data就创建fastopen child, 容易被攻击，不开启</span></code></pre></td></tr></table></div></figure>
+
+
+<h3>测试</h3>
+
+<h4>开启</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>echo 3 &gt; /proc/sys/net/ipv4/tcp_fastopen   # 1 开启客户端，2 开启服务端，3 都开启
+</span><span class='line'>
+</span><span class='line'>tc qdisc add dev lo root netem delay 300ms # 设置延迟才能看出效果
+</span><span class='line'>ifconfig lo mtu 1500</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>client</h4>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -656,37 +1058,1365 @@ var ss360Config = {
 <span class='line-number'>26</span>
 <span class='line-number'>27</span>
 <span class='line-number'>28</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>void release_sock(struct sock *sk)
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;stdio.h&gt;
+</span><span class='line'>#include &lt;unistd.h&gt;
+</span><span class='line'>#include &lt;string.h&gt;
+</span><span class='line'>#include &lt;errno.h&gt;
+</span><span class='line'>#include &lt;sys/types.h&gt;
+</span><span class='line'>#include &lt;sys/socket.h&gt;
+</span><span class='line'>#include &lt;netinet/in.h&gt;
+</span><span class='line'>
+</span><span class='line'>#include &lt;netinet/tcp.h&gt;
+</span><span class='line'>
+</span><span class='line'>#ifndef MSG_FASTOPEN
+</span><span class='line'>#define MSG_FASTOPEN   0x20000000
+</span><span class='line'>#endif
+</span><span class='line'>
+</span><span class='line'>int main(int argc, char *argv[])
 </span><span class='line'>{
-</span><span class='line'>&#9;/*
-</span><span class='line'>&#9; * The sk_lock has mutex_unlock() semantics:
-</span><span class='line'>&#9; */
-</span><span class='line'>&#9;mutex_release(&sk-&gt;sk_lock.dep_map, 1, _RET_IP_);
+</span><span class='line'>&#9;int sockfd, n;
+</span><span class='line'>&#9;struct sockaddr_in servaddr;
+</span><span class='line'>&#9;char buf[50000] = "aaabbbccc";
+</span><span class='line'>&#9;int ret = 0, tot;
 </span><span class='line'>
-</span><span class='line'>&#9;spin_lock_bh(&sk-&gt;sk_lock.slock);
-</span><span class='line'>&#9;if (sk-&gt;sk_backlog.tail)
-</span><span class='line'>&#9;&#9;__release_sock(sk); // 处理backlog的包
+</span><span class='line'>&#9;if ((sockfd = socket(AF_INET, SOCK_STREAM, 0)) &lt; 0) {
+</span><span class='line'>&#9;&#9;printf ("create socket error: %s(errno: %d)\n", strerror (errno), errno);
+</span><span class='line'>&#9;&#9;return -1;
+</span><span class='line'>&#9;}
 </span><span class='line'>
-</span><span class='line'>&#9;/* Warning : release_cb() might need to release sk ownership,
-</span><span class='line'>&#9; * ie call sock_release_ownership(sk) before us.
-</span><span class='line'>&#9; */
-</span><span class='line'>&#9;if (sk-&gt;sk_prot-&gt;release_cb)
-</span><span class='line'>&#9;&#9;sk-&gt;sk_prot-&gt;release_cb(sk);
+</span><span class='line'>&#9;memset (&servaddr, 0, sizeof (servaddr));
+</span><span class='line'>&#9;servaddr.sin_family = AF_INET;
+</span><span class='line'>&#9;servaddr.sin_port = htons (1935);
+</span><span class='line'>&#9;servaddr.sin_addr.s_addr = inet_addr("127.0.0.1");
 </span><span class='line'>
-</span><span class='line'>&#9;// 获取sk_lock.slock，然后清除 sk_lock.owned
-</span><span class='line'>&#9;sock_release_ownership(sk);
-</span><span class='line'>&#9;if (waitqueue_active(&sk-&gt;sk_lock.wq))
-</span><span class='line'>&#9;&#9;wake_up(&sk-&gt;sk_lock.wq);
-</span><span class='line'>&#9;spin_unlock_bh(&sk-&gt;sk_lock.slock);
-</span><span class='line'>}
+</span><span class='line'>#define FASTOPEN_TEST
+</span><span class='line'>#ifndef FASTOPEN_TEST
+</span><span class='line'>&#9;if (connect(sockfd, (struct sockaddr *)&servaddr, sizeof(servaddr))) {
+</span><span class='line'>&#9;&#9;printf("connect error\n");
+</span><span class='line'>&#9;&#9;return -2;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;ret = send(sockfd, buf, 1005, 0);
+</span><span class='line'>#else
+</span><span class='line'>&#9;ret = sendto(sockfd, buf, 1005, MSG_FASTOPEN, (struct sockaddr *)&servaddr, sizeof(servaddr));
+</span><span class='line'>#endif
+</span><span class='line'>&#9;if (ret &lt; 0) {
+</span><span class='line'>&#9;&#9;printf ("send msg error: %s(errno: %d)\n", strerror (errno), errno);
+</span><span class='line'>&#9;&#9;// 如果是连接失败会打印：Connection refused(errno: 111)
+</span><span class='line'>&#9;&#9;return -2;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;printf("client fastopen sendto len=%d\n", ret);
+</span><span class='line'>&#9;if ((ret = send(sockfd, buf, 20000, 0)) &lt; 0) {
+</span><span class='line'>&#9;&#9;printf("send error ret = %d\n", ret);
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;printf("client send len = %d\n", ret);
+</span><span class='line'>&#9;shutdown(sockfd, 1);
 </span><span class='line'>
-</span><span class='line'>static inline void sock_release_ownership(struct sock *sk)
-</span><span class='line'>{
-</span><span class='line'>&#9;sk-&gt;sk_lock.owned = 0;
+</span><span class='line'>&#9;tot = 0;
+</span><span class='line'>&#9;while ((n = recv(sockfd, buf, 1024, 0)) &gt; 0)
+</span><span class='line'>&#9;&#9;tot += n;
+</span><span class='line'>&#9;printf("client recv len = %d\n", tot);
+</span><span class='line'>&#9;close (sockfd);
+</span><span class='line'>&#9;return 0;
 </span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
+<h4>server</h4>
 
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;unistd.h&gt;
+</span><span class='line'>#include &lt;string.h&gt;
+</span><span class='line'>#include &lt;sys/types.h&gt;
+</span><span class='line'>#include &lt;sys/socket.h&gt;
+</span><span class='line'>#include &lt;netinet/in.h&gt;
+</span><span class='line'>#include &lt;netinet/tcp.h&gt;
+</span><span class='line'>#include &lt;stdio.h&gt;
+</span><span class='line'>
+</span><span class='line'>int main()
+</span><span class='line'>{
+</span><span class='line'>&#9;int serverSock, clientSock;
+</span><span class='line'>&#9;struct sockaddr_in addr, clientAddr;
+</span><span class='line'>&#9;int addrLen;
+</span><span class='line'>
+</span><span class='line'>&#9;char buf[10240];
+</span><span class='line'>&#9;int n, tot;
+</span><span class='line'>
+</span><span class='line'>&#9;serverSock = socket(AF_INET, SOCK_STREAM, 0);
+</span><span class='line'>&#9;if (serverSock == -1) {
+</span><span class='line'>&#9;&#9;printf("socket failed!\n");
+</span><span class='line'>&#9;&#9;return -1;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;memset(&addr, 0, sizeof(addr));
+</span><span class='line'>&#9;addr.sin_family = AF_INET;
+</span><span class='line'>&#9;addr.sin_port = htons(1935);
+</span><span class='line'>&#9;addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+</span><span class='line'>
+</span><span class='line'>&#9;if (bind(serverSock, (struct sockaddr*)&addr, sizeof(addr)) &lt; 0) {
+</span><span class='line'>&#9;&#9;printf("bind failed!\n");
+</span><span class='line'>&#9;&#9;return -2;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;int qlen = 5;
+</span><span class='line'>&#9;setsockopt(serverSock, SOL_TCP, TCP_FASTOPEN, &qlen, sizeof(qlen));
+</span><span class='line'>
+</span><span class='line'>&#9;if (listen(serverSock, 511) &lt; 0) {
+</span><span class='line'>&#9;&#9;printf("listen failed!\n");
+</span><span class='line'>&#9;&#9;return -3;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;while (1) {
+</span><span class='line'>&#9;&#9;addrLen = sizeof(clientAddr);
+</span><span class='line'>&#9;&#9;clientSock = accept(serverSock, (struct sockaddr*)&clientAddr, &addrLen);
+</span><span class='line'>&#9;&#9;if (clientSock &lt; 0) {
+</span><span class='line'>&#9;&#9;&#9;printf("accept failed!\n");
+</span><span class='line'>&#9;&#9;&#9;return -4;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if ((n = send(clientSock, buf, 10000, 0)) &lt; 0) {
+</span><span class='line'>&#9;&#9;&#9;printf("send error ret = %d\n", n);
+</span><span class='line'>&#9;&#9;&#9;return -5;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;printf("server send len = %d\n", n);
+</span><span class='line'>&#9;&#9;shutdown(clientSock, 1);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;sleep(1);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;tot = 0;
+</span><span class='line'>&#9;&#9;while ((n = recv(clientSock, buf, 1024, 0)) &gt; 0)
+</span><span class='line'>&#9;&#9;&#9;tot += n;
+</span><span class='line'>&#9;&#9;printf("server recv len = %d\n", tot);
+</span><span class='line'>&#9;&#9;close(clientSock);
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;return 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h3>原理</h3>
+
+<p>1.客户端发送一个SYN包到服务器，这个包中携带了Fast Open Cookie Request;</p>
+
+<p>2.服务器生成一个cookie，这个cookie是加密客户端的IP地址生成的。服务器给客户端发送SYN+ACK响应，在响应包的选项中包含了这个cookie;</p>
+
+<p>3.客户端存储这个cookie以便将来再次与这个服务器的IP建立TFO连接时使用;</p>
+
+<p>也就是说，第一次TCP连接只是交换cookie信息，无法在SYN包中携带数据。在第一次交换之后，接下来的TCP连接就可以在SYN中携带数据了。流程如下：</p>
+
+<p>4.客户端发送一个SYN包，这个包比较特殊，因为它携带应用数据和cookie;</p>
+
+<p>5.服务器验证这个cookie，如果合法，服务器发送一个SYN+ACK，这个ACK同时确认SYN和数据。然后数据被传递到应用进程;</p>
+
+<p>如果不合法，服务器丢弃数据，发送一个SYN+ACK，这个ACK只确认SYN，接下来走三次握手的普通流程;</p>
+
+<p>6.如果验证合法(接收了SYN包中的数据)，服务器在接收到客户端的第一个ACK前可以发送其它响应数据;</p>
+
+<p>7.如果验证不合法(客户端在SYN中带的数据没被确认)，客户端发送ACK确认服务器的SYN;并且，数据会在ACK包中重传;</p>
+
+<p>8.下面的流程与普通的TCP交互流程无异。</p>
+
+<p><img src="/images/kernel/2018-01-25.jpeg" alt="" /></p>
+
+<h3>源码分析</h3>
+
+<p>TFO功能在Linux 2.6.34内核中开始集成。</p>
+
+<p>下面通过分析内核代码来了解TFO的运行机制。开启TFO功能后，server端进程在调用listen系统调用时会初始化TFO队列：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int inet_listen(struct socket *sock, int backlog)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct sock *sk = sock-&gt;sk;
+</span><span class='line'>&#9;unsigned char old_state;
+</span><span class='line'>&#9;int err;
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;if (old_state != TCP_LISTEN) {
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;&#9;if ((sysctl_tcp_fastopen & TFO_SERVER_ENABLE) != 0 &&
+</span><span class='line'>&#9;&#9;&#9;inet_csk(sk)-&gt;icsk_accept_queue.fastopenq == NULL) {
+</span><span class='line'>&#9;&#9;&#9;if ((sysctl_tcp_fastopen & TFO_SERVER_WO_SOCKOPT1) != 0)
+</span><span class='line'>&#9;&#9;&#9;&#9;err = fastopen_init_queue(sk, backlog);
+</span><span class='line'>&#9;&#9;&#9;else if ((sysctl_tcp_fastopen &
+</span><span class='line'>&#9;&#9;&#9;&#9;  TFO_SERVER_WO_SOCKOPT2) != 0)
+</span><span class='line'>&#9;&#9;&#9;&#9;err = fastopen_init_queue(sk,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;((uint)sysctl_tcp_fastopen) &gt;&gt; 16);
+</span><span class='line'>&#9;&#9;&#9;else
+</span><span class='line'>&#9;&#9;&#9;&#9;err = 0;
+</span><span class='line'>&#9;&#9;&#9;if (err)
+</span><span class='line'>&#9;&#9;&#9;&#9;goto out;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;err = inet_csk_listen_start(sk, backlog);
+</span><span class='line'>...</span></code></pre></td></tr></table></div></figure>
+
+
+<p>fastopen_init_queue函数</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static inline int fastopen_init_queue(struct sock *sk, int backlog)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct request_sock_queue *queue =
+</span><span class='line'>&#9;&#9;&inet_csk(sk)-&gt;icsk_accept_queue;
+</span><span class='line'>
+</span><span class='line'>&#9;if (queue-&gt;fastopenq == NULL) {
+</span><span class='line'>&#9;&#9;queue-&gt;fastopenq = kzalloc(
+</span><span class='line'>&#9;&#9;&#9;sizeof(struct fastopen_queue),
+</span><span class='line'>&#9;&#9;&#9;sk-&gt;sk_allocation);
+</span><span class='line'>&#9;&#9;if (queue-&gt;fastopenq == NULL)
+</span><span class='line'>&#9;&#9;&#9;return -ENOMEM;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;sk-&gt;sk_destruct = tcp_sock_destruct;
+</span><span class='line'>&#9;&#9;spin_lock_init(&queue-&gt;fastopenq-&gt;lock);
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;queue-&gt;fastopenq-&gt;max_qlen = backlog;
+</span><span class='line'>&#9;return 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>如果net.ipv4.tcp_fastopen &amp;&amp; (TFO_SERVER_WO_SOCKOPT1|TFO_SERVER_WO_SOCKOPT2)为假，则TFO队列不会被初始化。但setsockopt函数也可以初始化TFO队列：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int do_tcp_setsockopt(struct sock *sk, int level,
+</span><span class='line'>&#9;&#9;int optname, char __user *optval, unsigned int optlen)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>&#9;struct inet_connection_sock *icsk = inet_csk(sk);
+</span><span class='line'>&#9;int val;
+</span><span class='line'>&#9;int err = 0;
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;case TCP_FASTOPEN:
+</span><span class='line'>&#9;&#9;if (val &gt;= 0 && ((1 &lt;&lt; sk-&gt;sk_state) & (TCPF_CLOSE |
+</span><span class='line'>&#9;&#9;&#9;TCPF_LISTEN)))
+</span><span class='line'>&#9;&#9;&#9;err = fastopen_init_queue(sk, val);
+</span><span class='line'>&#9;&#9;else
+</span><span class='line'>&#9;&#9;&#9;err = -EINVAL;
+</span><span class='line'>&#9;&#9;break;
+</span><span class='line'>&#9;...</span></code></pre></td></tr></table></div></figure>
+
+
+<p>如果inet_csk(sk)->icsk_accept_queue.fastopenq为NULL的话意味着TFO功能未开启。</p>
+
+<p>轮到client端出场了！client端的sendto系统调用在内核中对应的TCP函数是tcp_sendmsg：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int tcp_sendmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
+</span><span class='line'>&#9;&#9;size_t size)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct iovec *iov;
+</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>&#9;struct sk_buff *skb;
+</span><span class='line'>&#9;int iovlen, flags, err, copied = 0;
+</span><span class='line'>&#9;int mss_now = 0, size_goal, copied_syn = 0, offset = 0;
+</span><span class='line'>&#9;bool sg;
+</span><span class='line'>&#9;long timeo;
+</span><span class='line'>
+</span><span class='line'>&#9;lock_sock(sk);
+</span><span class='line'>
+</span><span class='line'>&#9;flags = msg-&gt;msg_flags;
+</span><span class='line'>&#9;if (flags & MSG_FASTOPEN) {//要使用TFO功能
+</span><span class='line'>&#9;&#9;err = tcp_sendmsg_fastopen(sk, msg, &copied_syn);//发送TFO数据
+</span><span class='line'>&#9;&#9;if (err == -EINPROGRESS && copied_syn &gt; 0)
+</span><span class='line'>&#9;&#9;&#9;goto out;
+</span><span class='line'>&#9;&#9;else if (err)
+</span><span class='line'>&#9;&#9;&#9;goto out_err;
+</span><span class='line'>&#9;&#9;offset = copied_syn;
+</span><span class='line'>&#9;}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>tcp_sendmsg_fastopen函数用于发送带TFO请求的SYN或携带数据的SYN：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int tcp_sendmsg_fastopen(struct sock *sk, struct msghdr *msg, int *size)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>&#9;int err, flags;
+</span><span class='line'>
+</span><span class='line'>&#9;if (!(sysctl_tcp_fastopen & TFO_CLIENT_ENABLE))
+</span><span class='line'>&#9;&#9;return -EOPNOTSUPP;
+</span><span class='line'>&#9;if (tp-&gt;fastopen_req != NULL)
+</span><span class='line'>&#9;&#9;return -EALREADY; /* Another Fast Open is in progress */
+</span><span class='line'>
+</span><span class='line'>&#9;tp-&gt;fastopen_req = kzalloc(sizeof(struct tcp_fastopen_request),
+</span><span class='line'>&#9;&#9;&#9;&#9;   sk-&gt;sk_allocation);
+</span><span class='line'>&#9;if (unlikely(tp-&gt;fastopen_req == NULL))
+</span><span class='line'>&#9;&#9;return -ENOBUFS;
+</span><span class='line'>&#9;tp-&gt;fastopen_req-&gt;data = msg;
+</span><span class='line'>
+</span><span class='line'>&#9;flags = (msg-&gt;msg_flags & MSG_DONTWAIT) ? O_NONBLOCK : 0;
+</span><span class='line'>&#9;err = __inet_stream_connect(sk-&gt;sk_socket, msg-&gt;msg_name,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;msg-&gt;msg_namelen, flags);      //发送连接请求
+</span><span class='line'>&#9;*size = tp-&gt;fastopen_req-&gt;copied;　//记录发送了多少数据，如果发送的是TFO请求则*size为0
+</span><span class='line'>&#9;tcp_free_fastopen_req(tp);
+</span><span class='line'>&#9;return err;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>　　<code>__inet_stream_connect</code>函数会调用tcp_connect函数发送SYN：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int tcp_connect(struct sock *sk)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>&#9;struct sk_buff *buff;
+</span><span class='line'>&#9;int err;
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;/* Send off SYN; include data in Fast Open. */
+</span><span class='line'>&#9;err = tp-&gt;fastopen_req ? tcp_send_syn_data(sk, buff) :
+</span><span class='line'>&#9;&#9;  tcp_transmit_skb(sk, buff, 1, sk-&gt;sk_allocation); //如果使用TFO，则会调用tcp_send_syn_data发送SYN</span></code></pre></td></tr></table></div></figure>
+
+
+<p>tcp_send_syn_data函数：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int tcp_send_syn_data(struct sock *sk, struct sk_buff *syn)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>&#9;struct tcp_fastopen_request *fo = tp-&gt;fastopen_req;
+</span><span class='line'>&#9;int syn_loss = 0, space, i, err = 0, iovlen = fo-&gt;data-&gt;msg_iovlen;
+</span><span class='line'>&#9;struct sk_buff *syn_data = NULL, *data;
+</span><span class='line'>&#9;unsigned long last_syn_loss = 0;
+</span><span class='line'>
+</span><span class='line'>&#9;tp-&gt;rx_opt.mss_clamp = tp-&gt;advmss;  /* If MSS is not cached */
+</span><span class='line'>&#9;tcp_fastopen_cache_get(sk, &tp-&gt;rx_opt.mss_clamp, &fo-&gt;cookie,
+</span><span class='line'>&#9;&#9;&#9;&#9;   &syn_loss, &last_syn_loss);//查询缓存的TFO cookie信息
+</span><span class='line'>&#9;/* Recurring FO SYN losses: revert to regular handshake temporarily */
+</span><span class='line'>&#9;if (syn_loss &gt; 1 &&
+</span><span class='line'>&#9;&#9;time_before(jiffies, last_syn_loss + (60*HZ &lt;&lt; syn_loss))) {
+</span><span class='line'>&#9;&#9;fo-&gt;cookie.len = -1;
+</span><span class='line'>&#9;&#9;goto fallback;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;if (sysctl_tcp_fastopen & TFO_CLIENT_NO_COOKIE)//无论有没有cookie,都发送携带数据的SYN
+</span><span class='line'>&#9;&#9;fo-&gt;cookie.len = -1;
+</span><span class='line'>&#9;else if (fo-&gt;cookie.len &lt;= 0)      //没有cookie,发送携带TFO请求选项的SYN
+</span><span class='line'>&#9;&#9;goto fallback;
+</span><span class='line'>
+</span><span class='line'>&#9;/* MSS for SYN-data is based on cached MSS and bounded by PMTU and
+</span><span class='line'>&#9; * user-MSS. Reserve maximum option space for middleboxes that add
+</span><span class='line'>&#9; * private TCP options. The cost is reduced data space in SYN :(
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;if (tp-&gt;rx_opt.user_mss && tp-&gt;rx_opt.user_mss &lt; tp-&gt;rx_opt.mss_clamp)
+</span><span class='line'>&#9;&#9;tp-&gt;rx_opt.mss_clamp = tp-&gt;rx_opt.user_mss;
+</span><span class='line'>&#9;space = __tcp_mtu_to_mss(sk, inet_csk(sk)-&gt;icsk_pmtu_cookie) -
+</span><span class='line'>&#9;&#9;MAX_TCP_OPTION_SPACE;//计算SYN包中的能够携带的数据的最大大小
+</span><span class='line'>
+</span><span class='line'>&#9;syn_data = skb_copy_expand(syn, skb_headroom(syn), space,
+</span><span class='line'>&#9;&#9;&#9;&#9;   sk-&gt;sk_allocation);//复制SYN包中的内容，并扩展SKB中的空间
+</span><span class='line'>&#9;if (syn_data == NULL)
+</span><span class='line'>&#9;&#9;goto fallback;
+</span><span class='line'>
+</span><span class='line'>&#9;for (i = 0; i &lt; iovlen && syn_data-&gt;len &lt; space; ++i) {//将用户态中缓存的数据copy到内核
+</span><span class='line'>&#9;&#9;struct iovec *iov = &fo-&gt;data-&gt;msg_iov[i];
+</span><span class='line'>&#9;&#9;unsigned char __user *from = iov-&gt;iov_base;
+</span><span class='line'>&#9;&#9;int len = iov-&gt;iov_len;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (syn_data-&gt;len + len &gt; space)//数据总长度大于SKB中空间的总大小
+</span><span class='line'>&#9;&#9;&#9;len = space - syn_data-&gt;len;
+</span><span class='line'>&#9;&#9;else if (i + 1 == iovlen)
+</span><span class='line'>&#9;&#9;&#9;/* No more data pending in inet_wait_for_connect() */
+</span><span class='line'>&#9;&#9;&#9;fo-&gt;data = NULL;//数据全部发送完毕，不需要在inet_wait_for_connect中等待时发送
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (skb_add_data(syn_data, from, len))//将用户数据copy到SKB中
+</span><span class='line'>&#9;&#9;&#9;goto fallback;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;/* Queue a data-only packet after the regular SYN for retransmission */
+</span><span class='line'>&#9;data = pskb_copy(syn_data, sk-&gt;sk_allocation);
+</span><span class='line'>&#9;if (data == NULL)
+</span><span class='line'>&#9;&#9;goto fallback;
+</span><span class='line'>&#9;TCP_SKB_CB(data)-&gt;seq++;
+</span><span class='line'>&#9;TCP_SKB_CB(data)-&gt;tcp_flags &= ~TCPHDR_SYN;
+</span><span class='line'>&#9;TCP_SKB_CB(data)-&gt;tcp_flags = (TCPHDR_ACK|TCPHDR_PSH);
+</span><span class='line'>&#9;tcp_connect_queue_skb(sk, data);
+</span><span class='line'>&#9;fo-&gt;copied = data-&gt;len;
+</span><span class='line'>
+</span><span class='line'>&#9;if (tcp_transmit_skb(sk, syn_data, 0, sk-&gt;sk_allocation) == 0) {//发送携带数据的SYN
+</span><span class='line'>&#9;&#9;tp-&gt;syn_data = (fo-&gt;copied &gt; 0);
+</span><span class='line'>&#9;&#9;NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPFASTOPENACTIVE);
+</span><span class='line'>&#9;&#9;goto done;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;syn_data = NULL;
+</span><span class='line'>
+</span><span class='line'>fallback:
+</span><span class='line'>&#9;/* Send a regular SYN with Fast Open cookie request option */
+</span><span class='line'>&#9;if (fo-&gt;cookie.len &gt; 0)
+</span><span class='line'>&#9;&#9;fo-&gt;cookie.len = 0;
+</span><span class='line'>&#9;err = tcp_transmit_skb(sk, syn, 1, sk-&gt;sk_allocation);
+</span><span class='line'>&#9;if (err)
+</span><span class='line'>&#9;&#9;tp-&gt;syn_fastopen = 0;
+</span><span class='line'>&#9;kfree_skb(syn_data);
+</span><span class='line'>done:
+</span><span class='line'>&#9;fo-&gt;cookie.len = -1;  /* Exclude Fast Open option for SYN retries */
+</span><span class='line'>&#9;return err;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>如果client是发送TFO请求，则tcp_send_syn_data函数会发送一个不带数据的SYN包，数据部分则会由tcp_sendmsg函数放入发送队列中，等待三次握手完成后再发送。</p>
+
+<p>tcp_transmit_skb函数会调用tcp_syn_options函数构建选项信息，tcp_options_write函数负责将选项写入TCP报头中：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static unsigned int tcp_syn_options(struct sock *sk, struct sk_buff *skb,
+</span><span class='line'>&#9;&#9;&#9;&#9;struct tcp_out_options *opts,
+</span><span class='line'>&#9;&#9;&#9;&#9;struct tcp_md5sig_key **md5)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>&#9;unsigned int remaining = MAX_TCP_OPTION_SPACE;
+</span><span class='line'>&#9;struct tcp_fastopen_request *fastopen = tp-&gt;fastopen_req;
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;if (fastopen && fastopen-&gt;cookie.len &gt;= 0) {
+</span><span class='line'>&#9;&#9;u32 need = TCPOLEN_EXP_FASTOPEN_BASE + fastopen-&gt;cookie.len;
+</span><span class='line'>&#9;&#9;need = (need + 3) & ~3U;  /* Align to 32 bits */
+</span><span class='line'>&#9;&#9;if (remaining &gt;= need) {
+</span><span class='line'>&#9;&#9;&#9;opts-&gt;options |= OPTION_FAST_OPEN_COOKIE;
+</span><span class='line'>&#9;&#9;&#9;opts-&gt;fastopen_cookie = &fastopen-&gt;cookie;
+</span><span class='line'>&#9;&#9;&#9;remaining -= need;
+</span><span class='line'>&#9;&#9;&#9;tp-&gt;syn_fastopen = 1;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;}</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void tcp_options_write(__be32 *ptr, struct tcp_sock *tp,
+</span><span class='line'>&#9;&#9;&#9;&#9;  struct tcp_out_options *opts)
+</span><span class='line'>{
+</span><span class='line'>&#9;u16 options = opts-&gt;options;    /* mungable copy */
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;if (unlikely(OPTION_FAST_OPEN_COOKIE & options)) {
+</span><span class='line'>&#9;&#9;struct tcp_fastopen_cookie *foc = opts-&gt;fastopen_cookie;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;*ptr++ = htonl((TCPOPT_EXP &lt;&lt; 24) |
+</span><span class='line'>&#9;&#9;&#9;&#9;   ((TCPOLEN_EXP_FASTOPEN_BASE + foc-&gt;len) &lt;&lt; 16) |
+</span><span class='line'>&#9;&#9;&#9;&#9;   TCPOPT_FASTOPEN_MAGIC);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;memcpy(ptr, foc-&gt;val, foc-&gt;len);  //如果找到了TFO cookie，则写入；没有RFO cookie则仅仅是一个TFO请求
+</span><span class='line'>&#9;&#9;if ((foc-&gt;len & 3) == 2) {
+</span><span class='line'>&#9;&#9;&#9;u8 *align = ((u8 *)ptr) + foc-&gt;len;
+</span><span class='line'>&#9;&#9;&#9;align[0] = align[1] = TCPOPT_NOP;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;ptr += (foc-&gt;len + 3) &gt;&gt; 2;
+</span><span class='line'>&#9;}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>client端在每次使用TFO功能时都会在TCP的选项中添加一个TFO选项，与server端进行第一次TFO交互时TFO选项只有4字节长，其值是一个“MAGIC”，这种TFO被称为“TFO请求”；后续的TFO选项长度会增加一个从服务器端获得的TFO cookie的长度值，并且在这个SYN中会携带数据。</p>
+
+<p>server收到SYN后，会在tcp_v4_conn_request中进行处理：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int tcp_v4_conn_request(struct sock *sk, struct sk_buff *skb)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct tcp_options_received tmp_opt;
+</span><span class='line'>&#9;struct request_sock *req;
+</span><span class='line'>&#9;struct inet_request_sock *ireq;
+</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>&#9;struct dst_entry *dst = NULL;
+</span><span class='line'>&#9;__be32 saddr = ip_hdr(skb)-&gt;saddr;
+</span><span class='line'>&#9;__be32 daddr = ip_hdr(skb)-&gt;daddr;
+</span><span class='line'>&#9;__u32 isn = TCP_SKB_CB(skb)-&gt;when;
+</span><span class='line'>&#9;bool want_cookie = false;
+</span><span class='line'>&#9;struct flowi4 fl4;
+</span><span class='line'>&#9;struct tcp_fastopen_cookie foc = { .len = -1 };
+</span><span class='line'>&#9;struct tcp_fastopen_cookie valid_foc = { .len = -1 };
+</span><span class='line'>&#9;struct sk_buff *skb_synack;
+</span><span class='line'>&#9;int do_fastopen;
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;tcp_parse_options(skb, &tmp_opt, 0, want_cookie ? NULL : &foc);//解析TFO选项
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;do_fastopen = tcp_fastopen_check(sk, skb, req, &foc, &valid_foc);//检查TFO选项的合法性
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;skb_synack = tcp_make_synack(sk, dst, req,
+</span><span class='line'>&#9;&#9;fastopen_cookie_present(&valid_foc) ? &valid_foc : NULL);//如果客户端发送的是TFO请求则发送TFO cookie，否则不发送
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;if (likely(!do_fastopen)) {
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;} else if (tcp_v4_conn_req_fastopen(sk, skb, skb_synack, req))//创建子sock，将SYN中的数据放入socekt中的接收队列中
+</span><span class='line'>&#9;&#9;goto drop_and_free;
+</span><span class='line'>
+</span><span class='line'>&#9;return 0;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>tcp_fastopen_check函数用于检查SYN中TFO请求的合法性以及生成TFO cookie：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static bool tcp_fastopen_check(struct sock *sk, struct sk_buff *skb,
+</span><span class='line'>&#9;&#9;&#9;&#9;   struct request_sock *req,
+</span><span class='line'>&#9;&#9;&#9;&#9;   struct tcp_fastopen_cookie *foc,
+</span><span class='line'>&#9;&#9;&#9;&#9;   struct tcp_fastopen_cookie *valid_foc)
+</span><span class='line'>{
+</span><span class='line'>&#9;bool skip_cookie = false;
+</span><span class='line'>&#9;struct fastopen_queue *fastopenq;
+</span><span class='line'>
+</span><span class='line'>&#9;if (likely(!fastopen_cookie_present(foc))) {//SYN中没有携带TFO选项
+</span><span class='line'>&#9;&#9;/* See include/net/tcp.h for the meaning of these knobs */
+</span><span class='line'>&#9;&#9;if ((sysctl_tcp_fastopen & TFO_SERVER_ALWAYS) ||
+</span><span class='line'>&#9;&#9;&#9;((sysctl_tcp_fastopen & TFO_SERVER_COOKIE_NOT_REQD) &&
+</span><span class='line'>&#9;&#9;&#9;(TCP_SKB_CB(skb)-&gt;end_seq != TCP_SKB_CB(skb)-&gt;seq + 1)))
+</span><span class='line'>&#9;&#9;&#9;skip_cookie = true; /* no cookie to validate */  //无需校验cookie，直接允许SYN中携带数据
+</span><span class='line'>&#9;&#9;else
+</span><span class='line'>&#9;&#9;&#9;return false;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;fastopenq = inet_csk(sk)-&gt;icsk_accept_queue.fastopenq;
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;if ((sysctl_tcp_fastopen & TFO_SERVER_ENABLE) == 0 ||
+</span><span class='line'>&#9;&#9;fastopenq == NULL || fastopenq-&gt;max_qlen == 0)//未开启Server端TFO功能
+</span><span class='line'>&#9;&#9;return false;
+</span><span class='line'>
+</span><span class='line'>&#9;if (fastopenq-&gt;qlen &gt;= fastopenq-&gt;max_qlen) {//TFO队列已满
+</span><span class='line'>&#9;&#9;struct request_sock *req1;
+</span><span class='line'>&#9;&#9;spin_lock(&fastopenq-&gt;lock);
+</span><span class='line'>&#9;&#9;req1 = fastopenq-&gt;rskq_rst_head;
+</span><span class='line'>&#9;&#9;if ((req1 == NULL) || time_after(req1-&gt;expires, jiffies)) {
+</span><span class='line'>&#9;&#9;&#9;spin_unlock(&fastopenq-&gt;lock);
+</span><span class='line'>&#9;&#9;&#9;NET_INC_STATS_BH(sock_net(sk),
+</span><span class='line'>&#9;&#9;&#9;&#9;LINUX_MIB_TCPFASTOPENLISTENOVERFLOW);
+</span><span class='line'>&#9;&#9;&#9;/* Avoid bumping LINUX_MIB_TCPFASTOPENPASSIVEFAIL*/
+</span><span class='line'>&#9;&#9;&#9;foc-&gt;len = -1;
+</span><span class='line'>&#9;&#9;&#9;return false;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;fastopenq-&gt;rskq_rst_head = req1-&gt;dl_next;//替换队列中最老的一个
+</span><span class='line'>&#9;&#9;fastopenq-&gt;qlen--;
+</span><span class='line'>&#9;&#9;spin_unlock(&fastopenq-&gt;lock);
+</span><span class='line'>&#9;&#9;reqsk_free(req1);
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;if (skip_cookie) {//不使用cookie，直接接收数据
+</span><span class='line'>&#9;&#9;tcp_rsk(req)-&gt;rcv_nxt = TCP_SKB_CB(skb)-&gt;end_seq;
+</span><span class='line'>&#9;&#9;return true;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;if (foc-&gt;len == TCP_FASTOPEN_COOKIE_SIZE) {//SYN中携带了TFO cookie
+</span><span class='line'>&#9;&#9;if ((sysctl_tcp_fastopen & TFO_SERVER_COOKIE_NOT_CHKED) == 0) {
+</span><span class='line'>&#9;&#9;&#9;tcp_fastopen_cookie_gen(ip_hdr(skb)-&gt;saddr, valid_foc);//生成TFO cookie
+</span><span class='line'>&#9;&#9;&#9;if ((valid_foc-&gt;len != TCP_FASTOPEN_COOKIE_SIZE) ||　//TFO初始化不成功
+</span><span class='line'>&#9;&#9;&#9;&#9;memcmp(&foc-&gt;val[0], &valid_foc-&gt;val[0],　//TFO cookie不合法
+</span><span class='line'>&#9;&#9;&#9;&#9;TCP_FASTOPEN_COOKIE_SIZE) != 0)
+</span><span class='line'>&#9;&#9;&#9;&#9;return false;
+</span><span class='line'>&#9;&#9;&#9;valid_foc-&gt;len = -1;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;/* Acknowledge the data received from the peer. */
+</span><span class='line'>&#9;&#9;tcp_rsk(req)-&gt;rcv_nxt = TCP_SKB_CB(skb)-&gt;end_seq;
+</span><span class='line'>&#9;&#9;return true;
+</span><span class='line'>&#9;} else if (foc-&gt;len == 0) { /* Client requesting a cookie */
+</span><span class='line'>&#9;&#9;tcp_fastopen_cookie_gen(ip_hdr(skb)-&gt;saddr, valid_foc);//生成一个TFO cookie保存在valid_foc中
+</span><span class='line'>&#9;&#9;NET_INC_STATS_BH(sock_net(sk),
+</span><span class='line'>&#9;&#9;&#9;LINUX_MIB_TCPFASTOPENCOOKIEREQD);
+</span><span class='line'>&#9;} else {
+</span><span class='line'>&#9;&#9;/* Client sent a cookie with wrong size. Treat it
+</span><span class='line'>&#9;&#9; * the same as invalid and return a valid one.
+</span><span class='line'>&#9;&#9; */
+</span><span class='line'>&#9;&#9;tcp_fastopen_cookie_gen(ip_hdr(skb)-&gt;saddr, valid_foc);
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;return false;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>1327：rskq_rst_head为NULL的场景为有很多带TFO的SYN到来但SYN|ACK发送后并没有收到RST包，这意味着之前收到的那些带数据的TFO SYN可能是合法的；如果不为NULL但对立中最老的一个仍然没有超时的话，也不能将其替换</p>
+
+<p>1344-1351：如果clienet端的TFO不是请求，而是cookie，则不设置valid_foc；另外如果server端被设置为不检查cookie的合法性，则生成一个cookie再检查SYN中的TFO cookie的合法性，如果不合法则不使用TFO功能。</p>
+
+<p>tcp_make_synack函数会将tcp_fastopen_check中生成的TFO cookie写入TCP首部中，tcp_synack_options函数用来构建SYN|ACK报文的选项信息：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static unsigned int tcp_synack_options(struct sock *sk,
+</span><span class='line'>&#9;&#9;&#9;&#9;   struct request_sock *req,
+</span><span class='line'>&#9;&#9;&#9;&#9;   unsigned int mss, struct sk_buff *skb,
+</span><span class='line'>&#9;&#9;&#9;&#9;   struct tcp_out_options *opts,
+</span><span class='line'>&#9;&#9;&#9;&#9;   struct tcp_md5sig_key **md5,
+</span><span class='line'>&#9;&#9;&#9;&#9;   struct tcp_fastopen_cookie *foc)
+</span><span class='line'>{
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;if (foc != NULL) {
+</span><span class='line'>&#9;&#9;u32 need = TCPOLEN_EXP_FASTOPEN_BASE + foc-&gt;len;
+</span><span class='line'>&#9;&#9;need = (need + 3) & ~3U;  /* Align to 32 bits */
+</span><span class='line'>&#9;&#9;if (remaining &gt;= need) {
+</span><span class='line'>&#9;&#9;&#9;opts-&gt;options |= OPTION_FAST_OPEN_COOKIE;
+</span><span class='line'>&#9;&#9;&#9;opts-&gt;fastopen_cookie = foc;
+</span><span class='line'>&#9;&#9;&#9;remaining -= need;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;...</span></code></pre></td></tr></table></div></figure>
+
+
+<p>将选项信息写入SYN|ACK的方法与client发送SYN时一样，都是调用tcp_options_write函数。可以看出，TCP server端会返回给发送TFO请求的client端一个TFO cookie。client发送的下一个带数据的SYN必须携带这个cookie，而TCP server对这样的SYN回复的SYN|ACK中不会携带TFO选项。</p>
+
+<p>在SYN携带TFO cookie的情况下TCP server会在收到SYN时就创建sock，这个功能由cp_v4_conn_req_fastopen函数完成：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+<span class='line-number'>82</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int tcp_v4_conn_req_fastopen(struct sock *sk,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;struct sk_buff *skb,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;struct sk_buff *skb_synack,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;struct request_sock *req)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>&#9;struct request_sock_queue *queue = &inet_csk(sk)-&gt;icsk_accept_queue;
+</span><span class='line'>&#9;const struct inet_request_sock *ireq = inet_rsk(req);
+</span><span class='line'>&#9;struct sock *child;
+</span><span class='line'>&#9;...
+</span><span class='line'>
+</span><span class='line'>&#9;child = inet_csk(sk)-&gt;icsk_af_ops-&gt;syn_recv_sock(sk, skb, req, NULL);//生成子socket，其状态为TCP_SYN_RECV
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;err = ip_build_and_send_pkt(skb_synack, sk, ireq-&gt;loc_addr,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;ireq-&gt;rmt_addr, ireq-&gt;opt);//构建SYN|ACK的IP头并将其发送出去
+</span><span class='line'>&#9;err = net_xmit_eval(err);
+</span><span class='line'>&#9;if (!err)
+</span><span class='line'>&#9;&#9;tcp_rsk(req)-&gt;snt_synack = tcp_time_stamp;
+</span><span class='line'>&#9;/* XXX (TFO) - is it ok to ignore error and continue? */
+</span><span class='line'>
+</span><span class='line'>&#9;spin_lock(&queue-&gt;fastopenq-&gt;lock);
+</span><span class='line'>&#9;queue-&gt;fastopenq-&gt;qlen++;//将这个连接计入TFO queue
+</span><span class='line'>&#9;spin_unlock(&queue-&gt;fastopenq-&gt;lock);
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;tp = tcp_sk(child);
+</span><span class='line'>
+</span><span class='line'>&#9;tp-&gt;fastopen_rsk = req;
+</span><span class='line'>&#9;/* Do a hold on the listner sk so that if the listener is being
+</span><span class='line'>&#9; * closed, the child that has been accepted can live on and still
+</span><span class='line'>&#9; * access listen_lock.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;sock_hold(sk);
+</span><span class='line'>&#9;tcp_rsk(req)-&gt;listener = sk;
+</span><span class='line'>
+</span><span class='line'>&#9;/* RFC1323: The window in SYN & SYN/ACK segments is never
+</span><span class='line'>&#9; * scaled. So correct it appropriately.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;tp-&gt;snd_wnd = ntohs(tcp_hdr(skb)-&gt;window);
+</span><span class='line'>
+</span><span class='line'>&#9;/* Activate the retrans timer so that SYNACK can be retransmitted.
+</span><span class='line'>&#9; * The request socket is not added to the SYN table of the parent
+</span><span class='line'>&#9; * because it's been added to the accept queue directly.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;inet_csk_reset_xmit_timer(child, ICSK_TIME_RETRANS,
+</span><span class='line'>&#9;&#9;TCP_TIMEOUT_INIT, TCP_RTO_MAX);
+</span><span class='line'>
+</span><span class='line'>&#9;/* Add the child socket directly into the accept queue */
+</span><span class='line'>&#9;inet_csk_reqsk_queue_add(sk, req, child);
+</span><span class='line'>
+</span><span class='line'>&#9;/* Now finish processing the fastopen child socket. */
+</span><span class='line'>&#9;inet_csk(child)-&gt;icsk_af_ops-&gt;rebuild_header(child);
+</span><span class='line'>&#9;tcp_init_congestion_control(child);
+</span><span class='line'>&#9;tcp_mtup_init(child);
+</span><span class='line'>&#9;tcp_init_buffer_space(child);
+</span><span class='line'>&#9;tcp_init_metrics(child);
+</span><span class='line'>
+</span><span class='line'>&#9;/* Queue the data carried in the SYN packet. We need to first
+</span><span class='line'>&#9; * bump skb's refcnt because the caller will attempt to free it.
+</span><span class='line'>&#9; *
+</span><span class='line'>&#9; * XXX (TFO) - we honor a zero-payload TFO request for now.
+</span><span class='line'>&#9; * (Any reason not to?)
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;if (TCP_SKB_CB(skb)-&gt;end_seq == TCP_SKB_CB(skb)-&gt;seq + 1) {//SYN包中没有数据
+</span><span class='line'>&#9;&#9;/* Don't queue the skb if there is no payload in SYN.
+</span><span class='line'>&#9;&#9; * XXX (TFO) - How about SYN+FIN?
+</span><span class='line'>&#9;&#9; */
+</span><span class='line'>&#9;&#9;tp-&gt;rcv_nxt = TCP_SKB_CB(skb)-&gt;end_seq;
+</span><span class='line'>&#9;} else {
+</span><span class='line'>&#9;&#9;skb = skb_get(skb);
+</span><span class='line'>&#9;&#9;skb_dst_drop(skb);
+</span><span class='line'>&#9;&#9;__skb_pull(skb, tcp_hdr(skb)-&gt;doff * 4);
+</span><span class='line'>&#9;&#9;skb_set_owner_r(skb, child);
+</span><span class='line'>&#9;&#9;__skb_queue_tail(&child-&gt;sk_receive_queue, skb);//将数据放入child的接收队列中
+</span><span class='line'>&#9;&#9;tp-&gt;rcv_nxt = TCP_SKB_CB(skb)-&gt;end_seq;
+</span><span class='line'>&#9;&#9;tp-&gt;syn_data_acked = 1;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;sk-&gt;sk_data_ready(sk, 0);//通知持有listening socket的进程调用accept系统调用创建新连接
+</span><span class='line'>&#9;bh_unlock_sock(child);
+</span><span class='line'>&#9;sock_put(child);
+</span><span class='line'>&#9;WARN_ON(req-&gt;sk == NULL);
+</span><span class='line'>&#9;return 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>应用进程收到listening socket的可读通告后，使用accept系统调用建立socket，就可以立即从这个新的socket中读到数据，并开始与客户端进行数据交互。</p>
+
+<p>如果client的TFO是cookie，则SYN|ACK的处理过程与不使用TFO的情况是一样的；如果client发送的TFO是请求，则在收到SYN|ACK时需要将包中的TFO cookie保存下来：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int tcp_rcv_synsent_state_process(struct sock *sk, struct sk_buff *skb,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9; const struct tcphdr *th, unsigned int len)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct inet_connection_sock *icsk = inet_csk(sk);
+</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>&#9;struct tcp_fastopen_cookie foc = { .len = -1 };
+</span><span class='line'>&#9;int saved_clamp = tp-&gt;rx_opt.mss_clamp;
+</span><span class='line'>
+</span><span class='line'>&#9;tcp_parse_options(skb, &tp-&gt;rx_opt, 0, &foc);//解析TFO选项
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;&#9;if ((tp-&gt;syn_fastopen || tp-&gt;syn_data) && //如果发送过TFO选项或在SYN中发送过数据
+</span><span class='line'>&#9;&#9;&#9;tcp_rcv_fastopen_synack(sk, skb, &foc))//记录SYN｜ACK中的FTO cookie
+</span><span class='line'>&#9;&#9;&#9;return -1;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>tcp_rcv_fastopen_synack函数检查并保存server端发送的TFO cookie：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static bool tcp_rcv_fastopen_synack(struct sock *sk, struct sk_buff *synack,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;struct tcp_fastopen_cookie *cookie)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>&#9;struct sk_buff *data = tp-&gt;syn_data ? tcp_write_queue_head(sk) : NULL;
+</span><span class='line'>&#9;u16 mss = tp-&gt;rx_opt.mss_clamp;
+</span><span class='line'>&#9;bool syn_drop;
+</span><span class='line'>
+</span><span class='line'>&#9;if (mss == tp-&gt;rx_opt.user_mss) {
+</span><span class='line'>&#9;&#9;struct tcp_options_received opt;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;/* Get original SYNACK MSS value if user MSS sets mss_clamp */
+</span><span class='line'>&#9;&#9;tcp_clear_options(&opt);
+</span><span class='line'>&#9;&#9;opt.user_mss = opt.mss_clamp = 0;
+</span><span class='line'>&#9;&#9;tcp_parse_options(synack, &opt, 0, NULL);
+</span><span class='line'>&#9;&#9;mss = opt.mss_clamp;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;if (!tp-&gt;syn_fastopen)  /* Ignore an unsolicited cookie */
+</span><span class='line'>&#9;&#9;cookie-&gt;len = -1;//如果客户端没有发送TFO请求但服务器给出了TFO cookie，忽略之
+</span><span class='line'>
+</span><span class='line'>&#9;/* The SYN-ACK neither has cookie nor acknowledges the data. Presumably
+</span><span class='line'>&#9; * the remote receives only the retransmitted (regular) SYNs: either
+</span><span class='line'>&#9; * the original SYN-data or the corresponding SYN-ACK is lost.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;syn_drop = (cookie-&gt;len &lt;= 0 && data && tp-&gt;total_retrans); //客户端认为发生了SYN丢失事件
+</span><span class='line'>
+</span><span class='line'>&#9;tcp_fastopen_cache_set(sk, mss, cookie, syn_drop);//存储SYN｜ACK包中的TFO cookie，并记录发现SYN丢失事件的时间
+</span><span class='line'>
+</span><span class='line'>&#9;if (data) { /* Retransmit unacked data in SYN */
+</span><span class='line'>&#9;&#9;tcp_for_write_queue_from(data, sk) {
+</span><span class='line'>&#9;&#9;&#9;if (data == tcp_send_head(sk) ||
+</span><span class='line'>&#9;&#9;&#9;&#9;__tcp_retransmit_skb(sk, data))
+</span><span class='line'>&#9;&#9;&#9;&#9;break;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;tcp_rearm_rto(sk);
+</span><span class='line'>&#9;&#9;return true;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;tp-&gt;syn_data_acked = tp-&gt;syn_data;
+</span><span class='line'>&#9;return false;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>在保存了TFO cookie后，client在向相同IP地址的server发送SYN时都可以携带数据（这时必须发送TFO cookie）。client在收到SYN|ACK后需要回复ACK报文，服务器端在接收ACK时对TFO的处理如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb,
+</span><span class='line'>&#9;&#9;&#9;  const struct tcphdr *th, unsigned int len)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>&#9;struct inet_connection_sock *icsk = inet_csk(sk);
+</span><span class='line'>&#9;struct request_sock *req;
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;req = tp-&gt;fastopen_rsk;//找到在SYN请求到来后创建子socket时使用的request sock
+</span><span class='line'>&#9;if (req != NULL) {
+</span><span class='line'>&#9;&#9;WARN_ON_ONCE(sk-&gt;sk_state != TCP_SYN_RECV &&
+</span><span class='line'>&#9;&#9;&#9;sk-&gt;sk_state != TCP_FIN_WAIT1);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (tcp_check_req(sk, skb, req, NULL, true) == NULL)//检查包的合法性
+</span><span class='line'>&#9;&#9;&#9;goto discard;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;&#9;switch (sk-&gt;sk_state) {
+</span><span class='line'>&#9;&#9;case TCP_SYN_RECV:
+</span><span class='line'>&#9;&#9;&#9;if (acceptable) {
+</span><span class='line'>&#9;&#9;&#9;&#9;/* Once we leave TCP_SYN_RECV, we no longer
+</span><span class='line'>&#9;&#9;&#9;&#9; * need req so release it.
+</span><span class='line'>&#9;&#9;&#9;&#9; */
+</span><span class='line'>&#9;&#9;&#9;&#9;if (req) {//使用了TFO cookie
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;tcp_synack_rtt_meas(sk, req);
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;tp-&gt;total_retrans = req-&gt;num_retrans;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;reqsk_fastopen_remove(sk, req, false);//将request sock从TFO queue中删除，TFO流程全部结束
+</span><span class='line'>&#9;&#9;&#9;&#9;} else {
+</span><span class='line'>&#9;...</span></code></pre></td></tr></table></div></figure>
+
+
+<p>综上，TFO在收到SYN的时候就创建socket并将数据提交给应用进程，这样就比普通模式节省了SYN|ACK与ACK的交互时间，减小了通信延迟。</p>
 </div>
   
   
@@ -708,7 +2438,7 @@ var ss360Config = {
   
     <section>
 <h1>Categories
-<span class='right_span'>(893)</span>
+<span class='right_span'>(899)</span>
 
 </h1>
 <head>
@@ -739,7 +2469,7 @@ if (!document.getElementById('blog~octopress')) document.getElementById('aexp_bl
 if (!document.getElementById('blog')) document.getElementById('aexp_blog').style.visibility = 'hidden';
 if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ruby').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(135)</span></li>
+<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(136)</span></li>
 <div id='language' class='catsub'><li><a href='/blog/cats/language~c/?opendiv=language'>c</a><a href='##' onmousedown=showDiv('language~c') id='aexp_language~c'><span class='exp_style' id='exp_language~c'>[+]</span></a><span class='right_span'>32</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~c')) document.getElementById('aexp_language~c').style.visibility = 'hidden';
@@ -756,7 +2486,7 @@ if (!document.getElementById('language~java')) document.getElementById('aexp_lan
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~jsp')) document.getElementById('aexp_language~jsp').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/language~php/?opendiv=language'>php</a><a href='##' onmousedown=showDiv('language~php') id='aexp_language~php'><span class='exp_style' id='exp_language~php'>[+]</span></a><span class='right_span'>40</span></li>
+<li><a href='/blog/cats/language~php/?opendiv=language'>php</a><a href='##' onmousedown=showDiv('language~php') id='aexp_language~php'><span class='exp_style' id='exp_language~php'>[+]</span></a><span class='right_span'>41</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~php')) document.getElementById('aexp_language~php').style.visibility = 'hidden';
 </script>
@@ -793,7 +2523,7 @@ if (!document.getElementById('assembly~base')) document.getElementById('aexp_ass
 if (!document.getElementById('assembly')) document.getElementById('aexp_assembly').style.visibility = 'hidden';
 if (!document.getElementById('assembly~win')) document.getElementById('aexp_assembly~win').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(192)</span></li>
+<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(194)</span></li>
 <div id='tools' class='catsub'><li><a href='/blog/cats/tools~apache2/?opendiv=tools'>apache2</a><a href='##' onmousedown=showDiv('tools~apache2') id='aexp_tools~apache2'><span class='exp_style' id='exp_tools~apache2'>[+]</span></a><span class='right_span'>9</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~apache2')) document.getElementById('aexp_tools~apache2').style.visibility = 'hidden';
@@ -834,7 +2564,7 @@ if (!document.getElementById('tools~haproxy')) document.getElementById('aexp_too
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~isal')) document.getElementById('aexp_tools~isal').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/tools~mysql/?opendiv=tools'>mysql</a><a href='##' onmousedown=showDiv('tools~mysql') id='aexp_tools~mysql'><span class='exp_style' id='exp_tools~mysql'>[+]</span></a><span class='right_span'>28</span></li>
+<li><a href='/blog/cats/tools~mysql/?opendiv=tools'>mysql</a><a href='##' onmousedown=showDiv('tools~mysql') id='aexp_tools~mysql'><span class='exp_style' id='exp_tools~mysql'>[+]</span></a><span class='right_span'>29</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~mysql')) document.getElementById('aexp_tools~mysql').style.visibility = 'hidden';
 </script>
@@ -878,7 +2608,7 @@ if (!document.getElementById('tools~sqlmap')) document.getElementById('aexp_tool
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~sqlserver')) document.getElementById('aexp_tools~sqlserver').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/tools~squid/?opendiv=tools'>squid</a><a href='##' onmousedown=showDiv('tools~squid') id='aexp_tools~squid'><span class='exp_style' id='exp_tools~squid'>[+]</span></a><span class='right_span'>4</span></li>
+<li><a href='/blog/cats/tools~squid/?opendiv=tools'>squid</a><a href='##' onmousedown=showDiv('tools~squid') id='aexp_tools~squid'><span class='exp_style' id='exp_tools~squid'>[+]</span></a><span class='right_span'>5</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~squid')) document.getElementById('aexp_tools~squid').style.visibility = 'hidden';
 </script>
@@ -903,12 +2633,12 @@ if (!document.getElementById('tools~vim')) document.getElementById('aexp_tools~v
 if (!document.getElementById('tools')) document.getElementById('aexp_tools').style.visibility = 'hidden';
 if (!document.getElementById('tools~wxwork')) document.getElementById('aexp_tools~wxwork').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/system/'>system</a><a href='##' onmousedown=showDiv('system') id='aexp_system'><span class='exp_style' id='exp_system'>[+]</span></a><span class='right_span'>(105)</span></li>
+<li class='catclass'><a href='/blog/cats/system/'>system</a><a href='##' onmousedown=showDiv('system') id='aexp_system'><span class='exp_style' id='exp_system'>[+]</span></a><span class='right_span'>(107)</span></li>
 <div id='system' class='catsub'><li><a href='/blog/cats/system~base/?opendiv=system'>base</a><a href='##' onmousedown=showDiv('system~base') id='aexp_system~base'><span class='exp_style' id='exp_system~base'>[+]</span></a><span class='right_span'>23</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('system~base')) document.getElementById('aexp_system~base').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/system~centos/?opendiv=system'>centos</a><a href='##' onmousedown=showDiv('system~centos') id='aexp_system~centos'><span class='exp_style' id='exp_system~centos'>[+]</span></a><span class='right_span'>12</span></li>
+<li><a href='/blog/cats/system~centos/?opendiv=system'>centos</a><a href='##' onmousedown=showDiv('system~centos') id='aexp_system~centos'><span class='exp_style' id='exp_system~centos'>[+]</span></a><span class='right_span'>14</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('system~centos')) document.getElementById('aexp_system~centos').style.visibility = 'hidden';
 </script>
@@ -953,7 +2683,7 @@ if (!document.getElementById('system~namespace')) document.getElementById('aexp_
 if (!document.getElementById('system')) document.getElementById('aexp_system').style.visibility = 'hidden';
 if (!document.getElementById('system~ubuntu')) document.getElementById('aexp_system~ubuntu').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/kernel/'>kernel</a><a href='##' onmousedown=showDiv('kernel') id='aexp_kernel'><span class='exp_style' id='exp_kernel'>[+]</span></a><span class='right_span'>(273)</span></li>
+<li class='catclass'><a href='/blog/cats/kernel/'>kernel</a><a href='##' onmousedown=showDiv('kernel') id='aexp_kernel'><span class='exp_style' id='exp_kernel'>[+]</span></a><span class='right_span'>(274)</span></li>
 <div id='kernel' class='catsub'><li><a href='/blog/cats/kernel~10gb/?opendiv=kernel'>10gb</a><a href='##' onmousedown=showDiv('kernel~10gb') id='aexp_kernel~10gb'><span class='exp_style' id='exp_kernel~10gb'>[+]</span></a><span class='right_span'>7</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('kernel~10gb')) document.getElementById('aexp_kernel~10gb').style.visibility = 'hidden';
@@ -1121,9 +2851,13 @@ if (!document.getElementById('algorithm~ds')) document.getElementById('aexp_algo
 if (!document.getElementById('algorithm~game')) document.getElementById('aexp_algorithm~game').style.visibility = 'hidden';
 </script>
 <li><a href='/blog/cats/algorithm~tc/?opendiv=algorithm'>tc</a><a href='##' onmousedown=showDiv('algorithm~tc') id='aexp_algorithm~tc'><span class='exp_style' id='exp_algorithm~tc'>[+]</span></a><span class='right_span'>2</span></li>
+<script language='javascript' type='text/javascript'>
+if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algorithm~tc').style.visibility = 'hidden';
+</script>
+<li><a href='/blog/cats/lernel~ipsec/?opendiv=algorithm'>ipsec</a><a href='##' onmousedown=showDiv('algorithm~ipsec') id='aexp_algorithm~ipsec'><span class='exp_style' id='exp_algorithm~ipsec'>[+]</span></a><span class='right_span'>1</span></li>
 </div><script language='javascript' type='text/javascript'>
 if (!document.getElementById('algorithm')) document.getElementById('aexp_algorithm').style.visibility = 'hidden';
-if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algorithm~tc').style.visibility = 'hidden';
+if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_algorithm~ipsec').style.visibility = 'hidden';
 </script>
 
 </ul>
@@ -1134,7 +2868,7 @@ if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algo
 
 <section>
 <h1>Date Categories
-<span class='right_span'>(893)</span>
+<span class='right_span'>(899)</span>
 
 </h1>
 <head>
@@ -1142,8 +2876,9 @@ if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algo
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(13)</span></li>
-<div id='2024' class='catsub'><li><a href='/blog/cats/2024~04/?opendiv=2024'>2024-04</a><span class='right_span'>2</span></li>
+<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(19)</span></li>
+<div id='2024' class='catsub'><li><a href='/blog/cats/2024~05/?opendiv=2024'>2024-05</a><span class='right_span'>3</span></li>
+<li><a href='/blog/cats/2024~04/?opendiv=2024'>2024-04</a><span class='right_span'>5</span></li>
 <li><a href='/blog/cats/2024~03/?opendiv=2024'>2024-03</a><span class='right_span'>5</span></li>
 <li><a href='/blog/cats/2024~02/?opendiv=2024'>2024-02</a><span class='right_span'>4</span></li>
 <li><a href='/blog/cats/2024~01/?opendiv=2024'>2024-01</a><span class='right_span'>2</span></li>
@@ -1295,7 +3030,7 @@ if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algo
 <a style="font-size: 100%" href="/tags/lvs/">lvs(3)</a>
 <a style="font-size: 131%" href="/tags/mptcp/">mptcp(9)</a>
 <a style="font-size: 119%" href="/tags/nginx/">nginx(6)</a>
-<a style="font-size: 108%" href="/tags/squid/">squid(4)</a>
+<a style="font-size: 114%" href="/tags/squid/">squid(5)</a>
 <a style="font-size: 131%" href="/tags/vpn/">vpn(9)</a>
 <a style="font-size: 108%" href="/tags/shu-ju-cai-ji/">数据采集(4)</a>
 <a style="font-size: 141%" href="/tags/hui-bian/">汇编(13)</a>
@@ -1305,6 +3040,30 @@ if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algo
 <section>
   <h1>Recent Posts</h1>
   <ul id="recent_posts">
+    
+      <li class="post">
+        <a href="/blog/2024/05/16/lang-centos8-php8/">Centos8安装PHP8</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2024/05/16/centos8-kernel/">CentOS8 编译内核错误</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2024/05/11/centos8.5-install/">CentOS8.5 安装</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2024/04/30/mariadb/">centos 安装 MariaDB</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2024/04/29/strongswan-make/">ubuntu 编译strongswan</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2024/04/29/tools-squid-log/">squid 日志格式, 时间格式</a>
+      </li>
     
       <li class="post">
         <a href="/blog/2024/04/26/tools-apache2-tmp/">centos7下httpd服务对tmp目录操作</a>
@@ -1320,30 +3079,6 @@ if (!document.getElementById('algorithm~tc')) document.getElementById('aexp_algo
     
       <li class="post">
         <a href="/blog/2024/03/26/TH40W-E/">华汉维无线wifi温湿度TH40W-E</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/03/26/ups-winpower/">山特UPS软件Winpower</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/03/23/lang-ci-cache/">php ci 数据缓存</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/03/01/nginx-proxy/">nginx配置多个域名, http https共用配置</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/02/26/lang-web-FormData/">Ajax使用FormData上传文件</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/02/26/lang-web-pdf-view/">pdf预览 jquery.media.js</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/02/26/vim-syntax-off/">Vim 在处理长字符串时变得非常慢</a>
       </li>
     
   </ul>
