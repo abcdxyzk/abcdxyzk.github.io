@@ -131,7 +131,7 @@ var ss360Config = {
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2020/07/09/kernel-adjust-mss/">将包减小到mss以下</a></h2>
+      <h2 class="entry-title"><a href="/blog/2020/07/20/kernel-mptcp-64/">MPTCP 64bit seq</a></h2>
     
     
       <p class="meta">
@@ -140,14 +140,331 @@ var ss360Config = {
 
 
 
-<time class='entry-date' datetime='2020-07-09T01:57:00+08:00'><span class='date'>2020-07-09</span> <span class='time'>01:57:00</span></time>
+<time class='entry-date' datetime='2020-07-20T00:16:00+08:00'><span class='date'>2020-07-20</span> <span class='time'>00:16:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+  <div class="entry-content"><h3>一、snd_high_order, rcv_high_order</h3>
+
+<p>发送和接收都将seq映射到64位上，这样能防止不同子流之间seq造成的歧义。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'># 发送
+</span><span class='line'>static inline __be32 mptcp_get_highorder_sndbits(const struct sk_buff *skb, const struct mptcp_cb *mpcb)
+</span><span class='line'>{
+</span><span class='line'>&#9;return htonl(mpcb-&gt;snd_high_order[(TCP_SKB_CB(skb)-&gt;mptcp_flags &
+</span><span class='line'>&#9;&#9;&#9;MPTCPHDR_SEQ64_INDEX) ? 1 : 0]);
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>static inline void mptcp_check_sndseq_wrap(struct tcp_sock *meta_tp, int inc)
+</span><span class='line'>{
+</span><span class='line'>&#9;if (unlikely(meta_tp-&gt;snd_nxt &gt; meta_tp-&gt;snd_nxt + inc)) {
+</span><span class='line'>&#9;&#9;struct mptcp_cb *mpcb = meta_tp-&gt;mpcb;
+</span><span class='line'>&#9;&#9;mpcb-&gt;snd_hiseq_index = mpcb-&gt;snd_hiseq_index ? 0 : 1;
+</span><span class='line'>&#9;&#9;mpcb-&gt;snd_high_order[mpcb-&gt;snd_hiseq_index] += 2;
+</span><span class='line'>&#9;}
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'># 接收
+</span><span class='line'>static inline u64 mptcp_get_data_seq_64(const struct mptcp_cb *mpcb, int index, u32 data_seq_32)
+</span><span class='line'>{
+</span><span class='line'>&#9;return ((u64)mpcb-&gt;rcv_high_order[index] &lt;&lt; 32) | data_seq_32;
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>static inline u64 mptcp_get_rcv_nxt_64(const struct tcp_sock *meta_tp)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct mptcp_cb *mpcb = meta_tp-&gt;mpcb;
+</span><span class='line'>&#9;return mptcp_get_data_seq_64(mpcb, mpcb-&gt;rcv_hiseq_index,
+</span><span class='line'>&#9;&#9;&#9;&#9;     meta_tp-&gt;rcv_nxt);
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>static inline void mptcp_check_rcvseq_wrap(struct tcp_sock *meta_tp, u32 old_rcv_nxt)
+</span><span class='line'>{
+</span><span class='line'>&#9;if (unlikely(old_rcv_nxt &gt; meta_tp-&gt;rcv_nxt)) {
+</span><span class='line'>&#9;&#9;struct mptcp_cb *mpcb = meta_tp-&gt;mpcb;
+</span><span class='line'>&#9;&#9;mpcb-&gt;rcv_high_order[mpcb-&gt;rcv_hiseq_index] += 2;
+</span><span class='line'>&#9;&#9;mpcb-&gt;rcv_hiseq_index = mpcb-&gt;rcv_hiseq_index ? 0 : 1;
+</span><span class='line'>&#9;}
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>1. 发送端 MPTCPHDR_SEQ64_INDEX</h4>
+
+<p>MPTCPHDR_SEQ64_INDEX 在发送和接收上有不同用法，在发送上</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static bool mptcp_skb_entail(struct sock *sk, struct sk_buff *skb, int reinject)
+</span><span class='line'>{
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;if (!reinject) // 如果是第一次发送的包, MPTCPHDR_SEQ64_INDEX 只是作为 snd_hiseq_index 的替代
+</span><span class='line'>&#9;&#9;TCP_SKB_CB(skb)-&gt;mptcp_flags |= (mpcb-&gt;snd_hiseq_index ? MPTCPHDR_SEQ64_INDEX : 0);
+</span><span class='line'>&#9;...</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>2. wrap</h4>
+
+<p>在 mptcp_check_sndseq_wrap 中 snd_hiseq_index ^= 1, 然后 snd_high_order[i] += 2; 所以 snd_high_order使用 snd_high_order[i] 和 snd_high_order[i-1]。</p>
+
+<p>在 mptcp_check_rcvseq_wrap 中 rcv_high_order[i] += 2; rcv_hiseq_index ^= 1; 所以 rcv_high_order 使用 rcv_high_order[i] 和 rcv_high_order[i+1]。</p>
+
+<p>为什么？</p>
+
+<p>因为发送的时候只需要用到最高seq(snd_nxt)，但接收的时候会超高最高seq(rcv_nxt)。在 mptcp_detect_mapping 中指明了：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (unlikely(after(data_seq, meta_tp-&gt;rcv_nxt) && data_seq &lt; meta_tp-&gt;rcv_nxt)) {
+</span><span class='line'>&#9;tp-&gt;mptcp-&gt;map_data_seq = mptcp_get_data_seq_64(mpcb, !mpcb-&gt;rcv_hiseq_index, data_seq);</span></code></pre></td></tr></table></div></figure>
+
+
+<h3>二、64bit OR 33bit</h3>
+
+<h4>1. 接收端 MPTCPHDR_SEQ64_INDEX</h4>
+
+<p>在 mptcp_write_dss_data_ack() 中 mdss->m = 0; 所以 MPTCPHDR_SEQ64_SET 永远不启用。 接收端只有在 MPTCPHDR_SEQ64_SET 启用时 MPTCPHDR_SEQ64_INDEX, MPTCPHDR_SEQ64_OFO 才有用， 见 mptcp_get_64_bit</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static inline u8 mptcp_get_64_bit(u64 data_seq, struct mptcp_cb *mpcb)
+</span><span class='line'>{
+</span><span class='line'>&#9;u64 data_seq_high = (u32)(data_seq &gt;&gt; 32);
+</span><span class='line'>
+</span><span class='line'>&#9;if (mpcb-&gt;rcv_high_order[0] == data_seq_high)
+</span><span class='line'>&#9;&#9;return 0;
+</span><span class='line'>&#9;else if (mpcb-&gt;rcv_high_order[1] == data_seq_high)
+</span><span class='line'>&#9;&#9;return MPTCPHDR_SEQ64_INDEX;
+</span><span class='line'>&#9;else
+</span><span class='line'>&#9;&#9;return MPTCPHDR_SEQ64_OFO;
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>static inline __u32 *mptcp_skb_set_data_seq(const struct sk_buff *skb, u32 *data_seq, struct mptcp_cb *mpcb)
+</span><span class='line'>{
+</span><span class='line'>&#9;__u32 *ptr = (__u32 *)(skb_transport_header(skb) + TCP_SKB_CB(skb)-&gt;dss_off);
+</span><span class='line'>
+</span><span class='line'>&#9;if (TCP_SKB_CB(skb)-&gt;mptcp_flags & MPTCPHDR_SEQ64_SET) {
+</span><span class='line'>&#9;&#9;u64 data_seq64 = get_unaligned_be64(ptr);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (mpcb)
+</span><span class='line'>&#9;&#9;&#9;TCP_SKB_CB(skb)-&gt;mptcp_flags |= mptcp_get_64_bit(data_seq64, mpcb);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;*data_seq = (u32)data_seq64;
+</span><span class='line'>&#9;&#9;ptr++;
+</span><span class='line'>&#9;} else {
+</span><span class='line'>&#9;&#9;*data_seq = get_unaligned_be32(ptr);
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;return ptr;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>2. bug??</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (mpcb-&gt;rcv_high_order[0] == data_seq_high)
+</span><span class='line'>&#9;return 0;
+</span><span class='line'>else if (mpcb-&gt;rcv_high_order[1] == data_seq_high)
+</span><span class='line'>&#9;return MPTCPHDR_SEQ64_INDEX;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这四句应该改成:</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>i = mpcb-&gt;rcv_hiseq_index;
+</span><span class='line'>if (mpcb-&gt;rcv_high_order[i] == data_seq_high)
+</span><span class='line'>&#9;return 0;
+</span><span class='line'>else if (mpcb-&gt;rcv_high_order[i^1] == data_seq_high)
+</span><span class='line'>&#9;return MPTCPHDR_SEQ64_INDEX;</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>3. 33bit</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>rcv_high_order[i^1] = rcv_high_order[i] + 1;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>所以所谓的64bit，其实是33bit。</p>
+
+<h4>4. MPTCPHDR_SEQ64_OFO</h4>
+
+<p>33bit seq 超过了 <code>rcv_high_order[i^1]</code>，判定为无效数据，不收取</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2020/07/19/kernel-mptcp-dss/">MPTCP DSS && MPTCPHDR_INF</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2020-07-19T23:33:00+08:00'><span class='date'>2020-07-19</span> <span class='time'>23:33:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><h3>dss=Data Sequence Signal</h3>
+
+<p>用于将子流的seq映射到主流上。</p>
+
+<p>三次握手后 maskter_sk = meta_sk, 然后 meta_sk 会重新分配seq, snd_nxt, rcv_nxt, write_seq, copied_seq 等。</p>
+
+<h3>master_sk, subflow 的seq和 meta_sk 建立联系</h3>
+
+<h4>output</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>mptcp_save_dss_data_seq {
+</span><span class='line'>&#9;mptcp_write_dss_data_ack
+</span><span class='line'>&#9;mptcp_write_dss_mapping
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>先写ACK映射，再写DATA映射。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int mptcp_write_dss_data_ack(const struct tcp_sock *tp, const struct sk_buff *skb,
+</span><span class='line'>&#9;&#9;&#9;&#9;    __be32 *ptr)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct mp_dss *mdss = (struct mp_dss *)ptr;
+</span><span class='line'>&#9;__be32 *start = ptr; 
+</span><span class='line'>
+</span><span class='line'>&#9;mdss-&gt;kind = TCPOPT_MPTCP;
+</span><span class='line'>&#9;mdss-&gt;sub = MPTCP_SUB_DSS;
+</span><span class='line'>&#9;mdss-&gt;rsv1 = 0; 
+</span><span class='line'>&#9;mdss-&gt;rsv2 = 0; 
+</span><span class='line'>&#9;mdss-&gt;F = mptcp_is_data_fin(skb) ? 1 : 0; 
+</span><span class='line'>&#9;mdss-&gt;m = 0; 
+</span><span class='line'>&#9;mdss-&gt;M = mptcp_is_data_seq(skb) ? 1 : 0; 
+</span><span class='line'>&#9;mdss-&gt;a = 0; 
+</span><span class='line'>&#9;mdss-&gt;A = 1; 
+</span><span class='line'>&#9;mdss-&gt;len = mptcp_sub_len_dss(mdss, tp-&gt;mpcb-&gt;dss_csum);
+</span><span class='line'>&#9;ptr++;
+</span><span class='line'>
+</span><span class='line'>&#9;*ptr++ = htonl(mptcp_meta_tp(tp)-&gt;rcv_nxt);
+</span><span class='line'>
+</span><span class='line'>&#9;return ptr - start;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
 <span class='line-number'>3</span>
 <span class='line-number'>4</span>
@@ -186,93 +503,122 @@ var ss360Config = {
 <span class='line-number'>37</span>
 <span class='line-number'>38</span>
 <span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-<span class='line-number'>58</span>
-<span class='line-number'>59</span>
-<span class='line-number'>60</span>
-<span class='line-number'>61</span>
-<span class='line-number'>62</span>
-<span class='line-number'>63</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>diff --git a/src/4.15.18/tcp_output.c b/src/4.15.18/tcp_output.c
-</span><span class='line'>index 82613f5..270545e 100644
-</span><span class='line'>--- a/src/4.15.18/tcp_output.c
-</span><span class='line'>+++ b/src/4.15.18/tcp_output.c
-</span><span class='line'>@@ -52,6 +52,7 @@
-</span><span class='line'> #include "fec_core.h"
-</span><span class='line'> 
-</span><span class='line'> u32 sysctl_post_local = 0xffffff00;
-</span><span class='line'>+int sysctl_mss_adjust = 0;
-</span><span class='line'> 
-</span><span class='line'> static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
-</span><span class='line'>             int push_one, gfp_t gfp);
-</span><span class='line'>@@ -1720,6 +1721,8 @@ unsigned int tcp_current_mss(struct sock *sk)
-</span><span class='line'>          mss_now = tcp_sync_mss(sk, mtu);
-</span><span class='line'>  }
-</span><span class='line'> 
-</span><span class='line'>+ mss_now -= sysctl_mss_adjust;
-</span><span class='line'>+
-</span><span class='line'>  header_len = tcp_established_options(sk, NULL, &opts, &md5, getconninfo(sk)) +
-</span><span class='line'>           sizeof(struct tcphdr);
-</span><span class='line'>  /* The mss_cache is sized based on tp-&gt;tcp_header_len, which assumes
-</span><span class='line'>@@ -3401,6 +3404,7 @@ struct sk_buff *tcp_make_synack(const struct sock *sk, struct dst_entry *dst,
-</span><span class='line'>  skb_dst_set(skb, dst);
-</span><span class='line'> 
-</span><span class='line'>  mss = tcp_mss_clamp(tp, dst_metric_advmss(dst));
-</span><span class='line'>+ mss -= sysctl_mss_adjust;
-</span><span class='line'> 
-</span><span class='line'>  memset(&opts, 0, sizeof(opts));
-</span><span class='line'> #ifdef CONFIG_SYN_COOKIES
-</span><span class='line'>@@ -3561,6 +3565,7 @@ static void tcp_connect_init(struct sock *sk)
-</span><span class='line'>  if (!tp-&gt;window_clamp)
-</span><span class='line'>      tp-&gt;window_clamp = dst_metric(dst, RTAX_WINDOW);
-</span><span class='line'>  tp-&gt;advmss = tcp_mss_clamp(tp, dst_metric_advmss(dst));
-</span><span class='line'>+ tp-&gt;advmss -= sysctl_mss_adjust;
-</span><span class='line'> 
-</span><span class='line'>  tcp_initialize_rcv_mss(sk);
-</span><span class='line'> 
-</span><span class='line'>diff --git a/src/io_sysctl.c b/src/io_sysctl.c
-</span><span class='line'>index c3b2ddd..6fdc1df 100644
-</span><span class='line'>--- a/src/io_sysctl.c
-</span><span class='line'>+++ b/src/io_sysctl.c
-</span><span class='line'>@@ -9,6 +9,7 @@ extern int sysctl_detail;
-</span><span class='line'> extern int sysctl_data_ssthresh;
-</span><span class='line'> 
-</span><span class='line'> extern int sysctl_post_local;
-</span><span class='line'>+extern int sysctl_mss_adjust;
-</span><span class='line'> 
-</span><span class='line'> extern unsigned long total_session;
-</span><span class='line'> extern unsigned long current_session;
-</span><span class='line'>@@ -39,6 +40,13 @@ static struct ctl_table tcp_sysctl_table[] = {
-</span><span class='line'>      .mode = 0644,
-</span><span class='line'>      .proc_handler = proc_dointvec
-</span><span class='line'>  },
-</span><span class='line'>+ {
-</span><span class='line'>+     .procname = "mss_adjust",
-</span><span class='line'>+     .data = &sysctl_mss_adjust,
-</span><span class='line'>+     .maxlen = sizeof(int),
-</span><span class='line'>+     .mode = 0644,
-</span><span class='line'>+     .proc_handler = proc_dointvec
-</span><span class='line'>+ },
-</span><span class='line'>  {
-</span><span class='line'>      .procname = "total_session",
-</span><span class='line'>      .data = &total_session,</span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int mptcp_write_dss_mapping(const struct tcp_sock *tp, const struct sk_buff *skb,
+</span><span class='line'>&#9;&#9;&#9;&#9;   __be32 *ptr)
+</span><span class='line'>{
+</span><span class='line'>&#9;const struct tcp_skb_cb *tcb = TCP_SKB_CB(skb);
+</span><span class='line'>&#9;__be32 *start = ptr; 
+</span><span class='line'>&#9;__u16 data_len;
+</span><span class='line'>
+</span><span class='line'>&#9;*ptr++ = htonl(tcb-&gt;seq); /* data_seq */
+</span><span class='line'>
+</span><span class='line'>&#9;/* If it's a non-data DATA_FIN, we set subseq to 0 (draft v7) */
+</span><span class='line'>&#9;if (mptcp_is_data_fin(skb) && skb-&gt;len == 0)
+</span><span class='line'>&#9;&#9;*ptr++ = 0; /* subseq */
+</span><span class='line'>&#9;else 
+</span><span class='line'>&#9;&#9;*ptr++ = htonl(tp-&gt;write_seq - tp-&gt;mptcp-&gt;snt_isn); /* subseq */
+</span><span class='line'>
+</span><span class='line'>&#9;if (tcb-&gt;mptcp_flags & MPTCPHDR_INF)
+</span><span class='line'>&#9;&#9;data_len = 0; 
+</span><span class='line'>&#9;else 
+</span><span class='line'>&#9;&#9;data_len = tcb-&gt;end_seq - tcb-&gt;seq;
+</span><span class='line'>
+</span><span class='line'>&#9;if (tp-&gt;mpcb-&gt;dss_csum && data_len) {
+</span><span class='line'>&#9;&#9;__sum16 *p16 = (__sum16 *)ptr;
+</span><span class='line'>&#9;&#9;__be32 hdseq = mptcp_get_highorder_sndbits(skb, tp-&gt;mpcb);
+</span><span class='line'>&#9;&#9;__wsum csum;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;*ptr = htonl(((data_len) &lt;&lt; 16) |
+</span><span class='line'>&#9;&#9;&#9;     (TCPOPT_EOL &lt;&lt; 8) | 
+</span><span class='line'>&#9;&#9;&#9;     (TCPOPT_EOL));
+</span><span class='line'>&#9;&#9;csum = csum_partial(ptr - 2, 12, skb-&gt;csum);
+</span><span class='line'>&#9;&#9;p16++;
+</span><span class='line'>&#9;&#9;*p16++ = csum_fold(csum_partial(&hdseq, sizeof(hdseq), csum));
+</span><span class='line'>&#9;} else {
+</span><span class='line'>&#9;&#9;*ptr++ = htonl(((data_len) &lt;&lt; 16) |
+</span><span class='line'>&#9;&#9;&#9;       (TCPOPT_NOP &lt;&lt; 8) | 
+</span><span class='line'>&#9;&#9;&#9;       (TCPOPT_NOP));
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;return ptr - start;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>input</h4>
+
+<ul>
+<li>收到的包有可能被中间设备分成多个包，或由于gso、tso、gro造成收发包大小不一一对应。所以在接收端能看到很多 skb_queue_walk_safe(&amp;sk->sk_receive_queue, skb, tmp)</li>
+</ul>
+
+
+<p>映射处理顺序：
+mptcp_data_ready -> mptcp_prevalidate_skb, mptcp_detect_mapping, mptcp_validate_mapping</p>
+
+<h5>mptcp_detect_mapping</h5>
+
+<p>发送一个包可能对应多个接收包，在接收第一个包的时候设置好</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>tp-&gt;mptcp-&gt;map_data_len = data_len;
+</span><span class='line'>tp-&gt;mptcp-&gt;map_subseq = sub_seq;
+</span><span class='line'>tp-&gt;mptcp-&gt;map_data_fin = mptcp_is_data_fin(skb) ? 1 : 0;
+</span><span class='line'>tp-&gt;mptcp-&gt;mapping_present = 1;</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>mptcp_queue_skb</h5>
+
+<p>处理完一个或多个接收包（=一个发送包）后调mptcp_reset_mapping，重置 map_data_len，map_data_seq，map_subseq，map_data_fin，mapping_present。</p>
+
+<h3>MPTCPHDR_INF 模式</h3>
+
+<p>MPTCPHDR_INF 模式是取消子流seq，退避回普通tcp，通通让meta_sk处理。</p>
+
+<p>infinite 模式正常不开启的</p>
+
+<h4>开启条件</h4>
+
+<ol>
+<li><p>dss_csum != 0 并且没有established连接，见 mptcp_verif_dss_csum()</p></li>
+<li><p>进入 mptcp_mp_fail_rcvd()</p></li>
+<li><p>接收到数据时还没established，进入INF模式。见 mptcp_prevalidate_skb()</p></li>
+</ol>
+
+
+<h4>参数</h4>
+
+<p>send_infinite_mapping = 1 发送端出错进入inf模式，需要发送数据通知接收端</p>
+
+<p>infinite_mapping_snd = 1 发送端进入INF模式</p>
+
+<p>infinite_mapping_rcv = 1 接收端进入INF模式, 接收seq映射改用 infinite_rcv_seq</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>mptcp_detect_mapping()
+</span><span class='line'>{
+</span><span class='line'>&#9;if (!data_len) {
+</span><span class='line'>&#9;&#9;...
+</span><span class='line'>&#9;&#9;set_infinite_rcv = true;
+</span><span class='line'>&#9;&#9;...
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;if (set_infinite_rcv)
+</span><span class='line'>&#9;&#9;mpcb-&gt;infinite_rcv_seq = tp-&gt;mptcp-&gt;map_data_seq;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
 
@@ -288,7 +634,7 @@ var ss360Config = {
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2020/07/09/kernel-mptcp-bug/">MPTCP 回复一样的option</a></h2>
+      <h2 class="entry-title"><a href="/blog/2020/07/19/kernel-mptcp-establish/">MPTCP pre_established fully_established</a></h2>
     
     
       <p class="meta">
@@ -297,18 +643,63 @@ var ss360Config = {
 
 
 
-<time class='entry-date' datetime='2020-07-09T01:39:00+08:00'><span class='date'>2020-07-09</span> <span class='time'>01:39:00</span></time>
+<time class='entry-date' datetime='2020-07-19T01:37:00+08:00'><span class='date'>2020-07-19</span> <span class='time'>01:37:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><p>对方回复一模一样的option</p>
+  <div class="entry-content"><h3>一、pre_established</h3>
 
-<h4>例如</h4>
+<p>只在subflow的客户端起作用，在收到synack时置为1，收到第4个ack时置为0，防止在synack到第四个ack期间发送数据包。</p>
 
-<p>curl ksurl.cn</p>
+<p>因为服务端要用第三个ack建连，客户端收到第四个ack表示建连成功，成功之后才能发数据</p>
+
+<h4>mptcp_ack_timer</h4>
+
+<p>所以客户端需要 mptcp_ack_timer，不停的发送第三个ack，直到收到第四个ack</p>
+
+<h3>二、fully_established</h3>
+
+<p>fully_established 和 pre_established 互不相关</p>
+
+<p>mptcp需要四次握手，四次握手完成后 fully_established=1, 再之后才能建立subflow</p>
+
+<p>tcp三次握手后，client和server两边的 fully_established = 0, 进入fully_established的条件如下：</p>
+
+<ol>
+<li>本端没发送数据包，但一直收到对端的mptcp数据包，见 mptcp_prevalidate_skb()</li>
+</ol>
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (!tp-&gt;mptcp-&gt;fully_established) {
+</span><span class='line'>&#9;tp-&gt;mptcp-&gt;init_rcv_wnd -= skb-&gt;len;
+</span><span class='line'>&#9;if (tp-&gt;mptcp-&gt;init_rcv_wnd &lt; 0)
+</span><span class='line'>&#9;&#9;mptcp_become_fully_estab(sk);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<ol>
+<li>本端发出去的mptcp数据包被mptcp_ack了，见 mptcp_process_data_ack</li>
+</ol>
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (unlikely(!tp-&gt;mptcp-&gt;fully_established) && tp-&gt;mptcp-&gt;snt_isn + 1 != TCP_SKB_CB(skb)-&gt;ack_seq)
+</span><span class='line'>&#9;mptcp_become_fully_estab(sk);</span></code></pre></td></tr></table></div></figure>
+
+
+<ol>
+<li>如果收到非mptcp数据包，则回退普通tcp，回退也会设置fully_established=1，见mptcp_prevalidate_skb()</li>
+</ol>
+
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -321,20 +712,23 @@ var ss360Config = {
 <span class='line-number'>9</span>
 <span class='line-number'>10</span>
 <span class='line-number'>11</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>01:42:57.092471 IP 192.168.8.162.34366 &gt; 103.102.200.3.80: Flags [S], seq 846976861, win 64240, options [mss 1460,nop,nop,sackOK,nop,wscale 7,mptcp capable csum {0xc7c6d84045bd8248}], length 0
-</span><span class='line'>01:42:57.130413 IP 103.102.200.3.80 &gt; 192.168.8.162.34366: Flags [S.], seq 668917669, ack 846976862, win 0, options [mss 1452,nop,nop,sackOK,nop,nop,nop,nop,mptcp capable csum {0xc7c6d84045bd8248}], length 0
-</span><span class='line'>01:42:57.130498 IP 192.168.8.162.34366 &gt; 103.102.200.3.80: Flags [.], ack 1, win 64240, options [mptcp capable csum {0xc7c6d84045bd8248,0xc7c6d84045bd8248},mptcp dss ack 1200875982], length 0
-</span><span class='line'>01:42:57.130525 IP 192.168.8.162.34366 &gt; 103.102.200.3.80: Flags [.], ack 1, win 64240, options [mptcp add-addr id 3 11.0.0.1,mptcp dss ack 1200875982], length 0
-</span><span class='line'>01:42:57.616370 IP 192.168.8.162.34366 &gt; 103.102.200.3.80: Flags [.], ack 1, win 64240, options [mptcp dss ack 1200875982], length 0
-</span><span class='line'>01:42:57.654157 IP 103.102.200.3.80 &gt; 192.168.8.162.34366: Flags [.], ack 1, win 29200, length 0
-</span><span class='line'>01:42:58.612344 IP 192.168.8.162.34366 &gt; 103.102.200.3.80: Flags [.], ack 1, win 64240, options [mptcp dss ack 1200875982], length 0
-</span><span class='line'>01:42:58.650740 IP 103.102.200.3.80 &gt; 192.168.8.162.34366: Flags [.], ack 1, win 29200, length 0
-</span><span class='line'>01:43:00.560359 IP 192.168.8.162.34366 &gt; 103.102.200.3.80: Flags [.], ack 1, win 64240, options [mptcp dss ack 1200875982], length 0
-</span><span class='line'>01:43:00.598942 IP 103.102.200.3.80 &gt; 192.168.8.162.34366: Flags [.], ack 1, win 29200, length 0
-</span><span class='line'>...</span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (!tp-&gt;mptcp-&gt;fully_established && !mptcp_is_data_seq(skb) &&
+</span><span class='line'>&#9;!tp-&gt;mptcp-&gt;mapping_present && !mpcb-&gt;infinite_mapping_rcv) {
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;if (!is_master_tp(tp)) { // subflow reset，master才回退
+</span><span class='line'>&#9;&#9;MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_FBDATASUB);
+</span><span class='line'>&#9;&#9;mptcp_send_reset(sk);
+</span><span class='line'>&#9;&#9;return 1;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;tp-&gt;mptcp-&gt;fully_established = 1;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
-<h4>修复</h4>
+<ol>
+<li>如果本端发出去的数据包被不带mptcp的ack ack了，那么大概率是对端没建立mptcp连接。那么本端回退到普通tcp，回退也会设置fully_established=1。</li>
+</ol>
+
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -351,193 +745,58 @@ var ss360Config = {
 <span class='line-number'>13</span>
 <span class='line-number'>14</span>
 <span class='line-number'>15</span>
-<span class='line-number'>16</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>diff --git a/src/4.15.18/tcp_input.c b/src/4.15.18/tcp_input.c
-</span><span class='line'>index 1c36791..397cb89 100644
-</span><span class='line'>--- a/src/4.15.18/tcp_input.c
-</span><span class='line'>+++ b/src/4.15.18/tcp_input.c
-</span><span class='line'>@@ -5845,6 +5845,11 @@ static int tcp_rcv_synsent_state_process(struct sock *sk, struct sk_buff *skb,
-</span><span class='line'>                if (tp-&gt;request_mptcp || mptcp(tp)) {
-</span><span class='line'>                        int ret;
-</span><span class='line'> 
-</span><span class='line'>+                       if (!mptcp(tp) && mopt.saw_mpc) {
-</span><span class='line'>+                               struct tcp_sock *meta_tp = tcp_sk(sk);
-</span><span class='line'>+                               if (meta_tp-&gt;mptcp_loc_key == mopt.mptcp_sender_key)
-</span><span class='line'>+                                       mopt.saw_mpc = 0;
-</span><span class='line'>+                       }
-</span><span class='line'>                        rcu_read_lock();
-</span><span class='line'>                        local_bh_disable();
-</span><span class='line'>                        ret = mptcp_rcv_synsent_state_process(sk, &sk,</span></code></pre></td></tr></table></div></figure>
-
-
-<h3>修复后</h3>
-
-<p>curl ksurl.cn</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>01:48:11.136480 IP 192.168.8.162.34388 &gt; 103.102.200.3.80: Flags [S], seq 1334883078, win 65320, options [mss 1420,nop,nop,sackOK,nop,wscale 7,mptcp capable csum {0xa48a1610f304b3a}], length 0
-</span><span class='line'>01:48:11.174632 IP 103.102.200.3.80 &gt; 192.168.8.162.34388: Flags [S.], seq 2018132645, ack 1334883079, win 0, options [mss 1420,nop,nop,sackOK,nop,nop,nop,nop,mptcp capable csum {0xa48a1610f304b3a}], length 0
-</span><span class='line'>01:48:11.174720 IP 192.168.8.162.34388 &gt; 103.102.200.3.80: Flags [.], ack 1, win 65320, length 0
-</span><span class='line'>01:48:11.213236 IP 103.102.200.3.80 &gt; 192.168.8.162.34388: Flags [.], ack 1, win 29200, length 0
-</span><span class='line'>01:48:11.213283 IP 192.168.8.162.34388 &gt; 103.102.200.3.80: Flags [P.], seq 1:73, ack 1, win 65320, length 72: HTTP: GET / HTTP/1.1
-</span><span class='line'>01:48:11.252192 IP 103.102.200.3.80 &gt; 192.168.8.162.34388: Flags [.], ack 73, win 29200, length 0
-</span><span class='line'>01:48:11.253261 IP 103.102.200.3.80 &gt; 192.168.8.162.34388: Flags [P.], seq 1:397, ack 73, win 29200, length 396: HTTP: HTTP/1.1 302 Moved Temporarily
-</span><span class='line'>01:48:11.253300 IP 192.168.8.162.34388 &gt; 103.102.200.3.80: Flags [.], ack 397, win 64924, length 0
-</span><span class='line'>01:48:11.253541 IP 192.168.8.162.34388 &gt; 103.102.200.3.80: Flags [F.], seq 73, ack 397, win 64924, length 0
-</span><span class='line'>01:48:11.292118 IP 103.102.200.3.80 &gt; 192.168.8.162.34388: Flags [F.], seq 397, ack 74, win 29200, length 0
-</span><span class='line'>01:48:11.292182 IP 192.168.8.162.34388 &gt; 103.102.200.3.80: Flags [.], ack 398, win 64923, length 0</span></code></pre></td></tr></table></div></figure>
-
-
-
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2020/07/07/kernel-mptcp-option/">MPTCP_OPTION</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2020-07-07T02:51:00+08:00'><span class='date'>2020-07-07</span> <span class='time'>02:51:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p>解析见 mptcp_parse_options()</p>
-
-<h3>MPTCP_SUB_CAPABLE</h3>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#define MPTCP_SUB_CAPABLE                       0
-</span><span class='line'>#define MPTCP_SUB_LEN_CAPABLE_SYN               12
-</span><span class='line'>#define MPTCP_SUB_LEN_CAPABLE_SYN_ALIGN         12
-</span><span class='line'>#define MPTCP_SUB_LEN_CAPABLE_ACK               20
-</span><span class='line'>#define MPTCP_SUB_LEN_CAPABLE_ACK_ALIGN         20</span></code></pre></td></tr></table></div></figure>
-
-
-<p>最初的三次握手时用</p>
-
-<h3>MPTCP_SUB_JOIN</h3>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#define MPTCP_SUB_JOIN                  1
-</span><span class='line'>#define MPTCP_SUB_LEN_JOIN_SYN          12
-</span><span class='line'>#define MPTCP_SUB_LEN_JOIN_SYN_ALIGN    12
-</span><span class='line'>#define MPTCP_SUB_LEN_JOIN_SYNACK       16
-</span><span class='line'>#define MPTCP_SUB_LEN_JOIN_SYNACK_ALIGN 16
-</span><span class='line'>#define MPTCP_SUB_LEN_JOIN_ACK          24
-</span><span class='line'>#define MPTCP_SUB_LEN_JOIN_ACK_ALIGN    24</span></code></pre></td></tr></table></div></figure>
-
-
-<p>第二次、第三次、。。。握手时用</p>
-
-<h3>MPTCP_SUB_DSS</h3>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#define MPTCP_SUB_DSS           2</span></code></pre></td></tr></table></div></figure>
-
-
-<h3>MPTCP_SUB_ADD_ADDR, MPTCP_SUB_REMOVE_ADDR</h3>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#define MPTCP_SUB_ADD_ADDR              3
-</span><span class='line'>#define MPTCP_SUB_LEN_ADD_ADDR4         8
-</span><span class='line'>#define MPTCP_SUB_LEN_ADD_ADDR4_VER1    16
-</span><span class='line'>#define MPTCP_SUB_LEN_ADD_ADDR6         20
-</span><span class='line'>#define MPTCP_SUB_LEN_ADD_ADDR6_VER1    28
-</span><span class='line'>#define MPTCP_SUB_LEN_ADD_ADDR4_ALIGN   8
-</span><span class='line'>#define MPTCP_SUB_LEN_ADD_ADDR4_ALIGN_VER1      16
-</span><span class='line'>#define MPTCP_SUB_LEN_ADD_ADDR6_ALIGN   20
-</span><span class='line'>#define MPTCP_SUB_LEN_ADD_ADDR6_ALIGN_VER1      28
+</pre></td><td class='code'><pre><code class=''><span class='line'>tcp_ack() {
+</span><span class='line'>&#9;mptcp_fallback_infinite() {
+</span><span class='line'>&#9;&#9;if (likely(tp-&gt;mptcp-&gt;fully_established))
+</span><span class='line'>&#9;&#9;&#9;return false;
 </span><span class='line'>
-</span><span class='line'>#define MPTCP_SUB_REMOVE_ADDR   4
-</span><span class='line'>#define MPTCP_SUB_LEN_REMOVE_ADDR       4</span></code></pre></td></tr></table></div></figure>
+</span><span class='line'>&#9;&#9;if (!(flag & MPTCP_FLAG_DATA_ACKED)) // 被ack的包一定是mptcp数据包
+</span><span class='line'>&#9;&#9;&#9;return false;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (!is_master_tp(tp)) { // subflow reset，master才回退
+</span><span class='line'>&#9;&#9;&#9;MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_FBACKSUB);
+</span><span class='line'>&#9;&#9;&#9;return true;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;...
+</span><span class='line'>&#9;}
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
-<p>fullmesh 模式通告ip</p>
+<p>因为 fully_established = 0 时刚完成3次握手，所以上面说的数据包基本都是第一个数据包</p>
 
-<h3>MPTCP_SUB_PRIO</h3>
+<p>以上条件对于client和server都适用，因为3次握手后谁先发包都是正常的。</p>
+
+<h3>mptcp 连接在 fully_established=1 之后再收到 不含mptcp option的包</h3>
+
+<ol>
+<li>不会进行mapping，见mptcp_detect_mapping()</li>
+</ol>
+
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
 <span class='line-number'>3</span>
 <span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#define MPTCP_SUB_PRIO          5
-</span><span class='line'>#define MPTCP_SUB_LEN_PRIO      3
-</span><span class='line'>#define MPTCP_SUB_LEN_PRIO_ADDR 4
-</span><span class='line'>#define MPTCP_SUB_LEN_PRIO_ALIGN        4</span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (!mptcp_is_data_seq(skb)) {
+</span><span class='line'>&#9;if (!tp-&gt;mptcp-&gt;mapping_present && tp-&gt;rcv_nxt - tp-&gt;copied_seq &gt; 65536) {
+</span><span class='line'>&#9;&#9;mptcp_send_reset(sk);
+</span><span class='line'>&#9;&#9;return 1;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;return 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
-<p>./ip/ip link set dev enp0s3 multipath off/on/backup</p>
-
-<p>backup命令就是将该接口设置为backup模式，并且会通过PRIO option通知对方，两边会标记low_prio、rcv_low_prio。但目前所有pm都没有用到low_prio。</p>
-
-<h3>MPTCP_SUB_FAIL</h3>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#define MPTCP_SUB_FAIL          6
-</span><span class='line'>#define MPTCP_SUB_LEN_FAIL      12 
-</span><span class='line'>#define MPTCP_SUB_LEN_FAIL_ALIGN        12</span></code></pre></td></tr></table></div></figure>
+<ol>
+<li>对于一个map_data_len包，可能被差成了多个包传输：</li>
+</ol>
 
 
-<h3>MPTCP_SUB_FCLOSE</h3>
+<p>如果多个包全不是mptcp包，则mapping_present=0，那么mptcp_queue_skb() 会直接return，然后 tp->rcv_nxt - tp->copied_seq > 65536, 然后被reset</p>
 
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#define MPTCP_SUB_FCLOSE        7
-</span><span class='line'>#define MPTCP_SUB_LEN_FCLOSE    12
-</span><span class='line'>#define MPTCP_SUB_LEN_FCLOSE_ALIGN      12</span></code></pre></td></tr></table></div></figure>
-
-
-
+<p>如果前一部分是mptcp的包，后一部分不是mptcp包，则mapping_present=1，然后会被mptcp_verif_dss_csum() reset</p>
 </div>
   
   
@@ -559,7 +818,7 @@ var ss360Config = {
   
     <section>
 <h1>Categories
-<span class='right_span'>(899)</span>
+<span class='right_span'>(903)</span>
 
 </h1>
 <head>
@@ -590,7 +849,7 @@ if (!document.getElementById('blog~octopress')) document.getElementById('aexp_bl
 if (!document.getElementById('blog')) document.getElementById('aexp_blog').style.visibility = 'hidden';
 if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ruby').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(136)</span></li>
+<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(138)</span></li>
 <div id='language' class='catsub'><li><a href='/blog/cats/language~c/?opendiv=language'>c</a><a href='##' onmousedown=showDiv('language~c') id='aexp_language~c'><span class='exp_style' id='exp_language~c'>[+]</span></a><span class='right_span'>32</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~c')) document.getElementById('aexp_language~c').style.visibility = 'hidden';
@@ -607,7 +866,7 @@ if (!document.getElementById('language~java')) document.getElementById('aexp_lan
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~jsp')) document.getElementById('aexp_language~jsp').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/language~php/?opendiv=language'>php</a><a href='##' onmousedown=showDiv('language~php') id='aexp_language~php'><span class='exp_style' id='exp_language~php'>[+]</span></a><span class='right_span'>41</span></li>
+<li><a href='/blog/cats/language~php/?opendiv=language'>php</a><a href='##' onmousedown=showDiv('language~php') id='aexp_language~php'><span class='exp_style' id='exp_language~php'>[+]</span></a><span class='right_span'>43</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~php')) document.getElementById('aexp_language~php').style.visibility = 'hidden';
 </script>
@@ -754,12 +1013,12 @@ if (!document.getElementById('tools~vim')) document.getElementById('aexp_tools~v
 if (!document.getElementById('tools')) document.getElementById('aexp_tools').style.visibility = 'hidden';
 if (!document.getElementById('tools~wxwork')) document.getElementById('aexp_tools~wxwork').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/system/'>system</a><a href='##' onmousedown=showDiv('system') id='aexp_system'><span class='exp_style' id='exp_system'>[+]</span></a><span class='right_span'>(107)</span></li>
+<li class='catclass'><a href='/blog/cats/system/'>system</a><a href='##' onmousedown=showDiv('system') id='aexp_system'><span class='exp_style' id='exp_system'>[+]</span></a><span class='right_span'>(109)</span></li>
 <div id='system' class='catsub'><li><a href='/blog/cats/system~base/?opendiv=system'>base</a><a href='##' onmousedown=showDiv('system~base') id='aexp_system~base'><span class='exp_style' id='exp_system~base'>[+]</span></a><span class='right_span'>23</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('system~base')) document.getElementById('aexp_system~base').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/system~centos/?opendiv=system'>centos</a><a href='##' onmousedown=showDiv('system~centos') id='aexp_system~centos'><span class='exp_style' id='exp_system~centos'>[+]</span></a><span class='right_span'>14</span></li>
+<li><a href='/blog/cats/system~centos/?opendiv=system'>centos</a><a href='##' onmousedown=showDiv('system~centos') id='aexp_system~centos'><span class='exp_style' id='exp_system~centos'>[+]</span></a><span class='right_span'>15</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('system~centos')) document.getElementById('aexp_system~centos').style.visibility = 'hidden';
 </script>
@@ -798,6 +1057,10 @@ if (!document.getElementById('system~mail')) document.getElementById('aexp_syste
 <li><a href='/blog/cats/system~namespace/?opendiv=system'>namespace</a><a href='##' onmousedown=showDiv('system~namespace') id='aexp_system~namespace'><span class='exp_style' id='exp_system~namespace'>[+]</span></a><span class='right_span'>2</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('system~namespace')) document.getElementById('aexp_system~namespace').style.visibility = 'hidden';
+</script>
+<li><a href='/blog/cats/system~rpmbuild/?opendiv=system'>rpmbuild</a><a href='##' onmousedown=showDiv('system~rpmbuild') id='aexp_system~rpmbuild'><span class='exp_style' id='exp_system~rpmbuild'>[+]</span></a><span class='right_span'>1</span></li>
+<script language='javascript' type='text/javascript'>
+if (!document.getElementById('system~rpmbuild')) document.getElementById('aexp_system~rpmbuild').style.visibility = 'hidden';
 </script>
 <li><a href='/blog/cats/system~ubuntu/?opendiv=system'>ubuntu</a><a href='##' onmousedown=showDiv('system~ubuntu') id='aexp_system~ubuntu'><span class='exp_style' id='exp_system~ubuntu'>[+]</span></a><span class='right_span'>18</span></li>
 </div><script language='javascript' type='text/javascript'>
@@ -989,7 +1252,7 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 
 <section>
 <h1>Date Categories
-<span class='right_span'>(899)</span>
+<span class='right_span'>(903)</span>
 
 </h1>
 <head>
@@ -997,8 +1260,9 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(19)</span></li>
-<div id='2024' class='catsub'><li><a href='/blog/cats/2024~05/?opendiv=2024'>2024-05</a><span class='right_span'>3</span></li>
+<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(23)</span></li>
+<div id='2024' class='catsub'><li><a href='/blog/cats/2024~06/?opendiv=2024'>2024-06</a><span class='right_span'>2</span></li>
+<li><a href='/blog/cats/2024~05/?opendiv=2024'>2024-05</a><span class='right_span'>5</span></li>
 <li><a href='/blog/cats/2024~04/?opendiv=2024'>2024-04</a><span class='right_span'>5</span></li>
 <li><a href='/blog/cats/2024~03/?opendiv=2024'>2024-03</a><span class='right_span'>5</span></li>
 <li><a href='/blog/cats/2024~02/?opendiv=2024'>2024-02</a><span class='right_span'>4</span></li>
@@ -1163,6 +1427,22 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
   <ul id="recent_posts">
     
       <li class="post">
+        <a href="/blog/2024/06/20/lang-php-date_sun_info/">PHP中的date_sun_info()函数, 日落/日出时间</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2024/06/20/centos-mkconfig/">grub2-mkconfig</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2024/05/23/lang-lunar/">农历节气查表</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2024/05/17/rpmbuild-check/">rpmbuild 错误：发现已安装(但未打包的)文件</a>
+      </li>
+    
+      <li class="post">
         <a href="/blog/2024/05/16/lang-centos8-php8/">Centos8安装PHP8</a>
       </li>
     
@@ -1184,22 +1464,6 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
     
       <li class="post">
         <a href="/blog/2024/04/29/tools-squid-log/">squid 日志格式, 时间格式</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/04/26/tools-apache2-tmp/">centos7下httpd服务对tmp目录操作</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/04/26/nginx-proxy-buffer/">nginx 禁用代理缓冲</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/03/26/db9/">USB-Serial Controller D USB转串口驱动</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/03/26/TH40W-E/">华汉维无线wifi温湿度TH40W-E</a>
       </li>
     
   </ul>

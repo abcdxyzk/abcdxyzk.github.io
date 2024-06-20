@@ -131,7 +131,7 @@ var ss360Config = {
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2018/01/04/kernel-net-df/">本地IP包分片--local_df,ignore_df</a></h2>
+      <h2 class="entry-title"><a href="/blog/2018/01/08/kernel-fpu-2/">内核态使用FPU、MMX和XMM寄存器</a></h2>
     
     
       <p class="meta">
@@ -140,48 +140,105 @@ var ss360Config = {
 
 
 
-<time class='entry-date' datetime='2018-01-04T01:41:00+08:00'><span class='date'>2018-01-04</span> <span class='time'>01:41:00</span></time>
+<time class='entry-date' datetime='2018-01-08T01:09:00+08:00'><span class='date'>2018-01-08</span> <span class='time'>01:09:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><p>local_df 和 ignore_df 是一个意思，在某个版本rename了</p>
+  <div class="entry-content"><p><a href="https://www.cnblogs.com/wz19860913/archive/2010/05/25/1742583.html">https://www.cnblogs.com/wz19860913/archive/2010/05/25/1742583.html</a></p>
 
-<h4>ip_queue_xmit 函数中有：</h4>
+<h4>保存和加载FPU、MMX和XMM寄存器</h4>
 
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if (ip_dont_fragment(sk, &rt-&gt;dst) && !skb-&gt;ignore_df)
-</span><span class='line'>&#9;iph-&gt;frag_off = htons(IP_DF);
-</span><span class='line'>else
-</span><span class='line'>&#9;iph-&gt;frag_off = 0;</span></code></pre></td></tr></table></div></figure>
+<p>  从Intel 80486DX开始，FPU（算术浮点单元）被集成到了CPU中，浮点算术功能用ESCAPE指令来执行，操纵CPU中的浮点寄存器集。显然，当一个进程正在使用ESCAPE指令，那么浮点寄存器的内容就属于它的硬件上下文。</p>
 
+<p>  为了加速多媒体程序的执行，Intel在微处理器中引入了新的指令集——MMX，MMX指令也作用于FPU的浮点寄存器。这样，MMX就不能和FPU指令混用，但是OS内核就可以忽略新的MMX指令集，因为保存浮点寄存器的功能代码也能够应用于MMX的状态。</p>
 
-<p>ip_dont_fragment</p>
+<p>  MMX使用SIMD（单指令多数据）流水线，Pentium III增强了这种SIMD能力，引入SSE（Streaming SIMD Extensions）扩展。该功能增强了8个128位寄存器（XMM寄存器）的功能，这些寄存器不和FPU/MMX寄存器重叠，因此能够与FPU/MMX指令混用。</p>
+
+<p>  Pentium IV还引入了SSE2扩展，支持高精度浮点值，SSE2和SSE使用同一个XMM寄存器组。</p>
+
+<p>  80x86微处理器不在TSS中保存FPU、MMX和XMM寄存器的值，不过还是提供了一些支持，能够在需要时保存它们。cr0寄存器有一个TS（Task-Switching）标志位，每当执行硬件上下文切换时，TS置位，每当TS被置位后进程执行ESCAPE、MMX、SSE或SSE2指令，控制器就产生一个“Device not available”异常。这样，TS标志位就能够让OS内核只有在真正需要时才保存或恢复FPU、MMX和XMM寄存器。</p>
+
+<p>  假设进程A使用了数学协处理器，那么当进程A被切换出去的时候，内核设置TS并将浮点寄存器的内容保存到进程A的TSS中（原著这么写，但是应该是保存到进程A描述符的一个字段中，TSS是与CPU关联的，进程没有TSS）。</p>
+
+<p>  如果新进程B不使用数学协处理器，那么内核就不需要恢复浮点寄存器的内容，但是，一旦进程B执行FPU、MMX等指令，CPU就产生一个“Device not available”异常，相应的异常处理程序就会用保存在进程B中的相关值来恢复浮点寄存器。</p>
+
+<p>  处理FPU、MMX和XMM寄存器的数据结构存放在进程描述符的thread字段的i387子字段中（即thread.i387），由i387_union联合体描述，其格式如下：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
 <span class='line-number'>3</span>
 <span class='line-number'>4</span>
 <span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static inline
-</span><span class='line'>int ip_dont_fragment(struct sock *sk, struct dst_entry *dst)
-</span><span class='line'>{
-</span><span class='line'>&#9;return  inet_sk(sk)-&gt;pmtudisc == IP_PMTUDISC_DO ||
-</span><span class='line'>&#9;&#9;(inet_sk(sk)-&gt;pmtudisc == IP_PMTUDISC_WANT &&
-</span><span class='line'>&#9;&#9; !(dst_metric_locked(dst, RTAX_MTU)));
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>union i387_union {
+</span><span class='line'>&#9;struct i387_fsave_struct    fsave; /* 保存FPU、MMX寄存器的内容 */
+</span><span class='line'>&#9;struct i387_fxsave_struct   fxsave;/* 保存SSE和SSE2寄存器内容 */
+</span><span class='line'>&#9;struct i387_soft_struct     soft;  /* 由无数学协处理器的老式CPU模型使用 */
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
 
 
-<p>一般情况下都是开启pmtu、skb->ignore_df = 0, 所以 iph->frag_off = htons(IP_DF);</p>
+<p>  此外，进程描述符中还包含了两个附加的标志：</p>
 
-<h4>ip_queue_xmit -> ip_finish_output -> ip_fragment :</h4>
+<p>  thread_info结构中status字段的TS_USEDFPU标志，表示进程当前执行过程中是否使用过FPU、MMX和XMM寄存器。
+  task_struct结构的flags字段的PF_USED_MATH标志，表示thread.i387的内容是否有意义。</p>
+
+<p>  保存和加载FPU、MMX和XMM寄存器主要用到<strong>unlazy_fpu宏，该宏在</strong>switch_to函数中使用，下一篇会对其进行分析。</p>
+
+<h4>内核态使用FPU、MMX和XMM寄存器</h4>
+
+<p>  OS内核也可以使用FPU、MMX和XMM寄存器，当然，这么做的时候应该避免干扰用户态进程。因此，Linux使用如下方法来解决：</p>
+
+<p>  在内核使用协处理器之前，如果用户态进程使用了FPU（TS_USEDFPU标志为1），内核就要调用kernel_fpu_begin()函数，该函数里又调用save_init_fpu()来保存寄存器内容，然后重新设置cr0寄存器的TS标志。
+  使用完协处理器之后，内核调用kernel_fpu_end宏设置cr0寄存器的TS标志。
+  当用户态进程恢复执行时，math_state_restore()函数将恢复FPU、MMX和XMM寄存器的内容。</p>
+
+<p>  需要注意的是，如果当前用户态进程有在用数学协处理器时，kernel_fpu_begin()函数的执行时间比较长，甚至无法通过FPU、MMX或XMM达到加速的目的。因此，内核只在有限的场合使用FPU、MMX或XMM指令，比如移动或清除大内存区字段、计算校验和等。</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2018/01/08/kernel-fpu-1/">linux 下的浮点运算</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2018-01-08T00:54:00+08:00'><span class='date'>2018-01-08</span> <span class='time'>00:54:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://blog.sina.com.cn/s/blog_6e32babb0101o9kf.html">linux 下的浮点运算</a></p>
+
+<ol>
+<li><p>intel 平台下，如果有浮点计算，都会用专门的浮点指令来执行。但是double/float 类型的加减乘除，gcc 是用的一般指令来做的，没有用浮点指令来做。</p></li>
+<li><p>还是intel 平台下，一个进程在被cpu调度到之后，运行的第一条浮点指令会触发“no deveice avaible”异常，从而导致执行相应的中断处理程序。后续的不再触发。这个中断处理程序中，一般会做的是，恢复/保存浮点运行相关的环境。如果该时间段内没有浮点操作，那么就不用恢复/保存浮点运行环境，从而减少开销。这也是为什么要设计成这样的原因。</p></li>
+<li><p>内核也可以执行浮点操作，只需要调用前后用 kernel_fpu_begin() and kernel_fpu_end() 括起来。但是有可能这个的开销已经超过了用浮点指令带来的便捷。所以内核应该尽量少用浮点操作。</p></li>
+</ol>
+
+
+<hr />
+
+<p><a href="http://www.lenky.info/archives/2012/10/2001/comment-page-1">Linux内核与浮点计算</a></p>
+
+<p>在Linux内核里无法直接进行浮点计算，这是从性能上的考虑，因为这样做可以省去在用户态与内核态之间进行切换时保存/恢复浮点寄存器 FPU的操作，当然，这到底可以提升多少性能我还不得而知，不过就目前而言，Linux内核的确就是这样做的。</p>
+
+<p>比如下面这个测试模块：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -210,188 +267,48 @@ var ss360Config = {
 <span class='line-number'>25</span>
 <span class='line-number'>26</span>
 <span class='line-number'>27</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static int ip_fragment(struct sock *sk, struct sk_buff *skb,
-</span><span class='line'>&#9;       unsigned int mtu, 
-</span><span class='line'>&#9;       int (*output)(struct sock *, struct sk_buff *))
-</span><span class='line'>{
-</span><span class='line'>&#9;struct iphdr *iph = ip_hdr(skb);
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'># Makefile
+</span><span class='line'>MDIR = $(shell pwd)
+</span><span class='line'>ifeq (, $(KSRC))
+</span><span class='line'>&#9;KSRC := /usr/src/linux-`uname -r`
+</span><span class='line'>endif
 </span><span class='line'>
-</span><span class='line'>&#9;// 如果需要分片，直接进入分片函数
-</span><span class='line'>&#9;if ((iph-&gt;frag_off & htons(IP_DF)) == 0)
-</span><span class='line'>&#9;&#9;return ip_do_fragment(sk, skb, output);
+</span><span class='line'>ifeq (, $(PROJECT_DIR))
+</span><span class='line'>&#9;PROJECT_DIR := $(PWD)/../
+</span><span class='line'>endif
 </span><span class='line'>
-</span><span class='line'>&#9;// 如果没设置分片，或手动设置的分片过大，则直接丢弃
-</span><span class='line'>&#9;if (unlikely(!skb-&gt;ignore_df ||
-</span><span class='line'>&#9;&#9;     (IPCB(skb)-&gt;frag_max_size &&
-</span><span class='line'>&#9;&#9;      IPCB(skb)-&gt;frag_max_size &gt; mtu))) {
-</span><span class='line'>&#9;&#9;struct rtable *rt = skb_rtable(skb);
-</span><span class='line'>&#9;&#9;struct net_device *dev = rt-&gt;dst.dev;
+</span><span class='line'>module := float_test
 </span><span class='line'>
-</span><span class='line'>&#9;&#9;IP_INC_STATS(dev_net(dev), IPSTATS_MIB_FRAGFAILS);
-</span><span class='line'>&#9;&#9;icmp_send(skb, ICMP_DEST_UNREACH, ICMP_FRAG_NEEDED,
-</span><span class='line'>&#9;&#9;&#9;  htonl(mtu));
-</span><span class='line'>&#9;&#9;kfree_skb(skb);
-</span><span class='line'>&#9;&#9;return -EMSGSIZE;
-</span><span class='line'>&#9;}
+</span><span class='line'>obj-m := $(module).o
 </span><span class='line'>
-</span><span class='line'>&#9;// 所以设置 skb-&gt;ignore_df = 1 且 skb-&gt;len &gt; mtu 则执行到这里
-</span><span class='line'>&#9;return ip_do_fragment(sk, skb, output);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>所以设置 skb->ignore_df = 1 且 skb->len > mtu 则执行 ip_do_fragment 进行IP分片,</p>
-
-<p>分片是按网卡mtu进行，如果mss小于网卡mtu-40，则需要设置 IPCB(skb)->frag_max_size</p>
-
-<h4>iph->frag_off 定义</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#define IP_DF           0x4000          /* Flag: "Don't Fragment"       */
-</span><span class='line'>#define IP_MF           0x2000          /* Flag: "More Fragments"       */
-</span><span class='line'>#define IP_OFFSET       0x1FFF          /* "Fragment Offset" part       */</span></code></pre></td></tr></table></div></figure>
-
-
-<p>1) 不分片的包 iph->frag_off = htons(IP_DF)<br/>
-2) 最后一个分片包 ((ntohs(iph->frag_off) &amp; IP_OFFSET) > 0)<br/>
-3) 其余分片包 ((ntohs(iph->frag_off) &amp; IP_OFFSET) > 0 &amp;&amp; (iph->frag_off &amp; htons(IP_MF)) > 0)</p>
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2018/01/03/debug-mark-cong-rmmod/">拥塞控制模块无法卸载</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2018-01-03T00:04:00+08:00'><span class='date'>2018-01-03</span> <span class='time'>00:04:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p>如果listen的sk设置了icsk_ca_setsockopt，那么派生的child默认都是sk的cong，而不是系统默认的cong</p>
-
-<hr />
-
-<p>如果：自定义拥塞控制中维护了hash表，且在init时加入hash表，在release时删除或卸载清理hash表。</p>
-
-<p>那么：有些情况会导致分配了拥塞控制模块给sk，但却没调init，导致卸载清理时就找不到模块被哪个sk引用，也就无法清理。</p>
-
-<h3>可能原因：</h3>
-
-<h4>1. 拥塞控制初始化时</h4>
-
-<p>标准内核：socket()时分配拥塞控制，但在连接建立时才会调 icsk->icsk_ca_ops->init(sk)
-如果只调了 socket(), bind(), listen() 那么就不会调 icsk->icsk_ca_ops->init(sk)（所以listen的sk就一定不调init）。</p>
-
-<p>内核可行修改方案：socket -> tcp_init_sock -> tcp_assign_congestion_control 时先分配一个内核内部的拥塞控制，连接建立时再分配实际拥塞控制，然后初始化。
-这么改还是有缺陷：先调 socket()，再调 setsockopt 设置拥塞控制模块，因为此时sk->sk_state = TCP_CLOSE，所以不会调init</p>
-
-<h4>2. 拥塞控制切换时</h4>
-
-<p>拥塞控制切换时：如果是TCP_CLOSE状态也不会调 icsk->icsk_ca_ops->init(sk) 初始化</p>
-
-<h3>可行解决方法</h3>
-
-<p>模仿 /proc/net/tcp 遍历hash表，修改拥塞控制</p>
-
-<h3>特殊情况：</h3>
-
-<p>调 socket 时 sk 不加入hash表，在 listen 或 connect 时才会加入到hash表，如果只调socket、bind然后不再使用该fd，那么sk不仅没调icsk->icsk_ca_ops->init(sk)，也没加入hash表。</p>
-
-<p>此时 /proc/net/tcp 也找不到sk，只能遍历所有进程的所有fd，找出sk再修改</p>
-
-<p><a href="/download/debug/conglist.tar.gz">conglist.tar.gz</a></p>
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2017/12/03/command-iptables/">iptables</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2017-12-03T13:58:00+08:00'><span class='date'>2017-12-03</span> <span class='time'>13:58:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><h4>一台通过另一台上网</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>find /proc/ -name rp_filter -exec sh -c "echo 0 &gt; {} " \;
-</span><span class='line'>find /proc/ -name rp_filter -exec cat {} \;
+</span><span class='line'>srcs =  $(wildcard, *.c)
 </span><span class='line'>
-</span><span class='line'>echo 1 &gt; /proc/sys/net/ipv4/ip_forward
-</span><span class='line'>cat /proc/sys/net/ipv4/ip_forward
+</span><span class='line'>$(module)-objs := $(addsuffix .o, $(basename $(srcs)))
 </span><span class='line'>
-</span><span class='line'>iptables -t nat -A POSTROUTING -s 12.0.0.10/24 -o wlp7s0 -j MASQUERADE
-</span><span class='line'>iptables -t nat -L -vn</span></code></pre></td></tr></table></div></figure>
-
-
-<hr />
-
-<p><a href="http://blog.csdn.net/l241002209/article/details/43987933">http://blog.csdn.net/l241002209/article/details/43987933</a></p>
-
-<h4>1、添加</h4>
-
-<p>添加规则有两个参数：-A和-I。其中<br/>
--A是添加到规则的末尾；<br/>
--I可以插入到指定位置，没有指定位置的话默认插入到规则的首部。</p>
-
-<h4>2、查看</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>iptables -nvL –line-number
+</span><span class='line'>EXTRA_CFLAGS += -g $(FLAG) -I$(PROJECT_DIR)/inc -I${SHAREDHDR} -I$(KERNELHDR) -O2 -D__KERNEL__ -DMODULE $(INCLUDE) -DEXPORT_SYMTAB
 </span><span class='line'>
-</span><span class='line'> -L 查看当前表的所有规则，默认查看的是filter表，如果要查看NAT表，可以加上-t NAT参数
-</span><span class='line'> -n 不对ip地址进行反查，加上这个参数显示速度会快很多
-</span><span class='line'> -v 输出详细信息，包含通过该规则的数据包数量，总字节数及相应的网络接口
-</span><span class='line'> –line-number 显示规则的序列号，这个参数在删除或修改规则时会用到</span></code></pre></td></tr></table></div></figure>
+</span><span class='line'>TARGET = $(module).ko
+</span><span class='line'>
+</span><span class='line'>all:
+</span><span class='line'>&#9;make -C $(KSRC) M=$(MDIR) modules
+</span><span class='line'>
+</span><span class='line'>debug:
+</span><span class='line'>&#9;make EXTRA_FLAGS="${EXTRA_CFLAGS} -DDEBUG" -C $(KSRC) M=$(MDIR) modules
+</span><span class='line'>
+</span><span class='line'>clean:
+</span><span class='line'>&#9;make -C $(KSRC) M=$(MDIR) clean
+</span><span class='line'>
+</span><span class='line'>install: all
+</span><span class='line'>&#9;cp -f $(TARGET) $(INSTALL_DIR)</span></code></pre></td></tr></table></div></figure>
 
 
-<h4>3</h4>
+
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -403,100 +320,235 @@ var ss360Config = {
 <span class='line-number'>8</span>
 <span class='line-number'>9</span>
 <span class='line-number'>10</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>iptables -nvL
-</span><span class='line'>iptables -F # 清除所有规则，但不改变默认策略
-</span><span class='line'>iptables -P INPUT ACCEPT  # INPUT 默认策略
-</span><span class='line'>iptables -P OUTPUT ACCEPT # OUTPUT 默认策略
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/**
+</span><span class='line'> * float_test.c
+</span><span class='line'> */
+</span><span class='line'>#include &lt;linux/kernel.h&gt;
+</span><span class='line'>#include &lt;linux/types.h&gt;
+</span><span class='line'>#include &lt;linux/stddef.h&gt;
+</span><span class='line'>#include &lt;linux/module.h&gt;
+</span><span class='line'>#include &lt;linux/fs.h&gt;
+</span><span class='line'>#include &lt;asm/desc.h&gt;
 </span><span class='line'>
-</span><span class='line'>iptables -I INPUT -s 192.168.1.5 -j DROP # 头部插入
-</span><span class='line'>iptables -A INPUT -p tcp --dport 22 -j ACCEPT # 尾部追加，规则按顺序匹配的，匹配到就返回
+</span><span class='line'>static float float_test(float a, float b)
+</span><span class='line'>{
+</span><span class='line'>&#9;return a/b;
+</span><span class='line'>}
 </span><span class='line'>
-</span><span class='line'>iptables -D INPUT -s 192.168.1.5 -j DROP
-</span><span class='line'>iptables -D INPUT 2
-</span></code></pre></td></tr></table></div></figure>
+</span><span class='line'>static int __init test_module_init(void)
+</span><span class='line'>{
+</span><span class='line'>&#9;float_test(1.0, 1.0);
+</span><span class='line'>&#9;return 0;
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>static void __exit test_module_fini(void)
+</span><span class='line'>{
+</span><span class='line'>
+</span><span class='line'>&#9;//Do Nothing
+</span><span class='line'>&#9;return;
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>module_init(test_module_init);
+</span><span class='line'>module_exit(test_module_fini);
+</span><span class='line'>
+</span><span class='line'>MODULE_LICENSE("GPL");
+</span><span class='line'>MODULE_AUTHOR("lenky0401 at gmail dot com");</span></code></pre></td></tr></table></div></figure>
 
 
-<p>4、修改
-修改使用-R参数</p>
+<p>编译它将得到如下错误提示：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>iptables -R INPUT 3 -j ACCEPT</span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>[root@localhost t]# make
+</span><span class='line'>make -C /usr/src/linux-`uname -r` M=/home/gqk/t modules
+</span><span class='line'>make[1]: Entering directory `/usr/src/linux-2.6.38.8'
+</span><span class='line'>  CC [M]  /home/gqk/t/float_test.o
+</span><span class='line'>/home/gqk/t/float_test.c: In function ‘float_test’:
+</span><span class='line'>/home/gqk/t/float_test.c:12: error: SSE register return with SSE disabled
+</span><span class='line'>make[2]: *** [/home/gqk/t/float_test.o] Error 1
+</span><span class='line'>make[1]: *** [_module_/home/gqk/t] Error 2
+</span><span class='line'>make[1]: Leaving directory `/usr/src/linux-2.6.38.8'
+</span><span class='line'>make: *** [all] Error 2
+</span><span class='line'>[root@localhost t]#
+</span><span class='line'>
+</span><span class='line'>[root@localhost t]# make V=1
+</span><span class='line'>make -C /usr/src/linux-`uname -r` M=/home/gqk/t modules
+</span><span class='line'>make[1]: Entering directory `/usr/src/linux-2.6.38.8'
+</span><span class='line'>test -e include/generated/autoconf.h -a -e include/config/auto.conf || (        \
+</span><span class='line'>&#9;echo;                               \
+</span><span class='line'>&#9;echo "  ERROR: Kernel configuration is invalid.";       \
+</span><span class='line'>&#9;echo "         include/generated/autoconf.h or include/config/auto.conf are missing.";\
+</span><span class='line'>&#9;echo "         Run 'make oldconfig && make prepare' on kernel src to fix it.";  \
+</span><span class='line'>&#9;echo;                               \
+</span><span class='line'>&#9;/bin/false)
+</span><span class='line'>mkdir -p /home/gqk/t/.tmp_versions ; rm -f /home/gqk/t/.tmp_versions/*
+</span><span class='line'>make -f scripts/Makefile.build obj=/home/gqk/t
+</span><span class='line'>  gcc -Wp,-MD,/home/gqk/t/.float_test.o.d  -nostdinc -isystem /usr/lib/gcc/x86_64-redhat-linux/4.4.4/include -I/usr/src/linux-2.6.38.8/arch/x86/include -Iinclude  -include include/generated/autoconf.h -D__KERNEL__ -Wall -Wundef -Wstrict-prototypes -Wno-trigraphs -fno-strict-aliasing -fno-common -Werror-implicit-function-declaration -Wno-format-security -fno-delete-null-pointer-checks -O1 -m64 -mtune=generic -mno-red-zone -mcmodel=kernel -funit-at-a-time -maccumulate-outgoing-args -fstack-protector -DCONFIG_AS_CFI=1 -DCONFIG_AS_CFI_SIGNAL_FRAME=1 -DCONFIG_AS_CFI_SECTIONS=1 -DCONFIG_AS_FXSAVEQ=1 -pipe -Wno-sign-compare -fno-asynchronous-unwind-tables -mno-sse -mno-mmx -mno-sse2 -mno-3dnow -Wframe-larger-than=2048 -fno-omit-frame-pointer -fno-optimize-sibling-calls -g -Wdeclaration-after-statement -Wno-pointer-sign -fno-strict-overflow -fconserve-stack -DCC_HAVE_ASM_GOTO -g -I/home/gqk/t/..//inc -I -I -O2 -D__KERNEL__ -DMODULE -DEXPORT_SYMTAB  -DMODULE  -D"KBUILD_STR(s)=#s" -D"KBUILD_BASENAME=KBUILD_STR(float_test)"  -D"KBUILD_MODNAME=KBUILD_STR(float_test)" -c -o /home/gqk/t/.tmp_float_test.o /home/gqk/t/float_test.c
+</span><span class='line'>/home/gqk/t/float_test.c: In function ‘float_test’:
+</span><span class='line'>/home/gqk/t/float_test.c:12: error: SSE register return with SSE disabled
+</span><span class='line'>make[2]: *** [/home/gqk/t/float_test.o] Error 1
+</span><span class='line'>make[1]: *** [_module_/home/gqk/t] Error 2
+</span><span class='line'>make[1]: Leaving directory `/usr/src/linux-2.6.38.8'
+</span><span class='line'>make: *** [all] Error 2
+</span><span class='line'>[root@localhost t]#</span></code></pre></td></tr></table></div></figure>
 
+
+<p>注意到其中的gcc编译选项：-mno-sse -mno-mmx -mno-sse2，这几个选项是Linux内核编译模块时自动带上的，就是它们（具体就是-mno-sse）明确禁止了Linux内核无法使用浮点数。</p>
+
+<p>在Linux内核里很少会有使用浮点数的需求，即便是有也大多是通过变通的办法解决，在下面链接里有一些很好的扩展介绍，感兴趣的可以看看：</p>
+
+<p><a href="http://stackoverflow.com/questions/6397430/overhead-of-supporting-floating-point-arithmetic-inside-the-linux-kernel">http://stackoverflow.com/questions/6397430/overhead-of-supporting-floating-point-arithmetic-inside-the-linux-kernel</a></p>
+
+<p><a href="http://stackoverflow.com/questions/10212892/how-to-avoid-fpu-when-given-float-numbers">http://stackoverflow.com/questions/10212892/how-to-avoid-fpu-when-given-float-numbers</a></p>
+
+<p><a href="http://www.linuxsmiths.com/blog/?p=253">http://www.linuxsmiths.com/blog/?p=253</a></p>
 
 <hr />
 
-<p><a href="https://blog.csdn.net/zqixiao_09/article/details/53401321">https://blog.csdn.net/zqixiao_09/article/details/53401321</a></p>
-
-<h3>NAT地址转换</h3>
-
-<h4>iptables nat 原理</h4>
-
-<p>同filter表一样，nat表也有三条缺省的"链"(chains)：</p>
-
-<h5>PREROUTING:目的DNAT规则</h5>
-
-<p>把从外来的访问重定向到其他的机子上，比如内部SERVER，或者DMZ。</p>
-
-<p>因为路由时只检查数据包的目的ip地址，所以必须在路由之前就进行目的PREROUTING DNAT;
-系统先PREROUTING DNAT翻译——>再过滤（FORWARD）——>最后路由。
-路由和过滤（FORWARD)中match 的目的地址，都是针对被PREROUTING DNAT之后的。</p>
-
-<h5>POSTROUTING:源SNAT规则</h5>
-
-<p>在路由以后在执行该链中的规则。</p>
-
-<p>系统先路由——>再过滤（FORWARD)——>最后才进行POSTROUTING SNAT地址其match 源地址是翻译前的。</p>
-
-<p>OUTPUT:定义对本地产生的数据包的目的NAT规则</p>
-
-<h4>内网访问外网  -J SNAT</h4>
-
-<p>-j SNAT 源网络地址转换，SNAT就是重写包的源IP地址, SNAT 只能用在nat表的POSTROUTING链里</p>
-
-<p>固定public 地址（外网接口地址）的最基本内访外SNAT</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>iptables -t nat -A POSTROUTING -s 192.168.0.0/24 -o eth0 -j SNAT --to 你的eth0地址</span></code></pre></td></tr></table></div></figure>
+<p><a href="http://blog.csdn.net/vbskj/article/details/38408467">http://blog.csdn.net/vbskj/article/details/38408467</a></p>
+</div>
+  
+  
 
 
-<p>-j MASQUERADE</p>
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2018/01/04/lang-c-format/">c scanf/fscanf 的%n和%[]使用方法</a></h2>
+    
+    
+      <p class="meta">
+        
 
-<p>用于外网口public地址是DHCP动态获取的（如ADSL）</p>
+
+
+
+<time class='entry-date' datetime='2018-01-04T02:51:00+08:00'><span class='date'>2018-01-04</span> <span class='time'>02:51:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://blog.csdn.net/wesweeky/article/details/6439777">http://blog.csdn.net/wesweeky/article/details/6439777</a></p>
+
+<h4>一、</h4>
+
+<p>%n说明符输出有效字符数量，%n在scanf和printf中都可使用。与%n相对应的形参是一个int类型的指针，%n不影响scanf和printf的返回值。例如：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>iptables -t nat  -A POSTROUTING –o eth1 –s 192.168.1.0/24 –j MASQUERADE
-</span><span class='line'>iptables -t nat  -A POSTROUTING -o ppp0  -j  MASQUERADE</span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>scanf("%d %d%n", &i, &j, &k);</span></code></pre></td></tr></table></div></figure>
 
 
-<h4>外网访问内网 –J DNT</h4>
-
-<p>DNAT：目的网络地址转换，重写包的目的IP地址</p>
-
-<h5>典型的DNAT的例子</h5>
-
-<p>外部接口ip：210.83.2.206 内部接口ip：192.168.1.1</p>
-
-<p>ftp服务器　：　ip 192.168.1.3 web服务器　：　ip 192.168.1.4</p>
+<p>如果输入434 6434，则k等于8，而scanf的返回值仍然为2。又如：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>iptables -t nat -A PREROUTING -d 210.83.2.206 -p tcp --dport 21 -j DNAT --to 192.168.1.3
-</span><span class='line'>iptables -t nat -A PREROUTING -d 210.83.2.206 -p tcp --dport 80 -j DNAT --to 192.168.1.4</span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>scanf("%c%n", &ch, &k);</span></code></pre></td></tr></table></div></figure>
 
 
-<p>DNAT用于内部SERVER的load-balance（即CISCO的rotery）</p>
+<p>输入“sbcdefdg”后，k等于1，而不是8，因为%c只取一个字符，%n输出的是有效字符数量。</p>
 
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>iptables –t nat –A PREROUTING –d 219.142.217.161 –j DNAT --to-destination 192.168.1.24-192.168.1.25</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>DNAT  带端口映射(改变SERVER的端口)</h5>
-
-<p>一个FTP SERVER从内部192.168.100.125:21映射到216.94.87.37:2121的例子</p>
+<p>%n用在printf函数里，表示输出的字符数量，例如：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>iptables -t nat -A PREROUTING -p tcp -d 216.94.87.37 --dport 2121 -j DNAT --to-destination 192.168.100.125:21</span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>printf("i=%d, j=%d/n%n", i, j, &k);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>在i=343、j=123的情况下，k=12，同时%n不影响printf的返回值，其返回值仍然为12，而不是14。</p>
+
+<h4>二、</h4>
+
+<p>众所周之，scanf以空白字符为定界符，但如果输入的字符串是以其它字符为定界符的，那怎么办？[]就是专门处理这个问题的转换说明符。[]转换说明符可以通过两种方式产生结果字符集，如果第一个[字符右边没有抑扬符（^），那么处于[]之间的字符就是结果字符集，不在其中的可输入字符都作为定界符；如果左边[符号紧靠一个抑扬符（^），那么意义相反，^和]之间的字符是定界符，其余可输入字符是结果字符集。</p>
+
+<p>在使用[]说明符之前，得先明白两个概念：一是扫描列表。扫描列表（scanlist）指的是包含在[和]两个字符之间除紧靠左边[字符的抑扬符之外的字符，例如：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>scanf("%[abcd]", ptr);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>abcd组成扫描列表。二是扫描字符集（scanset）。扫描字符集指的是结果字符集，例如上面的例子，结果字符集就是abcd。如果输入一个字符串“cbadkjf”，那么ptr得到的字符串是cbad，kjf三个字符都属于定界符，输入到k字符时输入字符串被截断，kjf三个字符被留在stdin里面。如果带有抑扬符，例如：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>scanf("%[^abcd]", ptr);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>扫描列表仍然是abcd，但扫描字符集是除abcd外的可输入字符。如果输入字符串“jksferakjjdf”，ptr得到的字符串是“jksfer”。如果想限制输入字符串的字符数量，可以象s说明符那样，在[]前面使用位域，例如：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>scanf("%10[^abcd]", ptr);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这样结果字符串最多只能包含10个字符（除'/0'字符外）。</p>
+
+<p>[符号可以作为扫描列表中的一个成员，但]字符除紧贴最左边的[字符或抑扬符两种情况外，其余情况下都不会被看作扫描列表的成员。例如“%[]abcd]”或者“%[^]abcd]”，上述两种情况下]字符属于扫描列表的成员，但如果是“%[ab]cd]”，中间的]字符不会被看作扫描列表的成员，而且输入输出的结果会是乱七八糟的。</p>
+
+<p>对于减号-，只有在紧贴[字符或抑扬字符以及作为扫描列表最后一个成员时，-字符才会被视为扫描列表的成员。c标准把其余情况规定为编译器相关的。大多数编译器把这种情况的减号定义为连字符，例如：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>scanf("%[a-zA-Z]", ptr);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>那么扫描列表由大小写各26个字母组成。少数编译器仍旧把这种情况下的减号视为扫描列表成员。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>fscanf(fd,"%*[^/n]/n"); // %*是虚读，没有存，只是让指针跳过了这个变量！</span></code></pre></td></tr></table></div></figure>
 
 
 
@@ -521,7 +573,7 @@ var ss360Config = {
   
     <section>
 <h1>Categories
-<span class='right_span'>(899)</span>
+<span class='right_span'>(903)</span>
 
 </h1>
 <head>
@@ -552,7 +604,7 @@ if (!document.getElementById('blog~octopress')) document.getElementById('aexp_bl
 if (!document.getElementById('blog')) document.getElementById('aexp_blog').style.visibility = 'hidden';
 if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ruby').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(136)</span></li>
+<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(138)</span></li>
 <div id='language' class='catsub'><li><a href='/blog/cats/language~c/?opendiv=language'>c</a><a href='##' onmousedown=showDiv('language~c') id='aexp_language~c'><span class='exp_style' id='exp_language~c'>[+]</span></a><span class='right_span'>32</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~c')) document.getElementById('aexp_language~c').style.visibility = 'hidden';
@@ -569,7 +621,7 @@ if (!document.getElementById('language~java')) document.getElementById('aexp_lan
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~jsp')) document.getElementById('aexp_language~jsp').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/language~php/?opendiv=language'>php</a><a href='##' onmousedown=showDiv('language~php') id='aexp_language~php'><span class='exp_style' id='exp_language~php'>[+]</span></a><span class='right_span'>41</span></li>
+<li><a href='/blog/cats/language~php/?opendiv=language'>php</a><a href='##' onmousedown=showDiv('language~php') id='aexp_language~php'><span class='exp_style' id='exp_language~php'>[+]</span></a><span class='right_span'>43</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~php')) document.getElementById('aexp_language~php').style.visibility = 'hidden';
 </script>
@@ -716,12 +768,12 @@ if (!document.getElementById('tools~vim')) document.getElementById('aexp_tools~v
 if (!document.getElementById('tools')) document.getElementById('aexp_tools').style.visibility = 'hidden';
 if (!document.getElementById('tools~wxwork')) document.getElementById('aexp_tools~wxwork').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/system/'>system</a><a href='##' onmousedown=showDiv('system') id='aexp_system'><span class='exp_style' id='exp_system'>[+]</span></a><span class='right_span'>(107)</span></li>
+<li class='catclass'><a href='/blog/cats/system/'>system</a><a href='##' onmousedown=showDiv('system') id='aexp_system'><span class='exp_style' id='exp_system'>[+]</span></a><span class='right_span'>(109)</span></li>
 <div id='system' class='catsub'><li><a href='/blog/cats/system~base/?opendiv=system'>base</a><a href='##' onmousedown=showDiv('system~base') id='aexp_system~base'><span class='exp_style' id='exp_system~base'>[+]</span></a><span class='right_span'>23</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('system~base')) document.getElementById('aexp_system~base').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/system~centos/?opendiv=system'>centos</a><a href='##' onmousedown=showDiv('system~centos') id='aexp_system~centos'><span class='exp_style' id='exp_system~centos'>[+]</span></a><span class='right_span'>14</span></li>
+<li><a href='/blog/cats/system~centos/?opendiv=system'>centos</a><a href='##' onmousedown=showDiv('system~centos') id='aexp_system~centos'><span class='exp_style' id='exp_system~centos'>[+]</span></a><span class='right_span'>15</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('system~centos')) document.getElementById('aexp_system~centos').style.visibility = 'hidden';
 </script>
@@ -760,6 +812,10 @@ if (!document.getElementById('system~mail')) document.getElementById('aexp_syste
 <li><a href='/blog/cats/system~namespace/?opendiv=system'>namespace</a><a href='##' onmousedown=showDiv('system~namespace') id='aexp_system~namespace'><span class='exp_style' id='exp_system~namespace'>[+]</span></a><span class='right_span'>2</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('system~namespace')) document.getElementById('aexp_system~namespace').style.visibility = 'hidden';
+</script>
+<li><a href='/blog/cats/system~rpmbuild/?opendiv=system'>rpmbuild</a><a href='##' onmousedown=showDiv('system~rpmbuild') id='aexp_system~rpmbuild'><span class='exp_style' id='exp_system~rpmbuild'>[+]</span></a><span class='right_span'>1</span></li>
+<script language='javascript' type='text/javascript'>
+if (!document.getElementById('system~rpmbuild')) document.getElementById('aexp_system~rpmbuild').style.visibility = 'hidden';
 </script>
 <li><a href='/blog/cats/system~ubuntu/?opendiv=system'>ubuntu</a><a href='##' onmousedown=showDiv('system~ubuntu') id='aexp_system~ubuntu'><span class='exp_style' id='exp_system~ubuntu'>[+]</span></a><span class='right_span'>18</span></li>
 </div><script language='javascript' type='text/javascript'>
@@ -951,7 +1007,7 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 
 <section>
 <h1>Date Categories
-<span class='right_span'>(899)</span>
+<span class='right_span'>(903)</span>
 
 </h1>
 <head>
@@ -959,8 +1015,9 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(19)</span></li>
-<div id='2024' class='catsub'><li><a href='/blog/cats/2024~05/?opendiv=2024'>2024-05</a><span class='right_span'>3</span></li>
+<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(23)</span></li>
+<div id='2024' class='catsub'><li><a href='/blog/cats/2024~06/?opendiv=2024'>2024-06</a><span class='right_span'>2</span></li>
+<li><a href='/blog/cats/2024~05/?opendiv=2024'>2024-05</a><span class='right_span'>5</span></li>
 <li><a href='/blog/cats/2024~04/?opendiv=2024'>2024-04</a><span class='right_span'>5</span></li>
 <li><a href='/blog/cats/2024~03/?opendiv=2024'>2024-03</a><span class='right_span'>5</span></li>
 <li><a href='/blog/cats/2024~02/?opendiv=2024'>2024-02</a><span class='right_span'>4</span></li>
@@ -1125,6 +1182,22 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
   <ul id="recent_posts">
     
       <li class="post">
+        <a href="/blog/2024/06/20/lang-php-date_sun_info/">PHP中的date_sun_info()函数, 日落/日出时间</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2024/06/20/centos-mkconfig/">grub2-mkconfig</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2024/05/23/lang-lunar/">农历节气查表</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2024/05/17/rpmbuild-check/">rpmbuild 错误：发现已安装(但未打包的)文件</a>
+      </li>
+    
+      <li class="post">
         <a href="/blog/2024/05/16/lang-centos8-php8/">Centos8安装PHP8</a>
       </li>
     
@@ -1146,22 +1219,6 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
     
       <li class="post">
         <a href="/blog/2024/04/29/tools-squid-log/">squid 日志格式, 时间格式</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/04/26/tools-apache2-tmp/">centos7下httpd服务对tmp目录操作</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/04/26/nginx-proxy-buffer/">nginx 禁用代理缓冲</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/03/26/db9/">USB-Serial Controller D USB转串口驱动</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/03/26/TH40W-E/">华汉维无线wifi温湿度TH40W-E</a>
       </li>
     
   </ul>
