@@ -131,7 +131,7 @@ var ss360Config = {
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2020/05/25/kernel-reuseport/">reuseport使用</a></h2>
+      <h2 class="entry-title"><a href="/blog/2020/07/19/kernel-mptcp-establish/">MPTCP pre_established fully_established</a></h2>
     
     
       <p class="meta">
@@ -140,42 +140,189 @@ var ss360Config = {
 
 
 
-<time class='entry-date' datetime='2020-05-25T16:57:00+08:00'><span class='date'>2020-05-25</span> <span class='time'>16:57:00</span></time>
+<time class='entry-date' datetime='2020-07-19T01:37:00+08:00'><span class='date'>2020-07-19</span> <span class='time'>01:37:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><p><a href="https://www.cnblogs.com/Anker/p/7076537.html">https://www.cnblogs.com/Anker/p/7076537.html</a></p>
+  <div class="entry-content"><h3>一、pre_established</h3>
 
-<h4>SO_REUSEPORT解决了什么问题</h4>
+<p>只在subflow的客户端起作用，在收到synack时置为1，收到第4个ack时置为0，防止在synack到第四个ack期间发送数据包。</p>
 
-<p>SO_REUSEPORT支持多个进程或者线程绑定到同一端口，提高服务器程序的性能，解决的问题：</p>
+<p>因为服务端要用第三个ack建连，客户端收到第四个ack表示建连成功，成功之后才能发数据</p>
 
-<p>允许多个套接字 bind()/listen() 同一个TCP/UDP端口<br/>
-  每一个线程拥有自己的服务器套接字<br/>
-  在服务器套接字上没有了锁的竞争</p>
+<h4>mptcp_ack_timer</h4>
 
-<p>内核层面实现负载均衡</p>
+<p>所以客户端需要 mptcp_ack_timer，不停的发送第三个ack，直到收到第四个ack</p>
 
-<p>安全层面，监听同一个端口的套接字只能位于同一个用户下面</p>
+<h3>二、fully_established</h3>
 
-<p>其核心的实现主要有三点：</p>
+<p>fully_established 和 pre_established 互不相关</p>
 
-<p>  扩展 socket option，增加 SO_REUSEPORT 选项，用来设置 reuseport。</p>
+<p>mptcp需要四次握手，四次握手完成后 fully_established=1, 再之后才能建立subflow</p>
 
-<p>  修改 bind 系统调用实现，以便支持可以绑定到相同的 IP 和端口</p>
+<p>tcp三次握手后，client和server两边的 fully_established = 0, 进入fully_established的条件如下：</p>
 
-<p>  修改处理新建连接的实现，查找 listener 的时候，能够支持在监听相同 IP 和端口的多个 sock 之间均衡选择。</p>
+<ol>
+<li>本端没发送数据包，但一直收到对端的mptcp数据包，见 mptcp_prevalidate_skb()</li>
+</ol>
 
-<p>有了SO_RESUEPORT后，每个进程可以自己创建socket、bind、listen、accept相同的地址和端口，各自是独立平等的。让多进程监听同一个端口，各个进程中accept socket fd不一样，有新连接建立时，内核只会唤醒一个进程来accept，并且保证唤醒的均衡性。</p>
 
-<h4>可优化 ？？</h4>
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (!tp-&gt;mptcp-&gt;fully_established) {
+</span><span class='line'>&#9;tp-&gt;mptcp-&gt;init_rcv_wnd -= skb-&gt;len;
+</span><span class='line'>&#9;if (tp-&gt;mptcp-&gt;init_rcv_wnd &lt; 0)
+</span><span class='line'>&#9;&#9;mptcp_become_fully_estab(sk);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
-<p>在 <code>___inet_lookup_listener</code> -> compute_score() 中，每个cpu只选特定的sk，这样能减少锁竞争和cache吗 ？？？</p>
 
-<h4>代码</h4>
+<ol>
+<li>本端发出去的mptcp数据包被mptcp_ack了，见 mptcp_process_data_ack</li>
+</ol>
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (unlikely(!tp-&gt;mptcp-&gt;fully_established) && tp-&gt;mptcp-&gt;snt_isn + 1 != TCP_SKB_CB(skb)-&gt;ack_seq)
+</span><span class='line'>&#9;mptcp_become_fully_estab(sk);</span></code></pre></td></tr></table></div></figure>
+
+
+<ol>
+<li>如果收到非mptcp数据包，则回退普通tcp，回退也会设置fully_established=1，见mptcp_prevalidate_skb()</li>
+</ol>
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (!tp-&gt;mptcp-&gt;fully_established && !mptcp_is_data_seq(skb) &&
+</span><span class='line'>&#9;!tp-&gt;mptcp-&gt;mapping_present && !mpcb-&gt;infinite_mapping_rcv) {
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;if (!is_master_tp(tp)) { // subflow reset，master才回退
+</span><span class='line'>&#9;&#9;MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_FBDATASUB);
+</span><span class='line'>&#9;&#9;mptcp_send_reset(sk);
+</span><span class='line'>&#9;&#9;return 1;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;tp-&gt;mptcp-&gt;fully_established = 1;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<ol>
+<li>如果本端发出去的数据包被不带mptcp的ack ack了，那么大概率是对端没建立mptcp连接。那么本端回退到普通tcp，回退也会设置fully_established=1。</li>
+</ol>
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>tcp_ack() {
+</span><span class='line'>&#9;mptcp_fallback_infinite() {
+</span><span class='line'>&#9;&#9;if (likely(tp-&gt;mptcp-&gt;fully_established))
+</span><span class='line'>&#9;&#9;&#9;return false;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (!(flag & MPTCP_FLAG_DATA_ACKED)) // 被ack的包一定是mptcp数据包
+</span><span class='line'>&#9;&#9;&#9;return false;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (!is_master_tp(tp)) { // subflow reset，master才回退
+</span><span class='line'>&#9;&#9;&#9;MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_FBACKSUB);
+</span><span class='line'>&#9;&#9;&#9;return true;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;...
+</span><span class='line'>&#9;}
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>因为 fully_established = 0 时刚完成3次握手，所以上面说的数据包基本都是第一个数据包</p>
+
+<p>以上条件对于client和server都适用，因为3次握手后谁先发包都是正常的。</p>
+
+<h3>mptcp 连接在 fully_established=1 之后再收到 不含mptcp option的包</h3>
+
+<ol>
+<li>不会进行mapping，见mptcp_detect_mapping()</li>
+</ol>
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (!mptcp_is_data_seq(skb)) {
+</span><span class='line'>&#9;if (!tp-&gt;mptcp-&gt;mapping_present && tp-&gt;rcv_nxt - tp-&gt;copied_seq &gt; 65536) {
+</span><span class='line'>&#9;&#9;mptcp_send_reset(sk);
+</span><span class='line'>&#9;&#9;return 1;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;return 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<ol>
+<li>对于一个map_data_len包，可能被差成了多个包传输：</li>
+</ol>
+
+
+<p>如果多个包全不是mptcp包，则mapping_present=0，那么mptcp_queue_skb() 会直接return，然后 tp->rcv_nxt - tp->copied_seq > 65536, 然后被reset</p>
+
+<p>如果前一部分是mptcp的包，后一部分不是mptcp包，则mapping_present=1，然后会被mptcp_verif_dss_csum() reset</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2020/07/09/kernel-tcp-icmp/">TCP包增一个ICMP头</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2020-07-09T02:00:00+08:00'><span class='date'>2020-07-09</span> <span class='time'>02:00:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p>发送加头，接收解头。checksum失效，需要额外处理</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -286,115 +433,317 @@ var ss360Config = {
 <span class='line-number'>107</span>
 <span class='line-number'>108</span>
 <span class='line-number'>109</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#define _GNU_SOURCE
+<span class='line-number'>110</span>
+<span class='line-number'>111</span>
+<span class='line-number'>112</span>
+<span class='line-number'>113</span>
+<span class='line-number'>114</span>
+<span class='line-number'>115</span>
+<span class='line-number'>116</span>
+<span class='line-number'>117</span>
+<span class='line-number'>118</span>
+<span class='line-number'>119</span>
+<span class='line-number'>120</span>
+<span class='line-number'>121</span>
+<span class='line-number'>122</span>
+<span class='line-number'>123</span>
+<span class='line-number'>124</span>
+<span class='line-number'>125</span>
+<span class='line-number'>126</span>
+<span class='line-number'>127</span>
+<span class='line-number'>128</span>
+<span class='line-number'>129</span>
+<span class='line-number'>130</span>
+<span class='line-number'>131</span>
+<span class='line-number'>132</span>
+<span class='line-number'>133</span>
+<span class='line-number'>134</span>
+<span class='line-number'>135</span>
+<span class='line-number'>136</span>
+<span class='line-number'>137</span>
+<span class='line-number'>138</span>
+<span class='line-number'>139</span>
+<span class='line-number'>140</span>
+<span class='line-number'>141</span>
+<span class='line-number'>142</span>
+<span class='line-number'>143</span>
+<span class='line-number'>144</span>
+<span class='line-number'>145</span>
+<span class='line-number'>146</span>
+<span class='line-number'>147</span>
+<span class='line-number'>148</span>
+<span class='line-number'>149</span>
+<span class='line-number'>150</span>
+<span class='line-number'>151</span>
+<span class='line-number'>152</span>
+<span class='line-number'>153</span>
+<span class='line-number'>154</span>
+<span class='line-number'>155</span>
+<span class='line-number'>156</span>
+<span class='line-number'>157</span>
+<span class='line-number'>158</span>
+<span class='line-number'>159</span>
+<span class='line-number'>160</span>
+<span class='line-number'>161</span>
+<span class='line-number'>162</span>
+<span class='line-number'>163</span>
+<span class='line-number'>164</span>
+<span class='line-number'>165</span>
+<span class='line-number'>166</span>
+<span class='line-number'>167</span>
+<span class='line-number'>168</span>
+<span class='line-number'>169</span>
+<span class='line-number'>170</span>
+<span class='line-number'>171</span>
+<span class='line-number'>172</span>
+<span class='line-number'>173</span>
+<span class='line-number'>174</span>
+<span class='line-number'>175</span>
+<span class='line-number'>176</span>
+<span class='line-number'>177</span>
+<span class='line-number'>178</span>
+<span class='line-number'>179</span>
+<span class='line-number'>180</span>
+<span class='line-number'>181</span>
+<span class='line-number'>182</span>
+<span class='line-number'>183</span>
+<span class='line-number'>184</span>
+<span class='line-number'>185</span>
+<span class='line-number'>186</span>
+<span class='line-number'>187</span>
+<span class='line-number'>188</span>
+<span class='line-number'>189</span>
+<span class='line-number'>190</span>
+<span class='line-number'>191</span>
+<span class='line-number'>192</span>
+<span class='line-number'>193</span>
+<span class='line-number'>194</span>
+<span class='line-number'>195</span>
+<span class='line-number'>196</span>
+<span class='line-number'>197</span>
+<span class='line-number'>198</span>
+<span class='line-number'>199</span>
+<span class='line-number'>200</span>
+<span class='line-number'>201</span>
+<span class='line-number'>202</span>
+<span class='line-number'>203</span>
+<span class='line-number'>204</span>
+<span class='line-number'>205</span>
+<span class='line-number'>206</span>
+<span class='line-number'>207</span>
+<span class='line-number'>208</span>
+<span class='line-number'>209</span>
+<span class='line-number'>210</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;linux/module.h&gt;
+</span><span class='line'>#include &lt;linux/kernel.h&gt;
+</span><span class='line'>#include &lt;linux/ip.h&gt;
+</span><span class='line'>#include &lt;linux/tcp.h&gt;
+</span><span class='line'>#include &lt;linux/sctp.h&gt;
+</span><span class='line'>#include &lt;linux/icmp.h&gt;
+</span><span class='line'>#include &lt;linux/slab.h&gt;
 </span><span class='line'>
-</span><span class='line'>#include &lt;stdio.h&gt;
-</span><span class='line'>#include &lt;unistd.h&gt;
-</span><span class='line'>#include &lt;sys/types.h&gt;
-</span><span class='line'>#include &lt;sys/socket.h&gt;
-</span><span class='line'>#include &lt;netinet/in.h&gt;
-</span><span class='line'>#include &lt;arpa/inet.h&gt;
-</span><span class='line'>#include &lt;assert.h&gt;
-</span><span class='line'>#include &lt;sys/wait.h&gt;
-</span><span class='line'>#include &lt;string.h&gt;
-</span><span class='line'>#include &lt;errno.h&gt;
-</span><span class='line'>#include &lt;stdlib.h&gt;
-</span><span class='line'>#include &lt;fcntl.h&gt;
+</span><span class='line'>#include &lt;net/ip.h&gt;
+</span><span class='line'>#include &lt;net/tcp.h&gt;
+</span><span class='line'>#include &lt;net/udp.h&gt;
+</span><span class='line'>#include &lt;net/icmp.h&gt;                   /* for icmp_send */
+</span><span class='line'>#include &lt;net/route.h&gt;
+</span><span class='line'>#include &lt;net/ip6_checksum.h&gt;
+</span><span class='line'>#include &lt;net/netns/generic.h&gt;      /* net_generic() */
+</span><span class='line'>
+</span><span class='line'>#include &lt;linux/netfilter.h&gt;
+</span><span class='line'>#include &lt;linux/netfilter_ipv4.h&gt;
+</span><span class='line'>
+</span><span class='line'>#ifdef CONFIG_IP_VS_IPV6
+</span><span class='line'>#include &lt;net/ipv6.h&gt;
+</span><span class='line'>#include &lt;linux/netfilter_ipv6.h&gt;
+</span><span class='line'>#include &lt;net/ip6_route.h&gt;
+</span><span class='line'>#endif
+</span><span class='line'>
+</span><span class='line'>#include &lt;net/ip_vs.h&gt;
+</span><span class='line'>#include &lt;linux/dns_resolver.h&gt;
 </span><span class='line'>
 </span><span class='line'>
-</span><span class='line'>#include &lt;sched.h&gt;
-</span><span class='line'>#include &lt;pthread.h&gt;
 </span><span class='line'>
-</span><span class='line'>#include &lt;netinet/tcp.h&gt;
+</span><span class='line'>#include &lt;linux/module.h&gt;
+</span><span class='line'>#include &lt;linux/kernel.h&gt;
+</span><span class='line'>#include &lt;linux/version.h&gt;
+</span><span class='line'>#include &lt;linux/ip.h&gt;
+</span><span class='line'>#include &lt;linux/tcp.h&gt;
+</span><span class='line'>#include &lt;linux/icmp.h&gt;
+</span><span class='line'>#include &lt;linux/if_arp.h&gt;
+</span><span class='line'>#include &lt;linux/if_ether.h&gt;
+</span><span class='line'>#include &lt;linux/kallsyms.h&gt;
+</span><span class='line'>#include &lt;linux/inetdevice.h&gt;
+</span><span class='line'>#include &lt;linux/netdevice.h&gt;
+</span><span class='line'>#include &lt;net/ip.h&gt;
+</span><span class='line'>#include &lt;net/tcp.h&gt;
+</span><span class='line'>#include &lt;net/udp.h&gt;
+</span><span class='line'>#include &lt;net/icmp.h&gt;
+</span><span class='line'>#include &lt;net/arp.h&gt;
+</span><span class='line'>#include &lt;net/route.h&gt;
+</span><span class='line'>#include &lt;net/neighbour.h&gt;
+</span><span class='line'>#include &lt;net/netevent.h&gt;
+</span><span class='line'>#if (LINUX_VERSION_CODE &gt;= KERNEL_VERSION(2, 6, 32))
+</span><span class='line'>#include &lt;net/net_namespace.h&gt;
+</span><span class='line'>#endif
+</span><span class='line'>#include &lt;linux/netfilter.h&gt;
+</span><span class='line'>#include &lt;linux/netfilter_ipv4.h&gt;
 </span><span class='line'>
-</span><span class='line'>#define IP        "192.168.3.6"
-</span><span class='line'>#define PORT      80
-</span><span class='line'>#define WORKER        8
-</span><span class='line'>#define MAXLINE       4096
+</span><span class='line'>#include &lt;linux/inet.h&gt;
+</span><span class='line'>#include &lt;linux/skbuff.h&gt;
+</span><span class='line'>#include &lt;linux/kthread.h&gt;
 </span><span class='line'>
+</span><span class='line'>int icmp_port = 80;
+</span><span class='line'>module_param(icmp_port, int, 0644);
 </span><span class='line'>
-</span><span class='line'>int worker(int i)
+</span><span class='line'>struct addhdr {
+</span><span class='line'>&#9;u32 saddr, daddr;
+</span><span class='line'>&#9;u16 sport, dport;
+</span><span class='line'>&#9;u16 len;
+</span><span class='line'>&#9;u16 magic;
+</span><span class='line'>};
+</span><span class='line'>
+</span><span class='line'>static unsigned int local_out(void *priv, struct sk_buff *skb, const struct nf_hook_state *state)
 </span><span class='line'>{
-</span><span class='line'>&#9;struct sockaddr_in address;
-</span><span class='line'>&#9;bzero(&address, sizeof(address));
-</span><span class='line'>&#9;address.sin_family = AF_INET;
-</span><span class='line'>&#9;inet_pton( AF_INET, IP, &address.sin_addr);
-</span><span class='line'>&#9;address.sin_port = htons(PORT);
+</span><span class='line'>&#9;struct iphdr *iph = ip_hdr(skb);
+</span><span class='line'>&#9;struct tcphdr *th;
+</span><span class='line'>&#9;struct icmphdr *icmp;
+</span><span class='line'>&#9;struct addhdr *add;
+</span><span class='line'>&#9;int delta;
 </span><span class='line'>
-</span><span class='line'>&#9;pid_t pid = getpid();
-</span><span class='line'>&#9;unsigned cc = 0;
-</span><span class='line'>&#9;cpu_set_t mask;
-</span><span class='line'>&#9;CPU_ZERO(&mask);
-</span><span class='line'>&#9;CPU_SET(i, &mask);
+</span><span class='line'>&#9;iph = ip_hdr(skb);
+</span><span class='line'>&#9;th = tcp_hdr(skb);
+</span><span class='line'>&#9;if (iph-&gt;protocol != IPPROTO_TCP)
+</span><span class='line'>&#9;&#9;return NF_ACCEPT;
 </span><span class='line'>
-</span><span class='line'>&#9;printf("pid=%d %d\n", pid, i);
-</span><span class='line'>&#9;if (sched_getaffinity(pid, sizeof(mask), &mask) &lt; 0) {
-</span><span class='line'>&#9;&#9;printf("sched_getaffinity err\n");
+</span><span class='line'>&#9;if (ntohs(th-&gt;source) != icmp_port && ntohs(th-&gt;dest) != icmp_port)
+</span><span class='line'>&#9;&#9;return NF_ACCEPT;
+</span><span class='line'>
+</span><span class='line'>&#9;if (skb-&gt;len + sizeof(struct icmphdr) + sizeof(struct addhdr) &gt; 1500)
+</span><span class='line'>&#9;&#9;return NF_ACCEPT;
+</span><span class='line'>
+</span><span class='line'>&#9;delta = sizeof(struct icmphdr) + sizeof(struct addhdr) + sizeof(struct ethhdr) - skb_headroom(skb);
+</span><span class='line'>&#9;if (delta &gt; 0 && pskb_expand_head(skb, SKB_DATA_ALIGN(delta), 0, GFP_ATOMIC))
+</span><span class='line'>&#9;&#9;return NF_ACCEPT;
+</span><span class='line'>
+</span><span class='line'>&#9;iph = ip_hdr(skb);
+</span><span class='line'>&#9;th = tcp_hdr(skb);
+</span><span class='line'>
+</span><span class='line'>&#9;if (skb-&gt;ip_summed != CHECKSUM_COMPLETE) {
+</span><span class='line'>&#9;&#9;th-&gt;check = 0;
+</span><span class='line'>&#9;&#9;skb-&gt;csum = 0;
+</span><span class='line'>&#9;&#9;th-&gt;check = tcp_v4_check(skb-&gt;len - ip_hdrlen(skb), iph-&gt;saddr, iph-&gt;daddr, skb_checksum(skb, ip_hdrlen(skb), skb-&gt;len - ip_hdrlen(skb), 0));
+</span><span class='line'>&#9;&#9;skb-&gt;ip_summed = CHECKSUM_COMPLETE;
 </span><span class='line'>&#9;}
 </span><span class='line'>
-</span><span class='line'>&#9;int listenfd = socket(PF_INET, SOCK_STREAM, 0);
-</span><span class='line'>&#9;assert(listenfd &gt;= 0);
+</span><span class='line'>&#9;skb_push(skb, sizeof(struct icmphdr) + sizeof(struct addhdr));
+</span><span class='line'>&#9;memcpy(skb-&gt;data, skb-&gt;data + sizeof(struct icmphdr) + sizeof(struct addhdr), ip_hdrlen(skb));
+</span><span class='line'>&#9;skb_reset_network_header(skb);
+</span><span class='line'>&#9;iph = ip_hdr(skb);
+</span><span class='line'>&#9;iph-&gt;protocol = IPPROTO_ICMP;
+</span><span class='line'>&#9;iph-&gt;tot_len = htons(skb-&gt;len);
 </span><span class='line'>
-</span><span class='line'>&#9;int val =1;
-</span><span class='line'>&#9;/*set SO_REUSEPORT*/
-</span><span class='line'>&#9;if (setsockopt(listenfd, SOL_SOCKET, SO_REUSEPORT, &val, sizeof(val)) &lt; 0) {
-</span><span class='line'>&#9;&#9;perror("setsockopt()");
-</span><span class='line'>&#9;}
+</span><span class='line'>&#9;icmp = (struct icmphdr *)(skb-&gt;data + ip_hdrlen(skb));
+</span><span class='line'>&#9;icmp-&gt;type = ICMP_ECHO;
+</span><span class='line'>&#9;icmp-&gt;code = 0;
+</span><span class='line'>&#9;icmp-&gt;un.echo.id = 1;
+</span><span class='line'>&#9;icmp-&gt;un.echo.sequence = 1;
 </span><span class='line'>
-</span><span class='line'>&#9;val = 1000 + i;
-</span><span class='line'>&#9;if (setsockopt(listenfd, SOL_TCP, TCP_MAXSEG, &val, sizeof(val))&lt;0) {
-</span><span class='line'>&#9;&#9;perror("setsockopt()");
-</span><span class='line'>&#9;}
+</span><span class='line'>&#9;add = (struct addhdr *)(skb-&gt;data + ip_hdrlen(skb) + sizeof(struct icmphdr));
+</span><span class='line'>&#9;add-&gt;saddr = iph-&gt;saddr;
+</span><span class='line'>&#9;add-&gt;daddr = iph-&gt;daddr;
+</span><span class='line'>&#9;add-&gt;sport = th-&gt;source;
+</span><span class='line'>&#9;add-&gt;dport = th-&gt;dest;
+</span><span class='line'>&#9;add-&gt;len = skb-&gt;len;
+</span><span class='line'>&#9;add-&gt;magic = skb-&gt;len;
 </span><span class='line'>
-</span><span class='line'>&#9;int ret = bind(listenfd, (struct sockaddr*)&address, sizeof(address));
-</span><span class='line'>&#9;assert(ret != -1);
+</span><span class='line'>&#9;skb_set_transport_header(skb, ip_hdrlen(skb));
 </span><span class='line'>
-</span><span class='line'>&#9;ret = listen(listenfd, 5);
-</span><span class='line'>&#9;assert(ret != -1);
-</span><span class='line'>&#9;while (1) {
-</span><span class='line'>&#9;&#9;cc ++;
-</span><span class='line'>&#9;&#9;if (cc % 100 == 0)
-</span><span class='line'>&#9;&#9;&#9;printf("thread=%d cc=%d\n", i, cc);
-</span><span class='line'>//        printf("I am worker %d, begin to accept connection.\n", i);
-</span><span class='line'>&#9;&#9;struct sockaddr_in client_addr;
-</span><span class='line'>&#9;&#9;socklen_t client_addrlen = sizeof( client_addr );
-</span><span class='line'>&#9;&#9;int connfd = accept(listenfd, (struct sockaddr*)&client_addr, &client_addrlen);
-</span><span class='line'>&#9;&#9;if (connfd != -1) {
-</span><span class='line'>//            printf("worker %d accept a connection success. ip:%s, prot:%d\n", i, inet_ntoa(client_addr.sin_addr), client_addr.sin_port);
-</span><span class='line'>&#9;&#9;} else {
-</span><span class='line'>//            printf("worker %d accept a connection failed,error:%s", i, strerror(errno));
-</span><span class='line'>&#9;&#9;}
-</span><span class='line'>&#9;&#9;char buffer[MAXLINE];
-</span><span class='line'>//        int nbytes = read(connfd, buffer, MAXLINE);
-</span><span class='line'>//        printf("read from client is:%s\n", buffer);
-</span><span class='line'>//        write(connfd, buffer, nbytes);
-</span><span class='line'>&#9;&#9;close(connfd);
-</span><span class='line'>&#9;}
+</span><span class='line'>&#9;icmp-&gt;checksum = 0;
+</span><span class='line'>&#9;icmp-&gt;checksum = csum_fold(csum_partial(skb-&gt;data + ip_hdrlen(skb), skb-&gt;len - ip_hdrlen(skb), 0));
+</span><span class='line'>
+</span><span class='line'>&#9;ip_send_check(iph);
+</span><span class='line'>&#9;skb-&gt;ip_summed = CHECKSUM_NONE;
+</span><span class='line'>
+</span><span class='line'>&#9;return NF_ACCEPT;
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>static unsigned int pre_route(void *priv, struct sk_buff *skb, const struct nf_hook_state *state)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct iphdr *iph;
+</span><span class='line'>&#9;struct tcphdr *th;
+</span><span class='line'>&#9;struct icmphdr *icmp;
+</span><span class='line'>&#9;struct addhdr *add;
+</span><span class='line'>
+</span><span class='line'>&#9;if (!pskb_may_pull(skb, sizeof(struct iphdr) + sizeof(struct tcphdr) + sizeof(struct icmphdr) + sizeof(struct addhdr)))
+</span><span class='line'>&#9;&#9;return NF_ACCEPT;
+</span><span class='line'>
+</span><span class='line'>&#9;iph = ip_hdr(skb);
+</span><span class='line'>&#9;if (iph-&gt;protocol != IPPROTO_ICMP)
+</span><span class='line'>&#9;&#9;return NF_ACCEPT;
+</span><span class='line'>
+</span><span class='line'>&#9;icmp = (struct icmphdr*)(skb-&gt;data + ip_hdrlen(skb));
+</span><span class='line'>&#9;if (icmp-&gt;type != ICMP_ECHO || icmp-&gt;code != 0)
+</span><span class='line'>&#9;&#9;return NF_ACCEPT;
+</span><span class='line'>
+</span><span class='line'>&#9;add = (struct addhdr*)(skb-&gt;data + ip_hdrlen(skb) + sizeof(struct icmphdr));
+</span><span class='line'>&#9;th = (struct tcphdr*)(skb-&gt;data + ip_hdrlen(skb) + sizeof(struct icmphdr) + sizeof(struct addhdr));
+</span><span class='line'>&#9;if (ntohs(th-&gt;source) != icmp_port && ntohs(th-&gt;dest) != icmp_port)
+</span><span class='line'>&#9;&#9;return NF_ACCEPT;
+</span><span class='line'>
+</span><span class='line'>&#9;//if (add-&gt;saddr != iph-&gt;saddr || add-&gt;daddr != iph-&gt;daddr || 
+</span><span class='line'>&#9;if (add-&gt;sport != th-&gt;source || add-&gt;dport != th-&gt;dest || add-&gt;len != skb-&gt;len || add-&gt;magic != skb-&gt;len)
+</span><span class='line'>&#9;&#9;return NF_ACCEPT;
+</span><span class='line'>
+</span><span class='line'>&#9;skb_pull(skb, sizeof(struct icmphdr) + sizeof(struct addhdr));
+</span><span class='line'>&#9;// sizeof(struct icmphdr) + sizeof(struct addhdr) &gt; ip_hdrlen(skb)
+</span><span class='line'>&#9;memcpy(skb-&gt;data, skb-&gt;data - sizeof(struct icmphdr) - sizeof(struct addhdr), ip_hdrlen(skb));
+</span><span class='line'>&#9;memcpy(skb-&gt;data - sizeof(struct ethhdr), skb-&gt;data - sizeof(struct icmphdr) - sizeof(struct addhdr) - sizeof(struct ethhdr), sizeof(struct ethhdr));
+</span><span class='line'>&#9;skb_reset_network_header(skb);
+</span><span class='line'>&#9;iph = ip_hdr(skb);
+</span><span class='line'>&#9;iph-&gt;protocol = IPPROTO_TCP;
+</span><span class='line'>&#9;iph-&gt;tot_len = htons(skb-&gt;len);
+</span><span class='line'>
+</span><span class='line'>&#9;ip_send_check(iph);
+</span><span class='line'>&#9;skb-&gt;ip_summed = CHECKSUM_UNNECESSARY;
+</span><span class='line'>&#9;skb_set_transport_header(skb, ip_hdrlen(skb));
+</span><span class='line'>&#9;th = tcp_hdr(skb);
+</span><span class='line'>&#9;skb_set_mac_header(skb, -(int)sizeof(struct ethhdr));
+</span><span class='line'>
+</span><span class='line'>&#9;return NF_ACCEPT;
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>static const struct nf_hook_ops ip_vs_ops[] = {
+</span><span class='line'>&#9;{
+</span><span class='line'>&#9;&#9;.hook     = local_out,
+</span><span class='line'>&#9;&#9;.pf       = NFPROTO_IPV4,
+</span><span class='line'>&#9;&#9;.hooknum  = NF_INET_LOCAL_OUT,
+</span><span class='line'>&#9;&#9;.priority = 0,
+</span><span class='line'>&#9;},
+</span><span class='line'>&#9;{
+</span><span class='line'>&#9;&#9;.hook     = pre_route,
+</span><span class='line'>&#9;&#9;.pf       = NFPROTO_IPV4,
+</span><span class='line'>&#9;&#9;.hooknum  = NF_INET_PRE_ROUTING,
+</span><span class='line'>&#9;&#9;.priority = 0,
+</span><span class='line'>&#9;},
+</span><span class='line'>};
+</span><span class='line'>
+</span><span class='line'>static int net_init(void)
+</span><span class='line'>{
+</span><span class='line'>&#9;if (nf_register_net_hooks(&init_net, ip_vs_ops, ARRAY_SIZE(ip_vs_ops)))
+</span><span class='line'>&#9;&#9;return -1;
+</span><span class='line'>
 </span><span class='line'>&#9;return 0;
 </span><span class='line'>}
 </span><span class='line'>
-</span><span class='line'>int main()
+</span><span class='line'>static void net_cleanup(void)
 </span><span class='line'>{
-</span><span class='line'>&#9;int i = 0;
-</span><span class='line'>&#9;for (i = 0; i &lt; WORKER; i++) {
-</span><span class='line'>&#9;&#9;printf("Create worker %d\n", i);
-</span><span class='line'>&#9;&#9;pid_t pid = fork();
-</span><span class='line'>&#9;&#9;/*child  process */
-</span><span class='line'>&#9;&#9;if (pid == 0) {
-</span><span class='line'>&#9;&#9;&#9;worker(i);
-</span><span class='line'>&#9;&#9;}
-</span><span class='line'>&#9;&#9;if (pid &lt; 0) {
-</span><span class='line'>&#9;&#9;&#9;printf("fork error");
-</span><span class='line'>&#9;&#9;}
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;/*wait child process*/
-</span><span class='line'>&#9;while (wait(NULL) != 0)
-</span><span class='line'>&#9;&#9;;
-</span><span class='line'>&#9;if (errno == ECHILD) {
-</span><span class='line'>&#9;&#9;fprintf(stderr, "wait error:%s\n", strerror(errno));
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;return 0;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+</span><span class='line'>&#9;nf_unregister_net_hooks(&init_net, ip_vs_ops, ARRAY_SIZE(ip_vs_ops));
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>module_init(net_init);
+</span><span class='line'>module_exit(net_cleanup);
+</span><span class='line'>MODULE_LICENSE("GPL");</span></code></pre></td></tr></table></div></figure>
 
 
 
@@ -410,7 +759,7 @@ var ss360Config = {
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2020/05/22/kernel-qdisc-veth/">veth虚拟网络设备的qdisc</a></h2>
+      <h2 class="entry-title"><a href="/blog/2020/07/09/kernel-adjust-mss/">将包减小到mss以下</a></h2>
     
     
       <p class="meta">
@@ -419,44 +768,14 @@ var ss360Config = {
 
 
 
-<time class='entry-date' datetime='2020-05-22T11:24:00+08:00'><span class='date'>2020-05-22</span> <span class='time'>11:24:00</span></time>
+<time class='entry-date' datetime='2020-07-09T01:57:00+08:00'><span class='date'>2020-07-09</span> <span class='time'>01:57:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><p><a href="http://hustcat.github.io/veth/">http://hustcat.github.io/veth/</a></p>
-
-<p><a href="http://hustcat.github.io/vlan-performance-problem/">http://hustcat.github.io/vlan-performance-problem/</a></p>
-
-<p>veth设备qdisc队列，而环回设备/桥接设备是没qdisc队列的，参考br_dev_setup函数。</p>
-
-<h4>内核实现</h4>
-
-<p>在注册（创建）设备时，qdisc设置为noop_qdisc， register_netdevice -> dev_init_scheduler</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>void dev_init_scheduler(struct net_device *dev)
-</span><span class='line'>{
-</span><span class='line'>&#9;dev-&gt;qdisc = &noop_qdisc;
-</span><span class='line'>&#9;netdev_for_each_tx_queue(dev, dev_init_scheduler_queue, &noop_qdisc);
-</span><span class='line'>&#9;dev_init_scheduler_queue(dev, &dev-&gt;rx_queue, &noop_qdisc);
-</span><span class='line'>
-</span><span class='line'>&#9;setup_timer(&dev-&gt;watchdog_timer, dev_watchdog, (unsigned long)dev);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>打开设备时，如果没有配置qdisc时，就指定为默认的pfifo_fast队列： dev_open -> dev_activate，</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+  <div class="entry-content"><figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
 <span class='line-number'>3</span>
 <span class='line-number'>4</span>
@@ -512,407 +831,76 @@ var ss360Config = {
 <span class='line-number'>54</span>
 <span class='line-number'>55</span>
 <span class='line-number'>56</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>void dev_activate(struct net_device *dev)
-</span><span class='line'>{
-</span><span class='line'>&#9;int need_watchdog;
-</span><span class='line'>
-</span><span class='line'>&#9;/* No queueing discipline is attached to device;
-</span><span class='line'>&#9;   create default one i.e. pfifo_fast for devices,
-</span><span class='line'>&#9;   which need queueing and noqueue_qdisc for
-</span><span class='line'>&#9;   virtual interfaces
-</span><span class='line'>&#9; */
-</span><span class='line'>
-</span><span class='line'>&#9;if (dev-&gt;qdisc == &noop_qdisc)
-</span><span class='line'>&#9;&#9;attach_default_qdiscs(dev);
-</span><span class='line'>...
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>static void attach_default_qdiscs(struct net_device *dev)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct netdev_queue *txq;
-</span><span class='line'>&#9;struct Qdisc *qdisc;
-</span><span class='line'>
-</span><span class='line'>&#9;txq = netdev_get_tx_queue(dev, 0);
-</span><span class='line'>
-</span><span class='line'>&#9;if (!netif_is_multiqueue(dev) || dev-&gt;tx_queue_len == 0) {
-</span><span class='line'>&#9;&#9;netdev_for_each_tx_queue(dev, attach_one_default_qdisc, NULL);
-</span><span class='line'>&#9;&#9;dev-&gt;qdisc = txq-&gt;qdisc_sleeping;
-</span><span class='line'>&#9;&#9;atomic_inc(&dev-&gt;qdisc-&gt;refcnt);
-</span><span class='line'>&#9;} else {///multi queue
-</span><span class='line'>&#9;&#9;qdisc = qdisc_create_dflt(dev, txq, &mq_qdisc_ops, TC_H_ROOT);
-</span><span class='line'>&#9;&#9;if (qdisc) {
-</span><span class='line'>&#9;&#9;&#9;qdisc-&gt;ops-&gt;attach(qdisc);
-</span><span class='line'>&#9;&#9;&#9;dev-&gt;qdisc = qdisc;
-</span><span class='line'>&#9;&#9;}
-</span><span class='line'>&#9;}
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>static void attach_one_default_qdisc(struct net_device *dev,
-</span><span class='line'>&#9;&#9;&#9;&#9;     struct netdev_queue *dev_queue,
-</span><span class='line'>&#9;&#9;&#9;&#9;     void *_unused)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct Qdisc *qdisc;
-</span><span class='line'>
-</span><span class='line'>&#9;if (dev-&gt;tx_queue_len) {
-</span><span class='line'>&#9;&#9;qdisc = qdisc_create_dflt(dev, dev_queue,
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;  &pfifo_fast_ops, TC_H_ROOT);
-</span><span class='line'>&#9;&#9;if (!qdisc) {
-</span><span class='line'>&#9;&#9;&#9;printk(KERN_INFO "%s: activation failed\n", dev-&gt;name);
-</span><span class='line'>&#9;&#9;&#9;return;
-</span><span class='line'>&#9;&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;/* Can by-pass the queue discipline for default qdisc */
-</span><span class='line'>&#9;&#9;qdisc-&gt;flags |= TCQ_F_CAN_BYPASS;
-</span><span class='line'>&#9;} else {
-</span><span class='line'>&#9;&#9;qdisc =  &noqueue_qdisc;
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;dev_queue-&gt;qdisc_sleeping = qdisc;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>创建noqueue</h4>
-
-<p>开始尝试直接删除设备默认的pfifo_fast队列，发现会出错：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'># tc qdisc del dev vethd4ea root
-</span><span class='line'>RTNETLINK answers: No such file or directory
-</span><span class='line'># tc  -s qdisc ls dev vethd4ea
-</span><span class='line'>qdisc pfifo_fast 0: root refcnt 2 bands 3 priomap  1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1
-</span><span class='line'> Sent 29705382 bytes 441562 pkt (dropped 0, overlimits 0 requeues 0) 
-</span><span class='line'> backlog 0b 0p requeues 0 </span></code></pre></td></tr></table></div></figure>
-
-
-<p>后来看到Jesper Brouer给出一个替换默认队列的方式，尝试了一下，成功完成。</p>
-
-<p>替换默认的qdisc队列</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'># tc qdisc replace dev vethd4ea root pfifo limit 100
-</span><span class='line'># tc  -s qdisc ls dev vethd4ea                      
-</span><span class='line'>qdisc pfifo 8001: root refcnt 2 limit 100p
-</span><span class='line'> Sent 264 bytes 4 pkt (dropped 0, overlimits 0 requeues 0) 
-</span><span class='line'> backlog 0b 0p requeues 0 
-</span><span class='line'># ip link show vethd4ea
-</span><span class='line'>9: vethd4ea: &lt;BROADCAST,UP,LOWER_UP&gt; mtu 1500 qdisc pfifo master docker0 state UP mode DEFAULT qlen 1000
-</span><span class='line'>link/ether 3a:15:3b:e1:d7:6d brd ff:ff:ff:ff:ff:ff</span></code></pre></td></tr></table></div></figure>
-
-
-<p>修改队列长度</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'># ifconfig vethd4ea txqueuelen 0</span></code></pre></td></tr></table></div></figure>
-
-
-<p>删除qdisc</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'># tc qdisc del dev vethd4ea root                    
-</span><span class='line'># ip link show vethd4ea                
-</span><span class='line'>9: vethd4ea: &lt;BROADCAST,UP,LOWER_UP&gt; mtu 1500 qdisc noqueue master docker0 state UP mode DEFAULT 
-</span><span class='line'>link/ether 3a:15:3b:e1:d7:6d brd ff:ff:ff:ff:ff:ff</span></code></pre></td></tr></table></div></figure>
-
-
-<p>可以看到，UP的veth设备成功修改成noqueue。</p>
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2020/05/22/kernel-qdisc-init/">qdisc 的创建过程</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2020-05-22T11:12:00+08:00'><span class='date'>2020-05-22</span> <span class='time'>11:12:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://blog.chinaunix.net/uid-26902809-id-4106161.html">http://blog.chinaunix.net/uid-26902809-id-4106161.html</a></p>
-
-<p>register_netdevice会初始化netdev的Tx调度discipline, 缺省使用noop_qdisc</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>register_netdevice
-</span><span class='line'>---&gt;dev_init_scheduler
-</span><span class='line'>
-</span><span class='line'>
-</span><span class='line'>void dev_init_scheduler(struct net_device *dev)
-</span><span class='line'>{
-</span><span class='line'>&#9;dev-&gt;qdisc = &noop_qdisc; //缺省为设备配置noop_qdisc
-</span><span class='line'>&#9;netdev_for_each_tx_queue(dev, dev_init_scheduler_queue, &noop_qdisc); //缺省为每个队列配置noop_qdisc
-</span><span class='line'>&#9;if (dev_ingress_queue(dev))
-</span><span class='line'>&#9;&#9;dev_init_scheduler_queue(dev, dev_ingress_queue(dev), &noop_qdisc);
-</span><span class='line'>
-</span><span class='line'>&#9;setup_timer(&dev-&gt;watchdog_timer, dev_watchdog, (unsigned long)dev);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>dev_open
-</span><span class='line'>---&gt;__dev_open
-</span><span class='line'>----&gt;dev_activate
-</span><span class='line'>----&gt;attach_default_qdiscs
-</span><span class='line'>----&gt;attach_one_default_qdisc
-</span><span class='line'>为单队列的设备创建pfifo_fast的qdisc
-</span><span class='line'>
-</span><span class='line'>static void attach_one_default_qdisc(struct net_device *dev,
-</span><span class='line'>&#9;&#9;&#9;&#9;struct netdev_queue *dev_queue,
-</span><span class='line'>&#9;&#9;&#9;&#9;void *_unused)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct Qdisc *qdisc = &noqueue_qdisc;
-</span><span class='line'>
-</span><span class='line'>&#9;if (dev-&gt;tx_queue_len) {
-</span><span class='line'>&#9;&#9;qdisc = qdisc_create_dflt(dev_queue,
-</span><span class='line'>&#9;&#9;&#9;&#9;&pfifo_fast_ops, TC_H_ROOT);
-</span><span class='line'>&#9;&#9;if (!qdisc) {
-</span><span class='line'>&#9;&#9;&#9;netdev_info(dev, "activation failed\n");
-</span><span class='line'>&#9;&#9;&#9;return;
-</span><span class='line'>&#9;&#9;}
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;dev_queue-&gt;qdisc_sleeping = qdisc;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>dev_open
-</span><span class='line'>---&gt;__dev_open
-</span><span class='line'>----&gt;dev_activate
-</span><span class='line'>----&gt;attach_default_qdiscs
-</span><span class='line'>----&gt;qdisc_create_dflt
-</span><span class='line'>为多队列的设备创建mq_qdisc, 创建完mq_qdisc， 接着调用mq_qdisc_ops-&gt;mq_init函数为每个队列创建pfifo_fast_ops的qdisc
-</span><span class='line'>
-</span><span class='line'>struct Qdisc *qdisc_create_dflt(struct netdev_queue *dev_queue,
-</span><span class='line'>&#9;&#9;&#9;struct Qdisc_ops *ops, unsigned int parentid)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct Qdisc *sch;
-</span><span class='line'>
-</span><span class='line'>&#9;sch = qdisc_alloc(dev_queue, ops);
-</span><span class='line'>&#9;if (IS_ERR(sch))
-</span><span class='line'>&#9;&#9;goto errout;
-</span><span class='line'>&#9;sch-&gt;parent = parentid;
-</span><span class='line'>
-</span><span class='line'>&#9;if (!ops-&gt;init || ops-&gt;init(sch, NULL) == 0)
-</span><span class='line'>&#9;&#9;return sch;
-</span><span class='line'>
-</span><span class='line'>&#9;qdisc_destroy(sch);
-</span><span class='line'>errout:
-</span><span class='line'>&#9;return NULL;
-</span><span class='line'>}
-</span><span class='line'>EXPORT_SYMBOL(qdisc_create_dflt);</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>dev_open
-</span><span class='line'>---&gt;__dev_open
-</span><span class='line'>----&gt;dev_activate
-</span><span class='line'>----&gt;attach_default_qdiscs
-</span><span class='line'>static void attach_default_qdiscs(struct net_device *dev)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct netdev_queue *txq;
-</span><span class='line'>&#9;struct Qdisc *qdisc;
-</span><span class='line'>
-</span><span class='line'>&#9;txq = netdev_get_tx_queue(dev, 0);
-</span><span class='line'>
-</span><span class='line'>&#9;if (!netif_is_multiqueue(dev) || dev-&gt;tx_queue_len == 0) {
-</span><span class='line'>&#9;&#9;netdev_for_each_tx_queue(dev, attach_one_default_qdisc, NULL);
-</span><span class='line'>&#9;&#9;dev-&gt;qdisc = txq-&gt;qdisc_sleeping;
-</span><span class='line'>&#9;&#9;atomic_inc(&dev-&gt;qdisc-&gt;refcnt);
-</span><span class='line'>&#9;} else {
-</span><span class='line'>&#9;&#9;qdisc = qdisc_create_dflt(txq, &mq_qdisc_ops, TC_H_ROOT);
-</span><span class='line'>&#9;&#9;if (qdisc) {
-</span><span class='line'>&#9;&#9;&#9;qdisc-&gt;ops-&gt;attach(qdisc);
-</span><span class='line'>&#9;&#9;&#9;dev-&gt;qdisc = qdisc;
-</span><span class='line'>&#9;&#9;}
-</span><span class='line'>&#9;}
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>dev_open函数会调用dev_activate：
-</span><span class='line'>a. 为单队列的设备创建pfifo_fast的qdisc
-</span><span class='line'>b. 为多队列的设备创建mq_qdisc, 创建完mq_qdisc， 接着调用mq_qdisc_ops-&gt;mq_init函数为每个队列创建pfifo_fast_ops的qdisc
-</span><span class='line'>dev_open
-</span><span class='line'>---&gt;__dev_open
-</span><span class='line'>----&gt;dev_activate
-</span><span class='line'>
-</span><span class='line'>void dev_activate(struct net_device *dev)
-</span><span class='line'>{
-</span><span class='line'>&#9;int need_watchdog;
-</span><span class='line'>
-</span><span class='line'>&#9;/* No queueing discipline is attached to device;
-</span><span class='line'>&#9;   create default one i.e. pfifo_fast for devices,
-</span><span class='line'>&#9;   which need queueing and noqueue_qdisc for
-</span><span class='line'>&#9;   virtual interfaces
-</span><span class='line'>&#9;*/
-</span><span class='line'>
-</span><span class='line'>&#9;if (dev-&gt;qdisc == &noop_qdisc)
-</span><span class='line'>&#9;&#9;attach_default_qdiscs(dev);
-</span><span class='line'>
-</span><span class='line'>&#9;if (!netif_carrier_ok(dev))
-</span><span class='line'>&#9;/* Delay activation until next carrier-on event */
-</span><span class='line'>&#9;&#9;return;
-</span><span class='line'>
-</span><span class='line'>&#9;need_watchdog = 0;
-</span><span class='line'>&#9;netdev_for_each_tx_queue(dev, transition_one_qdisc, &need_watchdog);
-</span><span class='line'>&#9;if (dev_ingress_queue(dev))
-</span><span class='line'>&#9;&#9;transition_one_qdisc(dev, dev_ingress_queue(dev), NULL);
-</span><span class='line'>
-</span><span class='line'>&#9;if (need_watchdog) {
-</span><span class='line'>&#9;&#9;dev-&gt;trans_start = jiffies;
-</span><span class='line'>&#9;&#9;dev_watchdog_up(dev);
-</span><span class='line'>&#9;}
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>diff --git a/src/4.15.18/tcp_output.c b/src/4.15.18/tcp_output.c
+</span><span class='line'>index 82613f5..270545e 100644
+</span><span class='line'>--- a/src/4.15.18/tcp_output.c
+</span><span class='line'>+++ b/src/4.15.18/tcp_output.c
+</span><span class='line'>@@ -52,6 +52,7 @@
+</span><span class='line'> #include "fec_core.h"
+</span><span class='line'> 
+</span><span class='line'> u32 sysctl_post_local = 0xffffff00;
+</span><span class='line'>+int sysctl_mss_adjust = 0;
+</span><span class='line'> 
+</span><span class='line'> static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
+</span><span class='line'>             int push_one, gfp_t gfp);
+</span><span class='line'>@@ -1720,6 +1721,8 @@ unsigned int tcp_current_mss(struct sock *sk)
+</span><span class='line'>          mss_now = tcp_sync_mss(sk, mtu);
+</span><span class='line'>  }
+</span><span class='line'> 
+</span><span class='line'>+ mss_now -= sysctl_mss_adjust;
+</span><span class='line'>+
+</span><span class='line'>  header_len = tcp_established_options(sk, NULL, &opts, &md5, getconninfo(sk)) +
+</span><span class='line'>           sizeof(struct tcphdr);
+</span><span class='line'>  /* The mss_cache is sized based on tp-&gt;tcp_header_len, which assumes
+</span><span class='line'>@@ -3401,6 +3404,7 @@ struct sk_buff *tcp_make_synack(const struct sock *sk, struct dst_entry *dst,
+</span><span class='line'>  skb_dst_set(skb, dst);
+</span><span class='line'> 
+</span><span class='line'>  mss = tcp_mss_clamp(tp, dst_metric_advmss(dst));
+</span><span class='line'>+ mss -= sysctl_mss_adjust;
+</span><span class='line'> 
+</span><span class='line'>  memset(&opts, 0, sizeof(opts));
+</span><span class='line'> #ifdef CONFIG_SYN_COOKIES
+</span><span class='line'>@@ -3561,6 +3565,7 @@ static void tcp_connect_init(struct sock *sk)
+</span><span class='line'>  if (!tp-&gt;window_clamp)
+</span><span class='line'>      tp-&gt;window_clamp = dst_metric(dst, RTAX_WINDOW);
+</span><span class='line'>  tp-&gt;advmss = tcp_mss_clamp(tp, dst_metric_advmss(dst));
+</span><span class='line'>+ tp-&gt;advmss -= sysctl_mss_adjust;
+</span><span class='line'> 
+</span><span class='line'>  tcp_initialize_rcv_mss(sk);
+</span><span class='line'> 
+</span><span class='line'>diff --git a/src/io_sysctl.c b/src/io_sysctl.c
+</span><span class='line'>index c3b2ddd..6fdc1df 100644
+</span><span class='line'>--- a/src/io_sysctl.c
+</span><span class='line'>+++ b/src/io_sysctl.c
+</span><span class='line'>@@ -9,6 +9,7 @@ extern int sysctl_detail;
+</span><span class='line'> extern int sysctl_data_ssthresh;
+</span><span class='line'> 
+</span><span class='line'> extern int sysctl_post_local;
+</span><span class='line'>+extern int sysctl_mss_adjust;
+</span><span class='line'> 
+</span><span class='line'> extern unsigned long total_session;
+</span><span class='line'> extern unsigned long current_session;
+</span><span class='line'>@@ -39,6 +40,13 @@ static struct ctl_table tcp_sysctl_table[] = {
+</span><span class='line'>      .mode = 0644,
+</span><span class='line'>      .proc_handler = proc_dointvec
+</span><span class='line'>  },
+</span><span class='line'>+ {
+</span><span class='line'>+     .procname = "mss_adjust",
+</span><span class='line'>+     .data = &sysctl_mss_adjust,
+</span><span class='line'>+     .maxlen = sizeof(int),
+</span><span class='line'>+     .mode = 0644,
+</span><span class='line'>+     .proc_handler = proc_dointvec
+</span><span class='line'>+ },
+</span><span class='line'>  {
+</span><span class='line'>      .procname = "total_session",
+</span><span class='line'>      .data = &total_session,</span></code></pre></td></tr></table></div></figure>
 
 
 
@@ -937,7 +925,7 @@ var ss360Config = {
   
     <section>
 <h1>Categories
-<span class='right_span'>(903)</span>
+<span class='right_span'>(913)</span>
 
 </h1>
 <head>
@@ -968,7 +956,7 @@ if (!document.getElementById('blog~octopress')) document.getElementById('aexp_bl
 if (!document.getElementById('blog')) document.getElementById('aexp_blog').style.visibility = 'hidden';
 if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ruby').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(138)</span></li>
+<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(142)</span></li>
 <div id='language' class='catsub'><li><a href='/blog/cats/language~c/?opendiv=language'>c</a><a href='##' onmousedown=showDiv('language~c') id='aexp_language~c'><span class='exp_style' id='exp_language~c'>[+]</span></a><span class='right_span'>32</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~c')) document.getElementById('aexp_language~c').style.visibility = 'hidden';
@@ -985,7 +973,7 @@ if (!document.getElementById('language~java')) document.getElementById('aexp_lan
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~jsp')) document.getElementById('aexp_language~jsp').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/language~php/?opendiv=language'>php</a><a href='##' onmousedown=showDiv('language~php') id='aexp_language~php'><span class='exp_style' id='exp_language~php'>[+]</span></a><span class='right_span'>43</span></li>
+<li><a href='/blog/cats/language~php/?opendiv=language'>php</a><a href='##' onmousedown=showDiv('language~php') id='aexp_language~php'><span class='exp_style' id='exp_language~php'>[+]</span></a><span class='right_span'>44</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~php')) document.getElementById('aexp_language~php').style.visibility = 'hidden';
 </script>
@@ -993,7 +981,7 @@ if (!document.getElementById('language~php')) document.getElementById('aexp_lang
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~python')) document.getElementById('aexp_language~python').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/language~web/?opendiv=language'>web</a><a href='##' onmousedown=showDiv('language~web') id='aexp_language~web'><span class='exp_style' id='exp_language~web'>[+]</span></a><span class='right_span'>42</span></li>
+<li><a href='/blog/cats/language~web/?opendiv=language'>web</a><a href='##' onmousedown=showDiv('language~web') id='aexp_language~web'><span class='exp_style' id='exp_language~web'>[+]</span></a><span class='right_span'>45</span></li>
 </div><script language='javascript' type='text/javascript'>
 if (!document.getElementById('language')) document.getElementById('aexp_language').style.visibility = 'hidden';
 if (!document.getElementById('language~web')) document.getElementById('aexp_language~web').style.visibility = 'hidden';
@@ -1022,7 +1010,7 @@ if (!document.getElementById('assembly~base')) document.getElementById('aexp_ass
 if (!document.getElementById('assembly')) document.getElementById('aexp_assembly').style.visibility = 'hidden';
 if (!document.getElementById('assembly~win')) document.getElementById('aexp_assembly~win').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(194)</span></li>
+<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(198)</span></li>
 <div id='tools' class='catsub'><li><a href='/blog/cats/tools~apache2/?opendiv=tools'>apache2</a><a href='##' onmousedown=showDiv('tools~apache2') id='aexp_tools~apache2'><span class='exp_style' id='exp_tools~apache2'>[+]</span></a><span class='right_span'>9</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~apache2')) document.getElementById('aexp_tools~apache2').style.visibility = 'hidden';
@@ -1063,7 +1051,7 @@ if (!document.getElementById('tools~haproxy')) document.getElementById('aexp_too
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~isal')) document.getElementById('aexp_tools~isal').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/tools~mysql/?opendiv=tools'>mysql</a><a href='##' onmousedown=showDiv('tools~mysql') id='aexp_tools~mysql'><span class='exp_style' id='exp_tools~mysql'>[+]</span></a><span class='right_span'>29</span></li>
+<li><a href='/blog/cats/tools~mysql/?opendiv=tools'>mysql</a><a href='##' onmousedown=showDiv('tools~mysql') id='aexp_tools~mysql'><span class='exp_style' id='exp_tools~mysql'>[+]</span></a><span class='right_span'>30</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~mysql')) document.getElementById('aexp_tools~mysql').style.visibility = 'hidden';
 </script>
@@ -1103,7 +1091,7 @@ if (!document.getElementById('tools~socksvpn')) document.getElementById('aexp_to
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~sqlmap')) document.getElementById('aexp_tools~sqlmap').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/tools~sqlserver/?opendiv=tools'>sqlserver</a><a href='##' onmousedown=showDiv('tools~sqlserver') id='aexp_tools~sqlserver'><span class='exp_style' id='exp_tools~sqlserver'>[+]</span></a><span class='right_span'>8</span></li>
+<li><a href='/blog/cats/tools~sqlserver/?opendiv=tools'>sqlserver</a><a href='##' onmousedown=showDiv('tools~sqlserver') id='aexp_tools~sqlserver'><span class='exp_style' id='exp_tools~sqlserver'>[+]</span></a><span class='right_span'>11</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~sqlserver')) document.getElementById('aexp_tools~sqlserver').style.visibility = 'hidden';
 </script>
@@ -1132,12 +1120,12 @@ if (!document.getElementById('tools~vim')) document.getElementById('aexp_tools~v
 if (!document.getElementById('tools')) document.getElementById('aexp_tools').style.visibility = 'hidden';
 if (!document.getElementById('tools~wxwork')) document.getElementById('aexp_tools~wxwork').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/system/'>system</a><a href='##' onmousedown=showDiv('system') id='aexp_system'><span class='exp_style' id='exp_system'>[+]</span></a><span class='right_span'>(109)</span></li>
-<div id='system' class='catsub'><li><a href='/blog/cats/system~base/?opendiv=system'>base</a><a href='##' onmousedown=showDiv('system~base') id='aexp_system~base'><span class='exp_style' id='exp_system~base'>[+]</span></a><span class='right_span'>23</span></li>
+<li class='catclass'><a href='/blog/cats/system/'>system</a><a href='##' onmousedown=showDiv('system') id='aexp_system'><span class='exp_style' id='exp_system'>[+]</span></a><span class='right_span'>(111)</span></li>
+<div id='system' class='catsub'><li><a href='/blog/cats/system~base/?opendiv=system'>base</a><a href='##' onmousedown=showDiv('system~base') id='aexp_system~base'><span class='exp_style' id='exp_system~base'>[+]</span></a><span class='right_span'>24</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('system~base')) document.getElementById('aexp_system~base').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/system~centos/?opendiv=system'>centos</a><a href='##' onmousedown=showDiv('system~centos') id='aexp_system~centos'><span class='exp_style' id='exp_system~centos'>[+]</span></a><span class='right_span'>15</span></li>
+<li><a href='/blog/cats/system~centos/?opendiv=system'>centos</a><a href='##' onmousedown=showDiv('system~centos') id='aexp_system~centos'><span class='exp_style' id='exp_system~centos'>[+]</span></a><span class='right_span'>16</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('system~centos')) document.getElementById('aexp_system~centos').style.visibility = 'hidden';
 </script>
@@ -1371,7 +1359,7 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 
 <section>
 <h1>Date Categories
-<span class='right_span'>(903)</span>
+<span class='right_span'>(913)</span>
 
 </h1>
 <head>
@@ -1379,8 +1367,9 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(23)</span></li>
-<div id='2024' class='catsub'><li><a href='/blog/cats/2024~06/?opendiv=2024'>2024-06</a><span class='right_span'>2</span></li>
+<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(33)</span></li>
+<div id='2024' class='catsub'><li><a href='/blog/cats/2024~07/?opendiv=2024'>2024-07</a><span class='right_span'>10</span></li>
+<li><a href='/blog/cats/2024~06/?opendiv=2024'>2024-06</a><span class='right_span'>2</span></li>
 <li><a href='/blog/cats/2024~05/?opendiv=2024'>2024-05</a><span class='right_span'>5</span></li>
 <li><a href='/blog/cats/2024~04/?opendiv=2024'>2024-04</a><span class='right_span'>5</span></li>
 <li><a href='/blog/cats/2024~03/?opendiv=2024'>2024-03</a><span class='right_span'>5</span></li>
@@ -1546,43 +1535,43 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
   <ul id="recent_posts">
     
       <li class="post">
-        <a href="/blog/2024/06/20/lang-php-date_sun_info/">PHP中的date_sun_info()函数, 日落/日出时间</a>
+        <a href="/blog/2024/07/15/tools-sqlserver-sys/">sql server系统表详细说明</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/06/20/centos-mkconfig/">grub2-mkconfig</a>
+        <a href="/blog/2024/07/15/tools-sqlserver-cols/">SQLserver查询数据库所有字段-表名</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/05/23/lang-lunar/">农历节气查表</a>
+        <a href="/blog/2024/07/15/tools-mysql-socket/">MySQL下的socket文件作用</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/05/17/rpmbuild-check/">rpmbuild 错误：发现已安装(但未打包的)文件</a>
+        <a href="/blog/2024/07/15/lang-php-iconv/">iconv与mb_convert_encoding的使用</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/05/16/lang-centos8-php8/">Centos8安装PHP8</a>
+        <a href="/blog/2024/07/15/bat/">Linux查看电池损耗</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/05/16/centos8-kernel/">CentOS8 编译内核错误</a>
+        <a href="/blog/2024/07/15/lang-web-box/">JavaScript的三种弹出提示框(alert、confirm、prompt)</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/05/11/centos8.5-install/">CentOS8.5 安装</a>
+        <a href="/blog/2024/07/15/lang-web-copy/">JavaScript复制内容到剪切板</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/04/30/mariadb/">centos 安装 MariaDB</a>
+        <a href="/blog/2024/07/15/lang-web-alert/">alert 弹窗去掉上方 title 网址域名</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/04/29/strongswan-make/">ubuntu 编译strongswan</a>
+        <a href="/blog/2024/07/15/tools-sqlserver-space/">SQL Server查看所有表大小，所占空间</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/04/29/tools-squid-log/">squid 日志格式, 时间格式</a>
+        <a href="/blog/2024/07/12/centos7-yum/">CentOS7 yum</a>
       </li>
     
   </ul>

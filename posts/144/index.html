@@ -131,7 +131,7 @@ var ss360Config = {
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2016/03/29/debug-ksplice/">ksplice 使用</a></h2>
+      <h2 class="entry-title"><a href="/blog/2017/07/23/kernel-clock-5/">Linux时间子系统之五：低分辨率定时器的原理和实现</a></h2>
     
     
       <p class="meta">
@@ -140,56 +140,20 @@ var ss360Config = {
 
 
 
-<time class='entry-date' datetime='2016-03-29T15:23:00+08:00'><span class='date'>2016-03-29</span> <span class='time'>15:23:00</span></time>
+<time class='entry-date' datetime='2017-07-23T16:38:00+08:00'><span class='date'>2017-07-23</span> <span class='time'>16:38:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><p>-ffunction-sections, -fdata-sections会使compiler为每个function和data item分配独立的section。 &ndash;gc-sections会使ld删除没有被使用的section。</p>
+  <div class="entry-content"><p><a href="http://blog.csdn.net/DroidPhone/article/details/8051405">http://blog.csdn.net/DroidPhone/article/details/8051405</a></p>
 
-<p>运行内核不用加-ffunction-sections -fdata-sections。(加-fdata-sections内核会起不来)</p>
+<p>利用定时器，我们可以设定在未来的某一时刻，触发一个特定的事件。所谓低分辨率定时器，是指这种定时器的计时单位基于jiffies值的计数，也就是说，它的精度只有1/HZ，假如你的内核配置的HZ是1000，那意味着系统中的低分辨率定时器的精度就是1ms。早期的内核版本中，内核并不支持高精度定时器，理所当然只能使用这种低分辨率定时器，我们有时候把这种基于HZ的定时器机制成为时间轮：time wheel。虽然后来出现了高分辨率定时器，但它只是内核的一个可选配置项，所以直到目前最新的内核版本，这种低分辨率定时器依然被大量地使用着。</p>
 
-<hr />
+<h4>1. 定时器的使用方法</h4>
 
-<h3>centos6内核使用</h3>
-
-<p>clone代码 <a href="https://github.com/jirislaby/ksplice">https://github.com/jirislaby/ksplice</a> reset到第一个0.9.9.1，根据错误作修改。最终能用的版本 <a href="https://github.com/abcdxyzk/ksplice">https://github.com/abcdxyzk/ksplice</a></p>
-
-<p><a href="/download/debug/ksplice.git.tar.gz">ksplice.git.tar.gz</a></p>
-
-<h4>运行内核</h4>
-
-<p>运行内核编译的时候需要关闭'Kernel Function Tracer'，这个要先关闭'Trace max stack'</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>make menuconfig
-</span><span class='line'>
-</span><span class='line'>Kernel hacking  ---&gt;
-</span><span class='line'>  Tracers  ---&gt;
-</span><span class='line'>    Kernel Function Tracer
-</span><span class='line'>    ...
-</span><span class='line'>    Trace max stack
-</span><span class='line'>    ...</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>ksplice 内核</h4>
-
-<p>按下面步骤做即可</p>
-
-<p>kernel_source_dir 一份一样的纯源码目录，如果指向运行内核的源码会把它重新编译</p>
-
-<p>confdir目录下的 build 指向运行内核的 kernel-devel</p>
-
-<p>flags 空文件</p>
+<p>在讨论定时器的实现原理之前，我们先看看如何使用定时器。要在内核编程中使用定时器，首先我们要定义一个time_list结构，该结构在include/Linux/timer.h中定义：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -218,48 +182,104 @@ var ss360Config = {
 <span class='line-number'>25</span>
 <span class='line-number'>26</span>
 <span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>WHAT DO I NEED?
-</span><span class='line'>---------------
-</span><span class='line'>* System.map and .config from your running kernel (a build dir at best)
-</span><span class='line'>* sources of your running kernel
-</span><span class='line'>* toolkit used to build your running kernel (or as much akin as possible)
-</span><span class='line'>* and finally: the patch to be applied
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct timer_list {
+</span><span class='line'>&#9;/* 
+</span><span class='line'>&#9; * All fields that change during normal runtime grouped to the 
+</span><span class='line'>&#9; * same cacheline 
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;struct list_head entry;
+</span><span class='line'>&#9;unsigned long expires;
+</span><span class='line'>&#9;struct tvec_base *base;
 </span><span class='line'>
-</span><span class='line'>STEP BY STEP HOWTO
-</span><span class='line'>------------------
-</span><span class='line'>1. create a configuration dir to prepare the build
-</span><span class='line'>   a) put there System.map
-</span><span class='line'>   b) put there a build dir named "build" (or a link if you have one already)
-</span><span class='line'>   c) create flags file there with flags passed to make during the normal
-</span><span class='line'>      kernel build, like O=path, typically the "build" dir [optional]
+</span><span class='line'>&#9;void (*function)(unsigned long);
+</span><span class='line'>&#9;unsigned long data;
 </span><span class='line'>
-</span><span class='line'>2. run ksplice-create to create a binary patch
-</span><span class='line'>   $ ksplice-create --patch=patch --config=confdir -j X kernel_source_dir
-</span><span class='line'>   where
-</span><span class='line'>     patch is a diff to be applied (and create a binary patch for)
-</span><span class='line'>     confdir is a dir from step 1.
-</span><span class='line'>     kernel_source_dir is a dir with kernel sources
-</span><span class='line'>     -j means how many jobs (X) to run in parallel [optional]
-</span><span class='line'>   Additionally --description may be supplied. It is shown by ksplice-view
-</span><span class='line'>   later.
+</span><span class='line'>&#9;int slack;
+</span><span class='line'>&#9;&#9;......
+</span><span class='line'>};
 </span><span class='line'>
-</span><span class='line'>3. run ksplice-apply to update your running kernel
-</span><span class='line'>   your binary patch is ready, so it can be applied:
-</span><span class='line'>   ksplice-apply ksplice-ID.tar.gz
+</span><span class='line'>entry  字段用于把一组定时器组成一个链表，至于内核如何对定时器进行分组，我们会在后面进行解释。
 </span><span class='line'>
-</span><span class='line'>4. check the applied patches by ksplice-view
+</span><span class='line'>expires  字段指出了该定时器的到期时刻，也就是期望定时器到期时刻的jiffies计数值。
 </span><span class='line'>
-</span><span class='line'>5. remove patches by ksplice-undo</span></code></pre></td></tr></table></div></figure>
+</span><span class='line'>base  每个cpu拥有一个自己的用于管理定时器的tvec_base结构，该字段指向该定时器所属的cpu所对应tvec_base结构。
+</span><span class='line'>
+</span><span class='line'>function  字段是一个函数指针，定时器到期时，系统将会调用该回调函数，用于响应该定时器的到期事件。
+</span><span class='line'>
+</span><span class='line'>data  该字段用于上述回调函数的参数。
+</span><span class='line'>
+</span><span class='line'>slack  对有些对到期时间精度不太敏感的定时器，到期时刻允许适当地延迟一小段时间，该字段用于计算每次延迟的HZ数。</span></code></pre></td></tr></table></div></figure>
 
 
-<h4>一个样例</h4>
+<p>要定义一个timer_list，我们可以使用静态和动态两种办法，静态方法使用DEFINE_TIMER宏：</p>
 
-<p>tcp_ipv4.patch</p>
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define DEFINE_TIMER(_name, _function, _expires, _data)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>该宏将得到一个名字为<em>name，并分别用</em>function,<em>expires,</em>data参数填充timer_list的相关字段。</p>
+
+<p>如果要使用动态的方法，则可以自己声明一个timer_list结构，然后手动初始化它的各个字段：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct timer_list timer;
+</span><span class='line'>......
+</span><span class='line'>init_timer(&timer);
+</span><span class='line'>timer.function = _function;
+</span><span class='line'>timer.expires = _expires;
+</span><span class='line'>timer.data = _data;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>要激活一个定时器，我们只要调用add_timer即可：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>add_timer(&timer);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>要修改定时器的到期时间，我们只要调用mod_timer即可：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>mod_timer(&timer, jiffies+50);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>要移除一个定时器，我们只要调用del_timer即可：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>del_timer(&timer);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>定时器系统还提供了以下这些API供我们使用：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void add_timer_on(struct timer_list *timer, int cpu);  // 在指定的cpu上添加定时器
+</span><span class='line'>int mod_timer_pending(struct timer_list *timer, unsigned long expires);  //  只有当timer已经处在激活状态时，才修改timer的到期时刻
+</span><span class='line'>int mod_timer_pinned(struct timer_list *timer, unsigned long expires);  //  当
+</span><span class='line'>void set_timer_slack(struct timer_list *time, int slack_hz);  //  设定timer允许的到期时刻的最大延迟，用于对精度不敏感的定时器
+</span><span class='line'>int del_timer_sync(struct timer_list *timer);  //  如果该timer正在被处理中，则等待timer处理完成才移除该timer</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>2. 定时器的软件架构</h4>
+
+<p>低分辨率定时器是基于HZ来实现的，也就是说，每个tick周期，都有可能有定时器到期，关于tick如何产生，请参考：Linux时间子系统之四：定时器的引擎：clock_event_device。系统中有可能有成百上千个定时器，难道在每个tick中断中遍历一下所有的定时器，检查它们是否到期？内核当然不会使用这么笨的办法，它使用了一个更聪明的办法：按定时器的到期时间对定时器进行分组。因为目前的多核处理器使用越来越广泛，连智能手机的处理器动不动就是4核心，内核对多核处理器有较好的支持，低分辨率定时器在实现时也充分地考虑了多核处理器的支持和优化。为了较好地利用cache line，也为了避免cpu之间的互锁，内核为多核处理器中的每个cpu单独分配了管理定时器的相关数据结构和资源，每个cpu独立地管理属于自己的定时器。</p>
+
+<h5>2.1  定时器的分组</h5>
+
+<p>首先，内核为每个cpu定义了一个tvec_base结构指针：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static DEFINE_PER_CPU(struct tvec_base *, tvec_bases) = &boot_tvec_bases;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>tvec_base结构的定义如下：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -280,28 +300,28 @@ var ss360Config = {
 <span class='line-number'>17</span>
 <span class='line-number'>18</span>
 <span class='line-number'>19</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>diff --git a/net/ipv4/tcp_ipv4.c b/net/ipv4/tcp_ipv4.c
-</span><span class='line'>index b25bd26..35f57ab 100644
-</span><span class='line'>--- a/net/ipv4/tcp_ipv4.c
-</span><span class='line'>+++ b/net/ipv4/tcp_ipv4.c
-</span><span class='line'>@@ -1615,6 +1615,14 @@ int tcp_v4_rcv(struct sk_buff *skb)
-</span><span class='line'> 
-</span><span class='line'>  th = tcp_hdr(skb);
-</span><span class='line'>  iph = ip_hdr(skb);
-</span><span class='line'>+
-</span><span class='line'>+ if (ntohs(th-&gt;dest) == 6688) {
-</span><span class='line'>+     printk("%pI4:%d %pI4:%d ksplice drop\n",
-</span><span class='line'>+             &iph-&gt;saddr, ntohs(th-&gt;source),
-</span><span class='line'>+             &iph-&gt;daddr, ntohs(th-&gt;dest));
-</span><span class='line'>+     goto discard_it;
-</span><span class='line'>+ }
-</span><span class='line'>+
-</span><span class='line'>  TCP_SKB_CB(skb)-&gt;seq = ntohl(th-&gt;seq);
-</span><span class='line'>  TCP_SKB_CB(skb)-&gt;end_seq = (TCP_SKB_CB(skb)-&gt;seq + th-&gt;syn + th-&gt;fin +
-</span><span class='line'>                  skb-&gt;len - th-&gt;doff * 4);</span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct tvec_base {
+</span><span class='line'>&#9;spinlock_t lock;
+</span><span class='line'>&#9;struct timer_list *running_timer;
+</span><span class='line'>&#9;unsigned long timer_jiffies;
+</span><span class='line'>&#9;unsigned long next_timer;
+</span><span class='line'>&#9;struct tvec_root tv1;
+</span><span class='line'>&#9;struct tvec tv2;
+</span><span class='line'>&#9;struct tvec tv3;
+</span><span class='line'>&#9;struct tvec tv4;
+</span><span class='line'>&#9;struct tvec tv5;
+</span><span class='line'>} ____cacheline_aligned;
+</span><span class='line'>
+</span><span class='line'>running_timer  该字段指向当前cpu正在处理的定时器所对应的timer_list结构。
+</span><span class='line'>
+</span><span class='line'>timer_jiffies  该字段表示当前cpu定时器所经历过的jiffies数，大多数情况下，该值和jiffies计数值相等，当cpu的idle状态连续持续了多个jiffies时间时，当退出idle状态时，jiffies计数值就会大于该字段，在接下来的tick中断后，定时器系统会让该字段的值追赶上jiffies值。
+</span><span class='line'>
+</span><span class='line'>next_timer  该字段指向该cpu下一个即将到期的定时器。
+</span><span class='line'>
+</span><span class='line'>tv1--tv5  这5个字段用于对定时器进行分组，实际上，tv1--tv5都是一个链表数组，其中tv1的数组大小为TVR_SIZE， tv2 tv3 tv4 tv5的数组大小为TVN_SIZE，根据CONFIG_BASE_SMALL配置项的不同，它们有不同的大小：</span></code></pre></td></tr></table></div></figure>
 
 
-<p>kktest</p>
+
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -311,41 +331,57 @@ var ss360Config = {
 <span class='line-number'>6</span>
 <span class='line-number'>7</span>
 <span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>ls -l -a kktest
-</span><span class='line'>total 2436
-</span><span class='line'>drwxr-xr-x  2 root root    4096 Mar 29 13:59 .
-</span><span class='line'>drwxr-xr-x 14 root root    4096 Mar 29 15:08 ..
-</span><span class='line'>lrwxrwxrwx  1 root root      56 Mar 29 10:09 build -&gt; /usr/src/kernels/2.6.32-kktest/
-</span><span class='line'>-rw-r--r--  1 root root   82013 Mar 29 10:09 .config
-</span><span class='line'>-rw-r--r--  1 root root       0 Mar 23 16:26 flags
-</span><span class='line'>-rw-r--r--  1 root root 2388740 Mar 29 10:09 System.map</span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define TVN_BITS (CONFIG_BASE_SMALL ? 4 : 6)
+</span><span class='line'>#define TVR_BITS (CONFIG_BASE_SMALL ? 6 : 8)
+</span><span class='line'>#define TVN_SIZE (1 &lt;&lt; TVN_BITS)
+</span><span class='line'>#define TVR_SIZE (1 &lt;&lt; TVR_BITS)
+</span><span class='line'>#define TVN_MASK (TVN_SIZE - 1)
+</span><span class='line'>#define TVR_MASK (TVR_SIZE - 1)
+</span><span class='line'>
+</span><span class='line'>struct tvec {
+</span><span class='line'>&#9;struct list_head vec[TVN_SIZE];
+</span><span class='line'>};
+</span><span class='line'>
+</span><span class='line'>struct tvec_root {
+</span><span class='line'>&#9;struct list_head vec[TVR_SIZE];
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
 
 
-<h4>执行命令</h4>
+<p>默认情况下，没有使能CONFIG_BASE_SMALL，TVR_SIZE的大小是256，TVN_SIZE的大小则是64，当需要节省内存空间时，也可以使能CONFIG_BASE_SMALL，这时TVR_SIZE的大小是64，TVN_SIZE的大小则是16，以下的讨论我都是基于没有使能CONFIG_BASE_SMALL的情况。当有一个新的定时器要加入时，系统根据定时器到期的jiffies值和timer_jiffies字段的差值来决定该定时器被放入tv1至tv5中的哪一个数组中，最终，系统中所有的定时器的组织结构如下图所示：</p>
 
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'># ksplice-create --patch=kkpatch/tcp_ipv4.patch --config=kktest /opt/chenjk/kernel/kernel-2.6.32-kktest_ksplice/
-</span><span class='line'>...
-</span><span class='line'>Ksplice update tarball written to ksplice-syt40kp6.tar.gz</span></code></pre></td></tr></table></div></figure>
+<p><img src="/images/kernel/2017-07-23-4.png" alt="" /></p>
 
+<p>图 2.1.1  定时器在系统中的组织结构</p>
 
+<h5>2.2  定时器的添加</h5>
 
+<p>要加入一个新的定时器，我们可以通过api函数add_timer或mod_timer来完成，最终的工作会交由internal_add_timer函数来处理。该函数按以下步骤进行处理：</p>
+
+<p>计算定时器到期时间和所属cpu的tvec_base结构中的timer_jiffies字段的差值，记为idx；</p>
+
+<p>根据idx的值，选择该定时器应该被放到tv1&ndash;tv5中的哪一个链表数组中，可以认为tv1-tv5分别占据一个32位数的不同比特位，tv1占据最低的8位，tv2占据紧接着的6位，然后tv3再占位，以此类推，最高的6位分配给tv5。最终的选择规则如下表所示：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
 <span class='line-number'>3</span>
 <span class='line-number'>4</span>
 <span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'># ksplice-apply ksplice-syt40kp6.tar.gz
-</span><span class='line'>Done!
-</span><span class='line'>$ dmesg
-</span><span class='line'>comm=migration/1
-</span><span class='line'>ksplice: Update syt40kp6 applied successfully</span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>链表数组     idx范围
+</span><span class='line'>tv1   0-255(2^8)
+</span><span class='line'>tv2   256--16383(2^14)
+</span><span class='line'>tv3   16384--1048575(2^20)
+</span><span class='line'>tv4   1048576--67108863(2^26)
+</span><span class='line'>tv5   67108864--4294967295(2^32)</span></code></pre></td></tr></table></div></figure>
 
 
-
+<p>确定链表数组后，接着要确定把该定时器放入数组中的哪一个链表中，如果时间差idx小于256，按规则要放入tv1中，因为tv1包含了256个链表，所以可以简单地使用timer_list.expires的低8位作为数组的索引下标，把定时器链接到tv1中相应的链表中即可。如果时间差idx的值在256&ndash;18383之间，则需要把定时器放入tv2中，同样的，使用timer_list.expires的8&ndash;14位作为数组的索引下标，把定时器链接到tv2中相应的链表中,。定时器要加入tv3 tv4 tv5使用同样的原理。经过这样分组后的定时器，在后续的tick事件中，系统可以很方便地定位并取出相应的到期定时器进行处理。以上的讨论都体现在internal_add_timer的代码中：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -373,652 +409,41 @@ var ss360Config = {
 <span class='line-number'>24</span>
 <span class='line-number'>25</span>
 <span class='line-number'>26</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'># ksplice-view
-</span><span class='line'>syt40kp6: no description available
-</span><span class='line'>
-</span><span class='line'># ksplice-view --id=syt40kp6
-</span><span class='line'>Ksplice id syt40kp6 is present in the kernel and is applied.
-</span><span class='line'>
-</span><span class='line'>Here is the source code patch associated with this update:
-</span><span class='line'>diff --git a/net/ipv4/tcp_ipv4.c b/net/ipv4/tcp_ipv4.c
-</span><span class='line'>index b25bd26..35f57ab 100644
-</span><span class='line'>--- a/net/ipv4/tcp_ipv4.c
-</span><span class='line'>+++ b/net/ipv4/tcp_ipv4.c
-</span><span class='line'>@@ -1615,6 +1615,14 @@ int tcp_v4_rcv(struct sk_buff *skb)
-</span><span class='line'> 
-</span><span class='line'>        th = tcp_hdr(skb);
-</span><span class='line'>        iph = ip_hdr(skb);
-</span><span class='line'>+
-</span><span class='line'>+       if (ntohs(th-&gt;dest) == 6688) {
-</span><span class='line'>+               printk("%pI4:%d %pI4:%d ksplice drop\n",
-</span><span class='line'>+                               &iph-&gt;saddr, ntohs(th-&gt;source),
-</span><span class='line'>+                               &iph-&gt;daddr, ntohs(th-&gt;dest));
-</span><span class='line'>+               goto discard_it;
-</span><span class='line'>+       }
-</span><span class='line'>+
-</span><span class='line'>        TCP_SKB_CB(skb)-&gt;seq = ntohl(th-&gt;seq);
-</span><span class='line'>        TCP_SKB_CB(skb)-&gt;end_seq = (TCP_SKB_CB(skb)-&gt;seq + th-&gt;syn + th-&gt;fin +
-</span><span class='line'>                                    skb-&gt;len - th-&gt;doff * 4);</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>ksplice-undo syt40kp6</span></code></pre></td></tr></table></div></figure>
-
-
-
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2016/03/28/debug-ftrace/">ftrace 简介</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2016-03-28T16:29:00+08:00'><span class='date'>2016-03-28</span> <span class='time'>16:29:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="https://www.ibm.com/developerworks/cn/linux/l-cn-ftrace/">https://www.ibm.com/developerworks/cn/linux/l-cn-ftrace/</a></p>
-
-<h3>ftrace 简介</h3>
-
-<p>ftrace 的作用是帮助开发人员了解 Linux 内核的运行时行为，以便进行故障调试或性能分析。</p>
-
-<p>最早 ftrace 是一个 function tracer，仅能够记录内核的函数调用流程。如今 ftrace 已经成为一个 framework，采用 plugin 的方式支持开发人员添加更多种类的 trace 功能。</p>
-
-<p>Ftrace 由 RedHat 的 Steve Rostedt 负责维护。到 2.6.30 为止，已经支持的 tracer 包括：</p>
-
-<p>Function tracer 和 Function graph tracer: 跟踪函数调用。</p>
-
-<p>Schedule switch tracer: 跟踪进程调度情况。</p>
-
-<p>Wakeup tracer：跟踪进程的调度延迟，即高优先级进程从进入 ready 状态到获得 CPU 的延迟时间。该 tracer 只针对实时进程。</p>
-
-<p>Irqsoff tracer：当中断被禁止时，系统无法相应外部事件，比如键盘和鼠标，时钟也无法产生 tick 中断。这意味着系统响应延迟，irqsoff 这个 tracer 能够跟踪并记录内核中哪些函数禁止了中断，对于其中中断禁止时间最长的，irqsoff 将在 log 文件的第一行标示出来，从而使开发人员可以迅速定位造成响应延迟的罪魁祸首。</p>
-
-<p>Preemptoff tracer：和前一个 tracer 类似，preemptoff tracer 跟踪并记录禁止内核抢占的函数，并清晰地显示出禁止抢占时间最长的内核函数。</p>
-
-<p>Preemptirqsoff tracer: 同上，跟踪和记录禁止中断或者禁止抢占的内核函数，以及禁止时间最长的函数。</p>
-
-<p>Branch tracer: 跟踪内核程序中的 likely/unlikely 分支预测命中率情况。 Branch tracer 能够记录这些分支语句有多少次预测成功。从而为优化程序提供线索。</p>
-
-<p>Hardware branch tracer：利用处理器的分支跟踪能力，实现硬件级别的指令跳转记录。在 x86 上，主要利用了 BTS 这个特性。</p>
-
-<p>Initcall tracer：记录系统在 boot 阶段所调用的 init call 。</p>
-
-<p>Mmiotrace tracer：记录 memory map IO 的相关信息。</p>
-
-<p>Power tracer：记录系统电源管理相关的信息。</p>
-
-<p>Sysprof tracer：缺省情况下，sysprof tracer 每隔 1 msec 对内核进行一次采样，记录函数调用和堆栈信息。</p>
-
-<p>Kernel memory tracer: 内存 tracer 主要用来跟踪 slab allocator 的分配情况。包括 kfree，kmem_cache_alloc 等 API 的调用情况，用户程序可以根据 tracer 收集到的信息分析内部碎片情况，找出内存分配最频繁的代码片断，等等。</p>
-
-<p>Workqueue statistical tracer：这是一个 statistic tracer，统计系统中所有的 workqueue 的工作情况，比如有多少个 work 被插入 workqueue，多少个已经被执行等。开发人员可以以此来决定具体的 workqueue 实现，比如是使用 single threaded workqueue 还是 per cpu workqueue.</p>
-
-<p>Event tracer: 跟踪系统事件，比如 timer，系统调用，中断等。</p>
-
-<p>这里还没有列出所有的 tracer，ftrace 是目前非常活跃的开发领域，新的 tracer 将不断被加入内核。</p>
-
-<h3>ftrace 的使用</h3>
-
-<p>ftrace 在内核态工作，用户通过 debugfs 接口来控制和使用 ftrace 。从 2.6.30 开始，ftrace 支持两大类 tracer：传统 tracer 和 Non-Tracer Tracer 。下面将分别介绍他们的使用。</p>
-
-<h4>传统 Tracer 的使用</h4>
-
-<p>使用传统的 ftrace 需要如下几个步骤：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>选择一种 tracer
-</span><span class='line'>使能 ftrace
-</span><span class='line'>执行需要 trace 的应用程序，比如需要跟踪 ls，就执行 ls
-</span><span class='line'>关闭 ftrace
-</span><span class='line'>查看 trace 文件</span></code></pre></td></tr></table></div></figure>
-
-
-<p>用户通过读写 debugfs 文件系统中的控制文件完成上述步骤。使用 debugfs，首先要挂载她。命令如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'># mkdir /debug 
-</span><span class='line'># mount -t debugfs nodev /debug</span></code></pre></td></tr></table></div></figure>
-
-
-<p>此时您将在 /debug 目录下看到 tracing 目录。 Ftrace 的控制接口就是该目录下的文件。</p>
-
-<p>选择 tracer 的控制文件叫作 current_tracer 。选择 tracer 就是将 tracer 的名字写入这个文件，比如，用户打算使用 function tracer，可输入如下命令：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'># echo ftrace &gt; /debug/tracing/current_tracer</span></code></pre></td></tr></table></div></figure>
-
-
-<p>文件 tracing_enabled 控制 ftrace 的开始和结束。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'># echo 1 &gt;/debug/tracing/tracing_enable</span></code></pre></td></tr></table></div></figure>
-
-
-<p>上面的命令使能 ftrace 。同样，将 0 写入 tracing_enable 文件便可以停止 ftrace 。</p>
-
-<p>ftrace 的输出信息主要保存在 3 个文件中。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>trace，该文件保存 ftrace 的输出信息，其内容可以直接阅读。
-</span><span class='line'>latency_trace，保存与 trace 相同的信息，不过组织方式略有不同。主要为了用户能方便地分析系统中有关延迟的信息。
-</span><span class='line'>trace_pipe 是一个管道文件，主要为了方便应用程序读取 trace 内容。算是扩展接口吧。</span></code></pre></td></tr></table></div></figure>
-
-
-<p>下面详细解析各种 tracer 的输出信息。</p>
-
-<h4>Function tracer 的输出</h4>
-
-<p>Function tracer 跟踪函数调用流程，其 trace 文件格式如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'> # tracer: function 
-</span><span class='line'> # 
-</span><span class='line'> #  TASK-PID   CPU#    TIMESTAMP        FUNCTION 
-</span><span class='line'> #   |  |       |          |                | 
-</span><span class='line'>  bash-4251  [01]  10152.583854:    path_put &lt;-path_walk 
-</span><span class='line'>  bash-4251  [01] 10152.583855: dput &lt;-path_put 
-</span><span class='line'>  bash-4251  [01] 10152.583855: _atomic_dec_and_lock &lt;-dput</span></code></pre></td></tr></table></div></figure>
-
-
-<p>可以看到，tracer 文件类似一张报表，前 4 行是表头。第一行显示当前 tracer 的类型。第三行是 header 。</p>
-
-<p>对于 function tracer，该表将显示 4 列信息。首先是进程信息，包括进程名和 PID ；第二列是 CPU，在 SMP 体系下，该列显示内核函数具体在哪一个 CPU 上执行；第三列是时间戳；第四列是函数信息，缺省情况下，这里将显示内核函数名以及它的上一层调用函数。</p>
-
-<p>通过对这张报表的解读，用户便可以获得完整的内核运行时流程。这对于理解内核代码也有很大的帮助。有志于精读内核代码的读者，或许可以考虑考虑 ftrace 。</p>
-
-<p>如上例所示，path_walk() 调用了 path_put 。此后 path_put 又调用了 dput，进而 dput 再调用 _atomic_dec_and_lock 。</p>
-
-<h4>Schedule switch tracer 的输出</h4>
-
-<p>Schedule switch tracer 记录系统中的进程切换信息。在其输出文件 trace 中 , 输出行的格式有两种：</p>
-
-<p>第一种表示进程切换信息：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>Context switches: 
-</span><span class='line'>       Previous task              Next Task 
-</span><span class='line'>  &lt;pid&gt;:&lt;prio&gt;:&lt;state&gt;  ==&gt;  &lt;pid&gt;:&lt;prio&gt;:&lt;state&gt;</span></code></pre></td></tr></table></div></figure>
-
-
-<p>第二种表示进程 wakeup 的信息：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>&#9;Wake ups: 
-</span><span class='line'>       Current task               Task waking up 
-</span><span class='line'>  &lt;pid&gt;:&lt;prio&gt;:&lt;state&gt;    +  &lt;pid&gt;:&lt;prio&gt;:&lt;state&gt;</span></code></pre></td></tr></table></div></figure>
-
-
-<p>这里举一个实例：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'> # tracer: sched_switch 
-</span><span class='line'> # 
-</span><span class='line'> #  TASK_PID   CPU#     TIMESTAMP             FUNCTION 
-</span><span class='line'> #     |         |            |                  | 
-</span><span class='line'>   fon-6263  [000] 4154504638.932214:  6263:120:R +   2717:120:S 
-</span><span class='line'>   fon-6263  [000] 4154504638.932214:  6263:120:? ==&gt; 2717:120:R 
-</span><span class='line'>   bash-2717 [000] 4154504638.932214:  2717:120:S +   2714:120:S</span></code></pre></td></tr></table></div></figure>
-
-
-<p>第一行表示进程 fon 进程 wakeup 了 bash 进程。其中 fon 进程的 pid 为 6263，优先级为 120，进程状态为 Ready 。她将进程 ID 为 2717 的 bash 进程唤醒。</p>
-
-<p>第二行表示进程切换发生，从 fon 切换到 bash 。</p>
-
-<h4>irqsoff tracer 输出</h4>
-
-<p>有四个 tracer 记录内核在某种状态下最长的时延，irqsoff 记录系统在哪里关中断的时间最长； preemptoff/preemptirqsoff 以及 wakeup 分别记录禁止抢占时间最长的函数，或者系统在哪里调度延迟最长 (wakeup) 。这些 tracer 信息对于实时应用具有很高的参考价值。</p>
-
-<p>为了更好的表示延迟，ftrace 提供了和 trace 类似的 latency_trace 文件。以 irqsoff 为例演示如何解读该文件的内容。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'> # tracer: irqsoff 
-</span><span class='line'> irqsoff latency trace v1.1.5 on 2.6.26 
-</span><span class='line'> -------------------------------------------------------------------- 
-</span><span class='line'> latency: 12 us, #3/3, CPU#1 | (M:preempt VP:0, KP:0, SP:0 HP:0 #P:2) 
-</span><span class='line'>    ----------------- 
-</span><span class='line'>    | task: bash-3730 (uid:0 nice:0 policy:0 rt_prio:0) 
-</span><span class='line'>    ----------------- 
-</span><span class='line'> =&gt; started at: sys_setpgid 
-</span><span class='line'> =&gt; ended at:   sys_setpgid 
-</span><span class='line'> #                _------=&gt; CPU# 
-</span><span class='line'> #               / _-----=&gt; irqs-off 
-</span><span class='line'> #              | / _----=&gt; need-resched 
-</span><span class='line'> #              || / _---=&gt; hardirq/softirq 
-</span><span class='line'> #              ||| / _--=&gt; preempt-depth 
-</span><span class='line'> #              |||| / 
-</span><span class='line'> #              |||||     delay 
-</span><span class='line'> #  cmd     pid ||||| time  |   caller 
-</span><span class='line'> #     \   /    |||||   \   |   / 
-</span><span class='line'>    bash-3730  1d...    0us : _write_lock_irq (sys_setpgid) 
-</span><span class='line'>    bash-3730  1d..1    1us+: _write_unlock_irq (sys_setpgid) 
-</span><span class='line'>    bash-3730  1d..2   14us : trace_hardirqs_on (sys_setpgid)</span></code></pre></td></tr></table></div></figure>
-
-
-<p>在文件的头部，irqsoff tracer 记录了中断禁止时间最长的函数。在本例中，函数 trace_hardirqs_on 将中断禁止了 12us 。</p>
-
-<p>文件中的每一行代表一次函数调用。 Cmd 代表进程名，pid 是进程 ID 。中间有 5 个字符，分别代表了 CPU#，irqs-off 等信息，具体含义如下：</p>
-
-<p>CPU# 表示 CPU ID ；</p>
-
-<p>irqs-off 这个字符的含义如下：’ d ’表示中断被 disabled 。’ . ’表示中断没有关闭；</p>
-
-<p>need-resched 字符的含义：’ N ’表示 need_resched 被设置，’ . ’表示 need-reched 没有被设置，中断返回不会进行进程切换；</p>
-
-<p>hardirq/softirq 字符的含义 : &lsquo;H&rsquo; 在 softirq 中发生了硬件中断， &lsquo;h&rsquo; – 硬件中断，’ s ’表示 softirq，’ . ’不在中断上下文中，普通状态。</p>
-
-<p>preempt-depth: 当抢占中断使能后，该域代表 preempt_disabled 的级别。</p>
-
-<p>在每一行的中间，还有两个域：time 和 delay 。 time: 表示从 trace 开始到当前的相对时间。 Delay 突出显示那些有高延迟的地方以便引起用户注意。当其显示为 ! 时，表示需要引起注意。</p>
-
-<h4>function graph tracer 输出</h4>
-
-<p>Function graph tracer 和 function tracer 类似，但输出为函数调用图，更加容易阅读：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'> # tracer: function_graph 
-</span><span class='line'> # 
-</span><span class='line'> # CPU  OVERHEAD/DURATION      FUNCTION CALLS 
-</span><span class='line'> # |     |   |                 |   |   |   | 
-</span><span class='line'> 0)               |  sys_open() { 
-</span><span class='line'> 0)               |    do_sys_open() { 
-</span><span class='line'> 0)               |      getname() { 
-</span><span class='line'> 0)               |        kmem_cache_alloc() { 
-</span><span class='line'> 0)   1.382 us    |          __might_sleep(); 
-</span><span class='line'> 0)   2.478 us    |        } 
-</span><span class='line'> 0)               |        strncpy_from_user() { 
-</span><span class='line'> 0)               |          might_fault() { 
-</span><span class='line'> 0)   1.389 us    |            __might_sleep(); 
-</span><span class='line'> 0)   2.553 us    |          } 
-</span><span class='line'> 0)   3.807 us    |        } 
-</span><span class='line'> 0)   7.876 us    |      } 
-</span><span class='line'> 0)                |      alloc_fd() { 
-</span><span class='line'> 0)   0.668 us    |        _spin_lock(); 
-</span><span class='line'> 0)   0.570 us    |        expand_files(); 
-</span><span class='line'> 0)   0.586 us    |        _spin_unlock();</span></code></pre></td></tr></table></div></figure>
-
-
-<p>OVERHEAD 为 ! 时提醒用户注意，该函数的性能比较差。上面的例子中可以看到 sys_open 调用了 do_sys_open，依次又调用了 getname()，依此类推。</p>
-
-<h4>Sysprof tracer 的输出</h4>
-
-<p>Sysprof tracer 定时对内核进行采样，她的输出文件中记录了每次采样时内核正在执行哪些内核函数，以及当时的内核堆栈情况。</p>
-
-<p>每一行前半部分的格式和 3.1.1 中介绍的 function tracer 一样，只是，最后一部分 FUNCTION 有所不同。</p>
-
-<p>Sysprof tracer 中，FUNCTION 列格式如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>Identifier  address frame_pointer/pid</span></code></pre></td></tr></table></div></figure>
-
-
-<p>当 identifier 为 0 时，代表一次采样的开始，此时第三个数字代表当前进程的 PID ；</p>
-
-<p>Identifier 为 1 代表内核态的堆栈信息；当 identifier 为 2 时，代表用户态堆栈信息；显示堆栈信息时，第三列显示的是 frame_pointer，用户可能需要打开 system map 文件查找具体的符号，这是 ftrace 有待改进的一个地方吧。</p>
-
-<p>当 identifier 为 3 时，代表一次采样结束。</p>
-
-<h3>Non-Tracer Tracer 的使用</h3>
-
-<p>从 2.6.30 开始，ftrace 还支持几种 Non-tracer tracer，所谓 Non-tracer tracer 主要包括以下几种：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>Max Stack Tracer
-</span><span class='line'>Profiling (branches / unlikely / likely / Functions)
-</span><span class='line'>Event tracing</span></code></pre></td></tr></table></div></figure>
-
-
-<p>和传统的 tracer 不同，Non-Tracer Tracer 并不对每个内核函数进行跟踪，而是一种类似逻辑分析仪的模式，即对系统进行采样，但似乎也不完全如此。无论怎样，这些 tracer 的使用方法和前面所介绍的 tracer 的使用稍有不同。下面我将试图描述这些 tracer 的使用方法。</p>
-
-<h4>Max Stack Tracer 的使用</h4>
-
-<p>这个 tracer 记录内核函数的堆栈使用情况，用户可以使用如下命令打开该 tracer：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'># echo 1 &gt; /proc/sys/kernel/stack_tracer_enabled</span></code></pre></td></tr></table></div></figure>
-
-
-<p>从此，ftrace 便留心记录内核函数的堆栈使用。 Max Stack Tracer 的输出在 stack_trace 文件中：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'> # cat /debug/tracing/stack_trace 
-</span><span class='line'> Depth Size Location (44 entries) 
-</span><span class='line'> ----- ---- -------- 
-</span><span class='line'> 0) 3088 64 update_curr+0x64/0x136 
-</span><span class='line'> 1) 3024 64 enqueue_task_fair+0x59/0x2a1 
-</span><span class='line'> 2) 2960 32 enqueue_task+0x60/0x6b 
-</span><span class='line'> 3) 2928 32 activate_task+0x27/0x30 
-</span><span class='line'> 4) 2896 80 try_to_wake_up+0x186/0x27f 
-</span><span class='line'>…
-</span><span class='line'> 42)  80 80 sysenter_do_call+0x12/0x32</span></code></pre></td></tr></table></div></figure>
-
-
-<p>从上例中可以看到内核堆栈最满的情况如下，有 43 层函数调用，堆栈使用大小为 3088 字节。此外还可以在 Location 这列中看到整个的 calling stack 情况。这在某些情况下，可以提供额外的 debug 信息，帮助开发人员定位问题。</p>
-
-<h4>Branch tracer</h4>
-
-<p>Branch tracer 比较特殊，她有两种模式，即是传统 tracer，又实现了 profiling tracer 模式。</p>
-
-<p>作为传统 tracer 。其输出文件为 trace，格式如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'> # tracer: branch 
-</span><span class='line'> # 
-</span><span class='line'> #  TASK-PID   CPU#    TIMESTAMP        FUNCTION 
-</span><span class='line'> #    |   |        |          |                | 
-</span><span class='line'>  Xorg-2491   [000] 688.561593: [ ok ] fput_light:file.h:29 
-</span><span class='line'>  Xorg-2491   [000] 688.561594: [ ok ] fput_light:file_table.c:330</span></code></pre></td></tr></table></div></figure>
-
-
-<p>在 FUNCTION 列中，显示了 4 类信息：</p>
-
-<p>函数名，文件和行号，用中括号引起来的部分，显示了分支的信息，假如该字符串为 ok，表明 likely/unlikely 返回为真，否则字符串为 MISS 。举例来说，在文件 file.h 的第 29 行，函数 fput_light 中，有一个 likely 分支在运行时解析为真。我们看看 file.h 的第 29 行：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static inline void fput_light(struct file *file, int fput_needed) 
-</span><span class='line'> {LINE29：    if (unlikely(fput_needed)) 
-</span><span class='line'>                  fput(file); 
-</span><span class='line'> }</span></code></pre></td></tr></table></div></figure>
-
-
-<p>Trace 结果告诉我们，在 688 秒的时候，第 29 行代码被执行，且预测结果为 ok，即 unlikely 成功。</p>
-
-<p>Branch tracer 作为 profiling tracer 时，其输出文件为 profile_annotated_branch，其中记录了 likely/unlikely 语句完整的统计结果。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'> #cat trace_stat/branch_ annotated 
-</span><span class='line'> correct incorrect    %      function            file        line 
-</span><span class='line'> ------- ----------  ---- ------------------ -------------- ----- 
-</span><span class='line'> 0      46             100   pre_schedule_rt    sched_rt.c     1449</span></code></pre></td></tr></table></div></figure>
-
-
-<p>下面是文件 sched_rt.c 的第 1449 行的代码：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if (unlikely(rt_task(prev)) && rq-&gt;rt.highest_prio.curr &gt; prev-&gt;prio) 
-</span><span class='line'>    pull_rt_task(rq);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>记录表明，unlikely 在这里有 46 次为假，命中率为 100% 。假如为真的次数更多，则说明这里应该改成 likely 。</p>
-
-<h4>Workqueue profiling</h4>
-
-<p>假如您在内核编译时选中该 tracer，ftrace 便会统计 workqueue 使用情况。您只需使用下面的命令查看结果即可：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'># cat /debug/tracing/trace_stat/workqueue</span></code></pre></td></tr></table></div></figure>
-
-
-<p>典型输出如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'> # CPU INSERTED  EXECUTED  NAME 
-</span><span class='line'> #  |     |         |           | 
-</span><span class='line'>   0   38044    38044    events/0 
-</span><span class='line'>   0     426      426    khelper 
-</span><span class='line'>   0    9853     9853    kblockd/0 
-</span><span class='line'>   0       0        0    kacpid 
-</span><span class='line'>…</span></code></pre></td></tr></table></div></figure>
-
-
-<p>可以看到 workqueue events 在 CPU 0 上有 38044 个 worker 被插入并执行。</p>
-
-<h4>Event tracer</h4>
-
-<p>Event t不间断地记录内核中的重要事件。用户可以用下面的命令查看 ftrace 支持的事件。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'># cat /debug/tracing/available_event</span></code></pre></td></tr></table></div></figure>
-
-
-<p>下面以跟踪进程切换为例讲述 event tracer 的使用。首先打开 event tracer，并记录进程切换：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'># echo sched:sched_switch &gt;&gt; /debug/tracing/set_event 
-</span><span class='line'># echo sched_switch &gt;&gt; /debug/tracing/set_event 
-</span><span class='line'># echo 1 &gt; /debug/tracing/events/sched/sched_switch/enable</span></code></pre></td></tr></table></div></figure>
-
-
-<p>上面三个命令的作用是一样的，您可以任选一种。</p>
-
-<p>此时可以查看 ftrace 的输出文件 trace:</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'> &gt;head trace 
-</span><span class='line'> # tracer: nop 
-</span><span class='line'> # 
-</span><span class='line'> #   TASK-PID CPU#  TIMESTAMP FUNCTION 
-</span><span class='line'> #    | |      |     |             | 
-</span><span class='line'> &lt;idle&gt;-0 [000] 12093.091053: sched_switch: task swapper:0 [140] ==&gt; 
-</span><span class='line'>  /user/bin/sealer:2612 [120]</span></code></pre></td></tr></table></div></figure>
-
-
-<p>我想您会发现该文件很容易解读。如上例，表示一个进程切换 event，从 idle 进程切换到 sealer 进程。</p>
-
-<hr />
-
-<h2>ftrace 的实现</h2>
-
-<p>研究 tracer 的实现是非常有乐趣的。理解 ftrace 的实现能够启发我们在自己的系统中设计更好的 trace 功能。</p>
-
-<h3>ftrace 的整体构架</h3>
-
-<p>Ftrace 的整体构架：
-图 1. ftrace 组成</p>
-
-<p><img src="/images/debug/2016-03-28.jpg" alt="" /></p>
-
-<h3>ftrace 组成</h3>
-
-<p>Ftrace 有两大组成部分，一是 framework，另外就是一系列的 tracer 。每个 tracer 完成不同的功能，它们统一由 framework 管理。 ftrace 的 trace 信息保存在 ring buffer 中，由 framework 负责管理。 Framework 利用 debugfs 系统在 /debugfs 下建立 tracing 目录，并提供了一系列的控制文件。</p>
-
-<p>本文并不打算系统介绍 tracer 和 ftrace framework 之间的接口，只是打算从纯粹理论的角度，简单剖析几种具体 tracer 的实现原理。假如读者需要开发新的 tracer，可以参考某个 tracer 的源代码。
-Function tracer 的实现</p>
-
-<p>Ftrace 采用 GCC 的 profile 特性在所有内核函数的开始部分加入一段 stub 代码，ftrace 重载这段代码来实现 trace 功能。</p>
-
-<p>gcc 的 -pg 选项将在每个函数入口处加入对 mcount 的调用代码。比如下面的 C 代码。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>//test.c 
-</span><span class='line'>void foo(void) 
+<span class='line-number'>27</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void internal_add_timer(struct tvec_base *base, struct timer_list *timer)
 </span><span class='line'>{
-</span><span class='line'>&#9;printf("foo"); 
+</span><span class='line'>&#9;unsigned long expires = timer-&gt;expires;
+</span><span class='line'>&#9;unsigned long idx = expires - base-&gt;timer_jiffies;
+</span><span class='line'>&#9;struct list_head *vec;
+</span><span class='line'>
+</span><span class='line'>&#9;if (idx &lt; TVR_SIZE) {
+</span><span class='line'>&#9;&#9;int i = expires & TVR_MASK;
+</span><span class='line'>&#9;&#9;vec = base-&gt;tv1.vec + i;
+</span><span class='line'>&#9;} else if (idx &lt; 1 &lt;&lt; (TVR_BITS + TVN_BITS)) {
+</span><span class='line'>&#9;&#9;int i = (expires &gt;&gt; TVR_BITS) & TVN_MASK;
+</span><span class='line'>&#9;&#9;vec = base-&gt;tv2.vec + i;
+</span><span class='line'>&#9;} else if (idx &lt; 1 &lt;&lt; (TVR_BITS + 2 * TVN_BITS)) {
+</span><span class='line'>&#9;&#9;int i = (expires &gt;&gt; (TVR_BITS + TVN_BITS)) & TVN_MASK;
+</span><span class='line'>&#9;&#9;vec = base-&gt;tv3.vec + i;
+</span><span class='line'>&#9;} else if (idx &lt; 1 &lt;&lt; (TVR_BITS + 3 * TVN_BITS)) {
+</span><span class='line'>&#9;&#9;int i = (expires &gt;&gt; (TVR_BITS + 2 * TVN_BITS)) & TVN_MASK;
+</span><span class='line'>&#9;&#9;vec = base-&gt;tv4.vec + i;
+</span><span class='line'>&#9;} else if ((signed long) idx &lt; 0) {
+</span><span class='line'>&#9;&#9;&#9;&#9;......
+</span><span class='line'>&#9;} else {
+</span><span class='line'>&#9;&#9;&#9;&#9;......
+</span><span class='line'>&#9;&#9;i = (expires &gt;&gt; (TVR_BITS + 3 * TVN_BITS)) & TVN_MASK;
+</span><span class='line'>&#9;&#9;vec = base-&gt;tv5.vec + i;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;list_add_tail(&timer-&gt;entry, vec);
 </span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
-<p>用 gcc 编译：</p>
+<h5>2.2  定时器的到期处理</h5>
 
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>gcc -S test.c</span></code></pre></td></tr></table></div></figure>
+<p>经过2.1节的处理后，系统中的定时器按到期时间有规律地放置在tv1&ndash;tv5各个链表数组中，其中tv1中放置着在接下来的256个jiffies即将到期的定时器列表，需要注意的是，并不是tv1.vec[0]中放置着马上到期的定时器列表，tv1.vec[1]中放置着将在jiffies+1到期的定时器列表。因为base.timer_jiffies的值一直在随着系统的运行而动态地增加，原则上是每个tick事件会加1，base.timer_jiffies代表者该cpu定时器系统当前时刻，定时器也是动态地加入头256个链表tv1中，按2.1节的讨论，定时器加入tv1中使用的下标索引是定时器到期时间expires的低8位，所以假设当前的base.timer_jiffies值是0x34567826，则马上到期的定时器是在tv1.vec[0x26]中，如果这时候系统加入一个在jiffies值0x34567828到期的定时器，他将会加入到tv1.vec[0x28]中，运行两个tick后，base.timer_jiffies的值会变为0x34567828，很显然，在每次tick事件中，定时器系统只要以base.timer_jiffies的低8位作为索引，取出tv1中相应的链表，里面正好包含了所有在该jiffies值到期的定时器列表。</p>
 
-
-<p>反汇编如下：
-清单 2. test.c 不加入 pg 选项的汇编代码</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>_foo: 
-</span><span class='line'>    pushl   %ebp 
-</span><span class='line'>    movl    %esp, %ebp 
-</span><span class='line'>    subl    $8, %esp 
-</span><span class='line'>    movl    $LC0, (%esp) 
-</span><span class='line'>    call    _printf 
-</span><span class='line'>    leave 
-</span><span class='line'>    ret</span></code></pre></td></tr></table></div></figure>
-
-
-<p>再加入 -gp 选项编译：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>gcc -pg -S test.c</span></code></pre></td></tr></table></div></figure>
-
-
-<p>得到的汇编如下：
-清单 3. test.c 加入 pg 选项后的汇编代码</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>_foo: 
-</span><span class='line'>        pushl   %ebp 
-</span><span class='line'>        movl    %esp, %ebp 
-</span><span class='line'>        subl    $8, %esp 
-</span><span class='line'> LP3: 
-</span><span class='line'>        movl    $LP3,%edx 
-</span><span class='line'>        call    _mcount 
-</span><span class='line'>        movl    $LC0, (%esp) 
-</span><span class='line'>        call    _printf 
-</span><span class='line'>        leave 
-</span><span class='line'>        ret</span></code></pre></td></tr></table></div></figure>
-
-
-<p>增加 pg 选项后，gcc 在函数 foo 的入口处加入了对 mcount 的调用：call _mcount 。原本 mcount 由 libc 实现，但您知道内核不会连接 libc 库，因此 ftrace 编写了自己的 mcount stub 函数，并借此实现 trace 功能。</p>
-
-<p>在每个内核函数入口加入 trace 代码，必然会影响内核的性能，为了减小对内核性能的影响，ftrace 支持动态 trace 功能。</p>
-
-<p>当 CONFIG_DYNAMIC_FTRACE 被选中后，内核编译时会调用一个 perl 脚本：recordmcount.pl 将每个函数的地址写入一个特殊的段：__mcount_loc</p>
-
-<p>在内核初始化的初期，ftrace 查询 __mcount_loc 段，得到每个函数的入口地址，并将 mcount 替换为 nop 指令。这样在默认情况下，ftrace 不会对内核性能产生影响。</p>
-
-<p>当用户打开 ftrace 功能时，ftrace 将这些 nop 指令动态替换为 ftrace_caller，该函数将调用用户注册的 trace 函数。其具体的实现在相应 arch 的汇编代码中，以 x86 为例，在 entry_32.s 中：</p>
+<p>那什么时候处理tv2&ndash;tv5中的定时器？每当base.timer_jiffies的低8位为0值时，这表明base.timer_jiffies的第8-13位有进位发生，这6位正好代表着tv2，这时只要按base.timer_jiffies的第8-13位的值作为下标，移出tv2中对应的定时器链表，然后用internal_add_timer把它们从新加入到定时器系统中来，因为这些定时器一定会在接下来的256个tick期间到期，所以它们肯定会被加入到tv1数组中，这样就完成了tv2往tv1迁移的过程。同样地，当base.timer_jiffies的第8-13位为0时，这表明base.timer_jiffies的第14-19位有进位发生，这6位正好代表着tv3，按base.timer_jiffies的第14-19位的值作为下标，移出tv3中对应的定时器链表，然后用internal_add_timer把它们从新加入到定时器系统中来，显然它们会被加入到tv2中，从而完成tv3到tv2的迁移，tv4，tv5的处理可以以此作类推。具体迁移的代码如下，参数index为事先计算好的高一级tv的需要迁移的数组索引：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -1039,76 +464,30 @@ Function tracer 的实现</p>
 <span class='line-number'>17</span>
 <span class='line-number'>18</span>
 <span class='line-number'>19</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>ENTRY(ftrace_caller) 
-</span><span class='line'>&#9;cmpl $0, function_trace_stop 
-</span><span class='line'>&#9;jne  ftrace_stub 
-</span><span class='line'>&#9;pushl %eax 
-</span><span class='line'>&#9;pushl %ecx 
-</span><span class='line'>&#9;pushl %edx 
-</span><span class='line'>&#9;movl 0xc(%esp), %eax 
-</span><span class='line'>&#9;movl 0x4(%ebp), %edx 
-</span><span class='line'>&#9;subl $MCOUNT_INSN_SIZE, %eax 
-</span><span class='line'>.globl ftrace_call 
-</span><span class='line'>ftrace_call: 
-</span><span class='line'>&#9;call ftrace_stubline 10popl %edx 
-</span><span class='line'>&#9;popl %ecx 
-</span><span class='line'>&#9;popl %eax 
+<span class='line-number'>20</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int cascade(struct tvec_base *base, struct tvec *tv, int index)
+</span><span class='line'>{
+</span><span class='line'>&#9;/* cascade all the timers from tv up one level */
+</span><span class='line'>&#9;struct timer_list *timer, *tmp;
+</span><span class='line'>&#9;struct list_head tv_list;
 </span><span class='line'>
-</span><span class='line'>.globl ftrace_stub 
-</span><span class='line'>ftrace_stub: 
-</span><span class='line'>&#9;ret 
-</span><span class='line'>END(ftrace_caller)</span></code></pre></td></tr></table></div></figure>
+</span><span class='line'>&#9;list_replace_init(tv-&gt;vec + index, &tv_list);  //  移除需要迁移的链表
+</span><span class='line'>
+</span><span class='line'>&#9;/* 
+</span><span class='line'>&#9; * We are removing _all_ timers from the list, so we 
+</span><span class='line'>&#9; * don't have to detach them individually. 
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;list_for_each_entry_safe(timer, tmp, &tv_list, entry) {
+</span><span class='line'>&#9;&#9;BUG_ON(tbase_get_base(timer-&gt;base) != base);
+</span><span class='line'>&#9;&#9;&#9;&#9;//  重新加入到定时器系统中，实际上将会迁移到下一级的tv数组中
+</span><span class='line'>&#9;&#9;internal_add_timer(base, timer);  
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;return index;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
-<p>Function tracer 将 line10 这行代码替换为 function_trace_call() 。这样每个内核函数都将调用 function_trace_call() 。</p>
-
-<p>在 function_trace_call() 函数内，ftrace 记录函数调用堆栈信息，并将结果写入 ring buffer，稍后，用户可以通过 debugfs 的 trace 文件读取该 ring buffer 中的内容。</p>
-
-<h3>Irqsoff tracer 的实现</h3>
-
-<p>Irqsoff tracer 的实现依赖于 IRQ-Flags 。 IRQ-Flags 是 Ingo Molnar 维护的一个内核特性。使得用户能够在中断关闭和打开时得到通知，ftrace 重载了其通知函数，从而能够记录中断禁止时间。即，中断被关闭时，记录下当时的时间戳。此后，中断被打开时，再计算时间差，由此便可得到中断禁止时间。</p>
-
-<p>IRQ-Flags 封装开关中断的宏定义：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#define local_irq_enable() \ 
-</span><span class='line'>&#9;do { trace_hardirqs_on (); raw_local_irq_enable(); } while (0)</span></code></pre></td></tr></table></div></figure>
-
-
-<p>ftrace 在文件 ftrace_irqsoff.c 中重载了 trace_hardirqs_on 。具体代码不再罗列，主要是使用了 sched_clock（）函数来获得时间戳。</p>
-
-<h3>hw-branch 的实现</h3>
-
-<p>Hw-branch 只在 IA 处理器上实现，依赖于 x86 的 BTS 功能。 BTS 将 CPU 实际执行到的分支指令的相关信息保存下来，即每个分支指令的源地址和目标地址。</p>
-
-<p>软件可以指定一块 buffer，处理器将每个分支指令的执行情况写入这块 buffer，之后，软件便可以分析这块 buffer 中的功能。</p>
-
-<p>Linux 内核的 DS 模块封装了 x86 的 BTS 功能。 Debug Support 模块封装了和底层硬件的接口，主要支持两种功能：Branch trace store(BTS) 和 precise-event based sampling (PEBS) 。 ftrace 主要使用了 BTS 功能。</p>
-
-<h3>branch tracer 的实现</h3>
-
-<p>内核代码中常使用 likely 和 unlikely 提高编译器生成的代码质量。 Gcc 可以通过合理安排汇编代码最大限度的利用处理器的流水线。合理的预测是 likely 能够提高性能的关键，ftrace 为此定义了 branch tracer，跟踪程序中 likely 预测的正确率。</p>
-
-<p>为了实现 branch tracer，重新定义了 likely 和 unlikely 。具体的代码在 compiler.h 中。
-清单 6. likely/unlikely 的 trace 实现</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'> # ifndef likely 
-</span><span class='line'> #  define likely(x) (__builtin_constant_p(x) ? !!(x) : __branch_check__(x, 1)) 
-</span><span class='line'> # endif 
-</span><span class='line'> # ifndef unlikely 
-</span><span class='line'> #  define unlikely(x) (__builtin_constant_p(x) ? !!(x) : __branch_check__(x, 0)) 
-</span><span class='line'> # endif</span></code></pre></td></tr></table></div></figure>
-
-
-<p>其中 <em><em>branch_check 的实现如下：
-清单 7. </em>branch_check</em> 的实现</p>
+<p>每个tick事件到来时，内核会在tick定时中断处理期间激活定时器软中断：TIMER_SOFTIRQ，关于软件中断，请参考另一篇博文：Linux中断（interrupt）子系统之五：软件中断（softIRQ。TIMER_SOFTIRQ的执行函数是<code>__run_timers</code>，它实现了本节讨论的逻辑，取出tv1中到期的定时器，执行定时器的回调函数，由此可见，低分辨率定时器的回调函数是执行在软件中断上下文中的，这点在写定时器的回调函数时需要注意。<code>__run_timers</code>的代码如下：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -1124,27 +503,153 @@ Function tracer 的实现</p>
 <span class='line-number'>12</span>
 <span class='line-number'>13</span>
 <span class='line-number'>14</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#define __branch_check__(x, expect) ({\ 
-</span><span class='line'>    int ______r;    \ 
-</span><span class='line'>    static struct ftrace_branch_data \ 
-</span><span class='line'>    __attribute__((__aligned__(4)))  \ 
-</span><span class='line'>    __attribute__((section("_ftrace_annotated_branch"))) \ 
-</span><span class='line'>                         ______f = { \ 
-</span><span class='line'>                           .func = __func__, \ 
-</span><span class='line'>                           .file = __FILE__, \ 
-</span><span class='line'>                           .line = __LINE__, \ 
-</span><span class='line'>                    }; \ 
-</span><span class='line'>              ______r = likely_notrace(x);\ 
-</span><span class='line'>              ftrace_likely_update(&______f, ______r, expect); \ 
-</span><span class='line'>              ______r; \ 
-</span><span class='line'>  })</span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static inline void __run_timers(struct tvec_base *base)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct timer_list *timer;
+</span><span class='line'>
+</span><span class='line'>&#9;spin_lock_irq(&base-&gt;lock);
+</span><span class='line'>&#9;&#9;/* 同步jiffies，在NO_HZ情况下，base-&gt;timer_jiffies可能落后不止一个tick  */
+</span><span class='line'>&#9;while (time_after_eq(jiffies, base-&gt;timer_jiffies)) {  
+</span><span class='line'>&#9;&#9;struct list_head work_list;
+</span><span class='line'>&#9;&#9;struct list_head *head = &work_list;
+</span><span class='line'>&#9;&#9;&#9;&#9;/*  计算到期定时器链表在tv1中的索引  */
+</span><span class='line'>&#9;&#9;int index = base-&gt;timer_jiffies & TVR_MASK;  
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;/* 
+</span><span class='line'>&#9;&#9; * /*  tv2--tv5定时器列表迁移处理  */
+</span><span class='line'>&#9;&#9; */
+</span><span class='line'>&#9;&#9;if (!index &&
+</span><span class='line'>&#9;&#9;&#9;(!cascade(base, &base-&gt;tv2, INDEX(0))) &&              
+</span><span class='line'>&#9;&#9;&#9;&#9;(!cascade(base, &base-&gt;tv3, INDEX(1))) &&      
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;!cascade(base, &base-&gt;tv4, INDEX(2)))  
+</span><span class='line'>&#9;&#9;&#9;cascade(base, &base-&gt;tv5, INDEX(3));  
+</span><span class='line'>&#9;&#9;&#9;&#9;/*  该cpu定时器系统运行时间递增一个tick  */                 
+</span><span class='line'>&#9;&#9;++base-&gt;timer_jiffies;  
+</span><span class='line'>&#9;&#9;&#9;&#9;/*  取出到期的定时器链表  */                                       
+</span><span class='line'>&#9;&#9;list_replace_init(base-&gt;tv1.vec + index, &work_list);
+</span><span class='line'>&#9;&#9;&#9;&#9;/*  遍历所有的到期定时器  */          
+</span><span class='line'>&#9;&#9;while (!list_empty(head)) {                                    
+</span><span class='line'>&#9;&#9;&#9;void (*fn)(unsigned long);
+</span><span class='line'>&#9;&#9;&#9;unsigned long data;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;timer = list_first_entry(head, struct timer_list,entry);
+</span><span class='line'>&#9;&#9;&#9;fn = timer-&gt;function;
+</span><span class='line'>&#9;&#9;&#9;data = timer-&gt;data;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;timer_stats_account_timer(timer);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;base-&gt;running_timer = timer;    /*  标记正在处理的定时器  */
+</span><span class='line'>&#9;&#9;&#9;detach_timer(timer, 1);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;spin_unlock_irq(&base-&gt;lock);
+</span><span class='line'>&#9;&#9;&#9;call_timer_fn(timer, fn, data);  /*  调用定时器的回调函数  */
+</span><span class='line'>&#9;&#9;&#9;spin_lock_irq(&base-&gt;lock);
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;base-&gt;running_timer = NULL;
+</span><span class='line'>&#9;spin_unlock_irq(&base-&gt;lock);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
-<p>ftrace_likely_update() 将记录 likely 判断的正确性，并将结果保存在 ring buffer 中，之后用户可以通过 ftrace 的 debugfs 接口读取分支预测的相关信息。从而调整程序代码，优化性能。</p>
+<p>通过上面的讨论，我们可以发现，内核的低分辨率定时器的实现非常精妙，既实现了大量定时器的管理，又实现了快速的O(1)查找到期定时器的能力，利用巧妙的数组结构，使得只需在间隔256个tick时间才处理一次迁移操作，5个数组就好比是5个齿轮，它们随着base->timer_jifffies的增长而不停地转动，每次只需处理第一个齿轮的某一个齿节，低一级的齿轮转动一圈，高一级的齿轮转动一个齿，同时自动把即将到期的定时器迁移到上一个齿轮中，所以低分辨率定时器通常又被叫做时间轮：time wheel。事实上，它的实现是一个很好的空间换时间软件算法。</p>
 
-<hr />
+<h4>3. 定时器软件中断</h4>
 
-<p><a href="http://blog.csdn.net/tommy_wxie/article/details/7340701">http://blog.csdn.net/tommy_wxie/article/details/7340701</a></p>
+<p>系统初始化时，start_kernel会调用定时器系统的初始化函数init_timers：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void __init init_timers(void)
+</span><span class='line'>{      
+</span><span class='line'>&#9;int err = timer_cpu_notify(&timers_nb, (unsigned long)CPU_UP_PREPARE, 
+</span><span class='line'>&#9;&#9;&#9;&#9;(void *)(long)smp_processor_id());
+</span><span class='line'>
+</span><span class='line'>&#9;init_timer_stats();
+</span><span class='line'>
+</span><span class='line'>&#9;BUG_ON(err != NOTIFY_OK);
+</span><span class='line'>&#9;register_cpu_notifier(&timers_nb);  /* 注册cpu notify，以便在hotplug时在cpu之间进行定时器的迁移 */
+</span><span class='line'>&#9;open_softirq(TIMER_SOFTIRQ, run_timer_softirq);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>可见，open_softirq把run_timer_softirq注册为TIMER_SOFTIRQ的处理函数，另外，当cpu的每个tick事件到来时，在事件处理中断中，update_process_times会被调用，该函数会进一步调用run_local_timers，run_local_timers会触发TIMER_SOFTIRQ软中断：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void run_local_timers(void)
+</span><span class='line'>{
+</span><span class='line'>&#9;hrtimer_run_queues();
+</span><span class='line'>&#9;raise_softirq(TIMER_SOFTIRQ);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>TIMER_SOFTIRQ的处理函数是run_timer_softirq：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void run_timer_softirq(struct softirq_action *h)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct tvec_base *base = __this_cpu_read(tvec_bases);
+</span><span class='line'>
+</span><span class='line'>&#9;hrtimer_run_pending();
+</span><span class='line'>
+</span><span class='line'>&#9;if (time_after_eq(jiffies, base-&gt;timer_jiffies))
+</span><span class='line'>&#9;&#9;__run_timers(base);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>好啦，终于看到<code>__run_timers</code>函数了，2.2节已经介绍过，正是这个函数完成了对到期定时器的处理工作，也完成了时间轮的不停转动。</p>
 </div>
   
   
@@ -1157,7 +662,7 @@ Function tracer 的实现</p>
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2016/03/28/debug-debugedit_el7/">debugedit，find-debuginfo 改进及el7</a></h2>
+      <h2 class="entry-title"><a href="/blog/2017/07/23/kernel-clock-4/">Linux时间子系统之四：定时器的引擎：clock_event_device</a></h2>
     
     
       <p class="meta">
@@ -1166,190 +671,34 @@ Function tracer 的实现</p>
 
 
 
-<time class='entry-date' datetime='2016-03-28T09:10:00+08:00'><span class='date'>2016-03-28</span> <span class='time'>09:10:00</span></time>
+<time class='entry-date' datetime='2017-07-23T14:04:00+08:00'><span class='date'>2017-07-23</span> <span class='time'>14:04:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><p><a href="http://vault.centos.org/7.2.1511/os/Source/SPackages/rpm-4.11.3-17.el7.src.rpm">http://vault.centos.org/7.2.1511/os/Source/SPackages/rpm-4.11.3-17.el7.src.rpm</a></p>
+  <div class="entry-content"><p><a href="http://blog.csdn.net/DroidPhone/article/details/8017604">http://blog.csdn.net/DroidPhone/article/details/8017604</a></p>
 
-<p>修改tool/debugedit.c</p>
+<p>早期的内核版本中，进程的调度基于一个称之为tick的时钟滴答，通常使用时钟中断来定时地产生tick信号，每次tick定时中断都会进行进程的统计和调度，并对tick进行计数，记录在一个jiffies变量中，定时器的设计也是基于jiffies。这时候的内核代码中，几乎所有关于时钟的操作都是在machine级的代码中实现，很多公共的代码要在每个平台上重复实现。随后，随着通用时钟框架的引入，内核需要支持高精度的定时器，为此，通用时间框架为定时器硬件定义了一个标准的接口：clock_event_device，machine级的代码只要按这个标准接口实现相应的硬件控制功能，剩下的与平台无关的特性则统一由通用时间框架层来实现。</p>
 
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-<span class='line-number'>58</span>
-<span class='line-number'>59</span>
-<span class='line-number'>60</span>
-<span class='line-number'>61</span>
-<span class='line-number'>62</span>
-<span class='line-number'>63</span>
-<span class='line-number'>64</span>
-<span class='line-number'>65</span>
-<span class='line-number'>66</span>
-<span class='line-number'>67</span>
-<span class='line-number'>68</span>
-<span class='line-number'>69</span>
-<span class='line-number'>70</span>
-<span class='line-number'>71</span>
-<span class='line-number'>72</span>
-<span class='line-number'>73</span>
-<span class='line-number'>74</span>
-<span class='line-number'>75</span>
-<span class='line-number'>76</span>
-<span class='line-number'>77</span>
-<span class='line-number'>78</span>
-<span class='line-number'>79</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>diff --git a/tools/debugedit.c b/tools/debugedit.c
-</span><span class='line'>index 0f85885..257f5f8 100644
-</span><span class='line'>--- a/tools/debugedit.c
-</span><span class='line'>+++ b/tools/debugedit.c
-</span><span class='line'>@@ -602,13 +602,14 @@ edit_dwarf2_line (DSO *dso, uint32_t off, char *comp_dir, int phase)
-</span><span class='line'>    if (base_dir == NULL)
-</span><span class='line'>      p = s;
-</span><span class='line'>    else if (has_prefix (s, base_dir))
-</span><span class='line'>-     p = s + strlen (base_dir);
-</span><span class='line'>+     { p = s + strlen (base_dir); while (*p == '/') p++; }
-</span><span class='line'>    else if (has_prefix (s, dest_dir))
-</span><span class='line'>-     p = s + strlen (dest_dir);
-</span><span class='line'>+     { p = s + strlen (dest_dir); while (*p == '/') p++; }
-</span><span class='line'> 
-</span><span class='line'>-   if (p)
-</span><span class='line'>+   if (p && strlen (p) &gt; 2 && flock(list_file_fd, LOCK_EX) == 0)
-</span><span class='line'>      {
-</span><span class='line'>        size_t size = strlen (p) + 1;
-</span><span class='line'>+     
-</span><span class='line'>        while (size &gt; 0)
-</span><span class='line'>      {
-</span><span class='line'>        ssize_t ret = write (list_file_fd, p, size);
-</span><span class='line'>@@ -617,6 +618,7 @@ edit_dwarf2_line (DSO *dso, uint32_t off, char *comp_dir, int phase)
-</span><span class='line'>        size -= ret;
-</span><span class='line'>        p += ret;
-</span><span class='line'>      }
-</span><span class='line'>+     flock(list_file_fd, LOCK_UN);
-</span><span class='line'>      }
-</span><span class='line'>  }
-</span><span class='line'> 
-</span><span class='line'>@@ -928,17 +930,18 @@ edit_attributes (DSO *dso, unsigned char *ptr, struct abbrev_tag *t, int phase)
-</span><span class='line'>      it and the debugger (GDB) cannot safely optimize out the missing
-</span><span class='line'>      CU current dir subdirectories.  */
-</span><span class='line'>   if (comp_dir && list_file_fd != -1)
-</span><span class='line'>-    {
-</span><span class='line'>+  {
-</span><span class='line'>       char *p;
-</span><span class='line'>       size_t size;
-</span><span class='line'> 
-</span><span class='line'>       if (base_dir && has_prefix (comp_dir, base_dir))
-</span><span class='line'>- p = comp_dir + strlen (base_dir);
-</span><span class='line'>+     { p = comp_dir + strlen (base_dir); while (*p == '/') p++; }
-</span><span class='line'>       else if (dest_dir && has_prefix (comp_dir, dest_dir))
-</span><span class='line'>- p = comp_dir + strlen (dest_dir);
-</span><span class='line'>+     { p = comp_dir + strlen (dest_dir); while (*p == '/') p++; }
-</span><span class='line'>       else
-</span><span class='line'>  p = comp_dir;
-</span><span class='line'> 
-</span><span class='line'>+    if (p && strlen (p) &gt; 2 && flock(list_file_fd, LOCK_EX) == 0) {
-</span><span class='line'>       size = strlen (p) + 1;
-</span><span class='line'>       while (size &gt; 0)
-</span><span class='line'>  {
-</span><span class='line'>@@ -949,6 +952,8 @@ edit_attributes (DSO *dso, unsigned char *ptr, struct abbrev_tag *t, int phase)
-</span><span class='line'>    p += ret;
-</span><span class='line'>  }
-</span><span class='line'>     }
-</span><span class='line'>+    flock(list_file_fd, LOCK_UN);
-</span><span class='line'>+  }
-</span><span class='line'> 
-</span><span class='line'>   if (found_list_offs && comp_dir)
-</span><span class='line'>     edit_dwarf2_line (dso, list_offs, comp_dir, phase);
-</span><span class='line'>@@ -1548,7 +1553,7 @@ main (int argc, char *argv[])
-</span><span class='line'>     canonicalize_path(dest_dir, dest_dir);
-</span><span class='line'> 
-</span><span class='line'>   /* Make sure there are trailing slashes in dirs */
-</span><span class='line'>-  if (base_dir != NULL && base_dir[strlen (base_dir)-1] != '/')
-</span><span class='line'>+  /*if (base_dir != NULL && base_dir[strlen (base_dir)-1] != '/')
-</span><span class='line'>     {
-</span><span class='line'>       p = malloc (strlen (base_dir) + 2);
-</span><span class='line'>       strcpy (p, base_dir);
-</span><span class='line'>@@ -1563,7 +1568,7 @@ main (int argc, char *argv[])
-</span><span class='line'>       strcat (p, "/");
-</span><span class='line'>       free (dest_dir);
-</span><span class='line'>       dest_dir = p;
-</span><span class='line'>-    }
-</span><span class='line'>+    }*/
-</span><span class='line'> 
-</span><span class='line'>   if (list_file != NULL)
-</span><span class='line'>     {</span></code></pre></td></tr></table></div></figure>
+<h4>1. 时钟事件软件架构</h4>
 
+<p>本系列文章的第一节中，我们曾经讨论了时钟源设备：clocksource，现在又来一个时钟事件设备：clock_event_device，它们有何区别？看名字，好像都是给系统提供时钟的设备，实际上，clocksource不能被编程，没有产生事件的能力，它主要被用于timekeeper来实现对真实时间进行精确的统计，而clock_event_device则是可编程的，它可以工作在周期触发或单次触发模式，系统可以对它进行编程，以确定下一次事件触发的时间，clock_event_device主要用于实现普通定时器和高精度定时器，同时也用于产生tick事件，供给进程调度子系统使用。时钟事件设备与通用时间框架中的其他模块的关系如下图所示：</p>
 
-<p><a href="/download/debug/debugedit_el7">debugedit_el7</a></p>
+<p><img src="/images/kernel/2017-07-23-2.png" alt="" /></p>
 
-<hr />
+<p>与clocksource一样，系统中可以存在多个clock_event_device，系统会根据它们的精度和能力，选择合适的clock_event_device对系统提供时钟事件服务。在smp系统中，为了减少处理器间的通信开销，基本上每个cpu都会具备一个属于自己的本地clock_event_device，独立地为该cpu提供时钟事件服务，smp中的每个cpu基于本地的clock_event_device，建立自己的tick_device，普通定时器和高精度定时器。</p>
 
-<h3>find-debuginfo.sh &lsquo;extracting debug info'时改成多进程</h3>
+<p>在软件架构上看，clock_event_device被分为了两层，与硬件相关的被放在了machine层，而与硬件无关的通用代码则被集中到了通用时间框架层，这符合内核对软件的设计需求，平台的开发者只需实现平台相关的接口即可，无需关注复杂的上层时间框架。</p>
 
-<h5>1. 首先要像上面那样debugedit.c加入文件锁</h5>
+<p>tick_device是基于clock_event_device的进一步封装，用于代替原有的时钟滴答中断，给内核提供tick事件，以完成进程的调度和进程信息统计，负载平衡和时间更新等操作。</p>
 
-<p><a href="/blog/2015/11/26/lang-c-flock/">c 文件锁flock</a></p>
+<h4>2. 时钟事件设备相关数据结构</h4>
 
-<h5>2. shell模拟多进程</h5>
+<h5>2.1  struct clock_event_device</h5>
 
-<p><a href="/blog/2016/03/25/shell-forks/">shell 多进程</a></p>
+<p>时钟事件设备的核心数据结构是clock_event_device结构，它代表着一个时钟硬件设备，该设备就好像是一个具有事件触发能力（通常就是指中断）的clocksource，它不停地计数，当计数值达到预先编程设定的数值那一刻，会引发一个时钟事件中断，继而触发该设备的事件处理回调函数，以完成对时钟事件的处理。clock_event_device结构的定义如下：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -1400,119 +749,915 @@ Function tracer 的实现</p>
 <span class='line-number'>47</span>
 <span class='line-number'>48</span>
 <span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-<span class='line-number'>58</span>
-<span class='line-number'>59</span>
-<span class='line-number'>60</span>
-<span class='line-number'>61</span>
-<span class='line-number'>62</span>
-<span class='line-number'>63</span>
-<span class='line-number'>64</span>
-<span class='line-number'>65</span>
-<span class='line-number'>66</span>
-<span class='line-number'>67</span>
-<span class='line-number'>68</span>
-<span class='line-number'>69</span>
-<span class='line-number'>70</span>
-<span class='line-number'>71</span>
-<span class='line-number'>72</span>
-<span class='line-number'>73</span>
-<span class='line-number'>74</span>
-<span class='line-number'>75</span>
-<span class='line-number'>76</span>
-<span class='line-number'>77</span>
-<span class='line-number'>78</span>
-<span class='line-number'>79</span>
-<span class='line-number'>80</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'># 先建立fd
-</span><span class='line'>tmp_fifo="/tmp/.tmp_fifo"
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct clock_event_device {
+</span><span class='line'>&#9;void            (*event_handler)(struct clock_event_device *);
+</span><span class='line'>&#9;int         (*set_next_event)(unsigned long evt,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;  struct clock_event_device *);
+</span><span class='line'>&#9;int         (*set_next_ktime)(ktime_t expires,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;  struct clock_event_device *);
+</span><span class='line'>&#9;ktime_t         next_event;
+</span><span class='line'>&#9;u64         max_delta_ns;
+</span><span class='line'>&#9;u64         min_delta_ns;
+</span><span class='line'>&#9;u32         mult;
+</span><span class='line'>&#9;u32         shift;
+</span><span class='line'>&#9;enum clock_event_mode   mode;
+</span><span class='line'>&#9;unsigned int        features;
+</span><span class='line'>&#9;unsigned long       retries;
 </span><span class='line'>
-</span><span class='line'>mkfifo $tmp_fifo
-</span><span class='line'>exec 6&lt;&gt;$tmp_fifo
-</span><span class='line'>rm $tmp_fifo
+</span><span class='line'>&#9;void            (*broadcast)(const struct cpumask *mask);
+</span><span class='line'>&#9;void            (*set_mode)(enum clock_event_mode mode,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;struct clock_event_device *);
+</span><span class='line'>&#9;unsigned long       min_delta_ticks;
+</span><span class='line'>&#9;unsigned long       max_delta_ticks;
 </span><span class='line'>
-</span><span class='line'># 假设8进程，先往fd中写入8字节
-</span><span class='line'>forks=8
-</span><span class='line'>for ((i=0;i&lt;$forks;i++))
-</span><span class='line'>do  
-</span><span class='line'>&#9;echo &gt;&6 
-</span><span class='line'>done
+</span><span class='line'>&#9;const char      *name;
+</span><span class='line'>&#9;int         rating;
+</span><span class='line'>&#9;int         irq;
+</span><span class='line'>&#9;const struct cpumask    *cpumask;
+</span><span class='line'>&#9;struct list_head    list;
+</span><span class='line'>} ____cacheline_aligned;
 </span><span class='line'>
-</span><span class='line'># Strip ELF binaries
-</span><span class='line'>find "$RPM_BUILD_ROOT" ! -path "${debugdir}/*.debug" -type f \
-</span><span class='line'>               \( -perm -0100 -or -perm -0010 -or -perm -0001 \) \
-</span><span class='line'>&#9;&#9;     -print |
-</span><span class='line'>file -N -f - | sed -n -e 's/^\(.*\):[     ]*.*ELF.*, not stripped/\1/p' |
-</span><span class='line'>xargs --no-run-if-empty stat -c '%h %D_%i %n' |
-</span><span class='line'>while read nlinks inum f; do
-</span><span class='line'>  get_debugfn "$f"
-</span><span class='line'>  [ -f "${debugfn}" ] && continue
+</span><span class='line'>event_handler  该字段是一个回调函数指针，通常由通用框架层设置，在时间中断到来时，machine底层的的中断服务程序会调用该回调，框架层利用该回调实现对时钟事件的处理。
 </span><span class='line'>
-</span><span class='line'>  # If this file has multiple links, keep track and make
-</span><span class='line'>  # the corresponding .debug files all links to one file too.
-</span><span class='line'>  if [ $nlinks -gt 1 ]; then
-</span><span class='line'>    eval linked=\$linked_$inum
-</span><span class='line'>    if [ -n "$linked" ]; then
-</span><span class='line'>      link=$debugfn
-</span><span class='line'>      get_debugfn "$linked"
-</span><span class='line'>      echo "hard linked $link to $debugfn"
-</span><span class='line'>      ln -nf "$debugfn" "$link"
-</span><span class='line'>      continue
-</span><span class='line'>    else
-</span><span class='line'>      eval linked_$inum=\$f
-</span><span class='line'>      echo "file $f has $[$nlinks - 1] other hard links"
-</span><span class='line'>    fi
-</span><span class='line'>  fi
+</span><span class='line'>set_next_event  设置下一次时间触发的时间，使用类似于clocksource的cycle计数值（离现在的cycle差值）作为参数。
 </span><span class='line'>
-</span><span class='line'>  # 从fd读取一个字节，开始一个进程
-</span><span class='line'>  read -u6
-</span><span class='line'>  {
-</span><span class='line'>    echo "extracting debug info from $f"
-</span><span class='line'>    id=$(/usr/lib/rpm/debugedit_kk -b "$RPM_BUILD_DIR" -d "/usr/src/debug$REPLACE_COMP_DIR" \
-</span><span class='line'>&#9;&#9;&#9;      -i -l "$SOURCEFILE" "$f")
-</span><span class='line'>    if $strict && [ -z "$id" ]; then
-</span><span class='line'>      echo &gt;&2 "*** ${strict_error}: No build ID note found in $f"
-</span><span class='line'>      $strict && exit 2   # 需要先写回一个字节？？？
-</span><span class='line'>    fi
+</span><span class='line'>set_next_ktime  设置下一次时间触发的时间，直接使用ktime时间作为参数。
 </span><span class='line'>
-</span><span class='line'>    # A binary already copied into /usr/lib/debug doesn't get stripped,
-</span><span class='line'>    # just has its file names collected and adjusted.
-</span><span class='line'>    case "$dn" in
-</span><span class='line'>    /usr/lib/debug/*)
-</span><span class='line'>      [ -z "$id" ] || make_id_link "$id" "$dn/$(basename $f)"
-</span><span class='line'>      continue ;;  # 需要先写回一个字节？？？
-</span><span class='line'>    esac
+</span><span class='line'>max_delta_ns  可设置的最大时间差，单位是纳秒。
 </span><span class='line'>
-</span><span class='line'>    mkdir -p "${debugdn}"
-</span><span class='line'>    if test -w "$f"; then
-</span><span class='line'>      strip_to_debug "${debugfn}" "$f"
-</span><span class='line'>    else
-</span><span class='line'>      chmod u+w "$f"
-</span><span class='line'>      strip_to_debug "${debugfn}" "$f"
-</span><span class='line'>      chmod u-w "$f"
-</span><span class='line'>    fi
+</span><span class='line'>min_delta_ns  可设置的最小时间差，单位是纳秒。
 </span><span class='line'>
-</span><span class='line'>    if [ -n "$id" ]; then
-</span><span class='line'>      make_id_link "$id" "$dn/$(basename $f)"
-</span><span class='line'>      make_id_link "$id" "/usr/lib/debug$dn/$bn" .debug
-</span><span class='line'>    fi
+</span><span class='line'>mult shift  与clocksource中的类似，只不过是用于把纳秒转换为cycle。
 </span><span class='line'>
-</span><span class='line'>    echo &gt;&6 # 一个进程结束写回一个字节
-</span><span class='line'>    exit 0   # 退出子进程
-</span><span class='line'>  } &
-</span><span class='line'>done || exit
+</span><span class='line'>mode  该时钟事件设备的工作模式，两种主要的工作模式分别是：
+</span><span class='line'>&#9;CLOCK_EVT_MODE_PERIODIC  周期触发模式，设置后按给定的周期不停地触发事件；
+</span><span class='line'>&#9;CLOCK_EVT_MODE_ONESHOT  单次触发模式，只在设置好的触发时刻触发一次；
 </span><span class='line'>
-</span><span class='line'>wait # 等待所有子进程结束
-</span><span class='line'>exec 6&gt;&-  # 删除fd</span></code></pre></td></tr></table></div></figure>
+</span><span class='line'>set_mode  函数指针，用于设置时钟事件设备的工作模式。
+</span><span class='line'>
+</span><span class='line'>rating  表示该设备的精度等级。
+</span><span class='line'>
+</span><span class='line'>list  系统中注册的时钟事件设备用该字段挂在全局链表变量clockevent_devices上。</span></code></pre></td></tr></table></div></figure>
 
 
+<h5>2.2 全局变量clockevent_devices</h5>
+
+<p>系统中所有注册的clock_event_device都会挂在该链表下面，它在kernel/time/clockevents.c中定义：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static LIST_HEAD(clockevent_devices);</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>2.3 全局变量clockevents_chain</h5>
+
+<p>通用时间框架初始化时会注册一个通知链（NOTIFIER），当系统中的时钟时间设备的状态发生变化时，利用该通知链通知系统的其它模块。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* Notification for clock events */
+</span><span class='line'>static RAW_NOTIFIER_HEAD(clockevents_chain);</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>3. clock_event_device的初始化和注册</h4>
+
+<p>每一个machine，都要定义一个自己的machine_desc结构，该结构定义了该machine的一些最基本的特性，其中需要设定一个sys_timer结构指针，machine级的代码负责定义sys_timer结构，sys_timer的声明很简单：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct sys_timer {
+</span><span class='line'>&#9;void            (*init)(void);
+</span><span class='line'>&#9;void            (*suspend)(void);
+</span><span class='line'>&#9;void            (*resume)(void);
+</span><span class='line'>#ifdef CONFIG_ARCH_USES_GETTIMEOFFSET
+</span><span class='line'>&#9;unsigned long       (*offset)(void);
+</span><span class='line'>#endif
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>通常，我们至少要定义它的init字段，系统初始化阶段，该init回调会被调用，该init回调函数的主要作用就是完成系统中的clocksource和clock_event_device的硬件初始化工作，以samsung的exynos4为例，在V3.4内核的代码树中，machine_desc的定义如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>MACHINE_START(SMDK4412, "SMDK4412")
+</span><span class='line'>&#9;/* Maintainer: Kukjin Kim &lt;kgene.kim@samsung.com&gt; */
+</span><span class='line'>&#9;/* Maintainer: Changhwan Youn &lt;chaos.youn@samsung.com&gt; */
+</span><span class='line'>&#9;.atag_offset    = 0x100,
+</span><span class='line'>&#9;.init_irq   = exynos4_init_irq,
+</span><span class='line'>&#9;.map_io     = smdk4x12_map_io,
+</span><span class='line'>&#9;.handle_irq = gic_handle_irq,
+</span><span class='line'>&#9;.init_machine   = smdk4x12_machine_init,
+</span><span class='line'>&#9;.timer      = &exynos4_timer,
+</span><span class='line'>&#9;.restart    = exynos4_restart,
+</span><span class='line'>MACHINE_END</span></code></pre></td></tr></table></div></figure>
+
+
+<p>定义的sys_timer是exynos4_timer，它的定义和init回调定义如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void __init exynos4_timer_init(void)
+</span><span class='line'>{
+</span><span class='line'>&#9;if (soc_is_exynos4210())
+</span><span class='line'>&#9;&#9;mct_int_type = MCT_INT_SPI;
+</span><span class='line'>&#9;else
+</span><span class='line'>&#9;&#9;mct_int_type = MCT_INT_PPI;
+</span><span class='line'>
+</span><span class='line'>&#9;exynos4_timer_resources();
+</span><span class='line'>&#9;exynos4_clocksource_init();
+</span><span class='line'>&#9;exynos4_clockevent_init();
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>struct sys_timer exynos4_timer = {
+</span><span class='line'>&#9;.init       = exynos4_timer_init,
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>exynos4_clockevent_init函数显然是初始化和注册clock_event_device的合适时机，在这里，它注册了一个rating为250的clock_event_device，并把它指定给cpu0：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static struct clock_event_device mct_comp_device = {
+</span><span class='line'>&#9;.name       = "mct-comp",
+</span><span class='line'>&#9;.features       = CLOCK_EVT_FEAT_PERIODIC | CLOCK_EVT_FEAT_ONESHOT,
+</span><span class='line'>&#9;.rating     = 250,
+</span><span class='line'>&#9;.set_next_event = exynos4_comp_set_next_event,
+</span><span class='line'>&#9;.set_mode   = exynos4_comp_set_mode,
+</span><span class='line'>};
+</span><span class='line'>......
+</span><span class='line'>static void exynos4_clockevent_init(void)
+</span><span class='line'>{
+</span><span class='line'>&#9;clockevents_calc_mult_shift(&mct_comp_device, clk_rate, 5);
+</span><span class='line'>&#9;&#9;......
+</span><span class='line'>&#9;mct_comp_device.cpumask = cpumask_of(0);
+</span><span class='line'>&#9;clockevents_register_device(&mct_comp_device);
+</span><span class='line'>
+</span><span class='line'>&#9;setup_irq(EXYNOS4_IRQ_MCT_G0, &mct_comp_event_irq);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>因为这个阶段其它cpu核尚未开始工作，所以该clock_event_device也只是在启动阶段给系统提供服务，实际上，因为exynos4是一个smp系统，具备2-4个cpu核心，前面说过，smp系统中，通常会使用各个cpu的本地定时器来为每个cpu单独提供时钟事件服务，继续翻阅代码，在系统初始化的后段，kernel_init会被调用，它会调用smp_prepare_cpus，其中会调用percpu_timer_setup函数，在arch/arm/kernel/smp.c中，为每个cpu定义了一个clock_event_device：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* 
+</span><span class='line'> * Timer (local or broadcast) support 
+</span><span class='line'> */
+</span><span class='line'>static DEFINE_PER_CPU(struct clock_event_device, percpu_clockevent);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>percpu_timer_setup最终会调用exynos4_local_timer_setup函数完成对本地clock_event_device的初始化工作：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int __cpuinit exynos4_local_timer_setup(struct clock_event_device *evt)
+</span><span class='line'>{
+</span><span class='line'>&#9;......
+</span><span class='line'>&#9;evt-&gt;name = mevt-&gt;name;
+</span><span class='line'>&#9;evt-&gt;cpumask = cpumask_of(cpu);
+</span><span class='line'>&#9;evt-&gt;set_next_event = exynos4_tick_set_next_event;
+</span><span class='line'>&#9;evt-&gt;set_mode = exynos4_tick_set_mode;
+</span><span class='line'>&#9;evt-&gt;features = CLOCK_EVT_FEAT_PERIODIC | CLOCK_EVT_FEAT_ONESHOT;
+</span><span class='line'>&#9;evt-&gt;rating = 450;
+</span><span class='line'>
+</span><span class='line'>&#9;clockevents_calc_mult_shift(evt, clk_rate / (TICK_BASE_CNT + 1), 5);
+</span><span class='line'>&#9;......
+</span><span class='line'>&#9;clockevents_register_device(evt);
+</span><span class='line'>&#9;......
+</span><span class='line'>&#9;enable_percpu_irq(EXYNOS_IRQ_MCT_LOCALTIMER, 0);
+</span><span class='line'>&#9;......
+</span><span class='line'>&#9;return 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>由此可见，每个cpu的本地clock_event_device的rating是450，比启动阶段的250要高，显然，之前注册给cpu0的精度要高，系统会用本地clock_event_device替换掉原来分配给cpu0的clock_event_device，至于怎么替换？我们先停一停，到这里我们一直在讨论machine级别的初始化和注册，让我们回过头来，看看框架层的初始化。在继续之前，让我们看看整个clock_event_device的初始化的调用序列图：</p>
+
+<p><img src="/images/kernel/2017-07-23-3.png" alt="" /></p>
+
+<p>图3.1  clock_event_device的系统初始化</p>
+
+<p>由上面的图示可以看出，框架层的初始化步骤很简单，又start_kernel开始，调用tick_init，它位于kernel/time/tick-common.c中，也只是简单地调用clockevents_register_notifier，同时把类型为notifier_block的tick_notifier作为参数传入，回看2.3节，clockevents_register_notifier注册了一个通知链，这样，当系统中的clock_event_device状态发生变化时（新增，删除，挂起，唤醒等等），tick_notifier中的notifier_call字段中设定的回调函数tick_notify就会被调用。接下来start_kernel调用了time_init函数，该函数通常定义在体系相关的代码中，正如前面所讨论的一样，它主要完成machine级别对时钟系统的初始化工作，最终通过clockevents_register_device注册系统中的时钟事件设备，把每个时钟时间设备挂在clockevent_device全局链表上，最后通过clockevent_do_notify触发框架层事先注册好的通知链，其实就是调用了tick_notify函数，我们主要关注CLOCK_EVT_NOTIFY_ADD通知，其它通知请自行参考代码，下面是tick_notify的简化版本：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int tick_notify(struct notifier_block *nb, unsigned long reason,
+</span><span class='line'>&#9;&#9;&#9;&#9;   void *dev)
+</span><span class='line'>{
+</span><span class='line'>&#9;switch (reason) {
+</span><span class='line'>
+</span><span class='line'>&#9;case CLOCK_EVT_NOTIFY_ADD:
+</span><span class='line'>&#9;&#9;return tick_check_new_device(dev);
+</span><span class='line'>
+</span><span class='line'>&#9;case CLOCK_EVT_NOTIFY_BROADCAST_ON:
+</span><span class='line'>&#9;case CLOCK_EVT_NOTIFY_BROADCAST_OFF:
+</span><span class='line'>&#9;case CLOCK_EVT_NOTIFY_BROADCAST_FORCE:
+</span><span class='line'>&#9;&#9;&#9;......
+</span><span class='line'>&#9;case CLOCK_EVT_NOTIFY_BROADCAST_ENTER:
+</span><span class='line'>&#9;case CLOCK_EVT_NOTIFY_BROADCAST_EXIT:
+</span><span class='line'>&#9;&#9;&#9;......
+</span><span class='line'>&#9;case CLOCK_EVT_NOTIFY_CPU_DYING:
+</span><span class='line'>&#9;&#9;&#9;......
+</span><span class='line'>&#9;case CLOCK_EVT_NOTIFY_CPU_DEAD:
+</span><span class='line'>&#9;&#9;&#9;......
+</span><span class='line'>&#9;case CLOCK_EVT_NOTIFY_SUSPEND:
+</span><span class='line'>&#9;&#9;&#9;......
+</span><span class='line'>&#9;case CLOCK_EVT_NOTIFY_RESUME:
+</span><span class='line'>&#9;&#9;&#9;......
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;return NOTIFY_OK;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>可见，对于新注册的clock_event_device，会发出CLOCK_EVT_NOTIFY_ADD通知，最终会进入函数：tick_check_new_device，这个函数比对当前cpu所使用的与新注册的clock_event_device之间的特性，如果认为新的clock_event_device更好，则会进行切换工作。下一节将会详细的讨论该函数。到这里，每个cpu已经有了自己的clock_event_device，在这以后，框架层的代码会根据内核的配置项（CONFIG_NO_HZ、CONFIG_HIGH_RES_TIMERS），对注册的clock_event_device进行不同的设置，从而为系统的tick和高精度定时器提供服务，这些内容我们留在本系列的后续文章进行讨论。</p>
+
+<h4>4. tick_device</h4>
+
+<p>当内核没有配置成支持高精度定时器时，系统的tick由tick_device产生，tick_device其实是clock_event_device的简单封装，它内嵌了一个clock_event_device指针和它的工作模式：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct tick_device {
+</span><span class='line'>&#9;struct clock_event_device *evtdev;
+</span><span class='line'>&#9;enum tick_device_mode mode;
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>在kernel/time/tick-common.c中，定义了一个per-cpu的tick_device全局变量，tick_cpu_device：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* 
+</span><span class='line'> * Tick devices 
+</span><span class='line'> */
+</span><span class='line'>DEFINE_PER_CPU(struct tick_device, tick_cpu_device);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>前面曾经说过，当machine的代码为每个cpu注册clock_event_device时，通知回调函数tick_notify会被调用，进而进入tick_check_new_device函数，下面让我们看看该函数如何工作，首先，该函数先判断注册的clock_event_device是否可用于本cpu，然后从per-cpu变量中取出本cpu的tick_device：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int tick_check_new_device(struct clock_event_device *newdev)
+</span><span class='line'>{
+</span><span class='line'>&#9;&#9;......
+</span><span class='line'>&#9;cpu = smp_processor_id();
+</span><span class='line'>&#9;if (!cpumask_test_cpu(cpu, newdev-&gt;cpumask))
+</span><span class='line'>&#9;&#9;goto out_bc;
+</span><span class='line'>
+</span><span class='line'>&#9;td = &per_cpu(tick_cpu_device, cpu);
+</span><span class='line'>&#9;curdev = td-&gt;evtdev;
+</span><span class='line'>
+</span><span class='line'>如果不是本地clock_event_device，会做进一步的判断：如果不能把irq绑定到本cpu，则放弃处理，如果本cpu已经有了一个本地clock_event_device，也放弃处理：
+</span><span class='line'>
+</span><span class='line'>&#9;if (!cpumask_equal(newdev-&gt;cpumask, cpumask_of(cpu))) {
+</span><span class='line'>&#9;&#9;&#9;   ......
+</span><span class='line'>&#9;&#9;if (!irq_can_set_affinity(newdev-&gt;irq))
+</span><span class='line'>&#9;&#9;&#9;goto out_bc;
+</span><span class='line'>&#9;&#9;&#9;   ......
+</span><span class='line'>&#9;&#9;if (curdev && cpumask_equal(curdev-&gt;cpumask, cpumask_of(cpu)))
+</span><span class='line'>&#9;&#9;&#9;goto out_bc;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>反之，如果本cpu已经有了一个clock_event_device，则根据是否支持单触发模式和它的rating值，决定是否替换原来旧的clock_event_device：
+</span><span class='line'>
+</span><span class='line'>&#9;if (curdev) {
+</span><span class='line'>&#9;&#9;if ((curdev-&gt;features & CLOCK_EVT_FEAT_ONESHOT) &&
+</span><span class='line'>&#9;&#9;&#9;!(newdev-&gt;features & CLOCK_EVT_FEAT_ONESHOT))
+</span><span class='line'>&#9;&#9;&#9;goto out_bc;  // 新的不支持单触发，但旧的支持，所以不能替换
+</span><span class='line'>&#9;&#9;if (curdev-&gt;rating &gt;= newdev-&gt;rating)
+</span><span class='line'>&#9;&#9;&#9;goto out_bc;  // 旧的比新的精度高，不能替换
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>在这些判断都通过之后，说明或者来cpu还没有绑定tick_device，或者是新的更好，需要替换：
+</span><span class='line'>
+</span><span class='line'>&#9;if (tick_is_broadcast_device(curdev)) {
+</span><span class='line'>&#9;&#9;clockevents_shutdown(curdev);
+</span><span class='line'>&#9;&#9;curdev = NULL;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;clockevents_exchange_device(curdev, newdev);
+</span><span class='line'>&#9;tick_setup_device(td, newdev, cpu, cpumask_of(cpu));</span></code></pre></td></tr></table></div></figure>
+
+
+<p>上面的tick_setup_device函数负责重新绑定当前cpu的tick_device和新注册的clock_event_device，如果发现是当前cpu第一次注册tick_device，就把它设置为TICKDEV_MODE_PERIODIC模式，如果是替换旧的tick_device，则根据新的tick_device的特性，设置为TICKDEV_MODE_PERIODIC或TICKDEV_MODE_ONESHOT模式。可见，在系统的启动阶段，tick_device是工作在周期触发模式的，直到框架层在合适的时机，才会开启单触发模式，以便支持NO_HZ和HRTIMER。</p>
+
+<h4>5. tick事件的处理&ndash;最简单的情况</h4>
+
+<p>clock_event_device最基本的应用就是实现tick_device，然后给系统定期地产生tick事件，通用时间框架对clock_event_device和tick_device的处理相当复杂，因为涉及配置项：CONFIG_NO_HZ和CONFIG_HIGH_RES_TIMERS的组合，两个配置项就有4种组合，这四种组合的处理都有所不同，所以这里我先只讨论最简单的情况：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>CONFIG_NO_HZ == 0;
+</span><span class='line'>CONFIG_HIGH_RES_TIMERS == 0;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>在这种配置模式下，我们回到上一节的tick_setup_device函数的最后：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (td-&gt;mode == TICKDEV_MODE_PERIODIC)
+</span><span class='line'>&#9;tick_setup_periodic(newdev, 0);
+</span><span class='line'>else
+</span><span class='line'>&#9;tick_setup_oneshot(newdev, handler, next_event);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>因为启动期间，第一个注册的tick_device必然工作在TICKDEV_MODE_PERIODIC模式，所以tick_setup_periodic会设置clock_event_device的事件回调字段event_handler为tick_handle_periodic，工作一段时间后，就算有新的支持TICKDEV_MODE_ONESHOT模式的clock_event_device需要替换，再次进入tick_setup_device函数，tick_setup_oneshot的handler参数也是之前设置的tick_handle_periodic函数，所以我们考察tick_handle_periodic即可：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void tick_handle_periodic(struct clock_event_device *dev)
+</span><span class='line'>{
+</span><span class='line'>&#9;int cpu = smp_processor_id();
+</span><span class='line'>&#9;ktime_t next;
+</span><span class='line'>
+</span><span class='line'>&#9;tick_periodic(cpu);
+</span><span class='line'>
+</span><span class='line'>&#9;if (dev-&gt;mode != CLOCK_EVT_MODE_ONESHOT)
+</span><span class='line'>&#9;&#9;return;
+</span><span class='line'>
+</span><span class='line'>&#9;next = ktime_add(dev-&gt;next_event, tick_period);
+</span><span class='line'>&#9;for (;;) {
+</span><span class='line'>&#9;&#9;if (!clockevents_program_event(dev, next, false))
+</span><span class='line'>&#9;&#9;&#9;return;
+</span><span class='line'>&#9;&#9;if (timekeeping_valid_for_hres())
+</span><span class='line'>&#9;&#9;&#9;tick_periodic(cpu);
+</span><span class='line'>&#9;&#9;next = ktime_add(next, tick_period);
+</span><span class='line'>&#9;}
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>该函数首先调用tick_periodic函数，完成tick事件的所有处理，如果是周期触发模式，处理结束，如果工作在单触发模式，则计算并设置下一次的触发时刻，这里用了一个循环，是为了防止当该函数被调用时，clock_event_device中的计时实际上已经经过了不止一个tick周期，这时候，tick_periodic可能被多次调用，使得jiffies和时间可以被正确地更新。tick_periodic的代码如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void tick_periodic(int cpu)
+</span><span class='line'>{
+</span><span class='line'>&#9;if (tick_do_timer_cpu == cpu) {
+</span><span class='line'>&#9;&#9;write_seqlock(&xtime_lock);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;/* Keep track of the next tick event */
+</span><span class='line'>&#9;&#9;tick_next_period = ktime_add(tick_next_period, tick_period);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;do_timer(1);
+</span><span class='line'>&#9;&#9;write_sequnlock(&xtime_lock);
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;update_process_times(user_mode(get_irq_regs()));
+</span><span class='line'>&#9;profile_tick(CPU_PROFILING);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>如果当前cpu负责更新时间，则通过do_timer进行以下操作：</p>
+
+<pre><code>更新jiffies_64变量；
+更新墙上时钟；
+每10个tick，更新一次cpu的负载信息；
+</code></pre>
+
+<p>调用update_peocess_times，完成以下事情：</p>
+
+<pre><code>更新进程的时间统计信息；
+触发TIMER_SOFTIRQ软件中断，以便系统处理传统的低分辨率定时器；
+检查rcu的callback；
+通过scheduler_tick触发调度系统进行进程统计和调度工作；
+</code></pre>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2017/07/23/kernel-clock-3/">Linux时间子系统之三：时间的维护者：timekeeper</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2017-07-23T13:46:00+08:00'><span class='date'>2017-07-23</span> <span class='time'>13:46:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://blog.csdn.net/droidphone/article/details/7989566">http://blog.csdn.net/droidphone/article/details/7989566</a></p>
+
+<p>本系列文章的前两节讨论了用于计时的时钟源：clocksource，以及内核内部时间的一些表示方法，但是对于真实的用户来说，我们感知的是真实世界的真实时间，也就是所谓的墙上时间，clocksource只能提供一个按给定频率不停递增的周期计数，如何把它和真实的墙上时间相关联？本节的内容正是要讨论这一点。</p>
+
+<h4>1. 时间的种类</h4>
+
+<p>内核管理着多种时间，它们分别是：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>RTC时间
+</span><span class='line'>wall time：墙上时间
+</span><span class='line'>monotonic time
+</span><span class='line'>raw monotonic time
+</span><span class='line'>boot time：总启动时间</span></code></pre></td></tr></table></div></figure>
+
+
+<p>RTC时间  在PC中，RTC时间又叫CMOS时间，它通常由一个专门的计时硬件来实现，软件可以读取该硬件来获得年月日、时分秒等时间信息，而在嵌入式系统中，有使用专门的RTC芯片，也有直接把RTC集成到Soc芯片中，读取Soc中的某个寄存器即可获取当前时间信息。一般来说，RTC是一种可持续计时的，也就是说，不管系统是否上电，RTC中的时间信息都不会丢失，计时会一直持续进行，硬件上通常使用一个后备电池对RTC硬件进行单独的供电。因为RTC硬件的多样性，开发者需要为每种RTC时钟硬件提供相应的驱动程序，内核和用户空间通过驱动程序访问RTC硬件来获取或设置时间信息。</p>
+
+<p>xtime  xtime和RTC时间一样，都是人们日常所使用的墙上时间，只是RTC时间的精度通常比较低，大多数情况下只能达到毫秒级别的精度，如果是使用外部的RTC芯片，访问速度也比较慢，为此，内核维护了另外一个wall time时间：xtime，取决于用于对xtime计时的clocksource，它的精度甚至可以达到纳秒级别，因为xtime实际上是一个内存中的变量，它的访问速度非常快，内核大部分时间都是使用xtime来获得当前时间信息。xtime记录的是自1970年1月1日24时到当前时刻所经历的纳秒数。</p>
+
+<p>monotonic time  该时间自系统开机后就一直单调地增加，它不像xtime可以因用户的调整时间而产生跳变，不过该时间不计算系统休眠的时间，也就是说，系统休眠时，monotoic时间不会递增。</p>
+
+<p>raw monotonic time  该时间与monotonic时间类似，也是单调递增的时间，唯一的不同是：raw monotonic time“更纯净”，他不会受到NTP时间调整的影响，它代表着系统独立时钟硬件对时间的统计。</p>
+
+<p>boot time  与monotonic时间相同，不过会累加上系统休眠的时间，它代表着系统上电后的总时间。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>时间种 类     精度（统计单位）     访问速度     累计休眠时间     受NTP调整的影响
+</span><span class='line'>RTC           低                   慢           Yes              Yes
+</span><span class='line'>xtime         高                   快           Yes              Yes
+</span><span class='line'>monotonic     高                   快           No               Yes
+</span><span class='line'>raw monotonic 高                   快           No               No
+</span><span class='line'>boot time     高                   快           Yes              Yes</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>2. struct timekeeper</h4>
+
+<p>内核用timekeeper结构来组织与时间相关的数据，它的定义如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct timekeeper {  
+</span><span class='line'>&#9;struct clocksource *clock;    /* Current clocksource used for timekeeping. */  
+</span><span class='line'>&#9;u32 mult;    /* NTP adjusted clock multiplier */  
+</span><span class='line'>&#9;int shift;  /* The shift value of the current clocksource. */  
+</span><span class='line'>&#9;cycle_t cycle_interval; /* Number of clock cycles in one NTP interval. */  
+</span><span class='line'>&#9;u64 xtime_interval; /* Number of clock shifted nano seconds in one NTP interval. */  
+</span><span class='line'>&#9;s64 xtime_remainder;    /* shifted nano seconds left over when rounding cycle_interval */  
+</span><span class='line'>&#9;u32 raw_interval;   /* Raw nano seconds accumulated per NTP interval. */  
+</span><span class='line'>  
+</span><span class='line'>&#9;u64 xtime_nsec; /* Clock shifted nano seconds remainder not stored in xtime.tv_nsec. */  
+</span><span class='line'>&#9;/* Difference between accumulated time and NTP time in ntp 
+</span><span class='line'>&#9; * shifted nano seconds. */  
+</span><span class='line'>&#9;s64 ntp_error;  
+</span><span class='line'>&#9;/* Shift conversion between clock shifted nano seconds and 
+</span><span class='line'>&#9; * ntp shifted nano seconds. */  
+</span><span class='line'>&#9;int ntp_error_shift;  
+</span><span class='line'>  
+</span><span class='line'>&#9;struct timespec xtime;  /* The current time */  
+</span><span class='line'>  
+</span><span class='line'>&#9;struct timespec wall_to_monotonic;  
+</span><span class='line'>&#9;struct timespec total_sleep_time;   /* time spent in suspend */  
+</span><span class='line'>&#9;struct timespec raw_time;   /* The raw monotonic time for the CLOCK_MONOTONIC_RAW posix clock. */  
+</span><span class='line'>  
+</span><span class='line'>&#9;ktime_t offs_real;  /* Offset clock monotonic -&gt; clock realtime */  
+</span><span class='line'>  
+</span><span class='line'>&#9;ktime_t offs_boot;  /* Offset clock monotonic -&gt; clock boottime */  
+</span><span class='line'>  
+</span><span class='line'>&#9;seqlock_t lock; /* Seqlock for all timekeeper values */  
+</span><span class='line'>};  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>其中的xtime字段就是上面所说的墙上时间，它是一个timespec结构的变量，它记录了自1970年1月1日以来所经过的时间，因为是timespec结构，所以它的精度可以达到纳秒级，当然那要取决于系统的硬件是否支持这一精度。</p>
+
+<p>内核除了用xtime表示墙上的真实时间外，还维护了另外一个时间：monotonic time，可以把它理解为自系统启动以来所经过的时间，该时间只能单调递增，可以理解为xtime虽然正常情况下也是递增的，但是毕竟用户可以主动向前或向后调整墙上时间，从而修改xtime值。但是monotonic时间不可以往后退，系统启动后只能不断递增。奇怪的是，内核并没有直接定义一个这样的变量来记录monotonic时间，而是定义了一个变量wall_to_monotonic，记录了墙上时间和monotonic时间之间的偏移量，当需要获得monotonic时间时，把xtime和wall_to_monotonic相加即可，因为默认启动时monotonic时间为0，所以实际上wall_to_monotonic的值是一个负数，它和xtime同一时间被初始化，请参考timekeeping_init函数。</p>
+
+<p>计算monotonic时间要去除系统休眠期间花费的时间，内核用total_sleep_time记录休眠的时间，每次休眠醒来后重新累加该时间，并调整wall_to_monotonic的值，使其在系统休眠醒来后，monotonic时间不会发生跳变。因为wall_to_monotonic值被调整。所以如果想获取boot time，需要加入该变量的值：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void get_monotonic_boottime(struct timespec *ts)  
+</span><span class='line'>{  
+</span><span class='line'>&#9;&#9;......  
+</span><span class='line'>&#9;do {  
+</span><span class='line'>&#9;&#9;seq = read_seqbegin(&timekeeper.lock);  
+</span><span class='line'>&#9;&#9;*ts = timekeeper.xtime;  
+</span><span class='line'>&#9;&#9;tomono = timekeeper.wall_to_monotonic;  
+</span><span class='line'>&#9;&#9;&lt;span style="color:#ff0000;"&gt;sleep = timekeeper.total_sleep_time;&lt;/span&gt;  
+</span><span class='line'>&#9;&#9;nsecs = timekeeping_get_ns();  
+</span><span class='line'>  
+</span><span class='line'>&#9;} while (read_seqretry(&timekeeper.lock, seq));  
+</span><span class='line'>  
+</span><span class='line'>&#9;set_normalized_timespec(ts, ts-&gt;tv_sec + tomono.tv_sec + sleep.tv_sec,  
+</span><span class='line'>&#9;&#9;&#9;ts-&gt;tv_nsec + tomono.tv_nsec + sleep.tv_nsec + nsecs);  
+</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>raw_time字段用来表示真正的硬件时间，也就是上面所说的raw monotonic time，它不受时间调整的影响，monotonic时间虽然也不受settimeofday的影响，但会受到ntp调整的影响，但是raw_time不受ntp的影响，他真的就是开完机后就单调地递增。xtime、monotonic-time和raw_time可以通过用户空间的clock_gettime函数获得，对应的ID参数分别是 CLOCK_REALTIME、CLOCK_MONOTONIC、CLOCK_MONOTONIC_RAW。</p>
+
+<p>clock字段则指向了目前timekeeper所使用的时钟源，xtime，monotonic time和raw time都是基于该时钟源进行计时操作，当有新的精度更高的时钟源被注册时，通过timekeeping_notify函数，change_clocksource函数将会被调用，timekeeper.clock字段将会被更新，指向新的clocksource。</p>
+
+<p>早期的内核版本中，xtime、wall_to_monotonic、raw_time其实是定义为全局静态变量，到我目前的版本（V3.4.10），这几个变量被移入到了timekeeper结构中，现在只需维护一个timekeeper全局静态变量即可：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static struct timekeeper timekeeper;  </span></code></pre></td></tr></table></div></figure>
+
+
+<h4>3. timekeeper的初始化</h4>
+
+<p>timekeeper的初始化由timekeeping_init完成，该函数在start_kernel的初始化序列中被调用，timekeeping_init首先从RTC中获取当前时间：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void __init timekeeping_init(void)  
+</span><span class='line'>{  
+</span><span class='line'>&#9;struct clocksource *clock;  
+</span><span class='line'>&#9;unsigned long flags;  
+</span><span class='line'>&#9;struct timespec now, boot;  
+</span><span class='line'>  
+</span><span class='line'>&#9;read_persistent_clock(&now);  
+</span><span class='line'>&#9;read_boot_clock(&boot);  
+</span><span class='line'>
+</span><span class='line'>然后对锁和ntp进行必要的初始化：
+</span><span class='line'>
+</span><span class='line'>&#9;seqlock_init(&timekeeper.lock);  
+</span><span class='line'>  
+</span><span class='line'>&#9;ntp_init();  
+</span><span class='line'>
+</span><span class='line'>接着获取默认的clocksource，如果平台没有重新实现clocksource_default_clock函数，
+</span><span class='line'>默认的clocksource就是基于jiffies的clocksource_jiffies，
+</span><span class='line'>然后通过timekeeper_setup_inernals内部函数把timekeeper和clocksource进行关联：
+</span><span class='line'>
+</span><span class='line'>&#9;write_seqlock_irqsave(&timekeeper.lock, flags);  
+</span><span class='line'>&#9;clock = clocksource_default_clock();  
+</span><span class='line'>&#9;if (clock-&gt;enable)  
+</span><span class='line'>&#9;&#9;clock-&gt;enable(clock);  
+</span><span class='line'>&#9;timekeeper_setup_internals(clock);  
+</span><span class='line'>
+</span><span class='line'>利用RTC的当前时间，初始化xtime，raw_time，wall_to_monotonic等字段：
+</span><span class='line'>
+</span><span class='line'>&#9;timekeeper.xtime.tv_sec = now.tv_sec;  
+</span><span class='line'>&#9;timekeeper.xtime.tv_nsec = now.tv_nsec;  
+</span><span class='line'>&#9;timekeeper.raw_time.tv_sec = 0;  
+</span><span class='line'>&#9;timekeeper.raw_time.tv_nsec = 0;  
+</span><span class='line'>&#9;if (boot.tv_sec == 0 && boot.tv_nsec == 0) {  
+</span><span class='line'>&#9;&#9;boot.tv_sec = timekeeper.xtime.tv_sec;  
+</span><span class='line'>&#9;&#9;boot.tv_nsec = timekeeper.xtime.tv_nsec;  
+</span><span class='line'>&#9;}  
+</span><span class='line'>&#9;set_normalized_timespec(&timekeeper.wall_to_monotonic,  
+</span><span class='line'>&#9;&#9;&#9;-boot.tv_sec, -boot.tv_nsec);  
+</span><span class='line'>
+</span><span class='line'>最后，初始化代表实时时间和monotonic时间之间偏移量的offs_real字段，total_sleep_time字段初始化为0：
+</span><span class='line'>
+</span><span class='line'>
+</span><span class='line'>&#9;update_rt_offset();  
+</span><span class='line'>&#9;timekeeper.total_sleep_time.tv_sec = 0;  
+</span><span class='line'>&#9;timekeeper.total_sleep_time.tv_nsec = 0;  
+</span><span class='line'>&#9;write_sequnlock_irqrestore(&timekeeper.lock, flags);  
+</span><span class='line'>
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>xtime字段因为是保存在内存中，系统掉电后无法保存时间信息，所以每次启动时都要通过timekeeping_init从RTC中同步正确的时间信息。其中，read_persistent_clock和read_boot_clock是平台级的函数，分别用于获取RTC硬件时间和启动时的时间，不过值得注意到是，到目前为止（我的代码树基于3.4版本），ARM体系中，只有tegra和omap平台实现了read_persistent_clock函数。如果平台没有实现该函数，内核提供了一个默认的实现：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void __attribute__((weak)) read_persistent_clock(struct timespec *ts)  
+</span><span class='line'>{  
+</span><span class='line'>&#9;ts-&gt;tv_sec = 0;  
+</span><span class='line'>&#9;ts-&gt;tv_nsec = 0;  
+</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void __attribute__((weak)) read_boot_clock(struct timespec *ts)  
+</span><span class='line'>{  
+</span><span class='line'>&#9;ts-&gt;tv_sec = 0;  
+</span><span class='line'>&#9;ts-&gt;tv_nsec = 0;  
+</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>那么，其他ARM平台是如何初始化xtime的？答案就是CONFIG_RTC_HCTOSYS这个内核配置项，打开该配置后，driver/rtc/hctosys.c将会编译到系统中，由rtc_hctosys函数通过do_settimeofday在系统初始化时完成xtime变量的初始化：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int __init rtc_hctosys(void)   
+</span><span class='line'>{   
+</span><span class='line'>&#9;&#9;......   
+</span><span class='line'>&#9;&#9;err = rtc_read_time(rtc, &tm);   
+</span><span class='line'>&#9;&#9;......  
+</span><span class='line'>&#9;&#9;rtc_tm_to_time(&tm, &tv.tv_sec);   
+</span><span class='line'>&#9;&#9;do_settimeofday(&tv);   
+</span><span class='line'>&#9;&#9;......   
+</span><span class='line'>&#9;&#9;return err;   
+</span><span class='line'>}   
+</span><span class='line'>late_initcall(rtc_hctosys);  </span></code></pre></td></tr></table></div></figure>
+
+
+<h4>4. 时间的更新</h4>
+
+<p>xtime一旦初始化完成后，timekeeper就开始独立于RTC，利用自身关联的clocksource进行时间的更新操作，根据内核的配置项的不同，更新时间的操作发生的频度也不尽相同，如果没有配置NO_HZ选项，通常每个tick的定时中断周期，do_timer会被调用一次，相反，如果配置了NO_HZ选项，可能会在好几个tick后，do_timer才会被调用一次，当然传入的参数是本次更新离上一次更新时相隔了多少个tick周期，系统会保证在clocksource的max_idle_ns时间内调用do_timer，以防止clocksource的溢出：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void do_timer(unsigned long ticks)  
+</span><span class='line'>{  
+</span><span class='line'>&#9;jiffies_64 += ticks;  
+</span><span class='line'>&#9;update_wall_time();  
+</span><span class='line'>&#9;calc_global_load(ticks);  
+</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>在do_timer中，jiffies_64变量被相应地累加，然后在update_wall_time中完成xtime等时间的更新操作，更新时间的核心操作就是读取关联clocksource的计数值，累加到xtime等字段中，其中还设计ntp时间的调整等代码，详细的代码就不贴了。</p>
+
+<h4>5. 获取时间</h4>
+
+<p>timekeeper提供了一系列的接口用于获取各种时间信息。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void getboottime(struct timespec *ts);    获取系统启动时刻的实时时间
+</span><span class='line'>void get_monotonic_boottime(struct timespec *ts);     获取系统启动以来所经过的时间，包含休眠时间
+</span><span class='line'>ktime_t ktime_get_boottime(void);   获取系统启动以来所经过的c时间，包含休眠时间，返回ktime类型
+</span><span class='line'>ktime_t ktime_get(void);    获取系统启动以来所经过的c时间，不包含休眠时间，返回ktime类型
+</span><span class='line'>void ktime_get_ts(struct timespec *ts) ;   获取系统启动以来所经过的c时间，不包含休眠时间，返回timespec结构
+</span><span class='line'>unsigned long get_seconds(void);    返回xtime中的秒计数值
+</span><span class='line'>struct timespec current_kernel_time(void);    返回内核最后一次更新的xtime时间，不累计最后一次更新至今clocksource的计数值
+</span><span class='line'>void getnstimeofday(struct timespec *ts);    获取当前时间，返回timespec结构
+</span><span class='line'>void do_gettimeofday(struct timeval *tv);    获取当前时间，返回timeval结构</span></code></pre></td></tr></table></div></figure>
 
 </div>
   
@@ -1535,7 +1680,7 @@ Function tracer 的实现</p>
   
     <section>
 <h1>Categories
-<span class='right_span'>(903)</span>
+<span class='right_span'>(913)</span>
 
 </h1>
 <head>
@@ -1566,7 +1711,7 @@ if (!document.getElementById('blog~octopress')) document.getElementById('aexp_bl
 if (!document.getElementById('blog')) document.getElementById('aexp_blog').style.visibility = 'hidden';
 if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ruby').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(138)</span></li>
+<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(142)</span></li>
 <div id='language' class='catsub'><li><a href='/blog/cats/language~c/?opendiv=language'>c</a><a href='##' onmousedown=showDiv('language~c') id='aexp_language~c'><span class='exp_style' id='exp_language~c'>[+]</span></a><span class='right_span'>32</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~c')) document.getElementById('aexp_language~c').style.visibility = 'hidden';
@@ -1583,7 +1728,7 @@ if (!document.getElementById('language~java')) document.getElementById('aexp_lan
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~jsp')) document.getElementById('aexp_language~jsp').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/language~php/?opendiv=language'>php</a><a href='##' onmousedown=showDiv('language~php') id='aexp_language~php'><span class='exp_style' id='exp_language~php'>[+]</span></a><span class='right_span'>43</span></li>
+<li><a href='/blog/cats/language~php/?opendiv=language'>php</a><a href='##' onmousedown=showDiv('language~php') id='aexp_language~php'><span class='exp_style' id='exp_language~php'>[+]</span></a><span class='right_span'>44</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~php')) document.getElementById('aexp_language~php').style.visibility = 'hidden';
 </script>
@@ -1591,7 +1736,7 @@ if (!document.getElementById('language~php')) document.getElementById('aexp_lang
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~python')) document.getElementById('aexp_language~python').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/language~web/?opendiv=language'>web</a><a href='##' onmousedown=showDiv('language~web') id='aexp_language~web'><span class='exp_style' id='exp_language~web'>[+]</span></a><span class='right_span'>42</span></li>
+<li><a href='/blog/cats/language~web/?opendiv=language'>web</a><a href='##' onmousedown=showDiv('language~web') id='aexp_language~web'><span class='exp_style' id='exp_language~web'>[+]</span></a><span class='right_span'>45</span></li>
 </div><script language='javascript' type='text/javascript'>
 if (!document.getElementById('language')) document.getElementById('aexp_language').style.visibility = 'hidden';
 if (!document.getElementById('language~web')) document.getElementById('aexp_language~web').style.visibility = 'hidden';
@@ -1620,7 +1765,7 @@ if (!document.getElementById('assembly~base')) document.getElementById('aexp_ass
 if (!document.getElementById('assembly')) document.getElementById('aexp_assembly').style.visibility = 'hidden';
 if (!document.getElementById('assembly~win')) document.getElementById('aexp_assembly~win').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(194)</span></li>
+<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(198)</span></li>
 <div id='tools' class='catsub'><li><a href='/blog/cats/tools~apache2/?opendiv=tools'>apache2</a><a href='##' onmousedown=showDiv('tools~apache2') id='aexp_tools~apache2'><span class='exp_style' id='exp_tools~apache2'>[+]</span></a><span class='right_span'>9</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~apache2')) document.getElementById('aexp_tools~apache2').style.visibility = 'hidden';
@@ -1661,7 +1806,7 @@ if (!document.getElementById('tools~haproxy')) document.getElementById('aexp_too
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~isal')) document.getElementById('aexp_tools~isal').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/tools~mysql/?opendiv=tools'>mysql</a><a href='##' onmousedown=showDiv('tools~mysql') id='aexp_tools~mysql'><span class='exp_style' id='exp_tools~mysql'>[+]</span></a><span class='right_span'>29</span></li>
+<li><a href='/blog/cats/tools~mysql/?opendiv=tools'>mysql</a><a href='##' onmousedown=showDiv('tools~mysql') id='aexp_tools~mysql'><span class='exp_style' id='exp_tools~mysql'>[+]</span></a><span class='right_span'>30</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~mysql')) document.getElementById('aexp_tools~mysql').style.visibility = 'hidden';
 </script>
@@ -1701,7 +1846,7 @@ if (!document.getElementById('tools~socksvpn')) document.getElementById('aexp_to
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~sqlmap')) document.getElementById('aexp_tools~sqlmap').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/tools~sqlserver/?opendiv=tools'>sqlserver</a><a href='##' onmousedown=showDiv('tools~sqlserver') id='aexp_tools~sqlserver'><span class='exp_style' id='exp_tools~sqlserver'>[+]</span></a><span class='right_span'>8</span></li>
+<li><a href='/blog/cats/tools~sqlserver/?opendiv=tools'>sqlserver</a><a href='##' onmousedown=showDiv('tools~sqlserver') id='aexp_tools~sqlserver'><span class='exp_style' id='exp_tools~sqlserver'>[+]</span></a><span class='right_span'>11</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~sqlserver')) document.getElementById('aexp_tools~sqlserver').style.visibility = 'hidden';
 </script>
@@ -1730,12 +1875,12 @@ if (!document.getElementById('tools~vim')) document.getElementById('aexp_tools~v
 if (!document.getElementById('tools')) document.getElementById('aexp_tools').style.visibility = 'hidden';
 if (!document.getElementById('tools~wxwork')) document.getElementById('aexp_tools~wxwork').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/system/'>system</a><a href='##' onmousedown=showDiv('system') id='aexp_system'><span class='exp_style' id='exp_system'>[+]</span></a><span class='right_span'>(109)</span></li>
-<div id='system' class='catsub'><li><a href='/blog/cats/system~base/?opendiv=system'>base</a><a href='##' onmousedown=showDiv('system~base') id='aexp_system~base'><span class='exp_style' id='exp_system~base'>[+]</span></a><span class='right_span'>23</span></li>
+<li class='catclass'><a href='/blog/cats/system/'>system</a><a href='##' onmousedown=showDiv('system') id='aexp_system'><span class='exp_style' id='exp_system'>[+]</span></a><span class='right_span'>(111)</span></li>
+<div id='system' class='catsub'><li><a href='/blog/cats/system~base/?opendiv=system'>base</a><a href='##' onmousedown=showDiv('system~base') id='aexp_system~base'><span class='exp_style' id='exp_system~base'>[+]</span></a><span class='right_span'>24</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('system~base')) document.getElementById('aexp_system~base').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/system~centos/?opendiv=system'>centos</a><a href='##' onmousedown=showDiv('system~centos') id='aexp_system~centos'><span class='exp_style' id='exp_system~centos'>[+]</span></a><span class='right_span'>15</span></li>
+<li><a href='/blog/cats/system~centos/?opendiv=system'>centos</a><a href='##' onmousedown=showDiv('system~centos') id='aexp_system~centos'><span class='exp_style' id='exp_system~centos'>[+]</span></a><span class='right_span'>16</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('system~centos')) document.getElementById('aexp_system~centos').style.visibility = 'hidden';
 </script>
@@ -1969,7 +2114,7 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 
 <section>
 <h1>Date Categories
-<span class='right_span'>(903)</span>
+<span class='right_span'>(913)</span>
 
 </h1>
 <head>
@@ -1977,8 +2122,9 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(23)</span></li>
-<div id='2024' class='catsub'><li><a href='/blog/cats/2024~06/?opendiv=2024'>2024-06</a><span class='right_span'>2</span></li>
+<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(33)</span></li>
+<div id='2024' class='catsub'><li><a href='/blog/cats/2024~07/?opendiv=2024'>2024-07</a><span class='right_span'>10</span></li>
+<li><a href='/blog/cats/2024~06/?opendiv=2024'>2024-06</a><span class='right_span'>2</span></li>
 <li><a href='/blog/cats/2024~05/?opendiv=2024'>2024-05</a><span class='right_span'>5</span></li>
 <li><a href='/blog/cats/2024~04/?opendiv=2024'>2024-04</a><span class='right_span'>5</span></li>
 <li><a href='/blog/cats/2024~03/?opendiv=2024'>2024-03</a><span class='right_span'>5</span></li>
@@ -2144,43 +2290,43 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
   <ul id="recent_posts">
     
       <li class="post">
-        <a href="/blog/2024/06/20/lang-php-date_sun_info/">PHP中的date_sun_info()函数, 日落/日出时间</a>
+        <a href="/blog/2024/07/15/tools-sqlserver-sys/">sql server系统表详细说明</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/06/20/centos-mkconfig/">grub2-mkconfig</a>
+        <a href="/blog/2024/07/15/tools-sqlserver-cols/">SQLserver查询数据库所有字段-表名</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/05/23/lang-lunar/">农历节气查表</a>
+        <a href="/blog/2024/07/15/tools-mysql-socket/">MySQL下的socket文件作用</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/05/17/rpmbuild-check/">rpmbuild 错误：发现已安装(但未打包的)文件</a>
+        <a href="/blog/2024/07/15/lang-php-iconv/">iconv与mb_convert_encoding的使用</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/05/16/lang-centos8-php8/">Centos8安装PHP8</a>
+        <a href="/blog/2024/07/15/bat/">Linux查看电池损耗</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/05/16/centos8-kernel/">CentOS8 编译内核错误</a>
+        <a href="/blog/2024/07/15/lang-web-box/">JavaScript的三种弹出提示框(alert、confirm、prompt)</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/05/11/centos8.5-install/">CentOS8.5 安装</a>
+        <a href="/blog/2024/07/15/lang-web-copy/">JavaScript复制内容到剪切板</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/04/30/mariadb/">centos 安装 MariaDB</a>
+        <a href="/blog/2024/07/15/lang-web-alert/">alert 弹窗去掉上方 title 网址域名</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/04/29/strongswan-make/">ubuntu 编译strongswan</a>
+        <a href="/blog/2024/07/15/tools-sqlserver-space/">SQL Server查看所有表大小，所占空间</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/04/29/tools-squid-log/">squid 日志格式, 时间格式</a>
+        <a href="/blog/2024/07/12/centos7-yum/">CentOS7 yum</a>
       </li>
     
   </ul>

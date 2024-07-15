@@ -131,7 +131,7 @@ var ss360Config = {
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2015/04/18/kernel-mm-alloc/">Linux物理内存页面分配</a></h2>
+      <h2 class="entry-title"><a href="/blog/2015/05/07/kernel-irq-stack2/">内核源码分析之linux内核栈</a></h2>
     
     
       <p class="meta">
@@ -140,16 +140,170 @@ var ss360Config = {
 
 
 
-<time class='entry-date' datetime='2015-04-18T22:38:00+08:00'><span class='date'>2015-04-18</span> <span class='time'>22:38:00</span></time>
+<time class='entry-date' datetime='2015-05-07T15:54:00+08:00'><span class='date'>2015-05-07</span> <span class='time'>15:54:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><p><a href="/download/kernel/Linux_Physical_Memory_Page_Allocation.pdf">Linux_Physical_Memory_Page_Allocation.pdf</a></p>
+  <div class="entry-content"><p><a href="http://www.cnblogs.com/liangning/p/3879177.html">http://www.cnblogs.com/liangning/p/3879177.html</a></p>
 
-<p>转自 <a href="http://www.jtben.com/document/1266382">http://www.jtben.com/document/1266382</a></p>
+<p>基于3.16-rc4</p>
+
+<p>在3.16-rc4内核源码中，内核给每个进程分配的内核栈大小为8KB。这个内核栈被称为异常栈，在进程的内核空间运行时或者执行异常处理程序时，使用的都是异常栈，看下异常栈的代码（include/linux/sched.h）：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>union thread_union {
+</span><span class='line'>&#9;struct thread_info thread_info;
+</span><span class='line'>&#9;unsigned long stack[THREAD_SIZE/sizeof(long)];
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>THREAD_SIZE值为8KB，因此内核为进程的异常栈（内核栈）分配了两个页框大小（页框大小4KB）。另外，进程的thread_info结构体保存在栈顶部。</p>
+
+<p>此外，内核为每个cpu分配一个硬中断栈和一个软中断栈（这两个栈也是内核栈），用来执行中断服务例程和下半部（软中断），看看代码（arch/x86/kernel/irq_32.c）。这两个栈属于cpu，不属于进程，这和异常栈是有区别的。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>DEFINE_PER_CPU(struct irq_stack *, hardirq_stack);
+</span><span class='line'>DEFINE_PER_CPU(struct irq_stack *, softirq_stack);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>定义了两个数组hardirq_stack和softirq_stack，每个数组元素对应一个cpu，指向了该cpu的硬中断栈或者软中断栈。再来看下struct irq_stack结构体（arch/x86/include/asm/processor.h）：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct irq_stack {
+</span><span class='line'>&#9;u32                     stack[THREAD_SIZE/sizeof(u32)];
+</span><span class='line'>} __aligned(THREAD_SIZE);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>可见，硬中断栈和软中断栈的大小均为8KB。</p>
+
+<p>内核在执行中断处理程序时，在do_IRQ函数中会调用handle_irq函数，在handle_irq函数中要进行堆栈切换，代码如下（arch/x86/kernel/irq_32.c）：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>bool handle_irq(unsigned irq, struct pt_regs *regs)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct irq_desc *desc;
+</span><span class='line'>&#9;int overflow;
+</span><span class='line'>
+</span><span class='line'>&#9;overflow = check_stack_overflow();
+</span><span class='line'>
+</span><span class='line'>&#9;desc = irq_to_desc(irq);
+</span><span class='line'>&#9;if (unlikely(!desc))
+</span><span class='line'>&#9;return false;
+</span><span class='line'>
+</span><span class='line'>&#9;if (user_mode_vm(regs) || !execute_on_irq_stack(overflow, desc, irq)) {
+</span><span class='line'>&#9;&#9;if (unlikely(overflow))
+</span><span class='line'>&#9;&#9;&#9;print_stack_overflow();
+</span><span class='line'>&#9;&#9;desc-&gt;handle_irq(irq, desc);
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;return true;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>第12行中执行execute_on_irq_stack函数来判断是否需要堆栈切换，如果不需要，则执行if体的中断服务例程，即在当前堆栈中执行中断服务例程，如果需要切换堆栈，则在execute_on_irq_stack函数中切换堆栈并在该函数中（新堆栈中）执行中断服务例程。下面看下execute_on_irq_stack代码（arch/x86/kernel/irq_32.c）：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static inline int
+</span><span class='line'>execute_on_irq_stack(int overflow, struct irq_desc *desc, int irq)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct irq_stack *curstk, *irqstk;
+</span><span class='line'>&#9;u32 *isp, *prev_esp, arg1, arg2;
+</span><span class='line'>
+</span><span class='line'>&#9;curstk = (struct irq_stack *) current_stack();
+</span><span class='line'>&#9;irqstk = __this_cpu_read(hardirq_stack);
+</span><span class='line'>
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * this is where we switch to the IRQ stack. However, if we are
+</span><span class='line'>&#9; * already using the IRQ stack (because we interrupted a hardirq
+</span><span class='line'>&#9; * handler) we can't do that and just have to keep using the
+</span><span class='line'>&#9; * current stack (which is the irq stack already after all)
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;if (unlikely(curstk == irqstk))
+</span><span class='line'>&#9;    return 0;
+</span><span class='line'>
+</span><span class='line'>&#9;isp = (u32 *) ((char *)irqstk + sizeof(*irqstk));
+</span><span class='line'>
+</span><span class='line'>&#9;/* Save the next esp at the bottom of the stack */
+</span><span class='line'>&#9;prev_esp = (u32 *)irqstk;
+</span><span class='line'>&#9;*prev_esp = current_stack_pointer;
+</span><span class='line'>
+</span><span class='line'>&#9;if (unlikely(overflow))
+</span><span class='line'>&#9;    call_on_stack(print_stack_overflow, isp);
+</span><span class='line'>
+</span><span class='line'>&#9;asm volatile("xchgl    %%ebx,%%esp    \n"
+</span><span class='line'>&#9;         "call    *%%edi        \n"
+</span><span class='line'>&#9;         "movl    %%ebx,%%esp    \n"
+</span><span class='line'>&#9;         : "=a" (arg1), "=d" (arg2), "=b" (isp)
+</span><span class='line'>&#9;         :  "0" (irq),   "1" (desc),  "2" (isp),
+</span><span class='line'>&#9;        "D" (desc-&gt;handle_irq)
+</span><span class='line'>&#9;         : "memory", "cc", "ecx");
+</span><span class='line'>&#9;return 1;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>第7行获取当前堆栈的指针，第8行获取本地cpu的硬中断栈指针，第16行对二者进行比较，如果相等，则不需要切换堆栈（说明当前堆栈就是硬中断栈，也说明是在中断处理程序中时又发生了中断）。如果不相等，就要进行堆栈切换，第22-23行将当前堆栈指针保存在将要切换到的堆栈中（用于返回）。第28行，交换ebx和esp寄存器的值（实现了堆栈切换，将中断栈指针给了esp），第29行跳转到相应的中断服务例程，第30行从中断服务例程返回后，又将原来的堆栈指针赋给esp，切换到原先堆栈。第33行将中断服务例程函数名存放在%edi中。</p>
 </div>
   
   
@@ -162,7 +316,7 @@ var ss360Config = {
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2015/04/18/kernel-mm-descript/">Linux物理内存描述</a></h2>
+      <h2 class="entry-title"><a href="/blog/2015/05/07/kernel-irq-stack/">中断栈溢出后的结果</a></h2>
     
     
       <p class="meta">
@@ -171,16 +325,115 @@ var ss360Config = {
 
 
 
-<time class='entry-date' datetime='2015-04-18T22:37:00+08:00'><span class='date'>2015-04-18</span> <span class='time'>22:37:00</span></time>
+<time class='entry-date' datetime='2015-05-07T15:54:00+08:00'><span class='date'>2015-05-07</span> <span class='time'>15:54:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><p><a href="/download/kernel/Linux_Physical_Memory_Description.pdf">Linux_Physical_Memory_Description.pdf</a></p>
+  <div class="entry-content"><p><a href="http://www.lenky.info/archives/2013/03/2247">http://www.lenky.info/archives/2013/03/2247</a></p>
 
-<p>转自 <a href="http://ilinuxkernel.com/?p=1332">http://ilinuxkernel.com/?p=1332</a></p>
+<p>说一下上文中最开始提到的“某个问题”：如果一台主机网卡比较多，然后每个网卡分队列又比较多，总之结果就是系统里的网卡设备的中断号比较多（关于超过256个中断数的情况，请见参考1，2，3），一旦所有这些中断都绑定到同一个CPU，那么如果网卡收到数据包进而触发中断，而众多硬中断一嵌套就非常容易出现中断栈溢出。一旦中断栈溢出，那么将会导致怎样的结果，这曾在之前的文章里隐含的提到过，这里再重新整理一遍。</p>
+
+<p>在继续下面的描述之前，先看两个知识点：</p>
+
+<h5>1，Linux 2.4.x的中断栈：</h5>
+
+<p>a)，由硬中断/软中断共同使用同一个中断栈<br/>
+b)，中断栈与内核栈共享一个栈<br/>
+c)，中断执行的时候使用的栈就是当前进程的内核栈</p>
+
+<h5>2，Linux 2.6.x的中断栈：</h5>
+
+<p>a)，硬中断与软中断分离使用不同的中断栈<br/>
+b)，中断栈与内核栈分离<br/>
+c)，X86_64 double fault、NMI还可以有额外的栈（64bit特性：IST(Interrupt Stack Table)）</p>
+
+<p>可以看到，对于Linux 2.4.x内核而言，因为中断处理函数使用内核栈作为中断栈，所以导致更加容易发生内核栈溢出（因内核函数本身用栈过多导致溢出，或内核函数本身还未导致内核栈溢出，但此时来了一个中断，因中断函数使用栈而导致溢出，即中断函数成了压死骆驼的最后一根稻草），而内核栈溢出的直接结果就是踩坏task结构体，从而无法正常执行对应的task进程而出现oops宕机。</p>
+
+<p>由于“中断执行的时候使用的栈就是当前进程的内核栈”，所以如果是执行到中断函数后才溢出，那么导致oops里提示的进程信息可能每次都不一样，因此如果出现这种情况，需要考虑是中断函数导致内核栈溢出，否则需怀疑普通的内核函数导致栈溢出即可。</p>
+
+<p>对于Linux 2.6.x内核而言，因为其中断/内核栈分离、软/硬中断栈分离，即每个CPU私有两个栈（见下面注释）分别处理软中断和硬中断，因此出现内核栈溢出，特别是中断栈溢出的概率大大降低。</p>
+
+<p>注释：这个说法来之书本《Understanding.the.Linux.Kernel.3rd.Edition》4.6.1.4. Multiple Kernel Mode stacks，而这本书针对的内核版本是2.6.11，且主要是指32位架构，所以与现在的新版内核源码有些许出入（比如现在情况的栈大小可能是占用2页），但这些细微改变与本文的具体问题相关不大（无非是溢出的难易程度问题），这里不再深入研究，具体情况请参考源代码自行斟酌。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>The hard IRQ stack is used when handling interrupts. There is one hard IRQ stack for each CPU in the system, and each stack is contained in a single page frame.
+</span><span class='line'>
+</span><span class='line'>The soft IRQ stack is used when handling deferrable functions (softirqs or tasklets; see the later section “Softirqs and Tasklets”). There is one soft IRQ stack for each CPU in the system, and each stack is contained in a single page frame. </span></code></pre></td></tr></table></div></figure>
+
+
+<p>回到本文的主题，在之前的文章里提到过，即如果中断/异常处理函数本身在处理的过程中出现异常，那么就有可能发生double fault，比如中断栈溢出。中断栈溢出导致的最终结果有两种情况，这由所使用的具体Linux内核版本来决定，更具体点说是由double fault异常的栈是否单独来决定（见参考1）。</p>
+
+<p>1，double fault的栈被单独出来<br/>
+这意味着double fault的处理函数还能正常执行，因此打印oops，宕机。</p>
+
+<p>2，double fault的栈没有被单独出来<br/>
+这意味着double fault的处理函数也无法正常执行，进而触发triple fault，机器直接重启。</p>
+
+<p>对于86-64架构下的Linux 2.6.x内核，因为IST(Interrupt Stack Table)的帮助，所以中断栈溢出导致的最终结果就是打印oops，宕机。</p>
+
+<p>下面来看内核源码文档kernel-stacks，<br/>
+1，每一个活动线程都有一个内核栈，大小为2页。<br/>
+2，每一个cpu有一些专门的栈，只有当cpu执行在内核态时，这些栈才有用；一旦cpu回退到用户态，这些特定栈就不再包含任何有用数据。<br/>
+3，主要的特定栈有：<br/>
+a，中断栈：外部硬件中断的处理函数使用，单独的栈可以提供给中断处理函数更多的栈空间。<br/>
+这里还提到，在2.6.x-i386下，如果设置内核栈只有4K，即CONFIG_4KSTACKS，那么中断栈也是单独开的。备注：这个已有修改，2010-06-29 x86: Always use irq stacks，即不管设置的内核栈是否只有4K，中断栈都是独立的了。</p>
+
+<p>另外，这里有个说法与前面的引用有点出入：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>The interrupt stack is also used when processing a softirq. </span></code></pre></td></tr></table></div></figure>
+
+
+<p>即软中断和硬中断一样，也是使用这个中断栈。</p>
+
+<p>b，x86_64所特有的（也就是i386没有，即同时2.6.30.8内核，32位的Linux就不具备下面所说的这个特性），为double fault或NMI单独准备的栈，这个特性被称为Interrupt Stack Table(IST)。每个cpu最多支持7个IST。关于IST的具体原理与实现暂且不说，直接来看当前已经分配的IST独立栈：</p>
+
+<ul>
+<li><p>STACKFAULT_STACK. EXCEPTION_STKSZ (PAGE_SIZE)<br/>
+12号中断Stack Fault Exception (#SS)使用</p></li>
+<li><p>DOUBLEFAULT_STACK. EXCEPTION_STKSZ (PAGE_SIZE)<br/>
+8号中断Double Fault Exception (#DF)使用</p></li>
+<li><p>NMI_STACK. EXCEPTION_STKSZ (PAGE_SIZE)<br/>
+2号中断non-maskable interrupts (NMI)使用</p></li>
+<li><p>DEBUG_STACK. DEBUG_STKSZ<br/>
+1号中断硬件调试和3号中断软件调试使用</p></li>
+<li><p>MCE_STACK. EXCEPTION_STKSZ (PAGE_SIZE)<br/>
+18号中断Machine Check Exception (#MC)使用</p></li>
+</ul>
+
+
+<p>正因为double fault异常处理函数所使用的栈被单独了出来，所以在出现中断栈溢出时，double fault异常的处理函数还能正常执行，顺利打印出oops信息。</p>
+
+<p>最后的最后，有补丁移除IST功能（貌似是因为如果没有IST功能，那么kvm可以得到更好的优化，具体请见参考5），但通过对比补丁修改与实际源码（2.6.30.8以及3.6.11）来看，这个补丁并没有合入mainline主线。</p>
+
+<h4>参考资料：</h4>
+
+<p>1，where is hardware timer interrupt?<br/>
+<a href="http://stackoverflow.com/questions/14481032/where-is-hardware-timer-interrupt">http://stackoverflow.com/questions/14481032/where-is-hardware-timer-interrupt</a></p>
+
+<p>2，The MSI Driver Guide HOWTO<br/>
+<a href="https://git.kernel.org/cgit/linux/kernel/git/stable/linux-stable.git/tree/Documentation/PCI/MSI-HOWTO.txt?id=v2.6.30.8">https://git.kernel.org/cgit/linux/kernel/git/stable/linux-stable.git/tree/Documentation/PCI/MSI-HOWTO.txt?id=v2.6.30.8</a><br/>
+对应的翻译版：<a href="http://blog.csdn.net/reviver/article/details/6802347">http://blog.csdn.net/reviver/article/details/6802347</a></p>
+
+<p>3，[PATCH] x86: 64bit support more than 256 irq v2<br/>
+<a href="http://linux-kernel.2935.n7.nabble.com/PATCH-x86-64bit-support-more-than-256-irq-v2-td323261.html">http://linux-kernel.2935.n7.nabble.com/PATCH-x86-64bit-support-more-than-256-irq-v2-td323261.html</a></p>
+
+<p>4，How is an Interrupt handled in Linux?<br/>
+<a href="http://unix.stackexchange.com/questions/5788/how-is-an-interrupt-handled-in-linux">http://unix.stackexchange.com/questions/5788/how-is-an-interrupt-handled-in-linux</a></p>
+
+<p>5，Remove interrupt stack table usage from x86_64 kernel (v2)<br/>
+<a href="http://lwn.net/Articles/313029/">http://lwn.net/Articles/313029/</a><br/>
+<a href="http://thread.gmane.org/gmane.comp.emulators.kvm.devel/26741">http://thread.gmane.org/gmane.comp.emulators.kvm.devel/26741</a></p>
+
+<p>6，Interrupt Descriptor Table<br/>
+<a href="http://wiki.osdev.org/IDT">http://wiki.osdev.org/IDT</a></p>
+
+<p>转载请保留地址：<a href="http://www.lenky.info/archives/2013/03/2247">http://www.lenky.info/archives/2013/03/2247</a> 或 <a href="http://lenky.info/?p=2247">http://lenky.info/?p=2247</a></p>
 </div>
   
   
@@ -193,7 +446,7 @@ var ss360Config = {
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2015/04/18/kernel-net-tcp-state/">TCP状态转换</a></h2>
+      <h2 class="entry-title"><a href="/blog/2015/05/07/kernel-irq-irq/">对Linux x86-64架构上硬中断的重新认识</a></h2>
     
     
       <p class="meta">
@@ -202,46 +455,229 @@ var ss360Config = {
 
 
 
-<time class='entry-date' datetime='2015-04-18T16:13:00+08:00'><span class='date'>2015-04-18</span> <span class='time'>16:13:00</span></time>
+<time class='entry-date' datetime='2015-05-07T15:48:00+08:00'><span class='date'>2015-05-07</span> <span class='time'>15:48:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><p><img src="/images/kernel/2015-04-18-1.png" alt="" /></p>
+  <div class="entry-content"><p><a href="http://www.lenky.info/archives/2013/03/2245">http://www.lenky.info/archives/2013/03/2245</a></p>
 
-<h5>1、建立连接协议（三次握手）</h5>
+<p>对于x86硬中断的概念，一直都落在理论的认识之上，直到这两天才（因某个问题）发现Linux的实现却并非如此，这里纠正一下（注意：Linux内核源码更新太快，一个说法的时效性太短，所以需注意我提到的香草内核版本，并且以x86-64架构为基准）。</p>
 
-<p>(1) 客户端发送一个带SYN标志的TCP报文到服务器。这是三次握手过程中的报文1。<br/>
-(2) 服务器端回应客户端的，这是三次握手中的第2个报文，这个报文同时带ACK标志和SYN标志。因此它表示对刚才客户端SYN报文的回应；同时又标志SYN给客户端，询问客户端是否准备好进行数据通讯。<br/>
-(3) 客户必须再次回应服务段一个ACK报文，这是报文段3。</p>
+<p>以前的认识：Linux对硬中断（本文如无特殊说明，都是指普通意义上的可屏蔽硬件中断）的处理有优先级概念，高优先级硬中断可以打断低优先级硬中断。</p>
 
-<h5>2、连接终止协议（四次握手）</h5>
+<h4>重新认识：</h4>
 
-<p>  由于TCP连接是全双工的，因此每个方向都必须单独进行关闭。这原则是当一方完成它的数据发送任务后就能发送一个FIN来终止这个方向的连接。收到一个 FIN只意味着这一方向上没有数据流动，一个TCP连接在收到一个FIN后仍能发送数据。首先进行关闭的一方将执行主动关闭，而另一方执行被动关闭。<br/>
-(1) TCP客户端发送一个FIN，用来关闭客户到服务器的数据传送（报文段4）。<br/>
-(2) 服务器收到这个FIN，它发回一个ACK，确认序号为收到的序号加1（报文段5）。和SYN一样，一个FIN将占用一个序号。<br/>
-(3) 服务器关闭客户端的连接，发送一个FIN给客户端（报文段6）。<br/>
-(4) 客户段发回ACK报文确认，并将确认序号设置为收到序号加1（报文段7）。</p>
+<p>1，对于x86硬件而言，在文档325462.pdf卷3章节6.9 PRIORITY AMONG SIMULTANEOUS EXCEPTIONS AND INTERRUPTS 提到一个表格，是指如果在同一时刻有多个异常或中断到达，那么CPU会按照一个指定的优先级顺序对它们进行响应和服务，而并不是我之前所想的判断是否可相互打断执行的高低级别。</p>
 
-<h4>tcp状态解释</h4>
+<p>2，对于Linux系统而言，硬中断之间并没有优先级的概念（虽然Intel CPU提供支持，请参考文档325462.pdf卷3章节10.8.3 Interrupt, Task, and Processor Priority），或者说优先级只有两个，全部关闭或全部开启，如下：</p>
 
-<ol>
-<li>CLOSED: 表示初始状态。</li>
-<li>LISTEN: 表示服务器端的某个SOCKET处于监听状态，可以接受连接了.</li>
-<li>SYN_SENT: 客户端通过应用程序调用connect进行active open.于是客户端tcp发送一个SYN以请求建立一个连接.之后状态置为SYN_SENT.</li>
-<li>SYN_RECV: 服务端应发出ACK确认客户端的SYN,同时自己向客户端发送一个SYN.之后状态置为SYN_RECV.</li>
-<li>ESTABLISHED：代表一个打开的连接，双方可以进行或已经在数据交互了.</li>
-<li>FIN_WAIT_1: 主动关闭(active close)端应用程序调用close，于是其TCP发出FIN请求主动关闭连接，之后进入FIN_WAIT1状态.</li>
-<li>FIN_WAIT2: 主动关闭端接到ACK后，就进入了FIN-WAIT-2 . 其实FIN_WAIT_1和FIN_WAIT_2状态的真正含义都是表示等待对方的FIN报文。而这两种状态的区别 是：FIN_WAIT_1状态实际上是当SOCKET在ESTABLISHED状态时，它想主动关闭连接，向对方发送了FIN报文，此时该SOCKET即 进入到FIN_WAIT_1状态。而当对方回应ACK报文后，则进入到FIN_WAIT_2状态.</li>
-<li>CLOSE_WAIT: CLOSE_WAIT:被动关闭(passive close)端TCP接到FIN后，就发出ACK以回应FIN请求(它的接收也作为文件结束符传递给上层应用程序),并进入CLOSE_WAIT。接下来还有数据发送给对方，如果没有的话，那么你也就可以 close这个SOCKET，发送FIN报文给对方，也即关闭连接。所以你在CLOSE_WAIT状态下，需要完成的事情是等待你去关闭连接.</li>
-<li>LAST_ACK: 被动关闭端一段时间后，接收到文件结束符的应用程序将调用CLOSE关闭连接。这导致它的TCP也发送一个 FIN,等待对方的ACK.就进入了LAST-ACK.</li>
-<li>TIME_WAIT: 在主动关闭端接收到FIN后，TCP就发送ACK包，并进入TIME-WAIT状态.</li>
-<li>CLOSING: 正常情况下，当你发送FIN报文后，按理来说是应该先收到（或同时收到）对方的 ACK报文，再收到对方的FIN报文。但是CLOSING状态表示你发送FIN报文后，没有收到对方的ACK报文，反而收到了对方的FIN报文。表示双方都正在关闭SOCKET连接.</li>
-<li>CLOSED: 被动关闭端在接受到ACK包后，就进入了closed的状态。连接结束.</li>
-</ol>
+<blockquote><blockquote><p>Regardless of what the hardware might support, typical UNIX-type systems only make use of two levels: the minimum (all interrupts enabled) and the maximum (all interrupts disabled).</p></blockquote></blockquote>
 
+<p>这意味着，如果一个硬中断处理函数正在执行，只要当前是处于开启中断的情况，那么此时发生的任何另外一个中断都可以打断当前处理函数，从而出现中断嵌套的情况。
+值得注意的是，Linux提供对单个中断开启/禁止的接口（以软件实现为主，比如给对应中断描述符desc的status打上IRQ_DISABLED旗标）：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void disable_irq(unsigned int irq)
+</span><span class='line'>void enable_irq(unsigned int irq)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>下面来看看Linux的实际处理，其硬中断的一般处理流程（具体可见参考1、2、3以及源代码，以2.6.30.8为例）：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>硬件中断 -&gt; common_interrupt -&gt; do_IRQ -&gt; handle_irq -&gt; generic_handle_irq_desc -&gt; desc-&gt;handle_irq或__do_IRQ。</span></code></pre></td></tr></table></div></figure>
+
+
+<p>其中desc->handle_irq是一个回调函数，会根据不同中断类型（I/O APIC、MSI）有不同的指向，比如：handle_fasteoi_irq()、handle_edge_irq()，这可以参考设置函数ioapic_register_intr()和setup_msi_irq()。通过/proc/interrupts可以看到各个中断的具体类型：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>[root@localhost ~]# cat /proc/interrupts
+</span><span class='line'>&#9;       CPU0       CPU1      
+</span><span class='line'>  0:        888          0   IO-APIC-edge      timer
+</span><span class='line'>  1:         96        112   IO-APIC-edge      i8042
+</span><span class='line'>  3:          1          0   IO-APIC-edge   
+</span><span class='line'>  4:          1          0   IO-APIC-edge   
+</span><span class='line'>  7:          0          0   IO-APIC-edge      parport0
+</span><span class='line'>  8:          1          0   IO-APIC-edge      rtc0
+</span><span class='line'>  9:          0          0   IO-APIC-fasteoi   acpi
+</span><span class='line'> 12:        204          0   IO-APIC-edge      i8042
+</span><span class='line'> 14:          0          0   IO-APIC-edge      ata_piix
+</span><span class='line'> 15:     460641        900   IO-APIC-edge      ata_piix
+</span><span class='line'> 16:          0          0   IO-APIC-fasteoi   Ensoniq AudioPCI
+</span><span class='line'> 17:     118347          0   IO-APIC-fasteoi   ehci_hcd:usb1, ioc0
+</span><span class='line'> 18:         70          0   IO-APIC-fasteoi   uhci_hcd:usb2
+</span><span class='line'> 19:     115143          0   IO-APIC-fasteoi   eth0
+</span><span class='line'> 24:          0          0   PCI-MSI-edge      pciehp
+</span><span class='line'> 25:          0          0   PCI-MSI-edge      pciehp
+</span><span class='line'> 26:          0          0   PCI-MSI-edge      pciehp
+</span><span class='line'> 27:          0          0   PCI-MSI-edge      pciehp
+</span><span class='line'> 28:          0          0   PCI-MSI-edge      pciehp
+</span><span class='line'>...</span></code></pre></td></tr></table></div></figure>
+
+
+<p>不管是desc->handle_irq还是__do_IRQ，它们都会调入到另外一个函数handle_IRQ_event()。重点：从CPU接收到中断信号并开始处理，到这个函数为止，都是处于中断禁止状态。为什么？很简单，因为Intel开发者手册上是这么说的，在文档325462.pdf卷3章节6.8.1 Masking Maskable Hardware Interrupts提到：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>When an interrupt is handled through an interrupt gate, the IF flag is automati-
+</span><span class='line'>cally cleared, which disables maskable hardware interrupts. (If an interrupt is
+</span><span class='line'>handled through a trap gate, the IF flag is not cleared.)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>在CPU开始处理一个硬中断到进入函数handle_IRQ_event()为止的这段时间里，因为处于中断禁止状态，所以不会出现被其它中断打断的情况。但是，在进入到函数handle_IRQ_event()后，立马有了这么两句：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>irqreturn_t handle_IRQ_event(unsigned int irq, struct irqaction *action)
+</span><span class='line'>{
+</span><span class='line'>&#9;irqreturn_t ret, retval = IRQ_NONE;
+</span><span class='line'>&#9;unsigned int status = 0;
+</span><span class='line'> 
+</span><span class='line'>&#9;if (!(action-&gt;flags & IRQF_DISABLED))
+</span><span class='line'>&#9;    local_irq_enable_in_hardirq();
+</span><span class='line'>...</span></code></pre></td></tr></table></div></figure>
+
+
+<p>函数local_irq_enable_in_hardirq()的定义如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#ifdef CONFIG_LOCKDEP
+</span><span class='line'># define local_irq_enable_in_hardirq()  do { } while (0)
+</span><span class='line'>#else
+</span><span class='line'># define local_irq_enable_in_hardirq()  local_irq_enable()
+</span><span class='line'>#endif</span></code></pre></td></tr></table></div></figure>
+
+
+<p>宏CONFIG_LOCKDEP用于表示当前是否开启内核Lockdep功能，这是一个调试功能，用于检测潜在的死锁类风险，如果开启，那么函数local_irq_enable_in_hardirq()为空，即继续保持中断禁止状态，为什么Lockdep功能需要保持中断禁止待后文再述，这里考虑一般情况，即不开启Lockdep功能，那么执行函数local_irq_enable_in_hardirq()就会开启中断。
+看函数handle_IRQ_event()里的代码，如果没有带上IRQF_DISABLED旗标，那么就会执行函数local_irq_enable_in_hardirq()，从而启用中断。旗标IRQF_DISABLED可在利用函数request_irq()注册中断处理回调时设置，比如：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (request_irq(uart-&gt;port.irq, bfin_serial_rx_int, IRQF_DISABLED,
+</span><span class='line'>&#9; "BFIN_UART_RX", uart)) {</span></code></pre></td></tr></table></div></figure>
+
+
+<p>如果没有设置，那么到函数handle_IRQ_event()这里的代码后，因为中断已经开启，当前中断的后续处理就可能被其它中断打断，从而出现中断嵌套的情况。</p>
+
+<p>3，如果新来的中断类型与当前正在执行的中断类型相同，那么会暂时挂起。主要实现代码在函数__do_IRQ()（handle_fasteoi_irq()、handle_edge_irq()类似）内：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/*
+</span><span class='line'> * If the IRQ is disabled for whatever reason, we cannot
+</span><span class='line'> * use the action we have.
+</span><span class='line'> */
+</span><span class='line'>action = NULL;
+</span><span class='line'>if (likely(!(status & (IRQ_DISABLED | IRQ_INPROGRESS)))) {
+</span><span class='line'>&#9;action = desc-&gt;action;
+</span><span class='line'>&#9;status &= ~IRQ_PENDING; /* we commit to handling */
+</span><span class='line'>&#9;status |= IRQ_INPROGRESS; /* we are handling it */
+</span><span class='line'>}
+</span><span class='line'>desc-&gt;status = status;
+</span><span class='line'> 
+</span><span class='line'>/*
+</span><span class='line'> * If there is no IRQ handler or it was disabled, exit early.
+</span><span class='line'> * Since we set PENDING, if another processor is handling
+</span><span class='line'> * a different instance of this same irq, the other processor
+</span><span class='line'> * will take care of it.
+</span><span class='line'> */
+</span><span class='line'>if (unlikely(!action))
+</span><span class='line'>&#9;goto out;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>逻辑很简单，如果当前中断被禁止（IRQ_DISABLED）或正在执行（IRQ_INPROGRESS），那么goto cot，所以同种类型中断不会相互嵌套。</p>
+
+<p>4，从这个补丁开始，Linux内核已经全面禁止硬中断嵌套了，即从2.6.35开始，默认就是：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>run the irq handlers with interrupts disabled.</span></code></pre></td></tr></table></div></figure>
+
+
+<p>因为这个补丁，所以旗标IRQF_DISABLED没用了，mainline内核在逐步删除它。</p>
+
+<p>我仔细检查了一下，对于2.6.34以及以前的内核，如果要合入这个补丁，那么有略微影响的主要是两个慢速驱动，分别为rtc-twl4030和twl4030-usb，需要按照类似开启Lockdep功能一样：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#ifdef CONFIG_LOCKDEP
+</span><span class='line'>/* WORKAROUND for lockdep forcing IRQF_DISABLED on us, which
+</span><span class='line'> * we don't want and can't tolerate.  Although it might be
+</span><span class='line'> * friendlier not to borrow this thread context...
+</span><span class='line'> */
+</span><span class='line'>local_irq_enable();
+</span><span class='line'>#endif</span></code></pre></td></tr></table></div></figure>
+
+
+<p>进行主动启用中断。还有另个一个慢速驱动IDE，其驱动中调用的是函数local_irq_enable_in_hardirq()，即它在开启Lockdep功能的情况下并没有明确要求启用中断，所以它应该不受补丁合入影响。嘛，我只是理论分析研究一下，仅供参考，如有风险，请实际操作者自行承担，:)。其它请看参考4，5，6。</p>
+
+<h4>参考：</h4>
+
+<p>1，Linux下386中断处理<br/>
+2，Linux中断基础构架<br/>
+3，linux源码entry_32.S中interrupt数组的分析<br/>
+4，<a href="http://lwn.net/Articles/321663/">http://lwn.net/Articles/321663/</a><br/>
+5，<a href="http://lwn.net/Articles/380931/">http://lwn.net/Articles/380931/</a><br/>
+6，<a href="http://thread.gmane.org/gmane.linux.kernel/801267">http://thread.gmane.org/gmane.linux.kernel/801267</a></p>
+
+<p>转载请保留地址：<a href="http://www.lenky.info/archives/2013/03/2245">http://www.lenky.info/archives/2013/03/2245</a> 或 <a href="http://lenky.info/?p=2245">http://lenky.info/?p=2245</a></p>
 </div>
   
   
@@ -263,7 +699,7 @@ var ss360Config = {
   
     <section>
 <h1>Categories
-<span class='right_span'>(903)</span>
+<span class='right_span'>(913)</span>
 
 </h1>
 <head>
@@ -294,7 +730,7 @@ if (!document.getElementById('blog~octopress')) document.getElementById('aexp_bl
 if (!document.getElementById('blog')) document.getElementById('aexp_blog').style.visibility = 'hidden';
 if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ruby').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(138)</span></li>
+<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(142)</span></li>
 <div id='language' class='catsub'><li><a href='/blog/cats/language~c/?opendiv=language'>c</a><a href='##' onmousedown=showDiv('language~c') id='aexp_language~c'><span class='exp_style' id='exp_language~c'>[+]</span></a><span class='right_span'>32</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~c')) document.getElementById('aexp_language~c').style.visibility = 'hidden';
@@ -311,7 +747,7 @@ if (!document.getElementById('language~java')) document.getElementById('aexp_lan
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~jsp')) document.getElementById('aexp_language~jsp').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/language~php/?opendiv=language'>php</a><a href='##' onmousedown=showDiv('language~php') id='aexp_language~php'><span class='exp_style' id='exp_language~php'>[+]</span></a><span class='right_span'>43</span></li>
+<li><a href='/blog/cats/language~php/?opendiv=language'>php</a><a href='##' onmousedown=showDiv('language~php') id='aexp_language~php'><span class='exp_style' id='exp_language~php'>[+]</span></a><span class='right_span'>44</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~php')) document.getElementById('aexp_language~php').style.visibility = 'hidden';
 </script>
@@ -319,7 +755,7 @@ if (!document.getElementById('language~php')) document.getElementById('aexp_lang
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~python')) document.getElementById('aexp_language~python').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/language~web/?opendiv=language'>web</a><a href='##' onmousedown=showDiv('language~web') id='aexp_language~web'><span class='exp_style' id='exp_language~web'>[+]</span></a><span class='right_span'>42</span></li>
+<li><a href='/blog/cats/language~web/?opendiv=language'>web</a><a href='##' onmousedown=showDiv('language~web') id='aexp_language~web'><span class='exp_style' id='exp_language~web'>[+]</span></a><span class='right_span'>45</span></li>
 </div><script language='javascript' type='text/javascript'>
 if (!document.getElementById('language')) document.getElementById('aexp_language').style.visibility = 'hidden';
 if (!document.getElementById('language~web')) document.getElementById('aexp_language~web').style.visibility = 'hidden';
@@ -348,7 +784,7 @@ if (!document.getElementById('assembly~base')) document.getElementById('aexp_ass
 if (!document.getElementById('assembly')) document.getElementById('aexp_assembly').style.visibility = 'hidden';
 if (!document.getElementById('assembly~win')) document.getElementById('aexp_assembly~win').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(194)</span></li>
+<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(198)</span></li>
 <div id='tools' class='catsub'><li><a href='/blog/cats/tools~apache2/?opendiv=tools'>apache2</a><a href='##' onmousedown=showDiv('tools~apache2') id='aexp_tools~apache2'><span class='exp_style' id='exp_tools~apache2'>[+]</span></a><span class='right_span'>9</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~apache2')) document.getElementById('aexp_tools~apache2').style.visibility = 'hidden';
@@ -389,7 +825,7 @@ if (!document.getElementById('tools~haproxy')) document.getElementById('aexp_too
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~isal')) document.getElementById('aexp_tools~isal').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/tools~mysql/?opendiv=tools'>mysql</a><a href='##' onmousedown=showDiv('tools~mysql') id='aexp_tools~mysql'><span class='exp_style' id='exp_tools~mysql'>[+]</span></a><span class='right_span'>29</span></li>
+<li><a href='/blog/cats/tools~mysql/?opendiv=tools'>mysql</a><a href='##' onmousedown=showDiv('tools~mysql') id='aexp_tools~mysql'><span class='exp_style' id='exp_tools~mysql'>[+]</span></a><span class='right_span'>30</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~mysql')) document.getElementById('aexp_tools~mysql').style.visibility = 'hidden';
 </script>
@@ -429,7 +865,7 @@ if (!document.getElementById('tools~socksvpn')) document.getElementById('aexp_to
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~sqlmap')) document.getElementById('aexp_tools~sqlmap').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/tools~sqlserver/?opendiv=tools'>sqlserver</a><a href='##' onmousedown=showDiv('tools~sqlserver') id='aexp_tools~sqlserver'><span class='exp_style' id='exp_tools~sqlserver'>[+]</span></a><span class='right_span'>8</span></li>
+<li><a href='/blog/cats/tools~sqlserver/?opendiv=tools'>sqlserver</a><a href='##' onmousedown=showDiv('tools~sqlserver') id='aexp_tools~sqlserver'><span class='exp_style' id='exp_tools~sqlserver'>[+]</span></a><span class='right_span'>11</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~sqlserver')) document.getElementById('aexp_tools~sqlserver').style.visibility = 'hidden';
 </script>
@@ -458,12 +894,12 @@ if (!document.getElementById('tools~vim')) document.getElementById('aexp_tools~v
 if (!document.getElementById('tools')) document.getElementById('aexp_tools').style.visibility = 'hidden';
 if (!document.getElementById('tools~wxwork')) document.getElementById('aexp_tools~wxwork').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/system/'>system</a><a href='##' onmousedown=showDiv('system') id='aexp_system'><span class='exp_style' id='exp_system'>[+]</span></a><span class='right_span'>(109)</span></li>
-<div id='system' class='catsub'><li><a href='/blog/cats/system~base/?opendiv=system'>base</a><a href='##' onmousedown=showDiv('system~base') id='aexp_system~base'><span class='exp_style' id='exp_system~base'>[+]</span></a><span class='right_span'>23</span></li>
+<li class='catclass'><a href='/blog/cats/system/'>system</a><a href='##' onmousedown=showDiv('system') id='aexp_system'><span class='exp_style' id='exp_system'>[+]</span></a><span class='right_span'>(111)</span></li>
+<div id='system' class='catsub'><li><a href='/blog/cats/system~base/?opendiv=system'>base</a><a href='##' onmousedown=showDiv('system~base') id='aexp_system~base'><span class='exp_style' id='exp_system~base'>[+]</span></a><span class='right_span'>24</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('system~base')) document.getElementById('aexp_system~base').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/system~centos/?opendiv=system'>centos</a><a href='##' onmousedown=showDiv('system~centos') id='aexp_system~centos'><span class='exp_style' id='exp_system~centos'>[+]</span></a><span class='right_span'>15</span></li>
+<li><a href='/blog/cats/system~centos/?opendiv=system'>centos</a><a href='##' onmousedown=showDiv('system~centos') id='aexp_system~centos'><span class='exp_style' id='exp_system~centos'>[+]</span></a><span class='right_span'>16</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('system~centos')) document.getElementById('aexp_system~centos').style.visibility = 'hidden';
 </script>
@@ -697,7 +1133,7 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 
 <section>
 <h1>Date Categories
-<span class='right_span'>(903)</span>
+<span class='right_span'>(913)</span>
 
 </h1>
 <head>
@@ -705,8 +1141,9 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(23)</span></li>
-<div id='2024' class='catsub'><li><a href='/blog/cats/2024~06/?opendiv=2024'>2024-06</a><span class='right_span'>2</span></li>
+<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(33)</span></li>
+<div id='2024' class='catsub'><li><a href='/blog/cats/2024~07/?opendiv=2024'>2024-07</a><span class='right_span'>10</span></li>
+<li><a href='/blog/cats/2024~06/?opendiv=2024'>2024-06</a><span class='right_span'>2</span></li>
 <li><a href='/blog/cats/2024~05/?opendiv=2024'>2024-05</a><span class='right_span'>5</span></li>
 <li><a href='/blog/cats/2024~04/?opendiv=2024'>2024-04</a><span class='right_span'>5</span></li>
 <li><a href='/blog/cats/2024~03/?opendiv=2024'>2024-03</a><span class='right_span'>5</span></li>
@@ -872,43 +1309,43 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
   <ul id="recent_posts">
     
       <li class="post">
-        <a href="/blog/2024/06/20/lang-php-date_sun_info/">PHP中的date_sun_info()函数, 日落/日出时间</a>
+        <a href="/blog/2024/07/15/tools-sqlserver-sys/">sql server系统表详细说明</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/06/20/centos-mkconfig/">grub2-mkconfig</a>
+        <a href="/blog/2024/07/15/tools-sqlserver-cols/">SQLserver查询数据库所有字段-表名</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/05/23/lang-lunar/">农历节气查表</a>
+        <a href="/blog/2024/07/15/tools-mysql-socket/">MySQL下的socket文件作用</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/05/17/rpmbuild-check/">rpmbuild 错误：发现已安装(但未打包的)文件</a>
+        <a href="/blog/2024/07/15/lang-php-iconv/">iconv与mb_convert_encoding的使用</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/05/16/lang-centos8-php8/">Centos8安装PHP8</a>
+        <a href="/blog/2024/07/15/bat/">Linux查看电池损耗</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/05/16/centos8-kernel/">CentOS8 编译内核错误</a>
+        <a href="/blog/2024/07/15/lang-web-box/">JavaScript的三种弹出提示框(alert、confirm、prompt)</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/05/11/centos8.5-install/">CentOS8.5 安装</a>
+        <a href="/blog/2024/07/15/lang-web-copy/">JavaScript复制内容到剪切板</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/04/30/mariadb/">centos 安装 MariaDB</a>
+        <a href="/blog/2024/07/15/lang-web-alert/">alert 弹窗去掉上方 title 网址域名</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/04/29/strongswan-make/">ubuntu 编译strongswan</a>
+        <a href="/blog/2024/07/15/tools-sqlserver-space/">SQL Server查看所有表大小，所占空间</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/04/29/tools-squid-log/">squid 日志格式, 时间格式</a>
+        <a href="/blog/2024/07/12/centos7-yum/">CentOS7 yum</a>
       </li>
     
   </ul>
