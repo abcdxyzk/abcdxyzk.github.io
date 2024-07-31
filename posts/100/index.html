@@ -131,7 +131,7 @@ var ss360Config = {
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2020/10/12/command-lsof/">lsof</a></h2>
+      <h2 class="entry-title"><a href="/blog/2020/11/09/kernel-device/">Linux 上的抽象网络设备</a></h2>
     
     
       <p class="meta">
@@ -140,26 +140,136 @@ var ss360Config = {
 
 
 
-<time class='entry-date' datetime='2020-10-12T15:48:00+08:00'><span class='date'>2020-10-12</span> <span class='time'>15:48:00</span></time>
+<time class='entry-date' datetime='2020-11-09T13:37:00+08:00'><span class='date'>2020-11-09</span> <span class='time'>13:37:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><h3>lsof查看端口被哪些程序在使用</h3>
+  <div class="entry-content"><p><a href="https://www.ibm.com/developerworks/cn/linux/1310_xiawc_networkdevice/">https://www.ibm.com/developerworks/cn/linux/1310_xiawc_networkdevice/</a></p>
 
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>lsof -i TCP:port -n
-</span><span class='line'>lsof -i UDP:port -n
-</span><span class='line'>lsof -i :port -n
-</span><span class='line'>lsof -i tcp:1521 -n</span></code></pre></td></tr></table></div></figure>
+<p>和磁盘设备类似，Linux 用户想要使用网络功能，不能通过直接操作硬件完成，而需要直接或间接的操作一个 Linux 为我们抽象出来的设备，既通用的 Linux 网络设备来完成。一个常见的情况是，系统里装有一个硬件网卡，Linux 会在系统里为其生成一个网络设备实例，如 eth0，用户需要对 eth0 发出命令以配置或使用它了。更多的硬件会带来更多的设备实例，虚拟的硬件也会带来更多的设备实例。随着网络技术，虚拟化技术的发展，更多的高级网络设备被加入了到了 Linux 中，使得情况变得更加复杂。在以下章节中，将一一分析在虚拟化技术中经常使用的几种 Linux 网络设备抽象类型：Bridge、802.1.q VLAN device、VETH、TAP，详细解释如何用它们配合 Linux 中的 Route table、IP table 简单的创建出本地虚拟网络。
+相关网络设备工作原理</p>
 
+<h3>Bridge</h3>
 
-<h3>查看连接创建时间</h3>
+<p> Bridge（桥）是 Linux 上用来做 TCP/IP 二层协议交换的设备，与现实世界中的交换机功能相似。Bridge 设备实例可以和 Linux 上其他网络设备实例连接，既 attach 一个从设备，类似于在现实世界中的交换机和一个用户终端之间连接一根网线。当有数据到达时，Bridge 会根据报文中的 MAC 信息进行广播、转发、丢弃处理。</p>
+
+<p>图 1.Bridge 设备工作过程</p>
+
+<p><img src="/images/kernel/20201109-1.jpg" alt="" /></p>
+
+<p> 如图所示，Bridge 的功能主要在内核里实现。当一个从设备被 attach 到 Bridge 上时，相当于现实世界里交换机的端口被插入了一根连有终端的网线。这时在内核程序里，netdev_rx_handler_register()被调用，一个用于接受数据的回调函数被注册。以后每当这个从设备收到数据时都会调用这个函数可以把数据转发到 Bridge 上。当 Bridge 接收到此数据时，br_handle_frame()被调用，进行一个和现实世界中的交换机类似的处理过程：判断包的类别（广播/单点），查找内部 MAC 端口映射表，定位目标端口号，将数据转发到目标端口或丢弃，自动更新内部 MAC 端口映射表以自我学习。</p>
+
+<p>Bridge 和现实世界中的二层交换机有一个区别，图中左侧画出了这种情况：数据被直接发到 Bridge 上，而不是从一个端口接受。这种情况可以看做 Bridge 自己有一个 MAC 可以主动发送报文，或者说 Bridge 自带了一个隐藏端口和寄主 Linux 系统自动连接，Linux 上的程序可以直接从这个端口向 Bridge 上的其他端口发数据。所以当一个 Bridge 拥有一个网络设备时，如 bridge0 加入了 eth0 时，实际上 bridge0 拥有两个有效 MAC 地址，一个是 bridge0 的，一个是 eth0 的，他们之间可以通讯。由此带来一个有意思的事情是，Bridge 可以设置 IP 地址。通常来说 IP 地址是三层协议的内容，不应该出现在二层设备 Bridge 上。但是 Linux 里 Bridge 是通用网络设备抽象的一种，只要是网络设备就能够设定 IP 地址。当一个 bridge0 拥有 IP 后，Linux 便可以通过路由表或者 IP 表规则在三层定位 bridge0，此时相当于 Linux 拥有了另外一个隐藏的虚拟网卡和 Bridge 的隐藏端口相连，这个网卡就是名为 bridge0 的通用网络设备，IP 可以看成是这个网卡的。当有符合此 IP 的数据到达 bridge0 时，内核协议栈认为收到了一包目标为本机的数据，此时应用程序可以通过 Socket 接收到它。一个更好的对比例子是现实世界中的带路由的交换机设备，它也拥有一个隐藏的 MAC 地址，供设备中的三层协议处理程序和管理程序使用。设备里的三层协议处理程序，对应名为 bridge0 的通用网络设备的三层协议处理程序，即寄主 Linux 系统内核协议栈程序。设备里的管理程序，对应 bridge0 寄主 Linux 系统里的应用程序。</p>
+
+<p>Bridge 的实现当前有一个限制：当一个设备被 attach 到 Bridge 上时，那个设备的 IP 会变的无效，Linux 不再使用那个 IP 在三层接受数据。举例如下：如果 eth0 本来的 IP 是 192.168.1.2，此时如果收到一个目标地址是 192.168.1.2 的数据，Linux 的应用程序能通过 Socket 操作接受到它。而当 eth0 被 attach 到一个 bridge0 时，尽管 eth0 的 IP 还在，但应用程序是无法接受到上述数据的。此时应该把 IP 192.168.1.2 赋予 bridge0。</p>
+
+<p>另外需要注意的是数据流的方向。对于一个被 attach 到 Bridge 上的设备来说，只有它收到数据时，此包数据才会被转发到 Bridge 上，进而完成查表广播等后续操作。当请求是发送类型时，数据是不会被转发到 Bridge 上的，它会寻找下一个发送出口。用户在配置网络时经常忽略这一点从而造成网络故障。</p>
+
+<h3>VLAN device for 802.1.q</h3>
+
+<p>VLAN 又称虚拟网络，是一个被广泛使用的概念，有些应用程序把自己的内部网络也称为 VLAN。此处主要说的是在物理世界中存在的，需要协议支持的 VLAN。它的种类很多，按照协议原理一般分为：MACVLAN、802.1.q VLAN、802.1.qbg VLAN、802.1.qbh VLAN。其中出现较早，应用广泛并且比较成熟的是 802.1.q VLAN，其基本原理是在二层协议里插入额外的 VLAN 协议数据（称为 802.1.q VLAN Tag)，同时保持和传统二层设备的兼容性。Linux 里的 VLAN 设备是对 802.1.q 协议的一种内部软件实现，模拟现实世界中的 802.1.q 交换机。</p>
+
+<p>图 2 .VLAN 设备工作过程</p>
+
+<p><img src="/images/kernel/20201109-2.jpg" alt="" /></p>
+
+<p>如图所示，Linux 里 802.1.q VLAN 设备是以母子关系成对出现的，母设备相当于现实世界中的交换机 TRUNK 口，用于连接上级网络，子设备相当于普通接口用于连接下级网络。当数据在母子设备间传递时，内核将会根据 802.1.q VLAN Tag 进行对应操作。母子设备之间是一对多的关系，一个母设备可以有多个子设备，一个子设备只有一个母设备。当一个子设备有一包数据需要发送时，数据将被加入 VLAN Tag 然后从母设备发送出去。当母设备收到一包数据时，它将会分析其中的 VLAN Tag，如果有对应的子设备存在，则把数据转发到那个子设备上并根据设置移除 VLAN Tag，否则丢弃该数据。在某些设置下，VLAN Tag 可以不被移除以满足某些监听程序的需要，如 DHCP 服务程序。举例说明如下：eth0 作为母设备创建一个 ID 为 100 的子设备 eth0.100。此时如果有程序要求从 eth0.100 发送一包数据，数据将被打上 VLAN 100 的 Tag 从 eth0 发送出去。如果 eth0 收到一包数据，VLAN Tag 是 100，数据将被转发到 eth0.100 上，并根据设置决定是否移除 VLAN Tag。如果 eth0 收到一包包含 VLAN Tag 101 的数据，其将被丢弃。上述过程隐含以下事实：对于寄主 Linux 系统来说，母设备只能用来收数据，子设备只能用来发送数据。和 Bridge 一样，母子设备的数据也是有方向的，子设备收到的数据不会进入母设备，同样母设备上请求发送的数据不会被转到子设备上。可以把 VLAN 母子设备作为一个整体想象为现实世界中的 802.1.q 交换机，下级接口通过子设备连接到寄主 Linux 系统网络里，上级接口同过主设备连接到上级网络，当母设备是物理网卡时上级网络是外界真实网络，当母设备是另外一个 Linux 虚拟网络设备时上级网络仍然是寄主 Linux 系统网络。</p>
+
+<p>需要注意的是母子 VLAN 设备拥有相同的 MAC 地址，可以把它当成现实世界中 802.1.q 交换机的 MAC，因此多个 VLAN 设备会共享一个 MAC。当一个母设备拥有多个 VLAN 子设备时，子设备之间是隔离的，不存在 Bridge 那样的交换转发关系，原因如下：802.1.q VLAN 协议的主要目的是从逻辑上隔离子网。现实世界中的 802.1.q 交换机存在多个 VLAN，每个 VLAN 拥有多个端口，同一 VLAN 端口之间可以交换转发，不同 VLAN 端口之间隔离，所以其包含两层功能：交换与隔离。Linux VLAN device 实现的是隔离功能，没有交换功能。一个 VLAN 母设备不可能拥有两个相同 ID 的 VLAN 子设备，因此也就不可能出现数据交换情况。如果想让一个 VLAN 里接多个设备，就需要交换功能。在 Linux 里 Bridge 专门实现交换功能，因此将 VLAN 子设备 attach 到一个 Bridge 上就能完成后续的交换功能。总结起来，Bridge 加 VLAN device 能在功能层面完整模拟现实世界里的 802.1.q 交换机。</p>
+
+<p>Linux 支持 VLAN 硬件加速，在安装有特定硬件情况下，图中所述内核处理过程可以被放到物理设备上完成。</p>
+
+<h3>TAP 设备与 VETH 设备</h3>
+
+<p>TUN/TAP 设备是一种让用户态程序向内核协议栈注入数据的设备，一个工作在三层，一个工作在二层，使用较多的是 TAP 设备。VETH 设备出现较早，它的作用是反转通讯数据的方向，需要发送的数据会被转换成需要收到的数据重新送入内核网络层进行处理，从而间接的完成数据的注入。</p>
+
+<p>图 3 .TAP 设备和 VETH 设备工作过程</p>
+
+<p><img src="/images/kernel/20201109-3.jpg" alt="" /></p>
+
+<p>如图所示，当一个 TAP 设备被创建时，在 Linux 设备文件目录下将会生成一个对应 char 设备，用户程序可以像打开普通文件一样打开这个文件进行读写。当执行 write()操作时，数据进入 TAP 设备，此时对于 Linux 网络层来说，相当于 TAP 设备收到了一包数据，请求内核接受它，如同普通的物理网卡从外界收到一包数据一样，不同的是其实数据来自 Linux 上的一个用户程序。Linux 收到此数据后将根据网络配置进行后续处理，从而完成了用户程序向 Linux 内核网络层注入数据的功能。当用户程序执行 read()请求时，相当于向内核查询 TAP 设备上是否有需要被发送出去的数据，有的话取出到用户程序里，完成 TAP 设备的发送数据功能。针对 TAP 设备的一个形象的比喻是：使用 TAP 设备的应用程序相当于另外一台计算机，TAP 设备是本机的一个网卡，他们之间相互连接。应用程序通过 read()/write()操作，和本机网络核心进行通讯。</p>
+
+<p>VETH 设备总是成对出现，送到一端请求发送的数据总是从另一端以请求接受的形式出现。该设备不能被用户程序直接操作，但使用起来比较简单。创建并配置正确后，向其一端输入数据，VETH 会改变数据的方向并将其送入内核网络核心，完成数据的注入。在另一端能读到此数据。</p>
+
+<h3>网络设置举例说明</h3>
+
+<p>为了更好的说明 Linux 网络设备的用法，下面将用一系列的例子，说明在一个复杂的 Linux 网络元素组合出的虚拟网络里，数据的流向。网络设置简介如下：一个中心 Bridge：bridge0 下 attach 了 4 个网络设备，包括 2 个 VETH 设备，1 个 TAP 设备 tap0，1 个物理网卡 eth0。在 VETH 的另外一端又创建了 VLAN 子设备。Linux 上共存在 2 个 VLAN 网络，既 vlan100 与 vlan200。物理网卡和外部网络相连，并且在它之下创建了一个 VLAN ID 为 200 的 VLAN 子设备。</p>
+
+<h4>从 vlan100 子设备发送 ARP 报文</h4>
+
+<p>图 4 .ARP from vlan100 child device</p>
+
+<p><img src="/images/kernel/20201109-4.jpg" alt="" /></p>
+
+<p>如图所示，当用户尝试 ping 192.168.100.3 时，Linux 将会根据路由表，从 vlan100 子设备发出 ARP 报文，具体过程如下：</p>
+
+<p>1) 用户 ping 192.168.100.3</p>
+
+<p>2) Linux 向 vlan100 子设备发送 ARP 信息。</p>
+
+<p>3) ARP 报文被打上 VLAN ID 100 的 Tag 成为 ARP@vlan100，转发到母设备上。</p>
+
+<p>4) VETH 设备将这一发送请求转变方向，成为一个需要接受处理的报文送入内核网络模块。</p>
+
+<p>5) 由于对端的 VETH 设备被加入到了 bridge0 上，并且内核发现它收到一个报文，于是报文被转发到 bridge0 上。</p>
+
+<p>6) bridge0 处理此 ARP@vlan100 信息，根据 TCP/IP 二层协议发现是一个广播请求，于是向它所知道的所有端口广播此报文，其中一路进入另一对 VETH 设备的一端，一路进入 TAP 设备 tap0，一路进入物理网卡设备 eth0。此时在 tap0 上，用户程序可以通过 read()操作读到 ARP@vlan100，eth0 将会向外界发送 ARP@vlan100，但 eth0 的 VLAN 子设备不会收到它，因为此数据方向为请求发送而不是请求接收。</p>
+
+<p>7) VETH 将请求方向转换，此时在另一端得到请求接受的 ARP@vlan100 报文。</p>
+
+<p>8) 对端 VETH 设备发现有数据需要接受，并且自己有两个 VLAN 子设备，于是执行 VLAN 处理逻辑。其中一个子设备是 vlan100，与 ARP@vlan100 吻合，于是去除 VLAN ID 100 的 Tag 转发到这个子设备上，重新成为标准的以太网 ARP 报文。另一个子设备由于 ID 不吻合，不会得到此报文。</p>
+
+<p>9) 此 VLAN 子设备又被 attach 到另一个桥 bridge1 上，于是转发自己收到的 ARP 报文。</p>
+
+<p>10) bridge1 广播 ARP 报文。</p>
+
+<p>11) 最终另外一个 TAP 设备 tap1 收到此请求发送报文，用户程序通过 read()可以得到它。</p>
+
+<h4>从 vlan200 子设备发送 ARP 报文</h4>
+
+<p>图 5 .ARP from vlan200 child device</p>
+
+<p><img src="/images/kernel/20201109-5.jpg" alt="" /></p>
+
+<p>和前面情况类似，区别是 VLAN ID 是 200，对端的 vlan200 子设备设置为 reorder_hdr = 0，表示此设备被要求保留收到的报文中的 VLAN Tag。此时子设备会收到 ARP 报文，但是带了 VLAN ID 200 的 Tag，既 ARP@vlan200。</p>
+
+<h4>从中心 bridge 发送 ARP 报文</h4>
+
+<p>图 5 .ARP from central bridge</p>
+
+<p><img src="/images/kernel/20201109-6.jpg" alt="" /></p>
+
+<p>当 bridge0 拥有 IP 时，通过 Linux 路由表用户程序可以直接将 ARP 报文发向 bridge0。这时 tap0 和外部网络都能收到 ARP，但 VLAN 子设备由于 VLAN ID 过滤的原因，将收不到 ARP 信息。</p>
+
+<h4>从外部网络向物理网卡发送 ARP@vlan200 报文</h4>
+
+<p>图 6 .ARP from external network</p>
+
+<p><img src="/images/kernel/20201109-7.jpg" alt="" /></p>
+
+<p>当外部网络连接在一个支持 VLAN 并且对应端口为 vlan200 时，此情况会发生。此时所有的 VLAN ID 为 200 的 VLAN 子设备都将接受到报文，如果设置 reorder_hdr=0 则会收到带 Tag 的 ARP@vlan200。</p>
+
+<h4>从 TAP 设备以 ping 方式发送 ARP</h4>
+
+<p>图 7 .ping from TAP device</p>
+
+<p><img src="/images/kernel/20201109-8.jpg" alt="" /></p>
+
+<p>给 tap0 赋予 IP 并加入路由，此时再 Ping 其对应网段的未知 IP 会产生 ARP 发送请求。需要注意的是此时由于 tap0 上存在的是发送而不是接收请求，因此 ARP 报文不会被转发到桥上，从而什么也不会发生。图中右边画了一个类似情况：从 vlan200 子设备发送 ARP 请求。由于缺少 VETH 设备反转请求方向，因此报文也不会被转发到桥上，而是直接通过物理网卡发往外部网络。</p>
+
+<h4>以文件操作方式从 TAP 设备发送报文</h4>
+
+<p>图 8 .file operation on TAP device</p>
+
+<p><img src="/images/kernel/20201109-9.jpg" alt="" /></p>
+
+<p>用户程序指定 tap0 设备发送报文有两种方式：socket 和 file operation。当用 socket_raw 标志新建 socket 并指定设备编号时，可以要求内核将报文从 tap0 发送。但和前面的 ping from tap0 情况类似，由于报文方向问题，消息并不会被转发到 bridge0 上。当用 open()方式打开 tap 设备文件时，情况有所不同。当执行 write()操作时，内核认为 tap0 收到了报文，从而会触发转发动作，bridge0 将收到它。如果发送的报文如图所示，是一个以 A 为目的地的携带 VLAN ID 100 Tag 的单点报文，bridge0 将会找到对应的设备进行转发，对应的 VLAN 子设备将收到没有 VLAN ID 100 Tag 的报文。
+Linux 上配置网络设备命令举例</p>
+
+<p>以 Redhat6.2 红帽 Linux 发行版为例，如果已安装 VLAN 内核模块和管理工具 vconfig，TAP/TUN 设备管理工具 tunctl，那么可以用以下命令设置前述网络设备：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -169,20 +279,38 @@ var ss360Config = {
 <span class='line-number'>6</span>
 <span class='line-number'>7</span>
 <span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>netstat -npt | grep port
-</span><span class='line'>tcp        0      0 ::ffff:192.168.251.43:51520 ::ffff:192.168.110.231:8998 ESTABLISHED 32439/java  
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>    创建 Bridge：brctl addbr [BRIDGE NAME]
+</span><span class='line'>    删除 Bridge：brctl delbr [BRIDGE NAME]
+</span><span class='line'>    attach 设备到 Bridge：brctl addif [BRIDGE NAME] [DEVICE NAME]
+</span><span class='line'>    从 Bridge detach 设备：brctl delif [BRIDGE NAME] [DEVICE NAME]
+</span><span class='line'>    查询 Bridge 情况：brctl show
+</span><span class='line'>    创建 VLAN 设备：vconfig add [PARENT DEVICE NAME] [VLAN ID]
+</span><span class='line'>    删除 VLAN 设备：vconfig rem [VLAN DEVICE NAME]
+</span><span class='line'>    设置 VLAN 设备 flag：vconfig set_flag [VLAN DEVICE NAME] [FLAG] [VALUE]
+</span><span class='line'>    设置 VLAN 设备 qos：
 </span><span class='line'>
-</span><span class='line'>lsof -p pid | grep port
-</span><span class='line'>java    32439 root  118u  IPv6          165707367      0t0       TCP SC-HOST-43:51518-&gt;192.168.110.231:8998 (ESTABLISHED) 
-</span><span class='line'>java    32439 root  126u  IPv6          165707404      0t0       TCP SC-HOST-43:51520-&gt;192.168.110.231:8998 (ESTABLISHED)
+</span><span class='line'>vconfig set_egress_map [VLAN DEVICE NAME] [SKB_PRIORITY] [VLAN_QOS]
 </span><span class='line'>
-</span><span class='line'>注意到118u和126u是这两个连接的文件名，然后去ll /proc/pid/fd/118，就可以看到这个连接的建立时间了。</span></code></pre></td></tr></table></div></figure>
-
-
-<h3>查看进程启动路径</h3>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>ls -l /proc/pid/xx</span></code></pre></td></tr></table></div></figure>
+</span><span class='line'>vconfig set_ingress_map [VLAN DEVICE NAME] [SKB_PRIORITY] [VLAN_QOS]
+</span><span class='line'>
+</span><span class='line'>    查询 VLAN 设备情况：cat /proc/net/vlan/[VLAN DEVICE NAME]
+</span><span class='line'>    创建 VETH 设备：ip link add link [DEVICE NAME] type veth
+</span><span class='line'>    创建 TAP 设备：tunctl -p [TAP DEVICE NAME]
+</span><span class='line'>    删除 TAP 设备：tunctl -d [TAP DEVICE NAME]
+</span><span class='line'>    查询系统里所有二层设备，包括 VETH/TAP 设备：ip link show
+</span><span class='line'>    删除普通二层设备：ip link delete [DEVICE NAME] type [TYPE]</span></code></pre></td></tr></table></div></figure>
 
 
 
@@ -198,7 +326,7 @@ var ss360Config = {
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2020/10/12/command-indent/">indent 代码格式化</a></h2>
+      <h2 class="entry-title"><a href="/blog/2020/11/07/docker-ip/">docker 设置固定IP</a></h2>
     
     
       <p class="meta">
@@ -207,14 +335,16 @@ var ss360Config = {
 
 
 
-<time class='entry-date' datetime='2020-10-12T13:51:00+08:00'><span class='date'>2020-10-12</span> <span class='time'>13:51:00</span></time>
+<time class='entry-date' datetime='2020-11-07T16:35:00+08:00'><span class='date'>2020-11-07</span> <span class='time'>16:35:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><p><a href="https://www.cnblogs.com/sky-heaven/p/9012508.html">https://www.cnblogs.com/sky-heaven/p/9012508.html</a></p>
+  <div class="entry-content"><h3>1 设置固定IP</h3>
+
+<p>使用默认的网络是不支持指派固定IP的</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -222,151 +352,16 @@ var ss360Config = {
 <span class='line-number'>4</span>
 <span class='line-number'>5</span>
 <span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-<span class='line-number'>58</span>
-<span class='line-number'>59</span>
-<span class='line-number'>60</span>
-<span class='line-number'>61</span>
-<span class='line-number'>62</span>
-<span class='line-number'>63</span>
-<span class='line-number'>64</span>
-<span class='line-number'>65</span>
-<span class='line-number'>66</span>
-<span class='line-number'>67</span>
-<span class='line-number'>68</span>
-<span class='line-number'>69</span>
-<span class='line-number'>70</span>
-<span class='line-number'>71</span>
-<span class='line-number'>72</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>常用的设置：
-</span><span class='line'>&#9;indent -npro -kr -i8 -ts8 -sob -l80 -ss -bl  -bli 0
+</pre></td><td class='code'><pre><code class=''><span class='line'># 创建自定义网络
+</span><span class='line'>docker network create --subnet=192.168.3.0/24 --gateway=192.168.3.1 nett
+</span><span class='line'>docker network ls
 </span><span class='line'>
-</span><span class='line'>参数说明：
-</span><span class='line'>-npro或--ignore-profile 　不要读取indent的配置文件.indent.pro。
-</span><span class='line'>-kr 　指定使用Kernighan&Ritchie的格式。
-</span><span class='line'>-i8 　--indent-level 设置缩排的格数为8。
-</span><span class='line'>-ts8 设置tab的长度
-</span><span class='line'>-sob或--swallow-optional-blank-lines 　删除多余的空白行。
-</span><span class='line'>-l80 代码超过80换行
-</span><span class='line'>-ss或--space-special-semicolon 　若for区段只有一行时，在分号前加上空格。
-</span><span class='line'>-ncs或--no-space-after-casts 　不要在cast之后空一格。
-</span><span class='line'>-bl {分行显示
-</span><span class='line'>-bli 0 括号缩进为0
-</span><span class='line'>功能说明：调整C原始代码文件的格式。
-</span><span class='line'>语　　法：indent [参数][源文件] 或 indent [参数][源文件][-o 目标文件]
-</span><span class='line'>补充说明：indent可辨识C的原始代码文件，并加以格式化，以方便程序设计师阅读。
-</span><span class='line'>参　　数：
-</span><span class='line'>　-bad或--blank-lines-after-declarations 　在声明区段或加上空白行。
-</span><span class='line'>　-bap或--blank-lines-after-procedures 　在程序或加上空白行。
-</span><span class='line'>　-bbb或--blank-lines-after-block-comments 　在注释区段后加上空白行。
-</span><span class='line'>　-bc或--blank-lines-after-commas 　在声明区段中，若出现逗号即换行。
-</span><span class='line'>　-bl或--braces-after-if-line 　if(或是else,for等等)与后面执行区段的"{"不同行，且"}"自成一行。
-</span><span class='line'>　-bli&lt;缩排格数&gt;或--brace-indent&lt;缩排格数&gt; 　设置{ }缩排的格数。
-</span><span class='line'>　-br或--braces-on-if-line 　if(或是else,for等等)与后面执行跛段的"{"不同行，且"}"自成一行。
-</span><span class='line'>　-bs或--blank-before-sizeof 　在sizeof之后空一格。
-</span><span class='line'>　-c&lt;栏数&gt;或--comment-indentation&lt;栏数&gt; 　将注释置于程序码右侧指定的栏位。
-</span><span class='line'>　-cd&lt;栏数&gt;或--declaration-comment-column&lt;栏数&gt; 　将注释置于声明右侧指定的栏位。
-</span><span class='line'>　-cdb或--comment-delimiters-on-blank-lines 　注释符号自成一行。
-</span><span class='line'>　-ce或--cuddle-else 　将else置于"}"(if执行区段的结尾)之后。
-</span><span class='line'>　-ci&lt;缩排格数&gt;或--continuation-indentation&lt;缩排格数&gt; 　叙述过长而换行时，指定换行后缩排的格数。
-</span><span class='line'>　-cli&lt;缩排格数&gt;或--case-indentation-&lt;缩排格数&gt; 　使用case时，switch缩排的格数。
-</span><span class='line'>　-cp&lt;栏数&gt;或-else-endif-column&lt;栏数&gt; 　将注释置于else与elseif叙述右侧定的栏位。
-</span><span class='line'>　-cs或--space-after-cast 　在cast之后空一格。
-</span><span class='line'>　-d&lt;缩排格数&gt;或-line-comments-indentation&lt;缩排格数&gt; 　针对不是放在程序码右侧的注释，设置其缩排格数。
-</span><span class='line'>　-di&lt;栏数&gt;或--declaration-indentation&lt;栏数&gt; 　将声明区段的变量置于指定的栏位。
-</span><span class='line'>　-fc1或--format-first-column-comments 　针对放在每行最前端的注释，设置其格式。
-</span><span class='line'>　-fca或--format-all-comments 　设置所有注释的格式。
-</span><span class='line'>　-gnu或--gnu-style. 　指定使用GNU的格式，此为预设值。
-</span><span class='line'>　-i&lt;格数&gt;或--indent-level&lt;格数&gt; 　设置缩排的格数。
-</span><span class='line'>　-ip&lt;格数&gt;或--parameter-indentation&lt;格数&gt; 　设置参数的缩排格数。
-</span><span class='line'>　-kr或--k-and-r-style. 　指定使用Kernighan&Ritchie的格式。
-</span><span class='line'>　-lp或--continue-at-parentheses 　叙述过长而换行，且叙述中包含了括弧时，将括弧中的每行起始栏位内容垂直对其排列。
-</span><span class='line'>　-nbad或--no-blank-lines-after-declarations 　在声明区段后不要加上空白行。
-</span><span class='line'>　-nbap或--no-blank-lines-after-procedures 　在程序后不要加上空白行。
-</span><span class='line'>　-nbbb或--no-blank-lines-after-block-comments 　在注释区段后不要加上空白行。
-</span><span class='line'>　-nbc或--no-blank-lines-after-commas 　在声明区段中，即使出现逗号，仍旧不要换行。
-</span><span class='line'>　-ncdb或--no-comment-delimiters-on-blank-lines 　注释符号不要自成一行。
-</span><span class='line'>　-nce或--dont-cuddle-else 　不要将else置于"}"之后。
-</span><span class='line'>　-ncs或--no-space-after-casts 　不要在cast之后空一格。
-</span><span class='line'>　-nfc1或--dont-format-first-column-comments 　不要格式化放在每行最前端的注释。
-</span><span class='line'>　-nfca或--dont-format-comments 　不要格式化任何的注释。
-</span><span class='line'>　-nip或--no-parameter-indentation 　参数不要缩排。
-</span><span class='line'>　-nlp或--dont-line-up-parentheses 　叙述过长而换行，且叙述中包含了括弧时，不用将括弧中的每行起始栏位垂直对其排列。
-</span><span class='line'>　-npcs或--no-space-after-function-call-names 　在调用的函数名称之后，不要加上空格。
-</span><span class='line'>　-npro或--ignore-profile 　不要读取indent的配置文件.indent.pro。
-</span><span class='line'>　-npsl或--dont-break-procedure-type 　程序类型与程序名称放在同一行。
-</span><span class='line'>　-nsc或--dont-star-comments 　注解左侧不要加上星号(*)。
-</span><span class='line'>　-nsob或--leave-optional-semicolon 　不用处理多余的空白行。
-</span><span class='line'>　-nss或--dont-space-special-semicolon 　若for或while区段仅有一行时，在分号前不加上空格。
-</span><span class='line'>　-nv或--no-verbosity 　不显示详细的信息。
-</span><span class='line'>　-orig或--original 　使用Berkeley的格式。
-</span><span class='line'>　-pcs或--space-after-procedure-calls 　在调用的函数名称与"{"之间加上空格。
-</span><span class='line'>　-psl或--procnames-start-lines 　程序类型置于程序名称的前一行。
-</span><span class='line'>　-sc或--start-left-side-of-comments 　在每行注释左侧加上星号(*)。
-</span><span class='line'>　-sob或--swallow-optional-blank-lines 　删除多余的空白行。
-</span><span class='line'>　-ss或--space-special-semicolon 　若for或swile区段今有一行时，在分号前加上空格。
-</span><span class='line'>　-st或--standard-output 　将结果显示在标准输出设备。
-</span><span class='line'>　-T 　数据类型名称缩排。
-</span><span class='line'>　-ts&lt;格数&gt;或--tab-size&lt;格数&gt; 　设置tab的长度。
-</span><span class='line'>　-v或--verbose 　执行时显示详细的信息。
-</span><span class='line'>　-version 　显示版本信息。</span></code></pre></td></tr></table></div></figure>
+</span><span class='line'>#
+</span><span class='line'>docker run -i -t --net nett --ip 192.168.3.2 49f7960eb7e4 /bin/bash
+</span></code></pre></td></tr></table></div></figure>
 
 
-<p>如果你不想在参数上花太多时间来研究，你也可以在你的linux下的源代码里面，也就是/usr/src/linux/scripts/Lindent,找到Lindent脚本，这个是linux内核源代码格式，你可以直接拿过来用。比如</p>
-
-<p>cp /usr/src/linux/scripts/Lindent /usr/bin  $Lindent test.c</p>
-
-<h3>Lindent脚本</h3>
+<h3>2 修改bridge</h3>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -378,32 +373,76 @@ var ss360Config = {
 <span class='line-number'>8</span>
 <span class='line-number'>9</span>
 <span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#!/bin/sh
-</span><span class='line'>PARAM="-npro -kr -i8 -ts8 -sob -l80 -ss -ncs -cp1"
-</span><span class='line'>RES=`indent --version`
-</span><span class='line'>V1=`echo $RES | cut -d' ' -f3 | cut -d'.' -f1`
-</span><span class='line'>V2=`echo $RES | cut -d' ' -f3 | cut -d'.' -f2`
-</span><span class='line'>V3=`echo $RES | cut -d' ' -f3 | cut -d'.' -f3`
-</span><span class='line'>if [ $V1 -gt 2 ]; then
-</span><span class='line'>  PARAM="$PARAM -il0"
-</span><span class='line'>elif [ $V1 -eq 2 ]; then
-</span><span class='line'>  if [ $V2 -gt 2 ]; then
-</span><span class='line'>    PARAM="$PARAM -il0";
-</span><span class='line'>  elif [ $V2 -eq 2 ]; then
-</span><span class='line'>    if [ $V3 -ge 10 ]; then
-</span><span class='line'>      PARAM="$PARAM -il0"
-</span><span class='line'>    fi
-</span><span class='line'>  fi
-</span><span class='line'>fi
-</span><span class='line'>indent $PARAM "$@"</span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>brctl addbr br1
+</span><span class='line'>brctl show
+</span><span class='line'>
+</span><span class='line'>vim /etc/sysconfig/docker
+</span><span class='line'>ifconfig br1 100.64.0.1 netmask 255.255.255.0
+</span><span class='line'>
+</span><span class='line'>vim /etc/sysconfig/docker-network
+</span><span class='line'>DOCKER_NETWORK_OPTIONS="-b=br1"
+</span><span class='line'>
+</span><span class='line'>service docker restart</span></code></pre></td></tr></table></div></figure>
+
+
+<p><a href="https://blog.csdn.net/yelllowcong/article/details/76405191">或者配置docker</a></p>
+
+<h3>3 pipework配置docker网络</h3>
+
+<p><a href="/download/system/pipework-master.zip">pipework-master.zip</a></p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>git clone https://github.com/jpetazzo/pipework.git
+</span><span class='line'>sudo cp pipework/pipework /usr/local/bin/
+</span><span class='line'>
+</span><span class='line'>docker run -itd --name d1 --net=none centos2 /bin/bash
+</span><span class='line'>pipework br1 d1 100.64.0.100/24@100.64.0.1
+</span><span class='line'>docker exec -it d1 /bin/bash</span></code></pre></td></tr></table></div></figure>
+
+
+<h3>4 修改本机为bridge, docker分配同本机网段</h3>
+
+<p>vim /etc/sysconfig/network-scripts/ifcfg-enp0s3</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>增加 BRIDGE="br0"</span></code></pre></td></tr></table></div></figure>
+
+
+<p>vim /etc/sysconfig/network-scripts/ifcfg-br0</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>DEVICE="br0"
+</span><span class='line'>ONBOOT="yes"
+</span><span class='line'>TYPE="Bridge"
+</span><span class='line'>BOOTPROTO=dhcp</span></code></pre></td></tr></table></div></figure>
+
+
+<p>service network restart</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>echo 1 &gt; /proc/sys/net/ipv4/ip_forward
+</span><span class='line'>echo 1 &gt; /proc/sys/net/ipv4/conf/enp0s3/proxy_arp
+</span><span class='line'>
+</span><span class='line'>docker run -itd --name d2 --net=none centos2 /bin/bash
+</span><span class='line'>pipework br0 d2 192.168.43.189/24@192.168.43.1
+</span><span class='line'>brctl show
+</span><span class='line'>
+</span><span class='line'>docker exec -it d2 /bin/bash</span></code></pre></td></tr></table></div></figure>
 
 
 
@@ -419,7 +458,7 @@ var ss360Config = {
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2020/10/12/slow-start/">hybrid slow start 混合慢启动算法</a></h2>
+      <h2 class="entry-title"><a href="/blog/2020/11/07/docker-net/">docker的四种网络模式</a></h2>
     
     
       <p class="meta">
@@ -428,212 +467,42 @@ var ss360Config = {
 
 
 
-<time class='entry-date' datetime='2020-10-12T13:37:00+08:00'><span class='date'>2020-10-12</span> <span class='time'>13:37:00</span></time>
+<time class='entry-date' datetime='2020-11-07T14:22:00+08:00'><span class='date'>2020-11-07</span> <span class='time'>14:22:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><p><a href="https://www.jianshu.com/p/f2edbaca4f2c">https://www.jianshu.com/p/f2edbaca4f2c</a></p>
+  <div class="entry-content"><p><a href="https://www.jianshu.com/p/270125484301">https://www.jianshu.com/p/270125484301</a></p>
 
-<p>传统的单纯采用指数增长的慢启动算法有一个无法避免的问题，在临界进入拥塞避免阶段时，特别是在高带宽长距离网络中，容易出现大规模丢包，进而导致大量数据包重传，也有可能出现timeout，致使网络带宽利用率下降。</p>
+<h4>1. host模式</h4>
 
-<p>Hybrid Slow Start，它在传统的慢启动算法中加入了判断机制，强制从慢启动转入拥塞避免。这里主要说说其在CUBIC中是怎么实现的。</p>
+<p>使用<code>--net=host</code>指定。</p>
 
-<h3>变量介绍</h3>
+<p>  众所周知，Docker使用了Linux的Namespaces技术来进行资源隔离，如PID Namespace隔离进程，Mount Namespace隔离文件系统，Network Namespace隔离网络等。一个Network Namespace提供了一份独立的网络环境，包括网卡、路由、Iptable规则等都与其他的Network Namespace隔离。一个Docker容器一般会分配一个独立的Network Namespace。但如果启动容器的时候使用host模式，那么这个容器将不会获得一个独立的Network Namespace，而是和宿主机共用一个Network Namespace。容器将不会虚拟出自己的网卡，配置自己的IP等，而是使用宿主机的IP和端口。</p>
 
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#define HYSTART_ACK_TRAIN      0x1 //进入拥塞避免的条件
-</span><span class='line'>#define HYSTART_DELAY          0x2 //进入拥塞避免的条件
-</span><span class='line'>#define HYSTART_MIN_SAMPLES    8   //表示至少取一个RTT的前8个ACK作为样本
-</span><span class='line'>#define HYSTART_DELAY_MIN      (4u&lt;&lt;3) 
-</span><span class='line'>#define HYSTART_DELAY_MAX      (16u&lt;&lt;3)
-</span><span class='line'>/* if x &gt; HYSTART_DELAY_MAX，return HYSTART_DELAY_MAX 
-</span><span class='line'> * else if x &lt; HYSTART_DELAY_MIN，return HYATART_DELAY_MIN
-</span><span class='line'> * else return x
-</span><span class='line'> */
-</span><span class='line'>#define HYSTART_DELAY_THRESH clamp(x, HYSTART_DELAY_MIN, HYSTART_DELAY_MAX)
-</span><span class='line'>static int hystart __read_mostly = 1;
-</span><span class='line'>static int hystart_detect __read_mostly = HYSTART_ACK_TRAIN | HYSART_DELAY;
-</span><span class='line'>static int hystart_low_window __read_mostly = 16;
-</span><span class='line'>static int hystart_ack_delta __read_mostly = 2;
-</span><span class='line'>
-</span><span class='line'>struct bictcp {
-</span><span class='line'>&#9;...
-</span><span class='line'>&#9;u32    delay_min;   //全局最小rtt
-</span><span class='line'>&#9;u32    round_start; //记录慢启动的起始时间
-</span><span class='line'>&#9;u32    curr_rtt;    //记录样本中的最小rtt
-</span><span class='line'>&#9;u8      found;
-</span><span class='line'>&#9;u8      sample_cnt; //样本计数变量
-</span><span class='line'>&#9;...
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+<p>  例如，我们在10.10.101.105/24的机器上用host模式启动一个含有web应用的Docker容器，监听tcp80端口。当我们在容器中执行任何类似ifconfig命令查看网络环境时，看到的都是宿主机上的信息。而外界访问容器中的应用，则直接使用10.10.101.105:80即可，不用任何NAT转换，就如直接跑在宿主机中一样。但是，容器的其他方面，如文件系统、进程列表等还是和宿主机隔离的。</p>
 
+<h4>2. container模式</h4>
 
-<h3>两类退出slow start机制</h3>
+<p>使用<code>--net=container:NAME_or_ID</code>指定。</p>
 
-<p>在Hybrid Slow Start算法中给出了种类判断机制用来退出慢启动进入拥塞避免，分别是ACKs train length和Increase in packet delays。</p>
+<p>在理解了host模式后，这个模式也就好理解了。这个模式指定新创建的容器和已经存在的一个容器共享一个Network Namespace，而不是和宿主机共享。新创建的容器不会创建自己的网卡，配置自己的IP，而是和一个指定的容器共享IP、端口范围等。同样，两个容器除了网络方面，其他的如文件系统、进程列表等还是隔离的。两个容器的进程可以通过lo网卡设备通信。</p>
 
-<h4>ACKS train length</h4>
+<h4>3. none模式</h4>
 
-<p>这里给出一段原文描述，在这段描述中说了怎么测ACKs train length以及为什么要用ACKs train length。</p>
+<p>使用<code>--net=none</code>指定。</p>
 
-<p>The ACK train length is measured by calculating the sum of inter-arrival times of all the closely spaced ACKs within an RTT round. The train length is strongly affected by the bottleneck bandwidth, routing delays and buffer sizes along the path, and is easily stretched out by congestion caused by cross traffic in the path, so by estimating the train length we can reliably find a safe exit point of Slow Start.</p>
+<p>这个模式和前两个不同。在这种模式下，Docker容器拥有自己的Network Namespace，但是，并不为Docker容器进行任何网络配置。也就是说，这个Docker容器没有网卡、IP、路由等信息。需要我们自己为Docker容器添加网卡、配置IP等。</p>
 
-<h4>Increase in packet delays</h4>
+<h4>4. bridge模式</h4>
 
-<p>同样还是一段原文描述，如果你问我为什么不直接翻译成中文，我不会回答你这个问题的。</p>
+<p>使用<code>--net=bridge</code>指定，默认设置。</p>
 
-<p>Increase in packet delays during Slow Start may indicate the possibility of the bottleneck router being congested.</p>
+<p>bridge模式是Docker默认的网络设置，此模式会为每一个容器分配Network Namespace、设置IP等，并将一个主机上的Docker容器连接到一个虚拟网桥上。</p>
 
-<p>但是Increase in packet delays的测量会受到bursty transmission的影响，所以只测一个RTT中刚开始的几个数据包的往返时间来避免bursty transission的影响，在后面给出的code中会看到</p>
-
-<h3>函数实现</h3>
-
-<p>hystart重置函数</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static inline void bictcp_hystart_reset(struct sock *sk)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
-</span><span class='line'>&#9;struct bictcp *ca = inet_csk_ca(sk);
-</span><span class='line'>
-</span><span class='line'>&#9;ca-&gt;round_start = ca-&gt;last_ack = bictcp_clock(); //记录慢启动的开始时间
-</span><span class='line'>&#9;ca-&gt;end_seq = tp-&gt;snd_nxt;
-</span><span class='line'>&#9;ca-&gt;curr_rtt = 0;   //重置样本最小rtt为0
-</span><span class='line'>&#9;ca-&gt;sample_cnt = 0; //重置样本计数为0
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>Hybrid Slow Start实现的核心部分</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static void hystart_update(struct sock *sk, u32 delay)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
-</span><span class='line'>&#9;struct bictcp *ca = inet_csk_ca(sk);
-</span><span class='line'>
-</span><span class='line'>&#9;//如果ca-&gt;found & hystart_detect为真，表示应该进入拥塞避免
-</span><span class='line'>&#9;if (!(ca-&gt;found & hystart_detect)) {
-</span><span class='line'>&#9;&#9;u32 now = bictcp_clock(); //获取当前时间
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;/* first detection parameter - ack-train detection */
-</span><span class='line'>&#9;&#9;/* 前后到来的两个ACK的间隔时间小于hystart_ack_delta才有效 */
-</span><span class='line'>&#9;&#9;if ((s32)(now - ca-&gt;last_ack) &lt;= hystart_ack_delta) {
-</span><span class='line'>&#9;&#9;&#9;ca-&gt;last_ack = now;  //更新上一个ACK到来的时间
-</span><span class='line'>&#9;&#9;&#9;/* 每次慢启动时会重置round_start为0，结合前面的if条件，下面的
-</span><span class='line'>&#9;&#9;&#9; * if成立的条件是：从慢启动开始到现在经过的时间如果大于
-</span><span class='line'>&#9;&#9;&#9; * delay_min&gt;&gt;4，那么可以进入拥塞避免了。至于为什么选
-</span><span class='line'>&#9;&#9;&#9; * delay_min&gt;&gt;4这个值，鬼知道。
-</span><span class='line'>&#9;&#9;&#9; */
-</span><span class='line'>&#9;&#9;&#9;if ((s32)(now - ca-&gt;round_start) &gt; ca-&gt;delay_min &gt;&gt; 4)
-</span><span class='line'>&#9;&#9;&#9;&#9;ca-&gt;found |= HYSTART_ACK_TRAIN;
-</span><span class='line'>&#9;&#9;}   
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;/* obtain the minimum delay of more than sampling packets */
-</span><span class='line'>&#9;&#9;/* 如果样本计数小于HYSTART_MIN_SAMPLES(默认为8) */
-</span><span class='line'>&#9;&#9;if (ca-&gt;sample_cnt &lt; HYSTART_MIN_SAMPLES) {
-</span><span class='line'>&#9;&#9;&#9;if (ca-&gt;curr_rtt == 0 || ca-&gt;curr_rtt &gt; delay)
-</span><span class='line'>&#9;&#9;&#9;&#9;ca-&gt;curr_rtt = delay;/* 更新样本中的最小rtt */
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;ca-&gt;sample_cnt++;
-</span><span class='line'>&#9;&#9;} else {//如果样本大于8了，那么就可以判断是否要进入拥塞避免了
-</span><span class='line'>&#9;&#9;&#9;/* 如果前面8个样本中的最小rtt大于全局最小rtt与阈值的和，那么表示网络出
-</span><span class='line'>&#9;&#9;&#9; * 现了拥塞，应立马进入拥塞避免阶段，HYSTART_DELAY_THRESH()的返
-</span><span class='line'>&#9;&#9;&#9; * 回值在前面的变量介绍中有说明。
-</span><span class='line'>&#9;&#9;&#9;if (ca-&gt;curr_rtt &gt; ca-&gt;delay_min +
-</span><span class='line'>&#9;&#9;&#9;&#9;HYSTART_DELAY_THRESH(ca-&gt;delay_min&gt;&gt;4))
-</span><span class='line'>&#9;&#9;&#9;&#9;ca-&gt;found |= HYSTART_DELAY;
-</span><span class='line'>&#9;&#9;}   
-</span><span class='line'>&#9;&#9;/*  
-</span><span class='line'>&#9;&#9; * Either one of two conditions are met,
-</span><span class='line'>&#9;&#9; * we exit from slow start immediately.
-</span><span class='line'>&#9;&#9; */
-</span><span class='line'>&#9;&#9;/* 如果为真就进入拥塞避免 */
-</span><span class='line'>&#9;&#9;if (ca-&gt;found & hystart_detect)
-</span><span class='line'>&#9;&#9;&#9;tp-&gt;snd_ssthresh = tp-&gt;snd_cwnd;
-</span><span class='line'>&#9;}   
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-
+<p>当Docker server启动时，会在主机上创建一个名为docker0的虚拟网桥，此主机上启动的Docker容器会连接到这个虚拟网桥上。虚拟网桥的工作方式和物理交换机类似，这样主机上的所有容器就通过交换机连在了一个二层网络中。接下来就要为容器分配IP了，Docker会从RFC1918所定义的私有IP网段中，选择一个和宿主机不同的IP地址和子网分配给docker0，连接到docker0的容器就从这个子网中选择一个未占用的IP使用。</p>
 </div>
   
   
@@ -655,7 +524,7 @@ var ss360Config = {
   
     <section>
 <h1>Categories
-<span class='right_span'>(913)</span>
+<span class='right_span'>(925)</span>
 
 </h1>
 <head>
@@ -686,7 +555,7 @@ if (!document.getElementById('blog~octopress')) document.getElementById('aexp_bl
 if (!document.getElementById('blog')) document.getElementById('aexp_blog').style.visibility = 'hidden';
 if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ruby').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(142)</span></li>
+<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(151)</span></li>
 <div id='language' class='catsub'><li><a href='/blog/cats/language~c/?opendiv=language'>c</a><a href='##' onmousedown=showDiv('language~c') id='aexp_language~c'><span class='exp_style' id='exp_language~c'>[+]</span></a><span class='right_span'>32</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~c')) document.getElementById('aexp_language~c').style.visibility = 'hidden';
@@ -703,7 +572,7 @@ if (!document.getElementById('language~java')) document.getElementById('aexp_lan
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~jsp')) document.getElementById('aexp_language~jsp').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/language~php/?opendiv=language'>php</a><a href='##' onmousedown=showDiv('language~php') id='aexp_language~php'><span class='exp_style' id='exp_language~php'>[+]</span></a><span class='right_span'>44</span></li>
+<li><a href='/blog/cats/language~php/?opendiv=language'>php</a><a href='##' onmousedown=showDiv('language~php') id='aexp_language~php'><span class='exp_style' id='exp_language~php'>[+]</span></a><span class='right_span'>50</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~php')) document.getElementById('aexp_language~php').style.visibility = 'hidden';
 </script>
@@ -711,7 +580,7 @@ if (!document.getElementById('language~php')) document.getElementById('aexp_lang
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~python')) document.getElementById('aexp_language~python').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/language~web/?opendiv=language'>web</a><a href='##' onmousedown=showDiv('language~web') id='aexp_language~web'><span class='exp_style' id='exp_language~web'>[+]</span></a><span class='right_span'>45</span></li>
+<li><a href='/blog/cats/language~web/?opendiv=language'>web</a><a href='##' onmousedown=showDiv('language~web') id='aexp_language~web'><span class='exp_style' id='exp_language~web'>[+]</span></a><span class='right_span'>48</span></li>
 </div><script language='javascript' type='text/javascript'>
 if (!document.getElementById('language')) document.getElementById('aexp_language').style.visibility = 'hidden';
 if (!document.getElementById('language~web')) document.getElementById('aexp_language~web').style.visibility = 'hidden';
@@ -850,8 +719,8 @@ if (!document.getElementById('tools~vim')) document.getElementById('aexp_tools~v
 if (!document.getElementById('tools')) document.getElementById('aexp_tools').style.visibility = 'hidden';
 if (!document.getElementById('tools~wxwork')) document.getElementById('aexp_tools~wxwork').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/system/'>system</a><a href='##' onmousedown=showDiv('system') id='aexp_system'><span class='exp_style' id='exp_system'>[+]</span></a><span class='right_span'>(111)</span></li>
-<div id='system' class='catsub'><li><a href='/blog/cats/system~base/?opendiv=system'>base</a><a href='##' onmousedown=showDiv('system~base') id='aexp_system~base'><span class='exp_style' id='exp_system~base'>[+]</span></a><span class='right_span'>24</span></li>
+<li class='catclass'><a href='/blog/cats/system/'>system</a><a href='##' onmousedown=showDiv('system') id='aexp_system'><span class='exp_style' id='exp_system'>[+]</span></a><span class='right_span'>(114)</span></li>
+<div id='system' class='catsub'><li><a href='/blog/cats/system~base/?opendiv=system'>base</a><a href='##' onmousedown=showDiv('system~base') id='aexp_system~base'><span class='exp_style' id='exp_system~base'>[+]</span></a><span class='right_span'>25</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('system~base')) document.getElementById('aexp_system~base').style.visibility = 'hidden';
 </script>
@@ -867,7 +736,7 @@ if (!document.getElementById('system~cgroup')) document.getElementById('aexp_sys
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('system~docker')) document.getElementById('aexp_system~docker').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/system~fs/?opendiv=system'>fs</a><a href='##' onmousedown=showDiv('system~fs') id='aexp_system~fs'><span class='exp_style' id='exp_system~fs'>[+]</span></a><span class='right_span'>9</span></li>
+<li><a href='/blog/cats/system~fs/?opendiv=system'>fs</a><a href='##' onmousedown=showDiv('system~fs') id='aexp_system~fs'><span class='exp_style' id='exp_system~fs'>[+]</span></a><span class='right_span'>11</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('system~fs')) document.getElementById('aexp_system~fs').style.visibility = 'hidden';
 </script>
@@ -1089,7 +958,7 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 
 <section>
 <h1>Date Categories
-<span class='right_span'>(913)</span>
+<span class='right_span'>(925)</span>
 
 </h1>
 <head>
@@ -1097,8 +966,8 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(33)</span></li>
-<div id='2024' class='catsub'><li><a href='/blog/cats/2024~07/?opendiv=2024'>2024-07</a><span class='right_span'>10</span></li>
+<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(45)</span></li>
+<div id='2024' class='catsub'><li><a href='/blog/cats/2024~07/?opendiv=2024'>2024-07</a><span class='right_span'>22</span></li>
 <li><a href='/blog/cats/2024~06/?opendiv=2024'>2024-06</a><span class='right_span'>2</span></li>
 <li><a href='/blog/cats/2024~05/?opendiv=2024'>2024-05</a><span class='right_span'>5</span></li>
 <li><a href='/blog/cats/2024~04/?opendiv=2024'>2024-04</a><span class='right_span'>5</span></li>
@@ -1245,6 +1114,8 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 <h1>Tags</h1>
 <ul class="tag-cloud">
 <a style="font-size: 124%" href="/tags/10gb/">10gb(7)</a>
+<a style="font-size: 114%" href="/tags/lvm/">LVM(5)</a>
+<a style="font-size: 100%" href="/tags/chrome-debug/">chrome_debug(3)</a>
 <a style="font-size: 131%" href="/tags/gdb/">gdb(9)</a>
 <a style="font-size: 127%" href="/tags/git/">git(8)</a>
 <a style="font-size: 114%" href="/tags/ipv6/">ipv6(5)</a>
@@ -1265,43 +1136,43 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
   <ul id="recent_posts">
     
       <li class="post">
-        <a href="/blog/2024/07/15/tools-sqlserver-sys/">sql server系统表详细说明</a>
+        <a href="/blog/2024/07/31/lvm-attr/">LVM 输出更多信息</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/15/tools-sqlserver-cols/">SQLserver查询数据库所有字段-表名</a>
+        <a href="/blog/2024/07/31/lvm-pvmove/">LVM 缩减 VG 大小 ( pvmove )</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/15/tools-mysql-socket/">MySQL下的socket文件作用</a>
+        <a href="/blog/2024/07/31/lang-web-override/">Chrome浏览器使用Overrides调试线上代码</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/15/lang-php-iconv/">iconv与mb_convert_encoding的使用</a>
+        <a href="/blog/2024/07/31/lang-web-fetch/">fetch使用介绍, chrome如何重新提交请求并且更改参数</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/15/bat/">Linux查看电池损耗</a>
+        <a href="/blog/2024/07/31/lang-web-95598/">95598停电公告信息抓取</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/15/lang-web-box/">JavaScript的三种弹出提示框(alert、confirm、prompt)</a>
+        <a href="/blog/2024/07/30/lang-php-sm1234/">sm1、sm2、sm3、sm4简单介绍</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/15/lang-web-copy/">JavaScript复制内容到剪切板</a>
+        <a href="/blog/2024/07/30/lang-php-sm2/">php sm2</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/15/lang-web-alert/">alert 弹窗去掉上方 title 网址域名</a>
+        <a href="/blog/2024/07/30/lang-php-sm3/">php sm3</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/15/tools-sqlserver-space/">SQL Server查看所有表大小，所占空间</a>
+        <a href="/blog/2024/07/30/lang-php-bgcolor/">php spreadsheet 填充背景色</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/12/centos7-yum/">CentOS7 yum</a>
+        <a href="/blog/2024/07/30/lang-php-mb/">php统计文章字数</a>
       </li>
     
   </ul>

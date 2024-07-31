@@ -131,7 +131,7 @@ var ss360Config = {
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2015/03/19/kernel-net-tso2/">TCP的TSO处理（一）</a></h2>
+      <h2 class="entry-title"><a href="/blog/2015/04/10/kernel-net-syncookie/">SYN cookies机制下连接的建立</a></h2>
     
     
       <p class="meta">
@@ -140,88 +140,42 @@ var ss360Config = {
 
 
 
-<time class='entry-date' datetime='2015-03-19T18:27:00+08:00'><span class='date'>2015-03-19</span> <span class='time'>18:27:00</span></time>
+<time class='entry-date' datetime='2015-04-10T14:34:00+08:00'><span class='date'>2015-04-10</span> <span class='time'>14:34:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><p><a href="http://blog.csdn.net/zhangskd/article/details/7699081">http://blog.csdn.net/zhangskd/article/details/7699081</a></p>
+  <div class="entry-content"><p><a href="http://blog.csdn.net/justlinux2010/article/details/12619761">http://blog.csdn.net/justlinux2010/article/details/12619761</a></p>
 
-<h4>概述</h4>
+<p>  在正常情况下，服务器端接收到客户端发送的SYN包，会分配一个连接请求块（即request_sock结构），用于保存连接请求信息，并且发送SYN+ACK包给客户端，然后将连接请求块添加到半连接队列中。客户端接收到SYN+ACK包后，会发送ACK包对服务器端的包进行确认。服务器端收到客户端的确认后，根据保存的连接信息，构建一个新的连接，放到监听套接字的连接队列中，等待用户层accept连接。这是正常的情况，但是在并发过高或者遭受SYN flood攻击的情况下，半连接队列的槽位数量很快就会耗尽，会导致丢弃新的连接请求，SYN cookies技术可以使服务器在半连接队列已满的情况下仍能处理新的SYN请求。</p>
 
-<p>In computer networking, large segment offload (LSO) is a technique for increasing outbound
-throughput of high-bandwidth network connections by reducing CPU overhead. It works by queuing
-up large buffers and letting the network interface card (NIC) split them into separate packets.
-The technique is also called TCP segmentation offload (TSO) when applied to TCP, or generic
-segmentation offload (GSO).</p>
+<p>  如果开启了SYN cookies选项，在半连接队列满时，SYN cookies并不丢弃SYN请求，而是将源目的IP、源目的端口号、接收到的客户端初始序列号以及其他一些安全数值等信息进行hash运算，并加密后得到服务器端的初始序列号，称之为cookie。服务器端在发送初始序列号为cookie的SYN+ACK包后，会将分配的连接请求块释放。如果接收到客户端的ACK包，服务器端将客户端的ACK序列号减1得到的值，与上述要素hash运算得到的值比较，如果相等，直接完成三次握手，构建新的连接。SYN cookies机制的核心就是避免攻击造成的大量构造无用的连接请求块，导致内存耗尽，而无法处理正常的连接请求。</p>
 
-<p>The inbound counterpart of large segment offload is large recive offload (LRO).</p>
+<p>  启用SYN cookies是通过在启动环境中设置以下命令完成：</p>
 
-<p>When large chunks of data are to be sent over a computer network, they need to be first broken
-down to smaller segments that can pass through all the network elements like routers and
-switches between the source and destination computers. This process it referred to as
-segmentation. Segmentation is often done by the TCP protocol in the host computer. Offloading
-this work to the NIC is called TCP segmentation offload (TSO).</p>
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>echo 1 &gt; /proc/sys/net/ipv4/tcp_syncookies</span></code></pre></td></tr></table></div></figure>
 
-<p>For example, a unit of 64KB (65,536 bytes) of data is usually segmented to 46 segments of 1448
-bytes each before it is sent over the network through the NIC. With some intelligence in the NIC,
-the host CPU can hand over the 64KB of data to the NIC in a single transmit request, the NIC can
-break that data down into smaller segments of 1448 bytes, add the TCP, IP, and data link layer
-protocol headers——according to a template provided by the host&rsquo;s TCP/IP stack——to each
-segment, and send the resulting frames over the network. This significantly reduces the work
-done by the CPU. Many new NICs on the market today support TSO. [1]</p>
 
-<h4>具体</h4>
+<p>  注意，即使开启该机制并不意味着所有的连接都是用SYN cookies机制来完成连接的建立，只有在半连接队列已满的情况下才会触发SYN cookies机制。由于SYN cookies机制严重违背TCP协议，不允许使用TCP扩展，可能对某些服务造成严重的性能影响（如SMTP转发），对于防御SYN flood攻击的确有效。对于没有收到攻击的高负载服务器，不要开启此选项，可以通过修改tcp_max_syn_backlog、tcp_synack_retries和tcp_abort_on_overflow系统参数来调节。</p>
 
-<p>It is a method to reduce CPU workload of packet cutting in 1500byte and asking hardware to
-perform the same functionality.</p>
+<p>下面来看看内核中是怎么通过SYN cookie机制来完成连接的建立。</p>
 
-<p>1.TSO feature is implemented using the hardware support. This means hardware should be
-able to segment the packets in max size of 1500 byte and reattach the header with every
-packets.</p>
-
-<p>2.Every network hardware is represented by netdevice structure in kernel. If hardware supports
-TSO, it enables the Segmentation offload features in netdevice, mainly represented by
-&ldquo; NETIF_F_TSO&rdquo; and other fields. [2]</p>
-
-<p>TCP Segmentation Offload is supported in Linux by the network device layer. A driver that wants
-to offer TSO needs to set the NETIF_F_TSO bit in the network device structure. In order for a
-device to support TSO, it needs to also support Net : TCP Checksum Offloading and
-Net : Scatter Gather.</p>
-
-<p>The driver will then receive super-sized skb&rsquo;s. These are indicated to the driver by
-skb_shinfo(skb)->gso_size being non-zero. The gso_size is the size the hardware should
-fragment the TCP data. TSO may change how and when TCP decides to send data. [3]</p>
-
-<h4>实现</h4>
+<p>  客户端的连接请求由</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
 <span class='line-number'>3</span>
 <span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/* This data is invariant across clones and lives at the end of the 
-</span><span class='line'> * header data, ie. at skb-&gt;end. 
-</span><span class='line'> */  
-</span><span class='line'>struct skb_share_info {  
-</span><span class='line'>&#9;...  
-</span><span class='line'>   unsigned short gso_size; // 每个数据段的大小  
-</span><span class='line'>   unsigned short gso_segs; // skb被分割成多少个数据段  
-</span><span class='line'>   unsigned short gso_type;  
-</span><span class='line'>   struct sk_buff *frag_list; // 分割后的数据包列表  
-</span><span class='line'>   ...  
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>tcp_v4_do_rcv()
+</span><span class='line'>&#9;tcp_rcv_state_process()
+</span><span class='line'>&#9;&#9;icsk-&gt;icsk_af_ops-&gt;conn_request()
+</span><span class='line'>&#9;&#9;&#9;tcp_v4_conn_request()</span></code></pre></td></tr></table></div></figure>
 
 
-
+<p>函数处理。tcp_v4_conn_request()中有一个局部变量want_cookie，用来标识是否使用SYN cookies机制。want_cookie的初始值为0，如果半连接队列已满，并且开启了tcp_syncookies系统参数，则将其值设置为1，如下所示：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -251,561 +205,164 @@ fragment the TCP data. TSO may change how and when TCP decides to send data. [3]
 <span class='line-number'>26</span>
 <span class='line-number'>27</span>
 <span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-<span class='line-number'>58</span>
-<span class='line-number'>59</span>
-<span class='line-number'>60</span>
-<span class='line-number'>61</span>
-<span class='line-number'>62</span>
-<span class='line-number'>63</span>
-<span class='line-number'>64</span>
-<span class='line-number'>65</span>
-<span class='line-number'>66</span>
-<span class='line-number'>67</span>
-<span class='line-number'>68</span>
-<span class='line-number'>69</span>
-<span class='line-number'>70</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/* Initialize TSO state of skb. 
-</span><span class='line'> * This must be invoked the first time we consider transmitting 
-</span><span class='line'> * SKB onto the wire. 
-</span><span class='line'> */  
-</span><span class='line'>static int tcp_init_tso_segs(struct sock *sk, struct sk_buff *skb,  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;unsigned int mss_now)  
-</span><span class='line'>{  
-</span><span class='line'>&#9;int tso_segs = tcp_skb_pcount(skb);  
-</span><span class='line'>  
-</span><span class='line'>&#9;/* 如果还没有分段，或者有多个分段但是分段长度不等于当前MSS，则需处理*/  
-</span><span class='line'>&#9;if (! tso_segs || (tso_segs &gt; 1 && tcp_skb_mss(skb) != mss_now)) {  
-</span><span class='line'>&#9;&#9;tcp_set_skb_tso_segs(sk, skb, mss_now);  
-</span><span class='line'>  
-</span><span class='line'>&#9;&#9;tso_segs = tcp_skb_pcount(skb);/* 重新获取分段数量 */  
-</span><span class='line'>&#9;}  
-</span><span class='line'>&#9;return tso_segs;  
-</span><span class='line'>}  
-</span><span class='line'>  
-</span><span class='line'>/* Initialize TSO segments for a packet. */  
-</span><span class='line'>static void tcp_set_skb_tso_segs(struct sock *sk, struct sk_buff *skb,  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;unsigned int mss_now)  
-</span><span class='line'>{  
-</span><span class='line'>&#9;/* 有以下情况则不需要分片： 
-</span><span class='line'>&#9;  * 1. 数据的长度不超过允许的最大长度MSS 
-</span><span class='line'>&#9; * 2. 网卡不支持GSO 
-</span><span class='line'>&#9; * 3. 网卡不支持重新计算校验和 
-</span><span class='line'>&#9; */  
-</span><span class='line'>&#9;if (skb-&gt;len &lt;= mss_now || ! sk_can_gso(sk) ||  
-</span><span class='line'>&#9;&#9;skb-&gt;ip_summed == CHECKSUM_NONE) {  
-</span><span class='line'>  
-</span><span class='line'>&#9;&#9;/* Avoid the costly divide in the normal non-TSO case.*/  
-</span><span class='line'>&#9;&#9;skb_shinfo(skb)-&gt;gso_segs = 1;  
-</span><span class='line'>&#9;&#9;skb_shinfo(skb)-&gt;gso_size = 0;  
-</span><span class='line'>&#9;&#9;skb_shinfo(skb)-&gt;gso_type = 0;  
-</span><span class='line'>&#9;} else {  
-</span><span class='line'>  
-</span><span class='line'>&#9;&#9;/* 计算需要分成几个数据段*/  
-</span><span class='line'>&#9;&#9;skb_shinfo(skb)-&gt;gso_segs = DIV_ROUND_UP(skb-&gt;len, mss_now);/*向上取整*/  
-</span><span class='line'>&#9;&#9;skb_shinfo(skb)-&gt;gso_size = mss_now; /* 每个数据段的大小*/  
-</span><span class='line'>&#9;&#9;skb_shinfo(skb)-&gt;gso_type = sk-&gt;sk_gso_type;  
-</span><span class='line'>&#9;}  
-</span><span class='line'>}  
-</span><span class='line'>  
-</span><span class='line'>/* Due to TSO, an SKB can be composed of multiple actual packets.  
-</span><span class='line'> * To keep these tracked properly, we use this. 
-</span><span class='line'> */  
-</span><span class='line'>static inline int tcp_skb_pcount (const struct sk_buff *skb)  
-</span><span class='line'>{  
-</span><span class='line'>&#9;return skb_shinfo(skb)-&gt;gso_segs;  
-</span><span class='line'>}  
-</span><span class='line'>   
-</span><span class='line'>/* This is valid if tcp_skb_pcount() &gt; 1 */  
-</span><span class='line'>static inline int tcp_skb_mss(const struct sk_buff *skb)  
-</span><span class='line'>{  
-</span><span class='line'>&#9;return skb_shinfo(skb)-&gt;gso_size;  
-</span><span class='line'>}  
-</span><span class='line'>  
-</span><span class='line'>static inline int sk_can_gso(const struct sock *sk)  
-</span><span class='line'>{  
-</span><span class='line'>&#9;/* sk_route_caps标志网卡驱动的特征, sk_gso_type表示GSO的类型， 
-</span><span class='line'>&#9; * 设置为SKB_GSO_TCPV4 
-</span><span class='line'>&#9; */  
-</span><span class='line'>&#9;return net_gso_ok(sk-&gt;sk_route_caps, sk-&gt;sk_gso_type);  
-</span><span class='line'>}  
-</span><span class='line'>  
-</span><span class='line'>static inline int net_gso_ok(int features, int gso_type)  
-</span><span class='line'>{  
-</span><span class='line'>&#9;int feature = gso_type &lt;&lt; NETIF_F_GSO_SHIFT;  
-</span><span class='line'>&#9;return (features & feature) == feature;  
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>sk_gso_max_size</h5>
-
-<p>NIC also specify the maximum segment size which it can handle, in sk_gso_max_size field.
-Mostly it will be set to 64k. This 64k values means if the data at TCP is more than 64k,
-then again TCP has to segment it in 64k and then push to interface.</p>
-
-<p>相关变量，sock中：unsigned int sk_gso_max_size.</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/* RFC2861 Check whether we are limited by application or congestion window 
-</span><span class='line'> * This is the inverse of cwnd check in tcp_tso_should_defer 
-</span><span class='line'> * 函数返回1，受拥塞控制窗口的限制，需要增加拥塞控制窗口； 
-</span><span class='line'> * 函数返回0，受应用程序的限制，不需要增加拥塞控制窗口。 
-</span><span class='line'> */  
-</span><span class='line'>  
-</span><span class='line'>int tcp_is_cwnd_limited(const struct sock *sk, u32 in_flight)  
-</span><span class='line'>{  
-</span><span class='line'>&#9;const struct tcp_sock *tp = tcp_sk(sk);  
-</span><span class='line'>&#9;u32 left;  
-</span><span class='line'>   
-</span><span class='line'>&#9;if (in_flight &gt;= tp-&gt;snd_cwnd)  
-</span><span class='line'>&#9;&#9;return 1;  
-</span><span class='line'>   
-</span><span class='line'>&#9;/* left表示还可以发送的数据量 */  
-</span><span class='line'>&#9;left = tp-&gt;snd_cwnd - in_flight;  
-</span><span class='line'>   
-</span><span class='line'>  
-</span><span class='line'>&#9;/* 如果使用gso，符合以下条件，认为是拥塞窗口受到了限制， 
-</span><span class='line'>&#9; * 可以增加拥塞窗口。 
-</span><span class='line'>&#9; */  
-</span><span class='line'>&#9;if (sk_can_gso(sk) &&   
-</span><span class='line'>&#9;&#9;left * sysctl_tcp_tso_win_divisor &lt; tp-&gt;snd_cwnd &&  
-</span><span class='line'>&#9;&#9;left * tp-&gt;mss_cache &lt; sk-&gt;sk_gso_max_size)  
-</span><span class='line'>&#9;&#9;return 1;  
-</span><span class='line'>  
-</span><span class='line'>&#9;/* 如果left大于允许的突发流量，那么拥塞窗口的增长已经很快了， 
-</span><span class='line'>&#9; * 不能再增加了。 
-</span><span class='line'>&#9; */  
-</span><span class='line'>&#9;return left &lt;= tcp_max_burst(tp);  
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>TSO Nagle</h4>
-
-<p>GSO, Generic Segmentation Offload，是协议栈提高效率的一个策略。</p>
-
-<p>它尽可能晚的推迟分段(segmentation)，最理想的是在网卡驱动里分段，在网卡驱动里把
-大包(super-packet)拆开，组成SG list，或在一块预先分配好的内存中重组各段，然后交给
-网卡。</p>
-
-<p>The idea behind GSO seems to be that many of the performance benefits of LSO (TSO/UFO)
-can be obtained in a hardware-independent way, by passing large &ldquo;superpackets&rdquo; around for
-as long as possible, and deferring segmentation to the last possible moment - for devices
-without hardware segmentation/fragmentation support, this would be when data is actually
-handled to the device driver; for devices with hardware support, it could even be done in hardware.</p>
-
-<p>Try to defer sending, if possible, in order to minimize the amount of TSO splitting we do.
-View it as a kind of TSO Nagle test.</p>
-
-<p>通过延迟数据包的发送，来减少TSO分段的次数，达到减小CPU负载的目的。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct tcp_sock {  
-</span><span class='line'>&#9;...  
-</span><span class='line'>&#9;u32 tso_deferred; /* 上次TSO延迟的时间戳 */  
-</span><span class='line'>&#9;...  
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-<span class='line-number'>58</span>
-<span class='line-number'>59</span>
-<span class='line-number'>60</span>
-<span class='line-number'>61</span>
-<span class='line-number'>62</span>
-<span class='line-number'>63</span>
-<span class='line-number'>64</span>
-<span class='line-number'>65</span>
-<span class='line-number'>66</span>
-<span class='line-number'>67</span>
-<span class='line-number'>68</span>
-<span class='line-number'>69</span>
-<span class='line-number'>70</span>
-<span class='line-number'>71</span>
-<span class='line-number'>72</span>
-<span class='line-number'>73</span>
-<span class='line-number'>74</span>
-<span class='line-number'>75</span>
-<span class='line-number'>76</span>
-<span class='line-number'>77</span>
-<span class='line-number'>78</span>
-<span class='line-number'>79</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/** This algorithm is from John Heffner. 
-</span><span class='line'> * 0: send now ; 1: deferred 
-</span><span class='line'> */  
-</span><span class='line'>static int tcp_tso_should_defer (struct sock *sk, struct sk_buff *skb)  
-</span><span class='line'>{  
-</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);  
-</span><span class='line'>&#9;const struct inet_connection_sock *icsk = inet_csk(sk);  
-</span><span class='line'>&#9;u32 in_flight, send_win, cong_win, limit;  
-</span><span class='line'>&#9;int win_divisor;  
-</span><span class='line'>&#9;  
-</span><span class='line'>&#9;/* 如果此skb包含结束标志，则马上发送*/  
-</span><span class='line'>&#9;if (TCP_SKB_CB(skb)-&gt;flags & TCPHDR_FIN)  
-</span><span class='line'>&#9;&#9;goto send_now;  
-</span><span class='line'>  
-</span><span class='line'>&#9;/* 如果此时不处于Open态，则马上发送*/  
-</span><span class='line'>&#9;if (icsk-&gt;icsk_ca_state != TCP_CA_Open)  
-</span><span class='line'>&#9;&#9;goto send_now;  
-</span><span class='line'>  
-</span><span class='line'>&#9;/* Defer for less than two clock ticks. 
-</span><span class='line'>&#9; * 上个skb被延迟了，且超过现在1ms以上，则不再延迟。 
-</span><span class='line'>&#9; * 也就是说，TSO延迟不能超过2ms！ 
-</span><span class='line'>&#9; */  
-</span><span class='line'>&#9;if (tp-&gt;tso_deferred && (((u32)jiffies &lt;&lt;1) &gt;&gt; 1) - (tp-&gt;tso_deferred &gt;&gt; 1) &gt; 1)  
-</span><span class='line'>&#9;&#9;goto send_now;  
-</span><span class='line'>&#9;
-</span><span class='line'>&#9;in_flight = tcp_packets_in_flight(tp);  
-</span><span class='line'>&#9;/* 如果此数据段不用分片，或者受到拥塞窗口的限制不能发包，则报错*/  
-</span><span class='line'>&#9;BUG_ON(tcp_skb_pcount(skb) &lt;= 1 || (tp-&gt;snd_cwnd &lt;= in_flight));  
-</span><span class='line'>&#9;/* 通告窗口的剩余大小*/  
-</span><span class='line'>&#9;send_win = tcp_wnd_end(tp) - TCP_SKB_CB(skb)-&gt;seq;  
-</span><span class='line'>&#9;/* 拥塞窗口的剩余大小*/  
-</span><span class='line'>&#9;cong_win = (tp-&gt;snd_cwnd - in_flight) * tp-&gt;mss_cache;  
-</span><span class='line'>&#9;/* 取其小者作为最终的发送限制*/  
-</span><span class='line'>&#9;limit = min(send_win, cong_win);  
-</span><span class='line'>  
-</span><span class='line'>&#9;/*If a full-sized TSO skb can be sent, do it. 
-</span><span class='line'>&#9; * 一般来说是64KB 
-</span><span class='line'>&#9; */  
-</span><span class='line'>&#9;if (limit &gt;= sk-&gt;sk_gso_max_size)  
-</span><span class='line'>&#9;&#9;goto send_now;  
-</span><span class='line'>  
-</span><span class='line'>&#9;/* Middle in queue won't get any more data, full sendable already ? */  
-</span><span class='line'>&#9;if ((skb != tcp_write_queue_tail(sk)) && (limit &gt;= skb-&gt;len))  
-</span><span class='line'>&#9;&#9;goto send_now;  
-</span><span class='line'>  
-</span><span class='line'>&#9;win_divisor = ACCESS_ONCE(sysctl_tcp_tso_win_divisor);  
-</span><span class='line'>&#9;if (win_divisor) {  
-</span><span class='line'>&#9;&#9;/* 一个RTT内允许发送的最大字节数*/  
-</span><span class='line'>&#9;&#9;u32 chunk = min(tp-&gt;snd_wnd, tp-&gt;snd_cwnd * tp-&gt;mss_cache);  
-</span><span class='line'>&#9;&#9;chunk /= win_divisor; /* 单个TSO段可消耗的发送量*/  
-</span><span class='line'>  
-</span><span class='line'>&#9;&#9;/* If at least some fraction of a window is available, just use it. */  
-</span><span class='line'>&#9;&#9;if (limit &gt;= chunk)  
-</span><span class='line'>&#9;&#9;&#9;goto send_now;  
-</span><span class='line'>&#9;} else {  
-</span><span class='line'>&#9;&#9;/* Different approach, try not to defer past a single ACK. 
-</span><span class='line'>&#9;&#9; * Receiver should ACK every other full sized frame, so if we have space for 
-</span><span class='line'>&#9;&#9; * more than 3 frames then send now. 
-</span><span class='line'>&#9;&#9; */  
-</span><span class='line'>&#9;&#9;if (limit &gt; tcp_max_burst(tp) * tp-&gt;mss_cache)  
-</span><span class='line'>&#9;&#9;&#9;goto send_now;  
-</span><span class='line'>&#9;}  
-</span><span class='line'>  
-</span><span class='line'>&#9;/* OK, it looks like it is advisable to defer. */  
-</span><span class='line'>&#9;tp-&gt;tso_deferred = 1 | (jiffies &lt;&lt; 1); /* 记录此次defer的时间戳*/  
-</span><span class='line'>  
-</span><span class='line'>&#9;return 1;  
-</span><span class='line'>  
-</span><span class='line'>send_now:  
-</span><span class='line'>&#9;tp-&gt;tso_deferred = 0;  
-</span><span class='line'>&#9;return 0;  
-</span><span class='line'>}  
-</span><span class='line'>  
-</span><span class='line'>/* Returns end sequence number of the receiver's advertised window */  
-</span><span class='line'>static inline u32 tcp_wnd_end (const struct tcp_sock *tp)  
-</span><span class='line'>{  
-</span><span class='line'>&#9;/* snd_wnd的单位为字节*/  
-</span><span class='line'>&#9;return tp-&gt;snd_una + tp-&gt;snd_wnd;  
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>tcp_tso_win_divisor：单个TSO段可消耗拥塞窗口的比例，默认值为3。</p>
-
-<h5>符合以下任意条件，不会TSO延迟，可马上发送：</h5>
-
-<p>(1) 数据包带有FIN标志。传输快结束了，不宜延迟。<br/>
-(2) 发送方不处于Open拥塞状态。处于异常状态时，不宜延迟。<br/>
-(3) 上一次skb被延迟了，且距离现在大于等于2ms。延迟不能超过2ms。<br/>
-(4) min(send_win, cong_win) > full-sized TSO skb。允许发送的数据量超过TSO一次能处理的最大值，没必要再defer。<br/>
-(5) skb处于发送队列中间，且允许整个skb一起发送。处于发送队列中间的skb不能再获得新的数据，没必要再defer。<br/>
-(6) tcp_tso_win_divisor有设置时，limit > 单个TSO段可消耗的数据量，即min(snd_wnd, snd_cwnd * mss_cache) / tcp_tso_win_divisor。<br/>
-(7) tcp_tso_win_divisor没有设置时，limit > tcp_max_burst(tp) * mss_cache，一般是3个数据包。</p>
-
-<p>条件4、5、6/7，都是limit > 某个阈值，就可以马上发送。这个因为通过这几个条件，可以确定此时发送是受到应用程序的限制，而不是通告窗口或者拥塞窗口。在应用程序发送的数据量很少的情况下，不宜采用TSO Nagle，因为这会影响此类应用。</p>
-
-<p>我们注意到tcp_is_cwnd_limited()中的注释说：<br/>
-&ldquo; This is the inverse of cwnd check in tcp_tso_should_defer"，所以可以认为在tcp_tso_should_defer()中包含判断
-tcp_is_not_cwnd_limited (或者tcp_is_application_limited) 的条件。</p>
-
-<h5>符合以下所有条件，才会进行TSO延迟：</h5>
-
-<p>(1) 数据包不带有FIN标志。<br/>
-(2) 发送方处于Open拥塞状态。<br/>
-(3) 距离上一次延迟的时间在2ms以内。<br/>
-(4) 允许发送的数据量小于sk_gso_max_size。<br/>
-(5) skb处于发送队列末尾，或者skb不能整个发送出去。<br/>
-(6) tcp_tso_win_divisor有设置时，允许发送的数据量不大于单个TSO段可消耗的。<br/>
-(7) tcp_tso_win_divisor没有设置时，允许发送的数据量不大于3个包。</p>
-
-<p>可以看到TSO的触发条件并不苛刻，所以被调用时并没有加unlikely。</p>
-
-<h4>应用</h4>
-
-<h5>(1) 禁用TSO</h5>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>ethtool -K ethX tso off</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>(2) 启用TSO</h5>
-
-<p>TSO是默认启用的。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>ethtool -K ethX tso on</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>Reference</h4>
-
-<p>[1] <a href="http://en.wikipedia.org/wiki/Large_segment_offload">http://en.wikipedia.org/wiki/Large_segment_offload</a></p>
-
-<p>[2] <a href="http://tejparkash.wordpress.com/2010/03/06/tso-explained/">http://tejparkash.wordpress.com/2010/03/06/tso-explained/</a></p>
-
-<p>[3] <a href="http://www.linuxfoundation.org/collaborate/workgroups/networking/tso">http://www.linuxfoundation.org/collaborate/workgroups/networking/tso</a></p>
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/03/19/kernel-net-tso1/">TSO/GSO</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-03-19T18:24:00+08:00'><span class='date'>2015-03-19</span> <span class='time'>18:24:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://book.51cto.com/art/201206/344985.htm">http://book.51cto.com/art/201206/344985.htm</a></p>
-
-<p>TSO是通过网络设备进行TCP段的分割，从而来提高网络性能的一种技术。较大的数据包（超过标准1518B的帧）可以使用该技术，使操作系统减少必须处理的数据数量以提高性能。通常，当请求大量数据时，TCP发送方必须将数据拆分为MSS大小的数据块，然后进一步将其封装为数据包形式，以便最终可以在网络中进行传输。而当启用了TSO技术之后，TCP发送方可以将数据拆分为MSS整数倍大小的数据块，然后将大块数据的分段直接交给网络设备处理，操作系统需要创建并传输的数据包数量更少，因此性能会有较大的提高。图1-3所示为标准帧和TSO技术特性比较。</p>
-
-<p><img src="/images/kernel/2015-03-19-3.jpg" alt="" /></p>
-
-<p> 图是标准帧和TSO的处理过程<br/>
-a) 不支持TSO  b) 启用TSO后</p>
-
-<p>从前面有关TSO的论述可以看出，TSO只是针对TCP协议的，使TCP协议在硬件上得到了有力的支持。事实上，这种概念也可以应用于其他的传输层协议，如TCPv6，UDP，甚至DCCP等，这就是GSO(Generic Segmentation Offload)。</p>
-
-<p>性能提高的关键在于尽可能地推迟分段的时机，这样才能有效地降低成本。最理想的是在网络设备驱动里进行分段，在网络设备驱动里把大包进行拆分，组成分段列表，或在一块预先分配好的内存中重组各段，然后交给网络设备。这样，就要在网络设备的驱动里边来实现它，那么就需要修改每一个网络设备的驱动程序。事实上，这样做不大现实。</p>
-
-<p>然而似乎有另一种更容易的解决办法来支持GSO，那就是在把数据报文提交给网络设备驱动之前进行聚合/分散操作。Linux目前支持GSO框架已经支持的传输层的其他协议。有关GSO方面的代码，参见后续章节。</p>
-
-<p>应用层可以使用ethtool -K eth0 tso off|on命令对支持TSO特性的网络设备进行TSO功能的关闭和启用。</p>
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/03/19/kernel-net-cwnd/">拥塞窗口cwnd的理解</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-03-19T18:15:00+08:00'><span class='date'>2015-03-19</span> <span class='time'>18:15:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://blog.csdn.net/linweixuan/article/details/4353015">http://blog.csdn.net/linweixuan/article/details/4353015</a></p>
-
-<p>开始的时候拥塞窗口是1，发一个数据包等ACK回来 cwnd++即2,这个时候可以发送两个包,发送间隔几乎没有, 对方回的ACK到达发送方几乎是同时到达的.一个RTT来回,cwnd就翻倍,cwnd++,cwnd++即4了.如此下去,cwnd是指数增加.</p>
-
-<p><img src="/images/kernel/2015-03-19-2.jpg" alt="" /></p>
-
-<p>snd_cwnd_clamp这个变量我们可以不管,假定是一个大值.窗口到了我们设置的门限,snd_cwnd不在增加 而通过snd_cwnd_cnt变量来计数增加,一直增加到大过cwnd值,cwnd才加1,然后snd_cwnd_cnt重新计数, 通过snd_cwnd_cnt延缓cwnd计数,由于TCP是固定大小报文,每一个snd_cwnd代表了一个报文段的增加,snd_cwnd_cnt则看成byte的增加</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>void tcp_cong_avoid(struct send_queue* sq)
+</pre></td><td class='code'><pre><code class=''><span class='line'>int tcp_v4_conn_request(struct sock *sk, struct sk_buff *skb)
 </span><span class='line'>{
-</span><span class='line'>&#9;/* In saft area, increase*/
-</span><span class='line'>&#9;if (sq-&gt;snd_cwnd &lt;= sq-&gt;snd_ssthresh){
-</span><span class='line'>&#9;&#9;if (sq-&gt;snd_cwnd &lt; sq-&gt;snd_cwnd_clamp)
-</span><span class='line'>&#9;&#9;&#9;sq-&gt;snd_cwnd++;
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;else{ 
-</span><span class='line'>&#9;&#9;/* In theory this is tp-&gt;snd_cwnd += 1 / tp-&gt;snd_cwnd */
-</span><span class='line'>&#9;&#9;if (sq-&gt;snd_cwnd_cnt &gt;= sq-&gt;snd_cwnd) {
-</span><span class='line'>&#9;&#9;&#9;if (sq-&gt;snd_cwnd &lt; sq-&gt;snd_cwnd_clamp)
-</span><span class='line'>&#9;&#9;&#9;&#9;sq-&gt;snd_cwnd++;
-</span><span class='line'>&#9;&#9;&#9;sq-&gt;snd_cwnd_cnt = 0;
+</span><span class='line'>#ifdef CONFIG_SYN_COOKIES
+</span><span class='line'>&#9;int want_cookie = 0;
+</span><span class='line'>#else
+</span><span class='line'>#define want_cookie 0 /* Argh, why doesn't gcc optimize this :( */
+</span><span class='line'>#endif
+</span><span class='line'>
+</span><span class='line'>...... 
+</span><span class='line'>
+</span><span class='line'>&#9;/* TW buckets are converted to open requests without
+</span><span class='line'>&#9; * limitations, they conserve resources and peer is
+</span><span class='line'>&#9; * evidently real one.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;if (inet_csk_reqsk_queue_is_full(sk) && !isn) {
+</span><span class='line'>#ifdef CONFIG_SYN_COOKIES
+</span><span class='line'>&#9;&#9;if (sysctl_tcp_syncookies) {
+</span><span class='line'>&#9;&#9;&#9;want_cookie = 1;
 </span><span class='line'>&#9;&#9;} else
-</span><span class='line'>&#9;&#9;&#9;sq-&gt;snd_cwnd_cnt++;
-</span><span class='line'>&#9;} 
+</span><span class='line'>#endif
+</span><span class='line'>&#9;   
+</span><span class='line'>&#9;&#9;goto drop;
+</span><span class='line'>&#9;}
+</span><span class='line'>......
+</span><span class='line'>
+</span><span class='line'>drop:
+</span><span class='line'>&#9;return 0;
 </span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
-<p>snd_cwnd 还没到达门限不断增加snd_cwnd++<br/>
-snd_cwnd++                      | &lt;&ndash;snd_ssthresh
-                                ^</p>
+<p>  如果没有开启SYN cookies机制，在半连接队列满时，会跳转到drop处，返回0。在调用tcp_v4_conn_request()的tcp_rcv_state_process()中会直接释放SKB包。</p>
 
-<p>到达了snd_ssthresh转入拥塞避免，这个阶段由变量snd_cwnd_cnt来控制</p>
+<p>  我们前面提高过，造成半连接队列满有两种情况（不考虑半连接队列很小的情况），一种是负载过高，正常的连接数过多；另一种是SYN flood攻击。如果是第一种情况，此时是否继续构建连接，则要取决于连接队列的情况及半连接队列的重传情况，如下所示：</p>
 
-<p>转入拥塞,由于snd_cwnd_cnt从0开始小于snd_ssthresh，即从snd_ssthresh那个点开始计数, 一旦计数达到snd_cwnd拥塞窗口的值，但是还小过牵制snd_cwnd_clamp值</p>
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (sk_acceptq_is_full(sk) && inet_csk_reqsk_queue_young(sk) &gt; 1)
+</span><span class='line'>&#9;goto drop;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  sk_acceptq_is_full()函数很好理解，根据字面意思就可以看出，该函数是检查连接队列是否已满。inet_csk_reqsk_queue_young()函数返回半连接队列中未重传过SYN+ACK段的连接请求块数量。如果连接队列已满并且半连接队列中的连接请求块中未重传的数量大于1，则会跳转到drop处，丢弃SYN包。如果半连接队列中未重传的请求块数量大于1，则表示未来可能有2个完成的连接，这些新完成的连接要放到连接队列中，但此时连接队列已满。如果在接收到三次握手中最后的ACK后连接队列中没有空闲的位置，会忽略接收到的ACK包，连接建立会推迟，所以此时最好丢掉部分新的连接请求，空出资源以完成正在进行的连接建立过程。还要注意，这个判断并没有考虑半连接队列是否已满的问题。从这里可以看出，即使开启了SYN cookies机制并不意味着一定可以完成连接的建立。</p>
+
+<p>  如果可以继续连接的建立，调用inet_reqsk_alloc()分配连接请求块，如下所示：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>req = inet_reqsk_alloc(&tcp_request_sock_ops);
+</span><span class='line'>if (!req)
+</span><span class='line'>&#9;goto drop;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  看到这里可能就有人疑惑，既然开启了SYN cookies机制，仍然分配连接请求块，那和正常的连接构建也没有什么区别了。这里之所以要分配连接请求块是用于发送SYN+ACK包给客户端，发送后会释放掉，并不会加入到半连接队列中。</p>
+
+<p>  接下来就是计算cookie的值，由cookie_v4_init_sequence()函数完成，如下所示：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (want_cookie) {
+</span><span class='line'>#ifdef CONFIG_SYN_COOKIES
+</span><span class='line'>&#9;syn_flood_warning(skb);
+</span><span class='line'>&#9;req-&gt;cookie_ts = tmp_opt.tstamp_ok;
+</span><span class='line'>#endif
+</span><span class='line'>&#9;isn = cookie_v4_init_sequence(sk, skb, &req-&gt;mss);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  计算得到的cookie值会保存在连接请求块tcp_request_sock结构的snt_isn成员中，接着会调用__tcp_v4_send_synack()函数发送SYN+ACK包，然后释放前面分配的连接请求块，如下所示：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (__tcp_v4_send_synack(sk, req, dst) || want_cookie)
+</span><span class='line'>&#9;goto drop_and_free;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  在服务器端发送完SYN+ACK包后，我们看到在服务器端没有保存任何关于这个未完成连接的信息，所以在接收到客户端的ACK包后，只能根据前面发送的SYN+ACK包中的cookie值来决定是否继续构建连接。</p>
+
+<p>  我们接下来看接收到ACK包后的处理情况。ACK包在tcp_v4_do_rcv()函数中调用的tcp_v4_hnd_req()中处理，如下所示：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static struct sock *tcp_v4_hnd_req(struct sock *sk, struct sk_buff *skb)
+</span><span class='line'>{
+</span><span class='line'>&#9;......
+</span><span class='line'> 
+</span><span class='line'>#ifdef CONFIG_SYN_COOKIES
+</span><span class='line'>&#9;if (!th-&gt;rst && !th-&gt;syn && th-&gt;ack)
+</span><span class='line'>&#9;&#9;sk = cookie_v4_check(sk, skb, &(IPCB(skb)-&gt;opt));
+</span><span class='line'>#endif
+</span><span class='line'>&#9;return sk;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  由于在服务器端没有保存未完成连接的信息，所以在半连接队列或ehash散列表中都不会找到对应的sock结构。如果开启了SYN cookies机制，则会检查接收到的数据包是否是ACK包，如果是，在cookie_v4_check()中会调用cookie_check()函数检查ACK包中的cookie值是否有效。如果有效，则会分配request_sock结构，并根据ACK包初始化相应的成员，开始构建描述连接的sock结构。创建过程和正常的连接创建过程一样。</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2015/04/01/centos-base/">CentOS各种设置</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-04-01T23:39:00+08:00'><span class='date'>2015-04-01</span> <span class='time'>23:39:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><h4>centos个人目录文件夹路径中文转英文</h4>
+
+<p>方法1. 修改系统语言环境</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>export LANG=en_US
+</span><span class='line'>xdg-user-dirs-gtk-update
+</span><span class='line'>export LANG=zh_CN.UTF-8</span></code></pre></td></tr></table></div></figure>
+
+
+<p>方法2. 修改系统配置文件</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>vim ~/.config/user-dirs.dirs</span></code></pre></td></tr></table></div></figure>
+
+
+<hr />
+
+<h4>centos 8 重启网络命令</h4>
+
+<p><a href="https://blog.csdn.net/weixin_54626591/article/details/135974971">https://blog.csdn.net/weixin_54626591/article/details/135974971</a></p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -820,22 +377,325 @@ snd_cwnd++                      | &lt;&ndash;snd_ssthresh
 <span class='line-number'>11</span>
 <span class='line-number'>12</span>
 <span class='line-number'>13</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>                          snd_cwnd_clamp
-</span><span class='line'>                                 ^
-</span><span class='line'>    snd_cwnd++                   |            | &lt;--snd_ssthresh
-</span><span class='line'>                                              ^
-</span><span class='line'>                                    snd_cwnd++        
-</span><span class='line'>                                                          snd_cwnd_clamp
-</span><span class='line'>                                                                 ^
-</span><span class='line'>                                snd_cwnd_cnt++                   |            | &lt;--snd_ssthresh
-</span><span class='line'>                                                                              ^
-</span><span class='line'>                                               0      ---&gt;       snd_cwnd_cnt++
-</span><span class='line'> 
-</span><span class='line'> 
-</span><span class='line'>               &lt;------                       时间                      -------&gt;</span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>nmcli c reload ens33        (不会立即生效)  # 重新载入网卡配置文件
+</span><span class='line'>
+</span><span class='line'>nmcli c up ens33            (立即生效)      # 重启网卡ens33
+</span><span class='line'>
+</span><span class='line'>两条命令一起执行, 如果不行，可尝试以下命令
+</span><span class='line'>
+</span><span class='line'># 重载所有ifcfg或route到connection（不会立即生效）
+</span><span class='line'>nmcli c reload  ifcfg-xxx
+</span><span class='line'>
+</span><span class='line'># 重载指定ifcfg或route到connection（不会立即生效）
+</span><span class='line'>nmcli c load etc/sysconfig/network-scripts/ifcfg-ethX
+</span><span class='line'>nmcli c load etc/sysconfig/network-scripts/route-ethX
+</span><span class='line'>
+</span><span class='line'># 立即生效connection，有3种方法
+</span><span class='line'>nmcli c up ethX
+</span><span class='line'>nmcli d reapply ethX
+</span><span class='line'>nmcli d connect ethX
+</span></code></pre></td></tr></table></div></figure>
+
+
+<hr />
+
+<h4>Centos7系统rc.local不起作用</h4>
+
+<p>chmod +x /etc/rc.d/rc.local</p>
+
+<p>开头加 #!/bin/bash</p>
+
+<p>启动此项服务：</p>
+
+<p>systemctl list-units &ndash;type=service  #来查看一下所有的开启启动项目里面有没有这个rc-local这个服务。</p>
+
+<p>systemctl  status rc-local.service #来查看一下当前是怎么个状态</p>
+
+<p>systemctl enable rc-local.service</p>
+
+<p>systemctl start rc-local.service</p>
+
+<hr />
+
+<p>使用gcc时，总是按中文提示。回归英文的提示，方法是：
+首先使用env查看，发现LANGUAGE=zh_CN.UTF-8，接着执行export LANG=en_US.UTF-8就可以，以后的编译是就按英文来提示</p>
+
+<hr />
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>lsattr /etc/passwd /etc/group /etc/shadow /etc/gshadow
+</span><span class='line'>chattr -i /etc/passwd /etc/group /etc/shadow /etc/gshadow</span></code></pre></td></tr></table></div></figure>
+
+
+<hr />
+
+<p>英文：E437: terminal capability &ldquo;cm&rdquo; required<br/>
+中文：e437 终端需要能力 cm</p>
+
+<p>这个错误一般是环境变量TERM没有配置或者配置错误所致, 用 export TERM=linux 或者 export TERM=xterm</p>
+
+<hr />
+
+<p>上传是用rz -be，并且去掉弹出的对话框中“Upload files as ASCII”前的勾选。
+ -a, –ascii
+ -b, –binary 用binary的方式上传下载，不解释字符为ascii
+ -e, –escape 强制escape 所有控制字符，比如Ctrl+x，DEL等</p>
+
+<hr />
+
+<p>nginx</p>
+
+<p><a href="http://nginx.org/packages/rhel/7/x86_64/RPMS/">http://nginx.org/packages/rhel/7/x86_64/RPMS/</a></p>
+
+<hr />
+
+<p>binkernel.spec</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>%pre
+</span><span class='line'>mkdir -p /usr/local/kernel/etc/
+</span><span class='line'>echo "version=%{version}-%{release}" &gt; /usr/local/kernel/etc/install.conf
+</span><span class='line'>
+</span><span class='line'>%post
+</span><span class='line'>/sbin/new-kernel-pkg --package kernel --mkinitrd --depmod --install 2.6.32-358.6.1.ws5.b.5.1.11t25
+</span><span class='line'>
+</span><span class='line'>%preun
+</span><span class='line'>rm -rf /usr/local/kernel/
+</span><span class='line'>
+</span><span class='line'>%postun
+</span><span class='line'>/sbin/new-kernel-pkg  --remove 2.6.32-358.6.1.ws5.b.5.1.11t25</span></code></pre></td></tr></table></div></figure>
+
+
+<hr />
+
+<p>更改 bash_history 默认历史记录</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>vim ~/.bashrc
+</span><span class='line'>
+</span><span class='line'># 忽略[连续]重复命令
+</span><span class='line'>HISTCONTROL=ignoredups
+</span><span class='line'>
+</span><span class='line'># 清除重复命令
+</span><span class='line'># HISTCONTROL=erasedups
+</span><span class='line'>
+</span><span class='line'># 忽略特定命令
+</span><span class='line'>HISTIGNORE="[   ]*:ls:ll:cd:vi:pwd:sync:exit:history*"
+</span><span class='line'>
+</span><span class='line'># 命令历史文件大小10M
+</span><span class='line'>HISTFILESIZE=1000000000
+</span><span class='line'>
+</span><span class='line'># 保存历史命令条数10W
+</span><span class='line'>HISTSIZE=1000000
+</span><span class='line'>
+</span><span class='line'>以上配置可以通过 set | grep HIST 查看可选项.
+</span><span class='line'>
+</span><span class='line'>
+</span><span class='line'>多终端追加
+</span><span class='line'>当打开多个终端，关闭其中一个终端时会覆盖其他终端的命令历史，这里我们采用追加的方式避免命令历史文件.bash_history 文件被覆盖。
+</span><span class='line'>
+</span><span class='line'>shopt -s histappend
+</span><span class='line'>
+</span><span class='line'>更多 shopt 可选项可以通过 echo $SHELLOPTS 命令查看。</span></code></pre></td></tr></table></div></figure>
+
+
+<hr />
+
+<p>关闭CentOS6启动进度条，显示详细自检信息。vim /boot/grub/grub.conf，将"rhgb"和 &ldquo;quiet"去掉，保存即可</p>
+
+<hr />
+
+<p>vmware虚拟机mkinitrd提示no module ehci-hcd 错误的话，加：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>--builtin=ehci-hcd --builtin=ohci-hcd --builtin=uhci-hcd</span></code></pre></td></tr></table></div></figure>
+
+
+<hr />
+
+<p>CentOS6.0 下默认开selinux时出现httpd 报“SELinux policy enabled; httpd running as context unconfined_u:system”的解决方案</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>yum install policycoreutils-python
+</span><span class='line'>
+</span><span class='line'># To allow httpd to use nfs dirs in CentOS-6
+</span><span class='line'>setsebool -P httpd_use_nfs 1
+</span><span class='line'>setsebool -P httpd_enable_homedirs 1</span></code></pre></td></tr></table></div></figure>
+
+
+<hr />
+
+<h4>CentOS 关闭防火墙</h4>
+
+<p>1） 永久性生效，重启后不会复原<br/>
+开启：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>chkconfig iptables on
+</span><span class='line'>chkconfig ip6tables on</span></code></pre></td></tr></table></div></figure>
+
+
+<p>关闭：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>chkconfig iptables off
+</span><span class='line'>chkconfig ip6tables off</span></code></pre></td></tr></table></div></figure>
+
+
+<p>2） 即时生效，重启后复原<br/>
+开启：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>service iptables start
+</span><span class='line'>service ip6tables start</span></code></pre></td></tr></table></div></figure>
+
+
+<p>关闭：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>service iptables stop
+</span><span class='line'>service ip6tables stop</span></code></pre></td></tr></table></div></figure>
+
+
+<hr />
+
+<h4>CentOS安装软件：/lib/ld-linux.so.2: bad ELF interpreter 解决</h4>
+
+<p>是因为64位系统中安装了32位程序, 解决方法：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>yum install glibc.i686</span></code></pre></td></tr></table></div></figure>
+
+
+<p>其他包</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>yum install libstdc++.i686</span></code></pre></td></tr></table></div></figure>
+
+
+<hr />
+
+<h4>gcc, c++</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>yum install glibc
+</span><span class='line'>yum install glibc-devel
+</span><span class='line'>yum install gcc-c++
+</span><span class='line'>yum install libstdc++</span></code></pre></td></tr></table></div></figure>
 
 
 
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2015/04/01/kernel-net-tc/">tc模拟丢包率时延</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-04-01T23:25:00+08:00'><span class='date'>2015-04-01</span> <span class='time'>23:25:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><h4>tc 的最最基本的使用</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>tc qdisc show    # 显示
+</span><span class='line'>tc qdisc add dev eth0 root ...... # 加入
+</span><span class='line'>tc qdisc change dev eth0 root ...... # 修改存在的 qdisc ，记的，加入同一条后只能用 change 来修改
+</span><span class='line'>tc qdisc del dev eth0 root  # 删除</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>Linux 中延时模拟</h4>
+
+<p>设置延时 3s :</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>tc qdisc add dev eth0 root netem delay 3000ms</span></code></pre></td></tr></table></div></figure>
+
+
+<p>可以在 3000ms 后面在加上一个延时，比如 3000ms 200ms 表示 3000ms ± 200ms ，延时范围 2800 – 3200 之间.</p>
+
+<h4>Linux 中丢包模拟</h4>
+
+<p>设置丢包 50% ,iptables 也可以模拟这个，但一下不记的命令了，下次放上来:</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>tc qdisc change dev eth0 root netem loss 50%</span></code></pre></td></tr></table></div></figure>
+
+
+<p>上面的设丢包，如果给后面的 50% 的丢包比率修改成 50% 80% 时，这时和上面的延时不一样，这是指丢包比率为 50-80% 之间。</p>
 </div>
   
   
@@ -857,7 +717,7 @@ snd_cwnd++                      | &lt;&ndash;snd_ssthresh
   
     <section>
 <h1>Categories
-<span class='right_span'>(913)</span>
+<span class='right_span'>(925)</span>
 
 </h1>
 <head>
@@ -888,7 +748,7 @@ if (!document.getElementById('blog~octopress')) document.getElementById('aexp_bl
 if (!document.getElementById('blog')) document.getElementById('aexp_blog').style.visibility = 'hidden';
 if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ruby').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(142)</span></li>
+<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(151)</span></li>
 <div id='language' class='catsub'><li><a href='/blog/cats/language~c/?opendiv=language'>c</a><a href='##' onmousedown=showDiv('language~c') id='aexp_language~c'><span class='exp_style' id='exp_language~c'>[+]</span></a><span class='right_span'>32</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~c')) document.getElementById('aexp_language~c').style.visibility = 'hidden';
@@ -905,7 +765,7 @@ if (!document.getElementById('language~java')) document.getElementById('aexp_lan
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~jsp')) document.getElementById('aexp_language~jsp').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/language~php/?opendiv=language'>php</a><a href='##' onmousedown=showDiv('language~php') id='aexp_language~php'><span class='exp_style' id='exp_language~php'>[+]</span></a><span class='right_span'>44</span></li>
+<li><a href='/blog/cats/language~php/?opendiv=language'>php</a><a href='##' onmousedown=showDiv('language~php') id='aexp_language~php'><span class='exp_style' id='exp_language~php'>[+]</span></a><span class='right_span'>50</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~php')) document.getElementById('aexp_language~php').style.visibility = 'hidden';
 </script>
@@ -913,7 +773,7 @@ if (!document.getElementById('language~php')) document.getElementById('aexp_lang
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~python')) document.getElementById('aexp_language~python').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/language~web/?opendiv=language'>web</a><a href='##' onmousedown=showDiv('language~web') id='aexp_language~web'><span class='exp_style' id='exp_language~web'>[+]</span></a><span class='right_span'>45</span></li>
+<li><a href='/blog/cats/language~web/?opendiv=language'>web</a><a href='##' onmousedown=showDiv('language~web') id='aexp_language~web'><span class='exp_style' id='exp_language~web'>[+]</span></a><span class='right_span'>48</span></li>
 </div><script language='javascript' type='text/javascript'>
 if (!document.getElementById('language')) document.getElementById('aexp_language').style.visibility = 'hidden';
 if (!document.getElementById('language~web')) document.getElementById('aexp_language~web').style.visibility = 'hidden';
@@ -1052,8 +912,8 @@ if (!document.getElementById('tools~vim')) document.getElementById('aexp_tools~v
 if (!document.getElementById('tools')) document.getElementById('aexp_tools').style.visibility = 'hidden';
 if (!document.getElementById('tools~wxwork')) document.getElementById('aexp_tools~wxwork').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/system/'>system</a><a href='##' onmousedown=showDiv('system') id='aexp_system'><span class='exp_style' id='exp_system'>[+]</span></a><span class='right_span'>(111)</span></li>
-<div id='system' class='catsub'><li><a href='/blog/cats/system~base/?opendiv=system'>base</a><a href='##' onmousedown=showDiv('system~base') id='aexp_system~base'><span class='exp_style' id='exp_system~base'>[+]</span></a><span class='right_span'>24</span></li>
+<li class='catclass'><a href='/blog/cats/system/'>system</a><a href='##' onmousedown=showDiv('system') id='aexp_system'><span class='exp_style' id='exp_system'>[+]</span></a><span class='right_span'>(114)</span></li>
+<div id='system' class='catsub'><li><a href='/blog/cats/system~base/?opendiv=system'>base</a><a href='##' onmousedown=showDiv('system~base') id='aexp_system~base'><span class='exp_style' id='exp_system~base'>[+]</span></a><span class='right_span'>25</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('system~base')) document.getElementById('aexp_system~base').style.visibility = 'hidden';
 </script>
@@ -1069,7 +929,7 @@ if (!document.getElementById('system~cgroup')) document.getElementById('aexp_sys
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('system~docker')) document.getElementById('aexp_system~docker').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/system~fs/?opendiv=system'>fs</a><a href='##' onmousedown=showDiv('system~fs') id='aexp_system~fs'><span class='exp_style' id='exp_system~fs'>[+]</span></a><span class='right_span'>9</span></li>
+<li><a href='/blog/cats/system~fs/?opendiv=system'>fs</a><a href='##' onmousedown=showDiv('system~fs') id='aexp_system~fs'><span class='exp_style' id='exp_system~fs'>[+]</span></a><span class='right_span'>11</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('system~fs')) document.getElementById('aexp_system~fs').style.visibility = 'hidden';
 </script>
@@ -1291,7 +1151,7 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 
 <section>
 <h1>Date Categories
-<span class='right_span'>(913)</span>
+<span class='right_span'>(925)</span>
 
 </h1>
 <head>
@@ -1299,8 +1159,8 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(33)</span></li>
-<div id='2024' class='catsub'><li><a href='/blog/cats/2024~07/?opendiv=2024'>2024-07</a><span class='right_span'>10</span></li>
+<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(45)</span></li>
+<div id='2024' class='catsub'><li><a href='/blog/cats/2024~07/?opendiv=2024'>2024-07</a><span class='right_span'>22</span></li>
 <li><a href='/blog/cats/2024~06/?opendiv=2024'>2024-06</a><span class='right_span'>2</span></li>
 <li><a href='/blog/cats/2024~05/?opendiv=2024'>2024-05</a><span class='right_span'>5</span></li>
 <li><a href='/blog/cats/2024~04/?opendiv=2024'>2024-04</a><span class='right_span'>5</span></li>
@@ -1447,6 +1307,8 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 <h1>Tags</h1>
 <ul class="tag-cloud">
 <a style="font-size: 124%" href="/tags/10gb/">10gb(7)</a>
+<a style="font-size: 114%" href="/tags/lvm/">LVM(5)</a>
+<a style="font-size: 100%" href="/tags/chrome-debug/">chrome_debug(3)</a>
 <a style="font-size: 131%" href="/tags/gdb/">gdb(9)</a>
 <a style="font-size: 127%" href="/tags/git/">git(8)</a>
 <a style="font-size: 114%" href="/tags/ipv6/">ipv6(5)</a>
@@ -1467,43 +1329,43 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
   <ul id="recent_posts">
     
       <li class="post">
-        <a href="/blog/2024/07/15/tools-sqlserver-sys/">sql server系统表详细说明</a>
+        <a href="/blog/2024/07/31/lvm-attr/">LVM 输出更多信息</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/15/tools-sqlserver-cols/">SQLserver查询数据库所有字段-表名</a>
+        <a href="/blog/2024/07/31/lvm-pvmove/">LVM 缩减 VG 大小 ( pvmove )</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/15/tools-mysql-socket/">MySQL下的socket文件作用</a>
+        <a href="/blog/2024/07/31/lang-web-override/">Chrome浏览器使用Overrides调试线上代码</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/15/lang-php-iconv/">iconv与mb_convert_encoding的使用</a>
+        <a href="/blog/2024/07/31/lang-web-fetch/">fetch使用介绍, chrome如何重新提交请求并且更改参数</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/15/bat/">Linux查看电池损耗</a>
+        <a href="/blog/2024/07/31/lang-web-95598/">95598停电公告信息抓取</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/15/lang-web-box/">JavaScript的三种弹出提示框(alert、confirm、prompt)</a>
+        <a href="/blog/2024/07/30/lang-php-sm1234/">sm1、sm2、sm3、sm4简单介绍</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/15/lang-web-copy/">JavaScript复制内容到剪切板</a>
+        <a href="/blog/2024/07/30/lang-php-sm2/">php sm2</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/15/lang-web-alert/">alert 弹窗去掉上方 title 网址域名</a>
+        <a href="/blog/2024/07/30/lang-php-sm3/">php sm3</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/15/tools-sqlserver-space/">SQL Server查看所有表大小，所占空间</a>
+        <a href="/blog/2024/07/30/lang-php-bgcolor/">php spreadsheet 填充背景色</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/12/centos7-yum/">CentOS7 yum</a>
+        <a href="/blog/2024/07/30/lang-php-mb/">php统计文章字数</a>
       </li>
     
   </ul>

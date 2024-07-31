@@ -131,7 +131,7 @@ var ss360Config = {
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2015/07/29/tools-haproxy_src5/">HAProxy 研究笔记 -- HTTP请求处理-2-解析</a></h2>
+      <h2 class="entry-title"><a href="/blog/2015/08/07/cgroup-4/">cpu子系统</a></h2>
     
     
       <p class="meta">
@@ -140,84 +140,26 @@ var ss360Config = {
 
 
 
-<time class='entry-date' datetime='2015-07-29T16:07:00+08:00'><span class='date'>2015-07-29</span> <span class='time'>16:07:00</span></time>
+<time class='entry-date' datetime='2015-08-07T16:41:00+08:00'><span class='date'>2015-08-07</span> <span class='time'>16:41:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><p><a href="http://blog.chinaunix.net/uid-10167808-id-3819702.html">http://blog.chinaunix.net/uid-10167808-id-3819702.html</a></p>
+  <div class="entry-content"><p><a href="http://www.cnblogs.com/lisperl/archive/2012/04/23/2466721.html">http://www.cnblogs.com/lisperl/archive/2012/04/23/2466721.html</a></p>
 
-<p> 本文继续分析 1.5-dev17 中接收到 client 数据之后的处理。</p>
+<p>cpu子系统用于控制cgroup中所有进程可以使用的cpu时间片。附加了cpu子系统的hierarchy下面建立的cgroup的目录下都有一个cpu.shares的文件，对其写入整数值可以控制该cgroup获得的时间片。例如：在两个 cgroup 中都将 cpu.shares 设定为 1 的任务将有相同的 CPU 时间，但在 cgroup 中将 cpu.shares 设定为 2 的任务可使用的 CPU 时间是在 cgroup 中将 cpu.shares 设定为 1 的任务可使用的 CPU 时间的两倍。</p>
 
-<p>haproxy-1.5-dev17 中接收 client 发送的请求数据流程见文档： HTTP请求处理-1-接收</p>
+<p>cpu子系统是通过Linux CFS调度器实现的。所以在介绍cpu子系统之前，先简单说一下CFS调度器。按照作者Ingo Molnar的说法："CFS百分之八十的工作可以用一句话概括：CFS在真实的硬件上模拟了完全理想的多任务处理器"。在“完全理想的多任务处理器”下，每个进程都能同时获得CPU的执行时间。当系统中有两个进程时，CPU的计算时间被分成两份，每个进程获得50%。然而在实际的硬件上，当一个进程占用CPU时，其它进程就必须等待。所以CFS将惩罚当前进程，使其它进程能够在下次调度时尽可能取代当前进程。最终实现所有进程的公平调度。</p>
 
-<h4>1. haproxy 主循环的处理流程</h4>
+<p>CFS调度器将所有状态为RUNABLE的进程都被插入红黑树。在每个调度点，CFS调度器都会选择红黑树的最左边的叶子节点作为下一个将获得cpu的进程。 那红黑树的键值是怎么计算的呢？红黑树的键值是进程所谓的虚拟运行时间。一个进程的虚拟运行时间是进程时间运行的时间按整个红黑树中所有的进程数量normalized的结果。</p>
 
-<p>主循环处理流程见文档 主循环简介</p>
+<p>每次tick中断，CFS调度器都要更新进程的虚拟运行时间，然后调整当前进程在红黑树中的位置，调整完成后如果发现当前进程不再是最左边的叶子，就标记need_resched 标志，中断返回时就会调用scheduler()完成进程切换。</p>
 
-<p>请求数据的解析工作在主循环 process_runnable_tasks() 中执行。</p>
+<p>最后再说一下，进程的优先级和进程虚拟运行时间的关系。前面提到了，每次tick中断，CFS调度器都要更新进程的虚拟运行时间。那这个时间是怎么计算的呢？CFS首先计算出进程的时间运行时间delta_exec，然后计算normalized后的delta_exec_weighted，最后再将delta_exec_weighted加到进程的虚拟运行时间上。跟进程优先级有关的就是delta_exec_weighted，delta_exec_weighted=delta_exec_weighted*NICE_0_LOAD/se->load，其中NICE_0_LOAD是个常量，而se->load跟进程的nice值成反比，因此进程优先级越高（nice值越小）则se->load越大，则计算出来的delta_exec_weighted越小，这样进程优先级高的进程就可以获得更多的cpu时间。</p>
 
-<h4>2. 执行 run queue 中的任务</h4>
-
-<p> HTTP请求处理-1-接收 中分析到 session 建立之后，一来会将 session 的 task 放入 runqueue，该 task 会 在下一轮遍历可以运行的 task 中出现，并得到执行。二是立即调用 conn_fd_handler 去 接收 client 发送的数据。</p>
-
-<p>数据接收流程结束后（注意，这并不代表接收到了完整的 client 请求，因为也可能暂时 读取不到 client 的数据退出接收），haproxy 调度执行下一轮循环，调用 process_runnable_tasks() 处理所有在 runqueue 中的 task：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>void process_runnable_tasks(int *next)
-</span><span class='line'>{
-</span><span class='line'>&#9;...
-</span><span class='line'>&#9;eb = eb32_lookup_ge(&rqueue, rqueue_ticks - TIMER_LOOK_BACK);
-</span><span class='line'>&#9;while (max_processed--) {
-</span><span class='line'>&#9;&#9;...
-</span><span class='line'>&#9;&#9;t = eb32_entry(eb, struct task, rq);
-</span><span class='line'>&#9;&#9;eb = eb32_next(eb);
-</span><span class='line'>&#9;&#9;__task_unlink_rq(t);
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;t-&gt;state |= TASK_RUNNING;
-</span><span class='line'>&#9;&#9;/* This is an optimisation to help the processor's branch
-</span><span class='line'>&#9;&#9; * predictor take this most common call.
-</span><span class='line'>&#9;&#9; */
-</span><span class='line'>&#9;&#9;t-&gt;calls++;
-</span><span class='line'>&#9;&#9;if (likely(t-&gt;process == process_session))
-</span><span class='line'>&#9;&#9;&#9;t = process_session(t);
-</span><span class='line'>&#9;&#9;else
-</span><span class='line'>&#9;&#9;&#9;t = t-&gt;process(t);
-</span><span class='line'>&#9;&#9;...
-</span><span class='line'>&#9;}
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>大多数情况下，task 的 proecss 都指向 process_session() 函数。该函数就是负责解析 已接收到的数据，选择 backend server，以及 session 状态的变化等等。</p>
-
-<h4>3. session 的处理：process_session()</h4>
-
-<p>下面介绍 process_session() 函数的实现。该函数代码比较庞大，超过一千行，这里仅 介绍与 HTTP 请求处理的逻辑，采用代码块的逻辑介绍。</p>
-
-<p>处理 HTTP 请求的逻辑代码集中在 label resync_request 处。</p>
+<p>介绍完CFS调度器，我们开始介绍cpu子系统是如何通过CFS调度器实现的。CFS调度器不仅支持基于进程的调度，还支持基于进程组的组调度。CFS中定义了一个task_group的数据结构来管理组调度。</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -244,624 +186,372 @@ var ss360Config = {
 <span class='line-number'>23</span>
 <span class='line-number'>24</span>
 <span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct task *process_session(struct task *t)
-</span><span class='line'>{
-</span><span class='line'>&#9;...
-</span><span class='line'> resync_request:
-</span><span class='line'>&#9;/* Analyse request */
-</span><span class='line'>&#9;if (((s-&gt;req-&gt;flags & ~rqf_last) & CF_MASK_ANALYSER) ||
-</span><span class='line'>&#9;&#9;((s-&gt;req-&gt;flags ^ rqf_last) & CF_MASK_STATIC) ||
-</span><span class='line'>&#9;&#9;s-&gt;si[0].state != rq_prod_last ||
-</span><span class='line'>&#9;&#9;s-&gt;si[1].state != rq_cons_last) {
-</span><span class='line'>&#9;&#9;unsigned int flags = s-&gt;req-&gt;flags;
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;if (s-&gt;req-&gt;prod-&gt;state &gt;= SI_ST_EST) {
-</span><span class='line'>&#9;&#9;&#9;ana_list = ana_back = s-&gt;req-&gt;analysers;
-</span><span class='line'>&#9;&#9;&#9;while (ana_list && max_loops--) {
-</span><span class='line'>&#9;&#9;&#9;&#9;/* 这段代码中逐一的列举出了所有的 analysers 对应的处理函数
-</span><span class='line'>&#9;&#9;&#9;&#9; * 这里不一一列出，等待下文具体分析
-</span><span class='line'>&#9;&#9;&#9;&#9; */
-</span><span class='line'>&#9;&#9;&#9;&#9;...
-</span><span class='line'>&#9;&#9;&#9;}
-</span><span class='line'>&#9;&#9;}
-</span><span class='line'>&#9;&#9;rq_prod_last = s-&gt;si[0].state;
-</span><span class='line'>&#9;&#9;rq_cons_last = s-&gt;si[1].state;
-</span><span class='line'>&#9;&#9;s-&gt;req-&gt;flags &= ~CF_WAKE_ONCE;
-</span><span class='line'>&#9;&#9;rqf_last = s-&gt;req-&gt;flags;
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;if ((s-&gt;req-&gt;flags ^ flags) & CF_MASK_STATIC)
-</span><span class='line'>&#9;&#9;&#9;goto resync_request;
-</span><span class='line'>&#9;}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>首先要判断 s->req->prod->state 的状态是否已经完成建连，根据之前的初始化动作， se->req->prod 指向 s->si[0]，即标识与 client 端连接的相关信息。正确建连成功之 后，会更改 si 的状态的，具体代码在 session_complete() 中：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>s-&gt;si[0].state     = s-&gt;si[0].prev_state = SI_ST_EST;
-</span><span class='line'>...
-</span><span class='line'>s-&gt;req-&gt;prod = &s-&gt;si[0];
-</span><span class='line'>s-&gt;req-&gt;cons = &s-&gt;si[1];</span></code></pre></td></tr></table></div></figure>
-
-
-<p>只有 frontend 连接建立成功，才具备处理 client 发送请求数据的基础。上一篇文章中 已经接收到了 client 发送的数据。这里就是需要根据 s->req->analysers 的值，确定 while 循环中哪些函数处理当前的数据。</p>
-
-<p>补充介绍一下 s->req->analysers 的赋值。 同样是在 session_complete 中初始化的</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/* activate default analysers enabled for this listener */
-</span><span class='line'>s-&gt;req-&gt;analysers = l-&gt;analysers;</span></code></pre></td></tr></table></div></figure>
-
-
-<p>可见，其直接使用 session 所在的 listener 的 analyser。 listener 中该数值的初始化 是在 check_config_validity() 中完成的：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>&#9;&#9;listener-&gt;analysers |= curproxy-&gt;fe_req_ana;</span></code></pre></td></tr></table></div></figure>
-
-
-<p>而归根结蒂还是来源于 listener 所在的 proxy 上的 fe_req_ana， proxy 上的 fe_req_ana 的初始化同样是在 check_config_validity()，且是在给 listener->analysers 赋值之前</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>&#9;if (curproxy-&gt;cap & PR_CAP_FE) {
-</span><span class='line'>&#9;&#9;if (!curproxy-&gt;accept)
-</span><span class='line'>&#9;&#9;&#9;curproxy-&gt;accept = frontend_accept;
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;if (curproxy-&gt;tcp_req.inspect_delay ||
-</span><span class='line'>&#9;&#9;&#9;!LIST_ISEMPTY(&curproxy-&gt;tcp_req.inspect_rules))
-</span><span class='line'>&#9;&#9;&#9;curproxy-&gt;fe_req_ana |= AN_REQ_INSPECT_FE;
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;if (curproxy-&gt;mode == PR_MODE_HTTP) {
-</span><span class='line'>&#9;&#9;&#9;curproxy-&gt;fe_req_ana |= AN_REQ_WAIT_HTTP | AN_REQ_HTTP_PROCESS_FE;
-</span><span class='line'>&#9;&#9;&#9;curproxy-&gt;fe_rsp_ana |= AN_RES_WAIT_HTTP | AN_RES_HTTP_PROCESS_FE;
-</span><span class='line'>&#9;&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;/* both TCP and HTTP must check switching rules */
-</span><span class='line'>&#9;&#9;curproxy-&gt;fe_req_ana |= AN_REQ_SWITCHING_RULES;
-</span><span class='line'>&#9;}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>从上面代码可以看出，一个 HTTP 模式的 proxy，至少有三个标记位会被置位： AN_REQ_WAIT_HTTP, AN_REQ_HTTP_PROCESS_FE, AN_REQ_SWITCHING_RULES。也就是说， s->req->analysers 由以上三个标记置位。那么随后处理 HTTP REQ 的循环中，就要经过 这三个标记位对应的 analyser 的处理。</p>
-
-<p>接着回到 resync_request 标签下的那个 while 循环，就是逐个判断 analysers 的设置， 并调用对应的函数处理。需要启用那些 analysers，是和 haproxy 的配置相对应的。本文 使用最简单的配置，下面仅列出配置所用到的几个处理函数：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>&#9;&#9;while (ana_list && max_loops--) {
-</span><span class='line'>&#9;&#9;&#9;/* Warning! ensure that analysers are always placed in ascending order! */
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;if (ana_list & AN_REQ_INSPECT_FE) {
-</span><span class='line'>&#9;&#9;&#9;&#9;if (!tcp_inspect_request(s, s-&gt;req, AN_REQ_INSPECT_FE))
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;break;
-</span><span class='line'>&#9;&#9;&#9;&#9;UPDATE_ANALYSERS(s-&gt;req-&gt;analysers, ana_list, ana_back, AN_REQ_INSPECT_FE);
-</span><span class='line'>&#9;&#9;&#9;}
-</span><span class='line'>&#9;&#9;
-</span><span class='line'>&#9;&#9;&#9;if (ana_list & AN_REQ_WAIT_HTTP) {
-</span><span class='line'>&#9;&#9;&#9;&#9;if (!http_wait_for_request(s, s-&gt;req, AN_REQ_WAIT_HTTP))
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;break;
-</span><span class='line'>&#9;&#9;&#9;&#9;UPDATE_ANALYSERS(s-&gt;req-&gt;analysers, ana_list, ana_back, AN_REQ_WAIT_HTTP);
-</span><span class='line'>&#9;&#9;&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;if (ana_list & AN_REQ_HTTP_PROCESS_FE) {
-</span><span class='line'>&#9;&#9;&#9;&#9;if (!http_process_req_common(s, s-&gt;req, AN_REQ_HTTP_PROCESS_FE, s-&gt;fe))
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;break;
-</span><span class='line'>&#9;&#9;&#9;&#9;UPDATE_ANALYSERS(s-&gt;req-&gt;analysers, ana_list, ana_back, AN_REQ_HTTP_PROCESS_FE);
-</span><span class='line'>&#9;&#9;&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;if (ana_list & AN_REQ_SWITCHING_RULES) {
-</span><span class='line'>&#9;&#9;&#9;&#9;if (!process_switching_rules(s, s-&gt;req, AN_REQ_SWITCHING_RULES))
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;break;
-</span><span class='line'>&#9;&#9;&#9;&#9;UPDATE_ANALYSERS(s-&gt;req-&gt;analysers, ana_list, ana_back, AN_REQ_SWITCHING_RULES);
-</span><span class='line'>&#9;&#9;&#9;}
-</span><span class='line'>&#9;&#9;&#9;...
-</span><span class='line'>&#9;&#9;}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>analysers 的处理也是有顺序的。其中处理请求的第一个函数是 tcp_inspect_request()。 该函数主要是在于如果配置了这里先介绍 http_wait_for_request() 函数的实现。 顾名思义，该函数主要是配置中启用 inspect_rules 时，会调用到该函数。否则的话， 处理 HTTP Req 的第一个函数就是 http_wait_for_request().</p>
-
-<p>顾名思义，http_wait_for_request() 该函数分析所解析的 HTTP Requset 不一定是一个 完整的请求。上篇文章分析读取 client 请求数据的实现中，已经提到，只要不能从 socket 读到更多的数据，就会结束数据的接收。一个请求完全完全有可能因为一些异常原因，或者 请求长度本身就比较大而被拆分到不同的 IP 报文中，一次 read 系统调用可能只读取到其 中的一部分内容。因此，该函数会同时分析已经接收到的数据，并确认是否已经接收到了 完整的 HTTP 请求。只有接收到了完整的 HTTP 请求，该函数处理完，才会交给下一个 analyser 处理，否则只能结束请求的处理，等待接收跟多的数据，解析出一个完成的 HTTP 请求才行。</p>
-
-<h4>4. 解析接收到的 http 请求数据： http_wait_for_request()</h4>
-
-<p>以下是 http_wait_for_request() 的简要分析：</p>
-
-<p>1.调用 http_msg_analyzer，解析 s->req->buf 中新读取到的数据。该函数会按照 HTTP 协议， 解析 HTTP request 和 response 的头部数据，并记录到数据结构 struct http_msg 中。</p>
-
-<p>2.如果开启了 debug，并且已经完整的解析了 header，则 header 内容打印出来</p>
-
-<p>3.尚未读取到完整的 request 的处理，分作以下几种情形处理：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if (unlikely(msg-&gt;msg_state &lt; HTTP_MSG_BODY)) {
-</span><span class='line'>&#9;/*
-</span><span class='line'>&#9; * First, let's catch bad requests.
-</span><span class='line'>&#9; */
-</span><span class='line'>
-</span><span class='line'>解析到 header 内容中有不符合 HTTP 协议的情形 HTTP_MSG_ERROR，应答 400 bad request 处理
-</span><span class='line'>req-&gt;buf 满了，甚至加入 maxrewrite 的空间仍然不够用，应答 400 bad request
-</span><span class='line'>读取错误 CF_READ_ERROR 发生，比如 client 发送 RST 断开连接， 应答 400 bad request
-</span><span class='line'>读取超时，client 超时未发送完整的请求，应答 408 Request Timeout
-</span><span class='line'>client 主动关闭，发送 FIN 包，实际上是所谓的 half-close，同样应答 400 bad request
-</span><span class='line'>如果以上情况都不满足，则意味着还可以继续尝试读取新数据，设置一下超时
-</span><span class='line'>
-</span><span class='line'>&#9;/* just set the request timeout once at the beginning of the request */
-</span><span class='line'>&#9;if (!tick_isset(req-&gt;analyse_exp)) {
-</span><span class='line'>&#9;&#9;if ((msg-&gt;msg_state == HTTP_MSG_RQBEFORE) &&
-</span><span class='line'>&#9;&#9;&#9;(txn-&gt;flags & TX_WAIT_NEXT_RQ) &&
-</span><span class='line'>&#9;&#9;&#9;tick_isset(s-&gt;be-&gt;timeout.httpka))
-</span><span class='line'>&#9;&#9;&#9;req-&gt;analyse_exp = tick_add(now_ms, s-&gt;be-&gt;timeout.httpka);
-</span><span class='line'>&#9;&#9;else
-</span><span class='line'>&#9;&#9;&#9;req-&gt;analyse_exp = tick_add_ifset(now_ms, s-&gt;be-&gt;timeout.httpreq);
-</span><span class='line'>&#9;}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>根据以上代码，在等待 http request 期间，有两种 timeout 可以设置： 当是http 连接 Keep-Alive 时，并且处理完了头一个请求之后，等待第二个请求期间，设置 httpka 的超 时，超过设定时间不发送新的请求，将会超时；否则，将设置 http 的 request timeout。</p>
-
-<p>因此，在不启用 http ka timeout 时，http request 同时承担起 http ka timeout 的 功能。在有 http ka timeout 时，这两者各自作用的时间段没有重叠。</p>
-
-<p>满足该环节的请求都终止处理，不再继续了。</p>
-
-<h5>4.2. 处理完整的 http request</h5>
-
-<p>这里处理的都是已经解析到完整 http request header 的情况，并且所有 header 都被 索引化了，便于快速查找。根据已经得到的 header 的信息，设置 session 和 txn 的 相关成员，相当于汇总一下 header 的摘要信息，便于随后处理之用。流程如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>更新 session 和 proxy 的统计计数
-</span><span class='line'>删除 http ka timeout 的超时处理。可能在上一个请求处理完之后，设置了 http ka 的 timeout，因为这里已经得到完整的请求，因此需要停止该 timeout 的处理逻辑
-</span><span class='line'>确认 METHOD，并设置 session 的标记位 s-&gt;flags |= SN_REDIRECTABLE，只有 GET 和 HEAD 请求可以被重定向
-</span><span class='line'>检测 URI 是否是配置的要做 monitor 的 URI，是的话，则执行对应 ACL，并设置应答
-</span><span class='line'>检测如果开启 log 功能的话，要给 txn-&gt;uri 分配内存，用于记录 URI
-</span><span class='line'>检测 HTTP version
-</span><span class='line'>&#9;将 0.9 版本的升级为 1.0
-</span><span class='line'>&#9;1.1 及其以上的版本都当做 1.1 处理
-</span><span class='line'>初始化用于标识 Connection header 的标记位
-</span><span class='line'>如果启用了 capture header 配置，调用 capture_headers() 记录下对应的 header
-</span><span class='line'>处理 Transfer-Encoding/Content-Length 等 header
-</span><span class='line'>最后一步，清理 req-&gt;analysers 的标记位 AN_REQ_WAIT_HTTP，因为本函数已经成功处理完毕，可以进行下一个 analyser 的处理了。</span></code></pre></td></tr></table></div></figure>
-
-
-<p>至此，http_wait_for_request() 的处理已经结束。</p>
-
-<h4>5. 其他对 HTTP 请求的处理逻辑</h4>
-
-<p>按照我们前面分析的，随后应该还有两个 analyser 要处理，简单介绍一下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>AN_REQ_HTTP_PROCESS_FE 对应的 http_process_req_common()
-</span><span class='line'>&#9;对 frontend 中 req 配置的常见处理，比如 block ACLs, filter, reqadd 等
-</span><span class='line'>&#9;设置 Connection mode， 主要是 haproxy 到 server 采用什么连接方式，tunnel 或者 按照 transcation 处理的短连接
-</span><span class='line'>AN_REQ_SWITCHING_RULES 对应的 process_switching_rules()
-</span><span class='line'>&#9;如果配置了选择 backend 的 rules，比如用 use_backend，则查询规则为 session 分配一个 backend
-</span><span class='line'>&#9;处理 persist_rules，一旦设置了 force-persist, 则不管 server 是否 down，都要保证 session 分配给 persistence 中记录的 server。</span></code></pre></td></tr></table></div></figure>
-
-
-<p>以上两个函数，不再具体分析。待以后需要时再完善。</p>
-
-<p>至此，client 端 http 请求已经完成解析和相关设置，并且给 session 指定了将来选择 server 所属的 backend。</p>
-
-<p>下一篇文章就分析选择 server 的流程。</p>
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/07/29/tools-haproxy_src4/">HAProxy 研究笔记 -- 主循环处理流程</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-07-29T16:05:00+08:00'><span class='date'>2015-07-29</span> <span class='time'>16:05:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://blog.chinaunix.net/uid-10167808-id-3807412.html">http://blog.chinaunix.net/uid-10167808-id-3807412.html</a></p>
-
-<p>本文简单介绍 HAProxy 主循环的处理逻辑，版本为 1.5-dev17.</p>
-
-<h4>0. 主循环 run_poll_loop</h4>
-
-<p>HAproxy 的主循环在 haproxy.c 中的 run_poll_loop() 函数，代码如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/* Runs the polling loop */
-</span><span class='line'>void run_poll_loop()
-</span><span class='line'>{
-</span><span class='line'>&#9;int next;
-</span><span class='line'>
-</span><span class='line'>&#9;tv_update_date(0,1);
-</span><span class='line'>&#9;while (1) {
-</span><span class='line'>&#9;&#9;/* check if we caught some signals and process them */
-</span><span class='line'>&#9;&#9;signal_process_queue();
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;/* Check if we can expire some tasks */
-</span><span class='line'>&#9;&#9;wake_expired_tasks(&next);
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;/* Process a few tasks */
-</span><span class='line'>&#9;&#9;process_runnable_tasks(&next);
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;/* stop when there's nothing left to do */
-</span><span class='line'>&#9;&#9;if (jobs == 0)
-</span><span class='line'>&#9;&#9;&#9;break;
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;/* The poller will ensure it returns around  */
-</span><span class='line'>&#9;&#9;cur_poller.poll(&cur_poller, next);
-</span><span class='line'>&#9;&#9;fd_process_spec_events();
-</span><span class='line'>&#9;}
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>主循环的结构比较清晰，就是循环的调用几个函数，并在适当的时候结束循环并退出：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>1. 处理信号队列
-</span><span class='line'>2. 超时任务
-</span><span class='line'>3. 处理可运行的任务
-</span><span class='line'>4. 检测是否可以结束循环
-</span><span class='line'>5. 执行 poll 处理 fd 的 IO 事件
-</span><span class='line'>6. 处理可能仍有 IO 事件的 fd</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>1. signal_process_queue - 处理信号队对列</h4>
-
-<p>haproxy 实现了自己的信号处理机制。接受到信号之后，将该信号放到信号队列中。在程序 运行到 signal_process_queue() 时处理所有位于信号队列中的信号。</p>
-
-<h4>2. wake_expired_tasks - 唤醒超时任务</h4>
-
-<p>haproxy 的顶层处理逻辑是 task，task 上存储着要处理的任务的全部信息。task 的管理 是采用队列方式，同时分为 wait queue 和 run queue。顾名思义，wait queue 是需要等 待一定时间的 task 的集合，而 run queue 则代表需要立即执行的 task 的集合。</p>
-
-<p>该函数就是检查 wait queue 中那些超时的任务，并将其放到 run queue 中。haproxy 在 执行的过程中，会因为一些情况导致需要将当前的任务通过调用 task_queue 等接口放到 wait queue 中。</p>
-
-<h4>3. process_runnable_tasks - 处理可运行的任务</h4>
-
-<p>处理位于 run queue 中的任务。</p>
-
-<p>前面提到，wake_expired_tasks 可能将一些超时的任务放到 run queue 中。此外，haproxy 执行的过程中，还有可能通过调用 task_wakeup 直接讲某个 task 放到 run queue 中，这代表程序希望该任务下次尽可能快的被执行。</p>
-
-<p>对于 TCP 或者 HTTP 业务流量的处理，该函数最终通过调用 process_session 来完成，包括解析已经接收到的数据， 并执行一系列 load balance 的特性，但不负责从 socket 收发数据。</p>
-
-<h4>4. jobs == 0 - 无任务可执行，结束循环</h4>
-
-<p>haproxy 中用 jobs 记录当前要处理的任务总数，一个 listener 也会被计算在内。因此， 如果 jobs 为 0 的话，通常意味着 haproxy 要退出了，因为连 listener 都要释放了。 jobs 的数值通常在 process_session 时更新。因此，是否可以退出循环，就放在了所有 任务的 process_session 执行之后。</p>
-
-<h4>5. cur_poller.poll() - 执行 poll 处理 fd 的 IO 事件</h4>
-
-<p>haproxy 启动阶段，会检测当前系统可以启用那种异步处理的机制，比如 select、poll、 epoll、kqueue 等，并注册对应 poller 的 poll 方法。epoll 的相关函数接口在 ev_epoll.c 中。</p>
-
-<p>这里就是执行已经注册的 poller 的 poll 方法，主要功能就是获取所有活动的 fd，并 调用对应的 handler，完成接受新建连接、数据收发等功能。</p>
-
-<h4>6. 处理可能仍有 IO 事件的 fd</h4>
-
-<p>poller 的 poll 方法执行时，程序会将某些符合条件以便再次执行 IO 处理的的 fd 放到 fd_spec list[] 中，fd_process_spec_events() 函数会再次执行这些 fd 的 io handler。</p>
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/07/29/tools-haproxy_src3/">HAProxy 研究笔记 -- HTTP请求处理-1-接收</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-07-29T16:03:00+08:00'><span class='date'>2015-07-29</span> <span class='time'>16:03:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://blog.chinaunix.net/uid-10167808-id-3795082.html">http://blog.chinaunix.net/uid-10167808-id-3795082.html</a></p>
-
-<p>这里继续分析 http req 的处理。当前分析的代码为 1.5-dev17。</p>
-
-<h4>1. 初始化 session 数据处理相关的设置</h4>
-
-<p>建连的处理基本上就是 _do_poll ->listener_accept ->session_accept ->fronend_accept()</p>
-
-<p>其中 session_accept() 会设置新建 fd 的 io handler</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/* Add the various callbacks. Right now the transport layer is present
-</span><span class='line'> * but not initialized. Also note we need to be careful as the stream
-</span><span class='line'> * int is not initialized yet.
-</span><span class='line'> */
-</span><span class='line'>conn_prepare(s-&gt;si[0].conn, &sess_conn_cb, l-&gt;proto, l-&gt;xprt, s);
-</span><span class='line'>
-</span><span class='line'>fdtab[cfd].owner = s-&gt;si[0].conn; /*fd 对应的 owner 为 connection 结构*/
-</span><span class='line'>fdtab[cfd].iocb = conn_fd_handler;
-</span><span class='line'>conn_data_want_recv(s-&gt;si[0].conn);
-</span><span class='line'>if (conn_xprt_init(s-&gt;si[0].conn) &lt; 0)
-</span><span class='line'>&#9;goto out_free_task;</span></code></pre></td></tr></table></div></figure>
-
-
-<p>IPv4 http 对应的 listener 的 xprt 和proto 分别被初始化为</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>l-&gt;xprt = &raw_sock;
-</span><span class='line'>l-&gt;proto = &proto_tcpv4;</span></code></pre></td></tr></table></div></figure>
-
-
-<p>conn_prepare() 就是将相关数据收发以及连接处理的函数都赋值到 connection 结构体上：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/* Assigns a connection with the appropriate data, ctrl, transport layers, and owner. */
-</span><span class='line'>static inline void conn_assign(struct connection *conn, const struct data_cb *data,
-</span><span class='line'>&#9;                           const struct protocol *ctrl, const struct xprt_ops *xprt,
-</span><span class='line'>&#9;                           void *owner)
-</span><span class='line'>{
-</span><span class='line'>&#9;conn-&gt;data = data;
-</span><span class='line'>&#9;conn-&gt;ctrl = ctrl;
-</span><span class='line'>&#9;conn-&gt;xprt = xprt;
-</span><span class='line'>&#9;conn-&gt;owner = owner;
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>/* prepares a connection with the appropriate data, ctrl, transport layers, and
-</span><span class='line'> * owner. The transport state and context are set to 0.
-</span><span class='line'> */
-</span><span class='line'>static inline void conn_prepare(struct connection *conn, const struct data_cb *data,
-</span><span class='line'>&#9;                            const struct protocol *ctrl, const struct xprt_ops *xprt,
-</span><span class='line'>&#9;                            void *owner)
-</span><span class='line'>{
-</span><span class='line'>&#9;conn_assign(conn, data, ctrl, xprt, owner);
-</span><span class='line'>&#9;conn-&gt;xprt_st = 0;
-</span><span class='line'>&#9;conn-&gt;xprt_ctx = NULL;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>经过初始化， session client 端的 connection 结构体初始化完成：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>conn-&gt;data 指向 sess_conn_cb。 后面调用 session_complete() 会被再次赋值
-</span><span class='line'>conn-&gt;ctrl 指向 l-&gt;proto, IPv4 下为 proto_tcpv4
-</span><span class='line'>conn-&gt;xprt 执向 l-&gt;xprt, 不启用 SSL 时为 raw_sock，启用 SSL 时为 ssl_sock
-</span><span class='line'>conn-&gt;owner 指向 session</span></code></pre></td></tr></table></div></figure>
-
-
-<p>接着调用 session_complete 完成建立一个 session 所需要的最后的初始化工作，其中 包含调用 frontend_accept，并将当前 session 对应的 task 放入runqueue 中以待下 次执行：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>...
-</span><span class='line'>      si_takeover_conn(&s-&gt;si[0], l-&gt;proto, l-&gt;xprt);
-</span><span class='line'>      ...
-</span><span class='line'>      t-&gt;process = l-&gt;handler;
-</span><span class='line'>      ...
-</span><span class='line'>if (p-&gt;accept && (ret = p-&gt;accept(s)) &lt;= 0) {
-</span><span class='line'>&#9;/* Either we had an unrecoverable error (&lt;0) or work is
-</span><span class='line'>&#9; * finished (=0, eg: monitoring), in both situations,
-</span><span class='line'>&#9; * we can release everything and close.
-</span><span class='line'>&#9; */
-</span><span class='line'>&#9;goto out_free_rep_buf;
-</span><span class='line'>}
-</span><span class='line'>...
-</span><span class='line'>task_wakeup(t, TASK_WOKEN_INIT);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>其中 si_takeover_conn 完成为 si 分配连接的处理函数，实现如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static inline void si_takeover_conn(struct stream_interface *si, const struct protocol *ctrl, const struct xprt_ops *xprt)
-</span><span class='line'>{
-</span><span class='line'>&#9;si-&gt;ops = &si_conn_ops;
-</span><span class='line'>&#9;conn_assign(si-&gt;conn, &si_conn_cb, ctrl, xprt, si);
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>si_conn_cb 的定义如下：
-</span><span class='line'>
-</span><span class='line'>struct data_cb si_conn_cb = {
-</span><span class='line'>&#9;.recv    = si_conn_recv_cb,
-</span><span class='line'>&#9;.send    = si_conn_send_cb,
-</span><span class='line'>&#9;.wake    = si_conn_wake_cb,
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct task_group {
+</span><span class='line'>&#9;struct cgroup_subsys_state css;
+</span><span class='line'> 
+</span><span class='line'>#ifdef CONFIG_FAIR_GROUP_SCHED
+</span><span class='line'>&#9;/* schedulable entities of this group on each cpu */
+</span><span class='line'>&#9;struct sched_entity **se;
+</span><span class='line'>&#9;/* runqueue "owned" by this group on each cpu */
+</span><span class='line'>&#9;struct cfs_rq **cfs_rq;
+</span><span class='line'>&#9;unsigned long shares;
+</span><span class='line'>#endif
+</span><span class='line'> 
+</span><span class='line'>#ifdef CONFIG_RT_GROUP_SCHED
+</span><span class='line'>&#9;struct sched_rt_entity **rt_se;
+</span><span class='line'>&#9;struct rt_rq **rt_rq;
+</span><span class='line'> 
+</span><span class='line'>&#9;struct rt_bandwidth rt_bandwidth;
+</span><span class='line'>#endif
+</span><span class='line'> 
+</span><span class='line'>&#9;struct rcu_head rcu;
+</span><span class='line'>&#9;struct list_head list;
+</span><span class='line'> 
+</span><span class='line'>&#9;struct task_group *parent;
+</span><span class='line'>&#9;struct list_head siblings;
+</span><span class='line'>&#9;struct list_head children;
 </span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
 
 
-<p>因此，si->conn->data 指向了 si_conn_cb。这个结构用在随后的 recv/send 中。</p>
+<p>task_group中内嵌了一个cgroup_subsys_state,也就是说进程可以通过cgroup_subsys_state来获取它所在的task_group,同样地cgroup也可以通过cgroup_subsys_state来获取它对应的task_group，因此进程和cgroup都存在了一组cgroup_subsys_state指针。</p>
 
-<p>此外，session 所对应的任务 task 在 session_complete 的最后通过调用 task_wakeup() 是在随后的循环中被执行。task 的处理函数初始化为 l->handler 即 process_session().</p>
+<p>struct sched_entity **se是一个指针数组，存了一组指向该task_group在每个cpu的调度实体（即一个struct sched_entity）。</p>
 
-<p>至此，一个新建 session 的 client fd 的 io 处理函数 conn_fd_handler() 及 session 的处理函数 process_session() 都已经正确初始化好了。</p>
+<p>struct cfs_rq **cfs_rq也是一个指针数组，存在一组指向该task_group在每个cpu上所拥有的一个可调度的进程队列。</p>
 
-<p>以后基本上就是这两个函数分别负责数据的读取，以及业务的处理。</p>
+<p>Parent、siblings和children三个指针负责将task_group 连成一颗树，这个跟cgroup树类似。</p>
 
-<h4>2. 接收 client 发送的请求数据</h4>
+<p>有了这个数据结构，我们来CFS在调度的时候是怎么处理进程组的。我们还是从CFS对tick中断的处理开始。</p>
 
-<p>epoll 中考虑的新建连接通常会尽可能快的传输数据，因此对于新建的 fd，通常会尽快的 执行 io handler，即调用 conn_fd_handler</p>
+<p>CFS对tick中断的处理在task_tick_fair中进行，在task_tick_fair中有：</p>
 
-<p>是在 ev_epoll.c 中的 _do_poll() 中进行：</p>
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>for_each_sched_entity(se) {
+</span><span class='line'>&#9;cfs_rq = cfs_rq_of(se);
+</span><span class='line'>&#9;entity_tick(cfs_rq, se, queued);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>我们首先来看一下在组调度的情况下，for_each_sched_entity是怎么定义的：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define for_each_sched_entity(se) \
+</span><span class='line'>&#9;for (; se; se = se-&gt;parent)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>即从当前进程的se开始，沿着task_group树从下到上对se调用entity_tick，即更新各个se的虚拟运行时间。</p>
+
+<p>在非组调度情况下，</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define for_each_sched_entity(se) \
+</span><span class='line'>&#9;for (; se; se = NULL)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>即只会对当前se做处理。</p>
+
+<p>CFS处理完tick中断后，如果有必要就会进行调度，CFS调度是通过pick_next_task_fair函数选择下一个运行的进程的。在pick_next_task_fair中有：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>do {
+</span><span class='line'>&#9;se = pick_next_entity(cfs_rq);
+</span><span class='line'>&#9;set_next_entity(cfs_rq, se);
+</span><span class='line'>&#9;cfs_rq = group_cfs_rq(se);
+</span><span class='line'>} while (cfs_rq);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>在这个循环中，首先从当前的队列选一个se，这个跟非组调度一样的（红黑树最左边的节点），再将se设置成下一个运行的se，再从该se获取该se对应的task_group拥有的cfs_rq（如果该se对应一个进程而非一个task_group的话，cfs_rq会变成NULL），继续这个过程直到cfs_rq为空，即当se对应的是一个进程。</p>
+
+<p>简而言之，同一层的task_group跟进程被当成同样的调度实体来选择，当被选到的是task_group时，则对task_group的孩子节点重复这个过程，直到选到一个运行的进程。因此当设置一个cgroup的shares值时，该cgroup当作一个整体和剩下的进程或其他cgroup分享cpu时间。比如,我在根cgroup下建立cgroup A，将其shares值设1024，再建立cgroup B,将其shares设为2048，再将一些进程分别加入到这两个cgroup中，则长期调度的结果应该是A:B:C=1:2:1（即cpu占用时间,其中C是系统中为加入到A或B的进程）。</p>
+
+<p>引起CFS调度的除了tick中断外，还有就是有新的进程加入可运行队列这种情况。CFS处理这个情况的函数是enqueue_task_fair,在enqueue_task_fair中有：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>for_each_sched_entity(se) {
+</span><span class='line'>&#9;if (se-&gt;on_rq)
+</span><span class='line'>&#9;&#9;break;
+</span><span class='line'>&#9;cfs_rq = cfs_rq_of(se);
+</span><span class='line'>&#9;enqueue_entity(cfs_rq, se, flags);
+</span><span class='line'>&#9;flags = ENQUEUE_WAKEUP;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>我们前面已经看过for_each_sched_entity在组调度下的定义了，这里是将当前se和se的直系祖先节点都加入到红黑树（enqueue_entity），而在非组调度情况下，只需要将当前se本身加入即可。造成这种差异的原因，在于在pick_next_task_fair中选择se时，是从上往下的，如果一个se的祖先节点不在红黑树中，它永远都不会被选中。而在非组调度的情况下，se之间并没有父子关系，所有se都是平等独立，在pick_next_task_fair，第一次选中的肯定就是进程，不需要向下迭代。</p>
+
+<p>类似的处理还发生在将一个se出列（dequeue_task_fair）和put_prev_task_fair中。</p>
+
+<p>以上是cpu系统通过CFS调度器实现以cgroup为单位的cpu时间片分享，下面我们来看一下cpu子系统本身。cpu子系统通过一个cgroup_subsys结构体来管理：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct cgroup_subsys cpu_cgroup_subsys = {
+</span><span class='line'>&#9;.name = "cpu",
+</span><span class='line'>&#9;.create = cpu_cgroup_create,
+</span><span class='line'>&#9;.destroy = cpu_cgroup_destroy,
+</span><span class='line'>&#9;.can_attach = cpu_cgroup_can_attach,
+</span><span class='line'>&#9;.attach = cpu_cgroup_attach,
+</span><span class='line'>&#9;.populate = cpu_cgroup_populate,
+</span><span class='line'>&#9;.subsys_id = cpu_cgroup_subsys_id,
+</span><span class='line'>&#9;.early_init = 1,
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>Cpu_cgroup_subsys其实是对抽象的cgroup_subsys的实现，其中的函数指针指向了特定于cpu子系统的实现。这里再说一下，Cgroups的整体设计。当用户使用cgroup文件系统，创建cgroup的时候，会调用cgroup目录操作的mkdir指针指向的函数，该函数调用了cgroup_create，而cgroup_create会根据该cgroup关联的子系统，分别调用对应的子系统实现的create指针指向的函数。即做了两次转换，一次从系统通用命令到cgroup文件系统，另一次从cgroup文件系统再特定的子系统实现。</p>
+
+<p>Cgroups中除了通用的控制文件外，每个子系统还有自己的控制文件，子系统也是通过cftype来管理这些控制文件。Cpu子系统很重要的一个文件就是cpu.shares文件，因为就是通过这个文件的数值来调节cgroup所占用的cpu时间。Shares文件对应的cftype结构为：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#ifdef CONFIG_FAIR_GROUP_SCHED
+</span><span class='line'>{
+</span><span class='line'>&#9;.name = "shares",
+</span><span class='line'>&#9;.read_u64 = cpu_shares_read_u64,
+</span><span class='line'>&#9;.write_u64 = cpu_shares_write_u64,
+</span><span class='line'>},
+</span><span class='line'>#endif</span></code></pre></td></tr></table></div></figure>
+
+
+<p>当对cgroup目录下的文件进行操作时，该结构体中定义的函数指针指向的函数就会被调用.下面我们就在看看这个两个函数的实现吗，从而发现shares文件的值是如何起作用的。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static u64 cpu_shares_read_u64(struct cgroup *cgrp, struct cftype *cft)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct task_group *tg = cgroup_tg(cgrp);
+</span><span class='line'> 
+</span><span class='line'>&#9;return (u64) tg-&gt;shares;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>比较简单，简单的读取task_group中存储的shares就行了。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int cpu_shares_write_u64(struct cgroup *cgrp, struct cftype *cftype,
+</span><span class='line'>&#9;&#9;&#9;&#9;u64 shareval)
+</span><span class='line'>{
+</span><span class='line'>&#9;return sched_group_set_shares(cgroup_tg(cgrp), shareval);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>则是设定cgroup对应的task_group的shares值。</p>
+
+<p>那这个shares值是怎么起作用的呢？在sched_group_set_shares中有:</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>tg-&gt;shares = shares;
+</span><span class='line'>for_each_possible_cpu(i) {
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * force a rebalance
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;cfs_rq_set_shares(tg-&gt;cfs_rq[i], 0);
+</span><span class='line'>&#9;set_se_shares(tg-&gt;se[i], shares);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>cfs_rq_set_shares强制做一次cpu SMP负载均衡。</p>
+
+<p>真正起作用的是在set_se_shares中，它调用了<strong>set_se_shares，在</strong>set_se_shares中有：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>se-&gt;load.weight = shares;
+</span><span class='line'>se-&gt;load.inv_weight = 0;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>根据之前我们分析的CFS的调度原理可以知道，load.weight的值越大，算出来的虚拟运行时间越小，进程能使用的cpu时间越多。这样以来，shares值最终就是通过调度实体的load值来起作用的。</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2015/08/07/cgroup-3/">cgroup文件系统</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-08-07T16:41:00+08:00'><span class='date'>2015-08-07</span> <span class='time'>16:41:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://www.cnblogs.com/lisperl/archive/2012/04/23/2466151.html">http://www.cnblogs.com/lisperl/archive/2012/04/23/2466151.html</a></p>
+
+<h4>Cgroups用户空间管理</h4>
+
+<p>Cgroups用户空间的管理是通过cgroup文件系统实现的。</p>
+
+<p>比如要创建一个层级：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>mount -t cgroup -o cpu,cpuset,memory cpu_and_mem /cgroup/cpu_and_mem</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这个命令就创建一个名为cpu_and_mem的层级，这个层级上附加了cpu,cpuset,memory三个子系统，并把层级挂载到了/cgroup/cpu_and_mem.</p>
+
+<p>创建一个cgroup：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>cd /cgroup/cpu_and_mem
+</span><span class='line'>mkdir foo</span></code></pre></td></tr></table></div></figure>
+
+
+<p>通过以上两个命令，我们就在刚才创建的层级下创建了一个叫foo的cgroup。</p>
+
+<p>你再cd foo，然后ls</p>
+
+<p>你会发现一些文件，这是cgroups相关子系统的控制文件，你可以读取这些控制文件，这些控制文件存储的值就是对相应的cgrouop的控制信息，你也可以写控制文件来更改控制信息。
+在这些文件中，有一个叫tasks的文件，里面的包含了所有属于这个cgroup的进程的进程号。</p>
+
+<p>在刚才创建的foo下，你cat tasks，应该是空的，因为此时这个cgroup里面还没有进程。你cd /cgroup/cpu_and_mem 再cat tasks，你可以看到系统中所有进程的进程号，这是因为每创建一个层级的时候，系统的所有进程都会自动被加到该层级的根cgroup里面。Tasks文件不仅可以读，还可以写，你将一个进程的进程号写入到某个cgroup目录下的tasks里面，你就将这个进程加入了相应的cgroup。</p>
+
+<h4>Cgroup文件系统的实现</h4>
+
+<p>在讲cgroup文件系统的实现之前，必须简单的介绍一下Linux VFS。</p>
+
+<p>VFS是所谓的虚拟文件系统转换，是一个内核软件层，用来处理与Unix标准文件系统的所有系统调用。VFS对用户提供统一的读写等文件操作调用接口，当用户调用读写等函数时，内核则调用特定的文件系统实现。具体而言，文件在内核内存中是一个file数据结构来表示的。这个数据结构包含一个f_op的字段，该字段中包含了一组指向特定文件系统实现的函数指针。当用户执行read()操作时，内核调用sys_read(),然后sys_read（）查找到指向该文件属于的文件系统的读函数指针，并调用它，即file->f_op->read().</p>
+
+<p>VFS其实是面向对象的，在这里，对象是一个软件结构，既定义数据也定义了之上的操作。处于效率，Linux并没有采用C++之类的面向对象的语言，而是采用了C的结构体，然后在结构体里面定义了一系列函数指针，这些函数指针对应于对象的方法。</p>
+
+<p>VFS文件系统定义了以下对象模型： <br/>
+超级块对象(superblock object)
+存放已安装文件系统的有关信息。
+索引节点对象(inode object)
+存放关于具体文件的一般信息。
+文件对象（file  object）
+存放打开文件与进程之间的交互信息
+目录项对象(dentry object)
+存放目录项与对应文件进行链接的有关信息。</p>
+
+<p>基于VFS实现的文件系统，都必须实现定义这些对象，并实现这些对象中定义的函数指针。cgroup文件系统也不例外，下面我们来看cgroups中这些对象的定义。</p>
+
+<p>cgroup文件系统的定义：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static struct file_system_type cgroup_fs_type = {
+</span><span class='line'>&#9;.name = "cgroup",
+</span><span class='line'>&#9;.get_sb = cgroup_get_sb,
+</span><span class='line'>&#9;.kill_sb = cgroup_kill_sb,
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这里有定义了两个函数指针，定义了一个文件系统必须实现了的两个操作get_sb,kill_sb，即获得超级块和释放超级块。这两个操作会在使用mount系统调用挂载cgroup文件系统时使用。</p>
+
+<p>cgroup 超级块的定义:</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static const struct super_operations cgroup_ops = {
+</span><span class='line'>&#9;.statfs = simple_statfs,
+</span><span class='line'>&#9;.drop_inode = generic_delete_inode,
+</span><span class='line'>&#9;.show_options = cgroup_show_options,
+</span><span class='line'>&#9;.remount_fs = cgroup_remount,
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>Cgroup 索引块定义：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static const struct inode_operations cgroup_dir_inode_operations = {
+</span><span class='line'>&#9;.lookup = simple_lookup,
+</span><span class='line'>&#9;.mkdir = cgroup_mkdir,
+</span><span class='line'>&#9;.rmdir = cgroup_rmdir,
+</span><span class='line'>&#9;.rename = cgroup_rename,
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>在cgroup文件系统中，使用mkdir创建cgroup或者用rmdir删除cgroup时，就会调用相应的函数指针指向的函数。比如：使用mkdir创建cgroup时，会调用cgroup_mkdir，然后在cgroup_mkdir中再调用具体实现的cgroup_create函数。</p>
+
+<p>Cgroup 文件操作定义：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static const struct file_operations cgroup_file_operations = {
+</span><span class='line'>&#9;.read = cgroup_file_read,
+</span><span class='line'>&#9;.write = cgroup_file_write,
+</span><span class='line'>&#9;.llseek = generic_file_llseek,
+</span><span class='line'>&#9;.open = cgroup_file_open,
+</span><span class='line'>&#9;.release = cgroup_file_release,
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>在cgroup文件系统中，对目录下的控制文件进行操作时，会调用该结构体中指针指向的函数。比如：对文件进行读操作时，会调用cgroup_file_read，在cgroup_file_read中，会根据需要调用该文件对应的cftype结构体定义的对应读函数。</p>
+
+<p>我们再来看cgroup文件系统中的cgroups控制文件。Cgroups定义一个cftype的结构体来管理控制文件。下面我们来看cftype的定义：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -886,32 +576,148 @@ var ss360Config = {
 <span class='line-number'>21</span>
 <span class='line-number'>22</span>
 <span class='line-number'>23</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>gettimeofday(&before_poll, NULL);
-</span><span class='line'>status = epoll_wait(epoll_fd, epoll_events, global.tune.maxpollevents, wait_time);
-</span><span class='line'>tv_update_date(wait_time, status);
-</span><span class='line'>measure_idle();
-</span><span class='line'>
-</span><span class='line'>/* process polled events */
-</span><span class='line'>
-</span><span class='line'>for (count = 0; count &lt; status; count++) {
-</span><span class='line'>&#9;unsigned int n;
-</span><span class='line'>&#9;unsigned int e = epoll_events[count].events;
-</span><span class='line'>&#9;fd = epoll_events[count].data.fd;
-</span><span class='line'>&#9;...
-</span><span class='line'>&#9;/* Save number of updates to detect creation of new FDs. */
-</span><span class='line'>&#9;old_updt = fd_nbupdt;
-</span><span class='line'>&#9;fdtab[fd].iocb(fd);
-</span><span class='line'>&#9;...
-</span><span class='line'>&#9;for (new_updt = fd_nbupdt; new_updt &gt; old_updt; new_updt--) {
-</span><span class='line'>&#9;&#9;fd = fd_updt[new_updt - 1];
-</span><span class='line'>&#9;&#9;...
-</span><span class='line'>&#9;&#9;if (fdtab[fd].ev && fdtab[fd].iocb && fdtab[fd].owner)
-</span><span class='line'>&#9;&#9;&#9;fdtab[fd].iocb(fd);
-</span><span class='line'>&#9;&#9;...
-</span><span class='line'>&#9;}</span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct cftype {
+</span><span class='line'>&#9;char name[MAX_CFTYPE_NAME];
+</span><span class='line'>&#9;int private; /*
+</span><span class='line'>&#9;mode_t mode;
+</span><span class='line'>&#9;size_t max_write_len;
+</span><span class='line'> 
+</span><span class='line'>&#9;int (*open)(struct inode *inode, struct file *file);
+</span><span class='line'>&#9;ssize_t (*read)(struct cgroup *cgrp, struct cftype *cft,
+</span><span class='line'>&#9;struct file *file,
+</span><span class='line'>&#9;char __user *buf, size_t nbytes, loff_t *ppos);
+</span><span class='line'>&#9;u64 (*read_u64)(struct cgroup *cgrp, struct cftype *cft);
+</span><span class='line'>&#9;s64 (*read_s64)(struct cgroup *cgrp, struct cftype *cft);
+</span><span class='line'>&#9;int (*read_map)(struct cgroup *cont, struct cftype *cft,
+</span><span class='line'>&#9;struct cgroup_map_cb *cb);
+</span><span class='line'>&#9;int (*read_seq_string)(struct cgroup *cont, struct cftype *cft,
+</span><span class='line'>&#9;&#9;&#9;&#9;struct seq_file *m);
+</span><span class='line'> 
+</span><span class='line'>&#9;ssize_t (*write)(struct cgroup *cgrp, struct cftype *cft,
+</span><span class='line'>&#9;&#9;&#9;&#9;struct file *file,
+</span><span class='line'>&#9;&#9;&#9;&#9;const char __user *buf, size_t nbytes, loff_t *ppos);
+</span><span class='line'>&#9;int (*write_u64)(struct cgroup *cgrp, struct cftype *cft, u64 val);
+</span><span class='line'>&#9;int (*write_s64)(struct cgroup *cgrp, struct cftype *cft, s64 val);
+</span><span class='line'>&#9;int (*write_string)(struct cgroup *cgrp, struct cftype *cft,
+</span><span class='line'>&#9;&#9;&#9;&#9;const char *buffer);
+</span><span class='line'>&#9;int (*trigger)(struct cgroup *cgrp, unsigned int event);
+</span><span class='line'> 
+</span><span class='line'>&#9;int (*release)(struct inode *inode, struct file *file);
+</span><span class='line'>&#9;int (*register_event)(struct cgroup *cgrp, struct cftype *cft,
+</span><span class='line'>&#9;struct eventfd_ctx *eventfd, const char *args); /*
+</span><span class='line'>&#9;void (*unregister_event)(struct cgroup *cgrp, struct cftype *cft,
+</span><span class='line'>&#9;struct eventfd_ctx *eventfd);
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
 
 
-<p>上面代码中第一处执行 iocb() 的是由 epoll_wait() 返回的 fd 触发的。而第二次的 iocb() 则就是在前面 iocb 的执行过程中新建的 fd，为了提高效率，则直接调用该 fd 的 iocb()，也 就是 conn_fd_handler() 函数。</p>
+<p>cftype中除了定义文件的名字和相关权限标记外，主要是定义了对文件进行操作的函数指针。不同的文件可以有不同的操作，对文件进行操作时，相关函数指针指向的函数会被调用。</p>
+
+<p>综合上面的分析，cgroups通过实现cgroup文件系统来为用户提供管理cgroup的工具，而cgroup文件系统是基于Linux VFS实现的。相应地，cgroups为控制文件定义了相应的数据结构cftype，对其操作由cgroup文件系统定义的通过操作捕获，再调用cftype定义的具体实现。</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2015/08/07/cgroup-2/">cgroups 数据结构设计</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-08-07T16:24:00+08:00'><span class='date'>2015-08-07</span> <span class='time'>16:24:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://www.cnblogs.com/lisperl/archive/2012/04/18/2455027.html">http://www.cnblogs.com/lisperl/archive/2012/04/18/2455027.html</a></p>
+
+<p>我们从进程出发来剖析cgroups相关数据结构之间的关系。
+在Linux中，管理进程的数据结构是task_struct，其中与cgroups有关的：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#ifdef CONFIG_CGROUPS
+</span><span class='line'>&#9;/* Control Group info protected by css_set_lock */
+</span><span class='line'>&#9;struct css_set *cgroups;
+</span><span class='line'>&#9;/* cg_list protected by css_set_lock and tsk-&gt;alloc_lock */
+</span><span class='line'>&#9;struct list_head cg_list;
+</span><span class='line'>#endif</span></code></pre></td></tr></table></div></figure>
+
+
+<p>其中cgroups指针指向了一个css_set结构，而css_set存储了与进程相关的cgroups信息。Cg_list是一个嵌入的list_head结构，用于将连到同一个css_set的进程组织成一个链表。下面我们来看css_set的结构：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct css_set {
+</span><span class='line'>&#9;atomic_t refcount;
+</span><span class='line'>&#9;struct hlist_node hlist;
+</span><span class='line'>&#9;struct list_head tasks;
+</span><span class='line'>&#9;struct list_head cg_links;
+</span><span class='line'>&#9;struct cgroup_subsys_state *subsys[CGROUP_SUBSYS_COUNT];
+</span><span class='line'>&#9;struct rcu_head rcu_head;
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>其中refcount是该css_set的引用数，因为一个css_set可以被多个进程共用，只要这些进程的cgroups信息相同，比如：在所有已创建的层级里面都在同一个cgroup里的进程。</p>
+
+<p>hlist是嵌入的hlist_node，用于把所有css_set组织成一个hash表，这样内核可以快速查找特定的css_set。</p>
+
+<p>tasks指向所有连到此css_set的进程连成的链表。</p>
+
+<p>cg_links指向一个由struct cg_cgroup_link连成的链表。</p>
+
+<p>Subsys是一个指针数组，存储一组指向cgroup_subsys_state的指针。一个cgroup_subsys_state就是进程与一个特定子系统相关的信息。通过这个指针数组，进程就可以获得相应的cgroups控制信息了。</p>
+
+<p>下面我们就来看cgroup_subsys_state的结构：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct cgroup_subsys_state {
+</span><span class='line'>&#9;struct cgroup *cgroup;
+</span><span class='line'>&#9;atomic_t refcnt;
+</span><span class='line'>&#9;unsigned long flags;
+</span><span class='line'>&#9;struct css_id *id;
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>cgroup指针指向了一个cgroup结构，也就是进程属于的cgroup。进程受到子系统的控制，实际上是通过加入到特定的cgroup实现的，因为cgroup在特定的层级上，而子系统又是附加到曾经上的。通过以上三个结构，进程就可以和cgroup连接起来了：task_struct->css_set->cgroup_subsys_state->cgroup。</p>
+
+<p>下面我们再来看cgroup的结构：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -928,26 +734,72 @@ var ss360Config = {
 <span class='line-number'>13</span>
 <span class='line-number'>14</span>
 <span class='line-number'>15</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>int conn_fd_handler(int fd) 
-</span><span class='line'>{
-</span><span class='line'>&#9;struct connection *conn = fdtab[fd].owner;
-</span><span class='line'>&#9;...
-</span><span class='line'>&#9;if ((fdtab[fd].ev & (FD_POLL_IN | FD_POLL_HUP | FD_POLL_ERR)) &&
-</span><span class='line'>&#9;&#9;conn-&gt;xprt &&
-</span><span class='line'>&#9;&#9;!(conn-&gt;flags & (CO_FL_WAIT_RD|CO_FL_WAIT_ROOM|CO_FL_ERROR|CO_FL_HANDSHAKE))) {
-</span><span class='line'>&#9;&#9;/* force detection of a flag change : it's impossible to have both
-</span><span class='line'>&#9;&#9; * CONNECTED and WAIT_CONN so we're certain to trigger a change.
-</span><span class='line'>&#9;&#9; */
-</span><span class='line'>&#9;&#9;flags = CO_FL_WAIT_L4_CONN | CO_FL_CONNECTED;
-</span><span class='line'>&#9;&#9;conn-&gt;data-&gt;recv(conn);
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;...
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct cgroup {
+</span><span class='line'>&#9;unsigned long flags;       
+</span><span class='line'>&#9;atomic_t count;
+</span><span class='line'>&#9;struct list_head sibling;  
+</span><span class='line'>&#9;struct list_head children; 
+</span><span class='line'>&#9;struct cgroup *parent;     
+</span><span class='line'>&#9;struct dentry *dentry;     
+</span><span class='line'>&#9;struct cgroup_subsys_state *subsys[CGROUP_SUBSYS_COUNT];
+</span><span class='line'>&#9;struct cgroupfs_root *root;
+</span><span class='line'>&#9;struct cgroup *top_cgroup;
+</span><span class='line'>&#9;struct list_head css_sets;
+</span><span class='line'>&#9;struct list_head release_list;
+</span><span class='line'>&#9;struct list_head pidlists;
+</span><span class='line'>&#9;struct mutex pidlist_mutex;
+</span><span class='line'>&#9;struct rcu_head rcu_head;
+</span><span class='line'>&#9;struct list_head event_list;
+</span><span class='line'>&#9;spinlock_t event_list_lock;
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
 
 
-<p>根据的 session_complete 的初始化，上面代码 conn->data->recv 指向 si_conn_recv_cb()。 该函数就是 haproxy 中负责接收数据的入口函数。相同的，si_conn_send_cb() 就是 haproxy 中负责发送数据的入口函数。</p>
+<p>sibling,children和parent三个嵌入的list_head负责将同一层级的cgroup连接成一颗cgroup树。</p>
 
-<p>si_conn_recv_cb() 函数简单介绍如下：</p>
+<p>subsys是一个指针数组，存储一组指向cgroup_subsys_state的指针。这组指针指向了此cgroup跟各个子系统相关的信息，这个跟css_set中的道理是一样的。</p>
+
+<p>root指向了一个cgroupfs_root的结构，就是cgroup所在的层级对应的结构体。这样以来，之前谈到的几个cgroups概念就全部联系起来了。</p>
+
+<p>top_cgroup指向了所在层级的根cgroup，也就是创建层级时自动创建的那个cgroup。</p>
+
+<p>css_set指向一个由struct cg_cgroup_link连成的链表，跟css_set中cg_links一样。</p>
+
+<p>下面我们来分析一个css_set和cgroup之间的关系。我们先看一下 cg_cgroup_link的结构</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct cg_cgroup_link {
+</span><span class='line'>&#9;struct list_head cgrp_link_list;
+</span><span class='line'>&#9;struct cgroup *cgrp;
+</span><span class='line'>&#9;struct list_head cg_link_list;
+</span><span class='line'>&#9;struct css_set *cg;
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>cgrp_link_list连入到cgroup->css_set指向的链表，cgrp则指向此cg_cgroup_link相关的cgroup。</p>
+
+<p>Cg_link_list则连入到css_set->cg_links指向的链表,cg则指向此cg_cgroup_link相关的css_set。</p>
+
+<p>那为什么要这样设计呢？</p>
+
+<p>那是因为cgroup和css_set是一个多对多的关系，必须添加一个中间结构来将两者联系起来，这跟数据库模式设计是一个道理。cg_cgroup_link中的cgrp和cg就是此结构体的联合主键，而cgrp_link_list和cg_link_list分别连入到cgroup和css_set相应的链表，使得能从cgroup或css_set都可以进行遍历查询。</p>
+
+<p>那为什么cgroup和css_set是多对多的关系呢？</p>
+
+<p>一个进程对应css_set，一个css_set就存储了一组进程（应该有可能被几个进程共享，所以是一组）跟各个子系统相关的信息，但是这些信息有可能不是从一个cgroup那里获得的，因为一个进程可以同时属于几个cgroup，只要这些cgroup不在同一个层级。举个例子：我们创建一个层级A，A上面附加了cpu和memory两个子系统，进程B属于A的根cgroup；然后我们再创建一个层级C，C上面附加了ns和blkio两个子系统，进程B同样属于C的根cgroup；那么进程B对应的cpu和memory的信息是从A的根cgroup获得的，ns和blkio信息则是从C的根cgroup获得的。因此，一个css_set存储的cgroup_subsys_state可以对应多个cgroup。另一方面，cgroup也存储了一组cgroup_subsys_state，这一组cgroup_subsys_state则是cgroup从所在的层级附加的子系统获得的。一个cgroup中可以有多个进程，而这些进程的css_set不一定都相同，因为有些进程可能还加入了其他cgroup。但是同一个cgroup中的进程与该cgroup关联的cgroup_subsys_state都受到该cgroup的管理（cgroups中进程控制是以cgroup为单位的）的，所以一个cgrouop也可以对应多个css_set。</p>
+
+<p>那为什么要这样一个结构呢？</p>
+
+<p>从前面的分析，我们可以看出从task到cgroup是很容易定位的，但是从cgroup获取此cgroup的所有的task就必须通过这个结构了。每个进程都会指向一个css_set，而与这个css_set关联的所有进程都会链入到css_set->tasks链表.而cgroup又通过一个中间结构cg_cgroup_link来寻找所有与之关联的所有css_set，从而可以得到与cgroup关联的所有进程。</p>
+
+<p>最后让我们看一下层级和子系统对应的结构体。层级对应的结构体是cgroupfs_root:</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -962,24 +814,106 @@ var ss360Config = {
 <span class='line-number'>11</span>
 <span class='line-number'>12</span>
 <span class='line-number'>13</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if (conn-&gt;xprt-&gt;rcv_pipe &&
-</span><span class='line'>&#9;chn-&gt;to_forward &gt;= MIN_SPLICE_FORWARD && chn-&gt;flags & CF_KERN_SPLICING) {
-</span><span class='line'>&#9;...
-</span><span class='line'>&#9;ret = conn-&gt;xprt-&gt;rcv_pipe(conn, chn-&gt;pipe, chn-&gt;to_forward);
-</span><span class='line'>&#9;...
-</span><span class='line'>}
-</span><span class='line'>...
-</span><span class='line'>while (!chn-&gt;pipe && !(conn-&gt;flags & (CO_FL_ERROR | CO_FL_SOCK_RD_SH | CO_FL_DATA_RD_SH | CO_FL_WAIT_RD | CO_FL_WAIT_ROOM | CO_FL_HANDSHAKE))) {
-</span><span class='line'>
-</span><span class='line'>&#9;...
-</span><span class='line'>&#9;ret = conn-&gt;xprt-&gt;rcv_buf(conn, chn-&gt;buf, max);
-</span><span class='line'>&#9;...
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct cgroupfs_root {
+</span><span class='line'>&#9;struct super_block *sb;
+</span><span class='line'>&#9;unsigned long subsys_bits;
+</span><span class='line'>&#9;int hierarchy_id;
+</span><span class='line'>&#9;unsigned long actual_subsys_bits;
+</span><span class='line'>&#9;struct list_head subsys_list;
+</span><span class='line'>&#9;struct cgroup top_cgroup;
+</span><span class='line'>&#9;int number_of_cgroups;
+</span><span class='line'>&#9;struct list_head root_list;
+</span><span class='line'>&#9;unsigned long flags;
+</span><span class='line'>&#9;char release_agent_path[PATH_MAX];
+</span><span class='line'>&#9;char name[MAX_CGROUP_ROOT_NAMELEN];
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
 
 
-<p>该函数主要根据数据的接收情况，选择调用 xprt 的 rcv_pipe 还是 rcv_buf. 前面已经 分析过， conn->xprt 指向了 listner 的 xprt，不启用 SSL 就是 raw_sock 数据结构</p>
+<p>sb指向该层级关联的文件系统超级块</p>
 
-<p>因此，数据的接收最终是通过调用 raw_sock 的 raw_sock_to_pipe 或/和 raw_sock_to_buf 完成的。</p>
+<p>subsys_bits和actual_subsys_bits分别指向将要附加到层级的子系统和现在实际附加到层级的子系统，在子系统附加到层级时使用</p>
+
+<p>hierarchy_id是该层级唯一的id</p>
+
+<p>top_cgroup指向该层级的根cgroup</p>
+
+<p>number_of_cgroups记录该层级cgroup的个数</p>
+
+<p>root_list是一个嵌入的list_head，用于将系统所有的层级连成链表</p>
+
+<p>子系统对应的结构体是cgroup_subsys:</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct cgroup_subsys {
+</span><span class='line'>&#9;struct cgroup_subsys_state *(*create)(struct cgroup_subsys *ss,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9;&#9;struct cgroup *cgrp);
+</span><span class='line'>&#9;int (*pre_destroy)(struct cgroup_subsys *ss, struct cgroup *cgrp);
+</span><span class='line'>&#9;void (*destroy)(struct cgroup_subsys *ss, struct cgroup *cgrp);
+</span><span class='line'>&#9;int (*can_attach)(struct cgroup_subsys *ss, struct cgroup *cgrp,
+</span><span class='line'>&#9;&#9;&#9;&#9;struct task_struct *tsk, bool threadgroup);
+</span><span class='line'>&#9;void (*cancel_attach)(struct cgroup_subsys *ss, struct cgroup *cgrp,
+</span><span class='line'>&#9;&#9;&#9;&#9;struct task_struct *tsk, bool threadgroup);
+</span><span class='line'>&#9;void (*attach)(struct cgroup_subsys *ss, struct cgroup *cgrp,
+</span><span class='line'>&#9;&#9;&#9;struct cgroup *old_cgrp, struct task_struct *tsk,
+</span><span class='line'>&#9;&#9;&#9;bool threadgroup);
+</span><span class='line'>&#9;void (*fork)(struct cgroup_subsys *ss, struct task_struct *task);
+</span><span class='line'>&#9;void (*exit)(struct cgroup_subsys *ss, struct task_struct *task);
+</span><span class='line'>&#9;int (*populate)(struct cgroup_subsys *ss,
+</span><span class='line'>&#9;&#9;&#9;struct cgroup *cgrp);
+</span><span class='line'>&#9;void (*post_clone)(struct cgroup_subsys *ss, struct cgroup *cgrp);
+</span><span class='line'>&#9;void (*bind)(struct cgroup_subsys *ss, struct cgroup *root);
+</span><span class='line'> 
+</span><span class='line'>&#9;int subsys_id;
+</span><span class='line'>&#9;int active;
+</span><span class='line'>&#9;int disabled;
+</span><span class='line'>&#9;int early_init;
+</span><span class='line'>&#9;bool use_id;
+</span><span class='line'>#define MAX_CGROUP_TYPE_NAMELEN 32
+</span><span class='line'>&#9;const char *name;
+</span><span class='line'>&#9;struct mutex hierarchy_mutex;
+</span><span class='line'>&#9;struct lock_class_key subsys_key;
+</span><span class='line'>&#9;struct cgroupfs_root *root;
+</span><span class='line'>&#9;struct list_head sibling;
+</span><span class='line'>&#9;struct idr idr;
+</span><span class='line'>&#9;spinlock_t id_lock;
+</span><span class='line'>&#9;struct module *module;
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>Cgroup_subsys定义了一组操作，让各个子系统根据各自的需要去实现。这个相当于C++中抽象基类，然后各个特定的子系统对应cgroup_subsys则是实现了相应操作的子类。类似的思想还被用在了cgroup_subsys_state中，cgroup_subsys_state并未定义控制信息，而只是定义了各个子系统都需要的共同信息，比如该cgroup_subsys_state从属的cgroup。然后各个子系统再根据各自的需要去定义自己的进程控制信息结构体，最后在各自的结构体中将cgroup_subsys_state包含进去，这样通过Linux内核的container_of等宏就可以通过cgroup_subsys_state来获取相应的结构体。</p>
 </div>
   
   
@@ -1001,7 +935,7 @@ var ss360Config = {
   
     <section>
 <h1>Categories
-<span class='right_span'>(913)</span>
+<span class='right_span'>(925)</span>
 
 </h1>
 <head>
@@ -1032,7 +966,7 @@ if (!document.getElementById('blog~octopress')) document.getElementById('aexp_bl
 if (!document.getElementById('blog')) document.getElementById('aexp_blog').style.visibility = 'hidden';
 if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ruby').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(142)</span></li>
+<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(151)</span></li>
 <div id='language' class='catsub'><li><a href='/blog/cats/language~c/?opendiv=language'>c</a><a href='##' onmousedown=showDiv('language~c') id='aexp_language~c'><span class='exp_style' id='exp_language~c'>[+]</span></a><span class='right_span'>32</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~c')) document.getElementById('aexp_language~c').style.visibility = 'hidden';
@@ -1049,7 +983,7 @@ if (!document.getElementById('language~java')) document.getElementById('aexp_lan
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~jsp')) document.getElementById('aexp_language~jsp').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/language~php/?opendiv=language'>php</a><a href='##' onmousedown=showDiv('language~php') id='aexp_language~php'><span class='exp_style' id='exp_language~php'>[+]</span></a><span class='right_span'>44</span></li>
+<li><a href='/blog/cats/language~php/?opendiv=language'>php</a><a href='##' onmousedown=showDiv('language~php') id='aexp_language~php'><span class='exp_style' id='exp_language~php'>[+]</span></a><span class='right_span'>50</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~php')) document.getElementById('aexp_language~php').style.visibility = 'hidden';
 </script>
@@ -1057,7 +991,7 @@ if (!document.getElementById('language~php')) document.getElementById('aexp_lang
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~python')) document.getElementById('aexp_language~python').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/language~web/?opendiv=language'>web</a><a href='##' onmousedown=showDiv('language~web') id='aexp_language~web'><span class='exp_style' id='exp_language~web'>[+]</span></a><span class='right_span'>45</span></li>
+<li><a href='/blog/cats/language~web/?opendiv=language'>web</a><a href='##' onmousedown=showDiv('language~web') id='aexp_language~web'><span class='exp_style' id='exp_language~web'>[+]</span></a><span class='right_span'>48</span></li>
 </div><script language='javascript' type='text/javascript'>
 if (!document.getElementById('language')) document.getElementById('aexp_language').style.visibility = 'hidden';
 if (!document.getElementById('language~web')) document.getElementById('aexp_language~web').style.visibility = 'hidden';
@@ -1196,8 +1130,8 @@ if (!document.getElementById('tools~vim')) document.getElementById('aexp_tools~v
 if (!document.getElementById('tools')) document.getElementById('aexp_tools').style.visibility = 'hidden';
 if (!document.getElementById('tools~wxwork')) document.getElementById('aexp_tools~wxwork').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/system/'>system</a><a href='##' onmousedown=showDiv('system') id='aexp_system'><span class='exp_style' id='exp_system'>[+]</span></a><span class='right_span'>(111)</span></li>
-<div id='system' class='catsub'><li><a href='/blog/cats/system~base/?opendiv=system'>base</a><a href='##' onmousedown=showDiv('system~base') id='aexp_system~base'><span class='exp_style' id='exp_system~base'>[+]</span></a><span class='right_span'>24</span></li>
+<li class='catclass'><a href='/blog/cats/system/'>system</a><a href='##' onmousedown=showDiv('system') id='aexp_system'><span class='exp_style' id='exp_system'>[+]</span></a><span class='right_span'>(114)</span></li>
+<div id='system' class='catsub'><li><a href='/blog/cats/system~base/?opendiv=system'>base</a><a href='##' onmousedown=showDiv('system~base') id='aexp_system~base'><span class='exp_style' id='exp_system~base'>[+]</span></a><span class='right_span'>25</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('system~base')) document.getElementById('aexp_system~base').style.visibility = 'hidden';
 </script>
@@ -1213,7 +1147,7 @@ if (!document.getElementById('system~cgroup')) document.getElementById('aexp_sys
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('system~docker')) document.getElementById('aexp_system~docker').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/system~fs/?opendiv=system'>fs</a><a href='##' onmousedown=showDiv('system~fs') id='aexp_system~fs'><span class='exp_style' id='exp_system~fs'>[+]</span></a><span class='right_span'>9</span></li>
+<li><a href='/blog/cats/system~fs/?opendiv=system'>fs</a><a href='##' onmousedown=showDiv('system~fs') id='aexp_system~fs'><span class='exp_style' id='exp_system~fs'>[+]</span></a><span class='right_span'>11</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('system~fs')) document.getElementById('aexp_system~fs').style.visibility = 'hidden';
 </script>
@@ -1435,7 +1369,7 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 
 <section>
 <h1>Date Categories
-<span class='right_span'>(913)</span>
+<span class='right_span'>(925)</span>
 
 </h1>
 <head>
@@ -1443,8 +1377,8 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(33)</span></li>
-<div id='2024' class='catsub'><li><a href='/blog/cats/2024~07/?opendiv=2024'>2024-07</a><span class='right_span'>10</span></li>
+<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(45)</span></li>
+<div id='2024' class='catsub'><li><a href='/blog/cats/2024~07/?opendiv=2024'>2024-07</a><span class='right_span'>22</span></li>
 <li><a href='/blog/cats/2024~06/?opendiv=2024'>2024-06</a><span class='right_span'>2</span></li>
 <li><a href='/blog/cats/2024~05/?opendiv=2024'>2024-05</a><span class='right_span'>5</span></li>
 <li><a href='/blog/cats/2024~04/?opendiv=2024'>2024-04</a><span class='right_span'>5</span></li>
@@ -1591,6 +1525,8 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 <h1>Tags</h1>
 <ul class="tag-cloud">
 <a style="font-size: 124%" href="/tags/10gb/">10gb(7)</a>
+<a style="font-size: 114%" href="/tags/lvm/">LVM(5)</a>
+<a style="font-size: 100%" href="/tags/chrome-debug/">chrome_debug(3)</a>
 <a style="font-size: 131%" href="/tags/gdb/">gdb(9)</a>
 <a style="font-size: 127%" href="/tags/git/">git(8)</a>
 <a style="font-size: 114%" href="/tags/ipv6/">ipv6(5)</a>
@@ -1611,43 +1547,43 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
   <ul id="recent_posts">
     
       <li class="post">
-        <a href="/blog/2024/07/15/tools-sqlserver-sys/">sql server系统表详细说明</a>
+        <a href="/blog/2024/07/31/lvm-attr/">LVM 输出更多信息</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/15/tools-sqlserver-cols/">SQLserver查询数据库所有字段-表名</a>
+        <a href="/blog/2024/07/31/lvm-pvmove/">LVM 缩减 VG 大小 ( pvmove )</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/15/tools-mysql-socket/">MySQL下的socket文件作用</a>
+        <a href="/blog/2024/07/31/lang-web-override/">Chrome浏览器使用Overrides调试线上代码</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/15/lang-php-iconv/">iconv与mb_convert_encoding的使用</a>
+        <a href="/blog/2024/07/31/lang-web-fetch/">fetch使用介绍, chrome如何重新提交请求并且更改参数</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/15/bat/">Linux查看电池损耗</a>
+        <a href="/blog/2024/07/31/lang-web-95598/">95598停电公告信息抓取</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/15/lang-web-box/">JavaScript的三种弹出提示框(alert、confirm、prompt)</a>
+        <a href="/blog/2024/07/30/lang-php-sm1234/">sm1、sm2、sm3、sm4简单介绍</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/15/lang-web-copy/">JavaScript复制内容到剪切板</a>
+        <a href="/blog/2024/07/30/lang-php-sm2/">php sm2</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/15/lang-web-alert/">alert 弹窗去掉上方 title 网址域名</a>
+        <a href="/blog/2024/07/30/lang-php-sm3/">php sm3</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/15/tools-sqlserver-space/">SQL Server查看所有表大小，所占空间</a>
+        <a href="/blog/2024/07/30/lang-php-bgcolor/">php spreadsheet 填充背景色</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/12/centos7-yum/">CentOS7 yum</a>
+        <a href="/blog/2024/07/30/lang-php-mb/">php统计文章字数</a>
       </li>
     
   </ul>

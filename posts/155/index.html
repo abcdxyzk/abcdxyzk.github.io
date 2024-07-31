@@ -131,7 +131,7 @@ var ss360Config = {
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2015/11/17/debug-CC_STACKPROTECTOR/">CC_STACKPROTECTOR防内核堆栈溢出补丁分析</a></h2>
+      <h2 class="entry-title"><a href="/blog/2016/01/21/system-base-init/">Linux系统启动过程分析</a></h2>
     
     
       <p class="meta">
@@ -140,128 +140,246 @@ var ss360Config = {
 
 
 
-<time class='entry-date' datetime='2015-11-17T16:01:00+08:00'><span class='date'>2015-11-17</span> <span class='time'>16:01:00</span></time>
+<time class='entry-date' datetime='2016-01-21T16:13:00+08:00'><span class='date'>2016-01-21</span> <span class='time'>16:13:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><p><a href="http://blog.aliyun.com/1126">http://blog.aliyun.com/1126</a></p>
+  <div class="entry-content"><p><a href="http://blog.chinaunix.net/uid-23069658-id-3142047.html">http://blog.chinaunix.net/uid-23069658-id-3142047.html</a></p>
 
-<p>内核堆栈溢出通常有两种情况。一种是函数调用栈超出了内核栈THREAD_SIZE的大小， 这是栈底越界，另一种是栈上缓冲越界访问，这是栈顶越界。</p>
+<h4>BIOS自检</h4>
 
-<h4>检测栈底越界</h4>
+<p>  稍有计算机基础的人都应该听过BIOS(Basic Input / Output System)，又称基本输入输出系统，可以视为是一个永久地记录在ROM中的一个软件，是操作系统输入输出管理系统的一部分。早期的BIOS芯片确实是"只读"的，里面的内容是用一种烧录器写入的，一旦写入就不能更改，除非更换芯片。现在的主机板都使用一种叫Flash EPROM的芯片来存储系统BIOS，里面的内容可通过使用主板厂商提供的擦写程序擦除后重新写入，这样就给用户升级BIOS提供了极大的方便。</p>
 
-<p>以arm平台为例，内核栈THREAD_SIZE为8K,当调用栈层次过多或某调用栈上分配过大的 空间，就会导致它越界。越界后struct thread_info结构可能被破坏，轻则内核 panic，重则内核数据被覆盖仍继续运行。</p>
+<p>  BIOS的功能由两部分组成，分别是POST码和Runtime服务。POST阶段完成后它将从存储器中被清除，而Runtime服务会被一直保留，用于目标操作系统的启动。BIOS两个阶段所做的详细工作如下：</p>
 
-<h4>检测栈顶越界</h4>
+<p>  步骤1：上电自检POST(Power-on self test)，主要负责检测系统外围关键设备（如：CPU、内存、显卡、I/O、键盘鼠标等）是否正常。例如，最常见的是内存松动的情况，BIOS自检阶段会报错，系统就无法启动起来；</p>
 
-<p>对于栈顶越界，gcc提供了支持。打开内核配置CONFIG_CC_STACKPROTECTOR后，会打 开编译选项-fstack-protector.</p>
+<p>  步骤2：步骤1成功后，便会执行一段小程序用来枚举本地设备并对其初始化。这一步主要是根据我们在BIOS中设置的系统启动顺序来搜索用于启动系统的驱动器，如硬盘、光盘、U盘、软盘和网络等。我们以硬盘启动为例，BIOS此时去读取硬盘驱动器的第一个扇区(MBR，512字节)，然后执行里面的代码。实际上这里BIOS并不关心启动设备第一个扇区中是什么内容，它只是负责读取该扇区内容、并执行。</p>
+
+<p>至此，BIOS的任务就完成了，此后将系统启动的控制权移交到MBR部分的代码。</p>
+
+<p>PS: 在个人电脑中，Linux的启动是从0xFFFF0地址开始的。</p>
+
+<h4>系统引导</h4>
+
+<p>  我们首先来了解一下MBR，它是Master Boot Record的缩写。硬盘的0柱面、0磁头、1扇区称为主引导扇区。它由三个部分组成，主引导程序(Bootloader)、 硬盘分区表DPT（Disk Partition table）和硬盘有效标志（55AA），其结构图如下所示：</p>
+
+<p><img src="/images/system/2016-01-21-1.png" alt="" /></p>
+
+<p> 磁盘分区表包含以下三部分：</p>
+
+<p>1）、Partition ID  （5：延申  82：Swap   83：Linux   8e：LVM     fd：RAID）</p>
+
+<p>2）、Partition起始磁柱</p>
+
+<p>3）、Partition的磁柱数量</p>
+
+<p>  通常情况下，诸如lilo、grub这些常见的引导程序都直接安装在MBR中。我们以grub为例来分析这个引导过程。</p>
+
+<h5>grub引导也分为两个阶段stage1阶段和stage2阶段(有些较新的grub又定义了stage1.5阶段)。</h5>
+
+<p>1)、stage1：stage1是直接被写入到MBR中去的，这样机器一启动检测完硬件后，就将控制权交给了GRUB的代码。也就是上图所看到的前446个字节空间中存放的是stage1的代码。BIOS将stage1载入内存中0x7c00处并跳转执行。stage1（/stage1/start.S）的任务非常单纯，仅仅是将硬盘0头0道2扇区读入内存。而0头0道2扇区内容是源代码中的/stage2/start.S，编译后512字节，它是stage2或者stage1_5的入口。而此时，stage1是没有识别文件系统的能力的。如果感觉脑子有些晕了，那么下面的过程就直接跳过，去看stage2吧！</p>
+
+<h5>【外传】定位硬盘的0头0道2扇区的过程：</h5>
+
+<p>  BIOS将stage1载入内存0x7c00处并执行，然后调用BIOS INIT13中断，将硬盘0头0道2扇区内容载入内存0x7000处，然后调用copy_buffer将其转移到内存0x8000处。在定位0头0道2扇区时通常有两种寻址方式：LBA和CHS。如果你是刨根问底儿型的爱好者，那么此时去找谷哥打听打听这两种方式的来龙去脉吧。</p>
+
+<p>2)、stage2：严格来说这里还应该再区分个stage1.5的，就一并把stage1.5放在这里一起介绍了，免得大家看得心里乱哄哄的。好的，我们继续说0头0到2扇区的/stage2/start.S文件，当它的内容被读入到内存之后，它的主要作用就是负责将stage2或stage1.5从硬盘读到内存中。如果是stage2，它将被载入到0x820处；如果是stage1.5，它将被载入到0x2200处。这里的stage2或者stage1_5不是/boot分区/boot/grub目录下的文件，因为这个时候grub还没有能力识别任何文件系统。</p>
+
+<p> 如果start.S加载stage1.5：stage1.5它存放在硬盘0头0道3扇区向后的位置，stage1_5作为stage1和stage2中间的桥梁，stage1_5有识别文件系统的能力，此后grub才有能力去访问/boot分区/boot/grub目录下的 stage2文件，将stage2载入内存并执行。</p>
+
+<p> 如果start.S加载stage2：同样，这个stage2也不是/boot分区/boot/grub目录下的stage2，这个时候start.S读取的是存放在/boot分区Boot Sector的stage2。这种情况下就有一个限制：因为start.S通过BIOS中断方式直接对硬盘寻址（而非通过访问具体的文件系统），其寻址范围有限，限制在8GB以内。因此这种情况需要将/boot分区分在硬盘8GB寻址空间之前。</p>
+
+<p>假如是情形2，我们将/boot/grub目录下的内容清空，依然能成功启动grub；假如是情形1，将/boot/grub目录下stage2删除后，则系统启动过程中grub会启动失败。</p>
+
+<h4>启动内核</h4>
+
+<p>  当stage2被载入内存执行时，它首先会去解析grub的配置文件/boot/grub/grub.conf，然后加载内核镜像到内存中，并将控制权转交给内核。而内核会立即初始化系统中各设备并做相关的配置工作，其中包括CPU、I/O、存储设备等。</p>
+
+<p>关于Linux的设备驱动程序的加载，有一部分驱动程序直接被编译进内核镜像中，另一部分驱动程序则是以模块的形式放在initrd(ramdisk)中。</p>
+
+<p>  Linux内核需要适应多种不同的硬件架构，但是将所有的硬件驱动编入内核又是不实际的，而且内核也不可能每新出一种硬件结构，就将该硬件的设备驱动写入内核。实际上Linux的内核镜像仅是包含了基本的硬件驱动，在系统安装过程中会检测系统硬件信息，根据安装信息和系统硬件信息将一部分设备驱动写入 initrd 。这样在以后启动系统时，一部分设备驱动就放在initrd中来加载。这里有必要给大家再多介绍一下initrd这个东东：</p>
+
+<p>  initrd 的英文含义是 bootloader initialized RAM disk，就是由 boot loader 初始化的内存盘。在 linu2.6内核启动前，boot loader 会将存储介质中的 initrd 文件加载到内存，内核启动时会在访问真正的根文件系统前先访问该内存中的 initrd 文件系统。在 boot loader 配置了 initrd 的情况下，内核启动被分成了两个阶段，第一阶段先执行 initrd 文件系统中的init，完成加载驱动模块等任务，第二阶段才会执行真正的根文件系统中的 /sbin/init 进程。</p>
+
+<p>另外一个概念：initramfs</p>
+
+<p>  initramfs 是在 kernel 2.5中引入的技术，实际上它的含义就是：在内核镜像中附加一个cpio包，这个cpio包中包含了一个小型的文件系统，当内核启动时，内核将这个 cpio包解开，并且将其中包含的文件系统释放到rootfs中，内核中的一部分初始化代码会放到这个文件系统中，作为用户层进程来执行。这样带来的明显的好处是精简了内核的初始化代码，而且使得内核的初始化过程更容易定制。
+疑惑的是：我的内核是2.6.32-71.el6.i686版本，但在我的/boot分区下面却存在的是/boot/initramfs-2.6.32-71.el6.i686.img类型的文件，没搞明白，还望高人解惑。我只知道在2.6内核中支持两种格式的initrd，一种是2.4内核的文件系统镜像image-initrd，一种是cpio格式。接下来我们就来探究一下initramfs-2.6.32-71.el6.i686.img里到底放了那些东西。</p>
+
+<p><img src="/images/system/2016-01-21-2.png" alt="" /></p>
+
+<p>在tmp文件夹中解压initrd.img里的内容：</p>
+
+<p><img src="/images/system/2016-01-21-3.png" alt="" /></p>
+
+<p>如果initrd.img文件的格式显示为“initrd.img:ISO 9660 CD-ROM filesystem data”，则可直接输入命令“mount -o loop initrd.img /mnt/test”进行挂载。</p>
+
+<p>通过上的分析和我们的验证，我们确实得到了这样的结论：</p>
+
+<p>  grub的stage2将initrd加载到内存里，让后将其中的内容释放到内容中，内核便去执行initrd中的init脚本，这时内核将控制权交给了init文件处理。我们简单浏览一下init脚本的内容，发现它也主要是加载各种存储介质相关的设备驱动程序。当所需的驱动程序加载完后，会创建一个根设备，然后将根文件系统rootfs以只读的方式挂载。这一步结束后，释放未使用的内存，转换到真正的根文件系统上面去，同时运行/sbin/init程序，执行系统的1号进程。此后系统的控制权就全权交给/sbin/init进程了。</p>
+
+<h4>初始化系统</h4>
+
+<p>经过千辛万苦的跋涉，我们终于接近黎明的曙光了。接下来就是最后一步了：初始化系统。/sbin/init进程是系统其他所有进程的父进程，当它接管了系统的控制权先之后，它首先会去读取/etc/inittab文件来执行相应的脚本进行系统初始化，如设置键盘、字体，装载模块，设置网络等。主要包括以下工作：</p>
+
+<p>1)、执行系统初始化脚本(/etc/rc.d/rc.sysinit)，对系统进行基本的配置，以读写方式挂载根文件系统及其它文件系统，到此系统算是基本运行起来了，后面需要进行运行级别的确定及相应服务的启动。rc.sysinit所做的事情(不同的Linux发行版，该文件可能有些差异)如下：</p>
+
+<p>（1）获取网络环境与主机类型。首先会读取网络环境设置文件"/etc/sysconfig/network"，获取主机名称与默认网关等网络环境。</p>
+
+<p>（2）测试与载入内存设备/proc及usb设备/sys。除了/proc外，系统会主动检测是否有usb设备，并主动加载usb驱动，尝试载入usb文件系统。</p>
+
+<p>（3）决定是否启动SELinux。</p>
+
+<p>（4）接口设备的检测与即插即用（pnp）参数的测试。</p>
+
+<p>（5）用户自定义模块的加载。用户可以再"/etc/sysconfig/modules/*.modules"加入自定义的模块，此时会加载到系统中。</p>
+
+<p>（6）加载核心的相关设置。按"/etc/sysctl.conf"这个文件的设置值配置功能。</p>
+
+<p>（7）设置系统时间（clock）。</p>
+
+<p>（8）设置终端的控制台的字形。</p>
+
+<p>（9）设置raid及LVM等硬盘功能。</p>
+
+<p>（10）以方式查看检验磁盘文件系统。</p>
+
+<p>（11）进行磁盘配额quota的转换。</p>
+
+<p>（12）重新以读取模式载入系统磁盘。</p>
+
+<p>（13）启动quota功能。</p>
+
+<p>（14）启动系统随机数设备（产生随机数功能）。</p>
+
+<p>（15）清楚启动过程中的临时文件。</p>
+
+<p>（16）将启动信息加载到"/var/log/dmesg"文件中。</p>
+
+<p> 当/etc/rc.d/rc.sysinit执行完后，系统就可以顺利工作了，只是还需要启动系统所需要的各种服务，这样主机才可以提供相关的网络和主机功能，因此便会执行下面的脚本。</p>
+
+<p>2)、执行/etc/rc.d/rc脚本。该文件定义了服务启动的顺序是先K后S，而具体的每个运行级别的服务状态是放在/etc/rc.d/rc<em>.d（</em>=0~6）目录下，所有的文件均是指向/etc/init.d下相应文件的符号链接。rc.sysinit通过分析/etc/inittab文件来确定系统的启动级别，然后才去执行/etc/rc.d/rc*.d下的文件。</p>
+
+<p>/etc/init.d-> /etc/rc.d/init.d</p>
+
+<p>/etc/rc ->/etc/rc.d/rc</p>
+
+<p>/etc/rc<em>.d ->/etc/rc.d/rc</em>.d</p>
+
+<p>/etc/rc.local-> /etc/rc.d/rc.local</p>
+
+<p>/etc/rc.sysinit-> /etc/rc.d/rc.sysinit</p>
+
+<p>也就是说，/etc目录下的init.d、rc、rc*.d、rc.local和rc.sysinit均是指向/etc/rc.d目录下相应文件和文件夹的符号链接。我们以启动级别3为例来简要说明一下。</p>
+
+<p>/etc/rc.d/rc3.d目录，该目录下的内容全部都是以 S 或 K 开头的链接文件，都链接到"/etc/rc.d/init.d"目录下的各种shell脚本。S表示的是启动时需要start的服务内容，K表示关机时需要关闭的服务内容。/etc/rc.d/rc<em>.d中的系统服务会在系统后台启动，如果要对某个运行级别中的服务进行更具体的定制，通过chkconfig命令来操作，或者通过setup、ntsys、system-config-services来进行定制。如果我们需要自己增加启动的内容，可以在init.d目录中增加相关的shell脚本，然后在rc</em>.d目录中建立链接文件指向该shell脚本。这些shell脚本的启动或结束顺序是由S或K字母后面的数字决定，数字越小的脚本越先执行。例如，/etc/rc.d/rc3.d /S01sysstat就比/etc/rc.d/rc3.d /S99local先执行。</p>
+
+<p>3)、执行用户自定义引导程序/etc/rc.d/rc.local。其实当执行/etc/rc.d/rc3.d/S99local时，它就是在执行/etc/rc.d/rc.local。S99local是指向rc.local的符号链接。就是一般来说，自定义的程序不需要执行上面所说的繁琐的建立shell增加链接文件的步骤，只需要将命令放在rc.local里面就可以了，这个shell脚本就是保留给用户自定义启动内容的。</p>
+
+<p>4)、完成了系统所有的启动任务后，linux会启动终端或X-Window来等待用户登录。tty1,tty2,tty3&hellip;这表示在运行等级1，2，3，4的时候，都会执行"/sbin/mingetty"，而且执行了6个，所以linux会有6个纯文本终端，mingetty就是启动终端的命令。</p>
+
+<p>除了这6个之外还会执行"/etc/X11/prefdm-nodaemon"这个主要启动X-Window</p>
+
+<p>至此，系统就启动完毕了。以上分析不到的地方还请各位大虾不吝指正。</p>
+
+<p>关于Linux的其他分析内容下次再继续写。
+最后附上一张非常完整的系统启动流程图，适合各个水平阶段的读者。</p>
+
+<p><img src="/images/system/2016-01-21-4.jpg" alt="" /></p>
+
+<p><a href="http://blog.itpub.net/8111049/viewspace-680043">http://blog.itpub.net/8111049/viewspace-680043</a></p>
+
+<p><a href="http://bbs.chinaunix.net/thread-2046548-1-1.html">http://bbs.chinaunix.net/thread-2046548-1-1.html</a></p>
+
+<p><a href="http://blog.chinaunix.net/uid-26495963-id-3066282.html">http://blog.chinaunix.net/uid-26495963-id-3066282.html</a></p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2016/01/12/kernel-base-rtc/">linux 实时时钟（RTC）驱动</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2016-01-12T15:53:00+08:00'><span class='date'>2016-01-12</span> <span class='time'>15:53:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="/download/kernel/rtc.txt">Documentation/rtc.txt</a></p>
 
 <hr />
 
-<p>  CC_STACKPROTECT补丁是Tejun Heo在09年给主线kernel提交的一个用来防止内核堆栈溢出的补丁。默认的config是将这个选项关闭的，可以在编译内核的时候， 修改.config文件为CONFIG_CC_STACKPROTECTOR=y来启用。未来飞天内核可以将这个选项开启来防止利用内核stack溢出的0day攻击。这个补丁的防溢出原理是： 在进程启动的时候， 在每个buffer的后面放置一个预先设置好的stack canary，你可以把它理解成一个哨兵， 当buffer发生缓冲区溢出的时候， 肯定会破坏stack canary的值， 当stack canary的值被破坏的时候， 内核就会直接当机。那么是怎么判断stack canary被覆盖了呢？ 其实这个事情是gcc来做的，内核在编译的时候给gcc加了个-fstack-protector参数， 我们先来研究下这个参数是做什么用的。</p>
+<p><a href="http://blog.csdn.net/yaozhenguo2006/article/details/6820218">http://blog.csdn.net/yaozhenguo2006/article/details/6820218</a></p>
 
-<p>先写个简单的有溢出的程序：</p>
+<p>这个是linux内核文档关于rtc实时时钟部分的说明，此文档主要描述了rtc实时时钟的作用和编程接口，分别介绍了老的rtc接口和新的rtc类架构。并给出了一个测试rtc驱动的程序。</p>
 
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>[wzt@localhost csaw]$ cat test.c
-</span><span class='line'>
-</span><span class='line'>#include &lt;stdio.h&gt;
-</span><span class='line'>#include &lt;stdlib.h&gt;
-</span><span class='line'>
-</span><span class='line'>void test(void)
-</span><span class='line'>{
-</span><span class='line'>&#9;char buff[64];
-</span><span class='line'>
-</span><span class='line'>&#9;memset(buff, 0x41, 128);     //向64大小的buffer拷贝128字节， 肯定会发生缓冲区溢出。
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>int main(void)
-</span><span class='line'>{
-</span><span class='line'>&#9;test();
-</span><span class='line'>
-</span><span class='line'>&#9;return 0;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+<h3>linux 实时时钟（RTC）驱动</h3>
 
+<p>翻译：窗外云天<a href="&#109;&#97;&#105;&#108;&#116;&#x6f;&#58;&#x79;&#97;&#111;&#x7a;&#x68;&#x65;&#x6e;&#103;&#117;&#x6f;&#50;&#x30;&#48;&#x36;&#64;&#49;&#50;&#54;&#46;&#99;&#111;&#x6d;">&#x79;&#x61;&#x6f;&#x7a;&#x68;&#x65;&#110;&#103;&#117;&#x6f;&#50;&#48;&#x30;&#54;&#x40;&#49;&#50;&#54;&#x2e;&#99;&#x6f;&#x6d;</a>  最后矫正时间：2011.9.25</p>
 
+<p>当linux开发者提到“实时时钟”的时候，他们通常所指的就是墙钟时间，这个时间是电池供电的，所以在系统掉电的情况下还能正常工作。除非在MS-Windows启动的时候设置，否则这个时钟不会同步于本地时区和夏令时间。事实上，他被设置成格林威治时间。</p>
 
+<p>最新的非pc体系的硬件趋向于记秒数，比如time(2)系统调用的输出，但是实时时钟用公历和24小时表示日期与时间，比如gmtime(3)的输出。</p>
 
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>[wzt@localhost csaw]$ gcc -o test test.c
-</span><span class='line'>[wzt@localhost csaw]$ ./test
-</span><span class='line'>段错误</span></code></pre></td></tr></table></div></figure>
+<p>linux提供两类的rtc兼容性很高的用户空间系统调用接口，如下所示：<br/>
+（1） /dev/rtc &hellip; 这个RTC适合pc体系的系统，而并不适合非x86体系的系统<br/>
+（2） /dev/rtc0,/dev/rtc1 &hellip; 他们依赖一种架构，这种架构在所有的系统上被RTC芯片广泛的支持。</p>
 
+<p>程序员必须知道，PC/AT的功能不总是有效，其他的系统可能会有另外的实现。这种情况下，如果在相同的系统结构上使用同样的RTC API，那么硬件会有不同的反应。例如，不是每一个RTC都提供IRQ，所以这些不能处理报警中断；标准的PC系统RTC只能处理未来24小时以内的闹钟，而其他系统的RTC可能处理未来一个世纪的任何时间。</p>
 
-<p>反汇编看看：</p>
+<h4>老的PC/AT驱动：/dev/rtc</h4>
 
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>[wzt@localhost csaw]$ objdump -d test &gt; hex
-</span><span class='line'>
-</span><span class='line'>08048384 &lt;test&gt;:
-</span><span class='line'> 8048384:       55                      push   %ebp
-</span><span class='line'> 8048385:       89 e5                   mov    %esp,%ebp
-</span><span class='line'> 8048387:       83 ec 58                sub    $0x58,%esp
-</span><span class='line'> 804838a:       c7 44 24 08 80 00 00    movl   $0x80,0x8(%esp)
-</span><span class='line'> 8048391:       00
-</span><span class='line'> 8048392:       c7 44 24 04 41 00 00    movl   $0x41,0x4(%esp)
-</span><span class='line'> 8048399:       00
-</span><span class='line'> 804839a:       8d 45 c0                lea    0xffffffc0(%ebp),%eax
-</span><span class='line'> 804839d:       89 04 24                mov    %eax,(%esp)
-</span><span class='line'> 80483a0:       e8 e3 fe ff ff          call   8048288 &lt;memset@plt&gt;
-</span><span class='line'> 80483a5:       c9                      leave
-</span><span class='line'> 80483a6:       c3                      ret</span></code></pre></td></tr></table></div></figure>
+<p>所有基于PC的系统（甚至Alpha体系的机器）都有一个集成的实时时钟。通常他们集成在计算机的芯片组内，但是也有一些系统是在主板上焊接着摩托罗拉MC146818（或者类似的芯片），他们给系统提供时间和日期，这个时间和日期在系统掉电后仍然会保存。</p>
 
+<p>ACPT(高级配置与电源管理接口)对MC146818的功能进行了标准化，并且在一些方面进行了功能扩展（提供了更长的定时周期，睡眠唤醒功能）。然而这些扩展的功能不适合老的驱动程序。</p>
 
-<p>没什么特别的，我们在加上-fstack-protector参数看看：</p>
+<p>这个RTC还可以产生频率从 2HZ 到 8192HZ 的信号，以2的乘方增长。这些信号通过中断信号线8报告给系统。这个RTC还可以用作定时限制为24小时的闹钟，当定时时间到时产生8号中断。这个闹钟可以设置成任意一个可编程值的子集，这意味着可以设置成任意小时的任意分钟任意秒，例如，可以将这个时钟设置成在每个clk产生中断，从而产生1hz的信号。</p>
 
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>[wzt@localhost csaw]$ gcc -o test test.c -fstack-protector
-</span><span class='line'>[wzt@localhost csaw]$ ./test
-</span><span class='line'>*** stack smashing detected ***: ./test terminated
-</span><span class='line'>已放弃</span></code></pre></td></tr></table></div></figure>
+<p>这些中断通过/dev/rtc报告给系统（主设备号10,次设备号135，只读字符设备），中断传回一个无符号整数类型的数据。最低的位包含中断的类型（更新，闹钟，或者期），其他的字节代表了最后一次读到现在中断发生的次数。状态信息由虚拟文件/proc/driver/rtc产生，前提条件是使能了/proc文件系统。驱动应该提供锁机制，保证在同一时刻只有一个进程访问/dev/rtc。</p>
 
+<p>用户进程通过系统调用read(2)或者select(2)读取/dev/rtc来获取这些中断。当调用这两个系统调用的时候，进程会阻塞或者退出直到下一个中断到来。这个功能用在需要不频繁的获取数据而又不希望通过轮询当前时间而占用CPU时间的情况下。</p>
 
-<p>这次程序打印了一条堆栈被溢出的信息，然后就自动退出了。</p>
+<p>在高频率中断或者高系统负载下，用户进程应该检查从上次读取到现在发生中断的次数以判断是否有未处理的中断。例如，一个典型的 486-33 对/dev/rtc以大于1024hz的频率进行循环读，偶尔会产生中断积累（从上次读取到现在发生大于一次的中断）。鉴于此你应该检查读取数据的高字节，特别是在频率高于普通定时器中断&ndash;100hz的情况下。</p>
 
-<p>在反汇编看下：</p>
+<p>中断频率是可编程的或可以让他超过64hz，但是只有root权限的用户可以这样做。这样做可能有点保守，但是我们不希望有恶意的用户在一个较慢的386sx-16机器上产生很多中断，这样会严重影响系统的性能。我们可以通过向/proc/sys/dev/rtc/max-user-freq写入值来修改这个64hz的限制。但是注意你一定要这样做，减少中断处理程序的代码才会亡羊补牢，使对系统性能的影响降到最小。</p>
+
+<p>如果内核时间是和外部时钟源同步的，那么内核将每隔11分钟就会将时间写回CMOS时钟。在这个过程中，内核会关闭rtc周期中断，如果你的程序在做一些关键的工作一定要注意到。如果你的内核不和外部时钟源同步，那么内核会一直处理rtc中断，处理方式根据你具体的应用。</p>
+
+<p>闹钟和中断频率可以通过系统调用ioctl(2)来设置，ioctl的命令定义在./include/linux/rtc.h。与其长篇大论的介绍怎么样使用这个系统调用，还不如写一个实例程序来的方便，这个程序用来演示驱动的功能，对很多人来说用驱动程序提供的功能来进行应用编程他们会更感兴趣。在这个文档的最后有这段程序。</p>
+
+<h4>新接口 “RTC类” 驱动：/dev/rtcn</h4>
+
+<p>因为linux支持许多非ACPI非PC平台，其中一些平台有不只一个RTC，所以需要更多可移植性的设计，而不是仅仅在每个系统都实现类似MC146818的接口。在这种情况下，新的“RTC类”构架产生了。他提供不同的用户空间接口：
+（1） /dev/rtcn 和老的接口一样
+（2）/dev/class/rtc/rtcn   sysfs 属性，一些属性是只读的
+（3） /dev/driver/rtc 第一个rtc会使用procfs接口。更多的信息会显示在这里而不是sysfs。</p>
+
+<p>RTC类构架支持很多类型的RTC，从集成在嵌入式SOC处理器内的RTC到通过I2C，SPI和其他总线连接到CPU的芯片。这个架构甚至还支持PC系统的RTC，包括使用ACPI，PC的一些新特性。</p>
+
+<p>新架构也打破了“每个系统只有一个RTC”的限制。例如，一个低功耗电池供电的RTC是一个分离的I2C接口的芯片，但是系统可能还集成了一个多功能的RTC。系统可能从分离的RTC读取系统时钟，但是对于其他任务用集成的RTC，因为这个RTC提供更多的功能。</p>
+
+<h4>SYSFS 接口</h4>
+
+<p>在/sys/class/rtc/rtcn下面的sysfs接口提供了操作rtc属性的方法，而不用通过Ioclt系统调用。所有的日期时间都是墙钟时间，而不是系统时间。</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -270,340 +388,33 @@ var ss360Config = {
 <span class='line-number'>5</span>
 <span class='line-number'>6</span>
 <span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>[wzt@localhost csaw]$ objdump -d test &gt; hex1
-</span><span class='line'>
-</span><span class='line'>080483d4 &lt;test&gt;:
-</span><span class='line'> 80483d4:       55                      push   %ebp
-</span><span class='line'> 80483d5:       89 e5                   mov    %esp,%ebp
-</span><span class='line'> 80483d7:       83 ec 68                sub    $0x68,%esp
-</span><span class='line'> 80483da:       65 a1 14 00 00 00       mov    %gs:0x14,%eax
-</span><span class='line'> 80483e0:       89 45 fc                mov    %eax,0xfffffffc(%ebp)
-</span><span class='line'> 80483e3:       31 c0                   xor    %eax,%eax
-</span><span class='line'> 80483e5:       c7 44 24 08 80 00 00    movl   $0x80,0x8(%esp)
-</span><span class='line'> 80483ec:       00
-</span><span class='line'> 80483ed:       c7 44 24 04 41 00 00    movl   $0x41,0x4(%esp)
-</span><span class='line'> 80483f4:       00
-</span><span class='line'> 80483f5:       8d 45 bc                lea    0xffffffbc(%ebp),%eax
-</span><span class='line'> 80483f8:       89 04 24                mov    %eax,(%esp)
-</span><span class='line'> 80483fb:       e8 cc fe ff ff          call   80482cc &lt;memset@plt&gt;
-</span><span class='line'> 8048400:       8b 45 fc                mov    0xfffffffc(%ebp),%eax
-</span><span class='line'> 8048403:       65 33 05 14 00 00 00    xor    %gs:0x14,%eax
-</span><span class='line'> 804840a:       74 05                   je     8048411 &lt;test+0x3d&gt;
-</span><span class='line'> 804840c:       e8 db fe ff ff          call   80482ec &lt;__stack_chk_fail@plt&gt;
-</span><span class='line'> 8048411:       c9                      leave
-</span><span class='line'> 8048412:       c3                      ret</span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>date:           RTC提供的日期
+</span><span class='line'>hctosys:        如果在内核配置选项中配置了CONFIG_RTC_HCTOSYS，RTC会在系统启动的时候提供系统时间，这种情况下这个位就是1,否则为0
+</span><span class='line'>max_user_freq:  非特权用户可以从RTC得到的最大中断频率
+</span><span class='line'>name:           RTC的名字，与sysfs目录相关
+</span><span class='line'>since_epoch:    从纪元开始所经历的秒数
+</span><span class='line'>time:           RTC提供的时间
+</span><span class='line'>wakealarm:      唤醒时间的时间事件。 这是一种单次的唤醒事件，所以如果还需要唤醒，在唤醒发生后必须复位。这个域的数据结构或者是从纪元开始经历的妙数，或者是相对的秒数</span></code></pre></td></tr></table></div></figure>
 
 
-<p>使用-fstack-protector参数后， gcc在函数的开头放置了几条汇编代码：</p>
+<h4>IOCTL 接口</h4>
 
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'> 80483d7:       83 ec 68                sub    $0x68,%esp
-</span><span class='line'> 80483da:       65 a1 14 00 00 00       mov    %gs:0x14,%eax
-</span><span class='line'> 80483e0:       89 45 fc                mov    %eax,0xfffffffc(%ebp)</span></code></pre></td></tr></table></div></figure>
+<p>/dev/rtc支持的Ioctl系统调用，RTC类构架也支持。然而，因为芯片和系统没有一个统一的标准，一些PC/AT功能可能没有提供。以相同方式工作的一些新特性，&ndash;包括ACPI提供的，&ndash;在RTC类构架中表现出的，在老的驱动上不会工作。</p>
 
+<p>（1） RTC_RD_TIME,RTC_SET_TIME .. 每一个RTC都至少支持读时间这个命令，时间格式为公历和24小时制墙钟时间。最有用的特性是，这个时间可以更新。<br/>
+（2） RTC_ATE_ON,RTC_ATE_OFF,RTC_ALM_SET,RTC_ALM_READ &hellip; 当RTC连接了一条IRQ线，他还能处理在未来24小时的报警中断。<br/>
+（3） RTC_WKALM_SET，RTC_WKALM_RD 。。。 RTCs 使用一个功能更强大的api,他可以处理超过24小时的报警时间。这个API支持设置更长的报警时间，支持单次请求的IRQ中断。<br/>
+（4） RTC_UIE_ON,RTC_UIE_OFF &hellip; 如果RTC提供IRQ，他可能也提供每秒更新的IRQ中断。如果需要，RTC结构可以模仿这个机制。</p>
 
-<p>将代码段gs偏移0×14内存处的值赋值给了ebp-4， 也就是第一个变量值的后面。</p>
+<p>（5） RTC_PIE_ON,RTC_PIE_OFF,RTC_IRQP_SET,RTC_IRQP_READ &hellip; 如果一个IRQ是周期中断，那么这个IRQ还有可设置频率的特性（频率通常是2的n次方）</p>
 
-<p>在call完memeset后，有如下汇编代码：</p>
+<p>很多情况下，RTC报警时钟通常是一个系统唤醒事件，用于将Linux从低功耗睡眠模式唤醒到正常的工作模式。例如，系统会处于低功耗的模式下，直到时间到了去执行一些任务。注意这些ioctl的一些功能不必在你的驱动程序中实现。如果一个ioctl调用，你的驱动返回ENOIOCTLCMD，那么这个Ioctl就由通用RTC设备接口处理。下面是一些通用的例子：<br/>
+（6） RTC_RD_TIME, RTC_SET_TIME: read_time/set_time 函数会被调用。<br/>
+（7） RTC_ALM_SET, RTC_ALM_READ, RTC_WKALM_SET, RTC_WKALM_RD: set_alarm/read_alarm 函数将会被调用.<br/>
+（8） RTC_IRQP_SET, RTC_IRQP_READ: irq_set_freq 函数将会调用，用来设置频率，RTC类构架会处理读请求，而频率保存在RTC设备结构中的irq_freq域。你的驱动需要在模块初始化的时候初始化irq_freq，你必须在irq_set_freq函数里检查设置的频率是否在硬件允许的范围。如果不是那么驱动应该返回-EINVAL。如果你不需要改变这个频率，那么不要定义irq_set_freq这个函数。<br/>
+（7） RTC_PIE_ON, RTC_PIE_OFF: irq_set_state 函数会被调用。</p>
 
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'> 80483fb:       e8 cc fe ff ff          call   80482cc &lt;memset@plt&gt;
-</span><span class='line'> 8048400:       8b 45 fc                mov    0xfffffffc(%ebp),%eax
-</span><span class='line'> 8048403:       65 33 05 14 00 00 00    xor    %gs:0x14,%eax
-</span><span class='line'> 804840a:       74 05                   je     8048411 &lt;test+0x3d&gt;
-</span><span class='line'> 804840c:       e8 db fe ff ff          call   80482ec &lt;__stack_chk_fail@plt&gt;</span></code></pre></td></tr></table></div></figure>
-
-
-<p>在memset后，gcc要检查这个操作是否发生了堆栈溢出, 将保存在ebp-4的这个值与原来的值对比一下，如果不相同， 说明堆栈发生了溢出，那么就会执行stack_chk_fail这个函数， 这个函数是glibc实现的，打印出上面看到的信息， 然后进程退出。</p>
-
-<p>从这个例子中我们可以看出gcc使用了-fstack-protector参数后，会自动检查堆栈是否发生了溢出， 但是有一个前提就是内核要给每个进程提前设置好一个检测值放置在%gs:0×14位置处，这个值称之为stack canary。所以我们可以看到防止堆栈溢出是由内核和gcc共同来完成的。</p>
-
-<p>gcc的任务就是放置几条汇编代码， 然后和%gs:0×14位置处的值进行对比即可。 主要任务还是内核如何来设置stack canary， 也是CC_STACKPROTECTOR补丁要实现的目的， 下面我们仔细来看下这个补丁是如何实现的。</p>
-
-<p>既然gcc硬性规定了stack canary必须在%gs的某个偏移位置处， 那么内核也必须按着这个规定来设置。</p>
-
-<p>对于32位和64位内核， gs寄存器有着不同的功能。</p>
-
-<p>64位内核gcc要求stack canary是放置在gs段的40偏移处， 并且gs寄存器在每cpu变量中是共享的，每cpu变量irq_stack_union的结构如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>arch/x86/include/asm/processor.h
-</span><span class='line'>
-</span><span class='line'>union irq_stack_union {
-</span><span class='line'>&#9;char irq_stack[IRQ_STACK_SIZE];
-</span><span class='line'>&#9;/*
-</span><span class='line'>&#9; * GCC hardcodes the stack canary as %gs:40.  Since the
-</span><span class='line'>&#9; * irq_stack is the object at %gs:0, we reserve the bottom
-</span><span class='line'>&#9; * 48 bytes of the irq stack for the canary. 
-</span><span class='line'>&#9; */
-</span><span class='line'>&#9;struct {
-</span><span class='line'>&#9;&#9;char gs_base[40];
-</span><span class='line'>&#9;&#9;unsigned long stack_canary;
-</span><span class='line'>&#9;};
-</span><span class='line'>};
-</span><span class='line'>
-</span><span class='line'>DECLARE_PER_CPU_FIRST(union irq_stack_union, irq_stack_union);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>gs_base只是一个40字节的站位空间， stack_canary就紧挨其后。并且在应用程序进出内核的时候，内核会使用swapgs指令自动更换gs寄存器的内容。</p>
-
-<p>32位下就稍微有点复杂了。由于某些处理器在加载不同的段寄存器时很慢， 所以内核使用fs段寄存器替换了gs寄存器。 但是gcc在使用-fstack-protector的时候， 还要用到gs段寄存器， 所以内核还要管理gs寄存器，我们要把CONFIG_X86_32_LAZY_GS选项关闭， gs也只在进程切换的时候才改变。 32位用每cpu变量stack_canary保存stack canary。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct stack_canary {
-</span><span class='line'>&#9;char __pad[20];         /* canary at %gs:20 */
-</span><span class='line'>&#9;unsigned long canary;
-</span><span class='line'>};      
-</span><span class='line'>DECLARE_PER_CPU_ALIGNED(struct stack_canary, stack_canary);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>内核是处于保护模式的， 因此gs寄存器就变成了保护模式下的段选子，在GDT表中也要有相应的设置：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>diff --git a/arch/x86/include/asm/segment.h b/arch/x86/include/asm/segment.h
-</span><span class='line'>index 1dc1b51..14e0ed8 100644 (file)
-</span><span class='line'>--- a/arch/x86/include/asm/segment.h
-</span><span class='line'>+++ b/arch/x86/include/asm/segment.h
-</span><span class='line'>@@ -61,7 +61,7 @@
-</span><span class='line'>  *
-</span><span class='line'>  *  26 - ESPFIX small SS
-</span><span class='line'>  *  27 - per-cpu                       [ offset to per-cpu data area ]
-</span><span class='line'>- *  28 - unused
-</span><span class='line'>+ *  28 - stack_canary-20               [ for stack protector ]
-</span><span class='line'>  *  29 - unused
-</span><span class='line'>  *  30 - unused
-</span><span class='line'>  *  31 - TSS for double fault handler
-</span><span class='line'>@@ -95,6 +95,13 @@
-</span><span class='line'> #define __KERNEL_PERCPU 0
-</span><span class='line'> #endif
-</span><span class='line'>
-</span><span class='line'>+#define GDT_ENTRY_STACK_CANARY         (GDT_ENTRY_KERNEL_BASE + 16)
-</span><span class='line'>+#ifdef CONFIG_CC_STACKPROTECTOR
-</span><span class='line'>+#define __KERNEL_STACK_CANARY          (GDT_ENTRY_STACK_CANARY * 8)
-</span><span class='line'>+#else
-</span><span class='line'>+#define __KERNEL_STACK_CANARY          0
-</span><span class='line'>+#endif
-</span><span class='line'>+
-</span><span class='line'> #define GDT_ENTRY_DOUBLEFAULT_TSS      31</span></code></pre></td></tr></table></div></figure>
-
-
-<p>GDT表中的第28个表项用来定为stack canary所在的段。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#define GDT_STACK_CANARY_INIT                                           \
-</span><span class='line'>        [GDT_ENTRY_STACK_CANARY] = GDT_ENTRY_INIT(0x4090, 0, 0x18),</span></code></pre></td></tr></table></div></figure>
-
-
-<p>GDT_STACK_CANARY_INIT在刚进入保护模式的时候被调用， 这个段描述符项被设置为基地址为0， 段大小设为24，因为只在基地址为0， 偏移为0×14处放置一个4bytes的stack canary， 所以24字节正好。不理解的同学可以看看intel保护模式的手册， 对着段描述符结构一个个看就行了。</p>
-
-<p>在进入保护模式后， start_kernel()会调用boot_init_stack_canary()来初始话一个stack canary。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/*      
-</span><span class='line'> * Initialize the stackprotector canary value.
-</span><span class='line'> *
-</span><span class='line'> * NOTE: this must only be called from functions that never return,
-</span><span class='line'> * and it must always be inlined.
-</span><span class='line'> */
-</span><span class='line'>static __always_inline void boot_init_stack_canary(void)
-</span><span class='line'>{
-</span><span class='line'>&#9;u64 canary;
-</span><span class='line'>&#9;u64 tsc;
-</span><span class='line'>
-</span><span class='line'>#ifdef CONFIG_X86_64
-</span><span class='line'>&#9;BUILD_BUG_ON(offsetof(union irq_stack_union, stack_canary) != 40);
-</span><span class='line'>#endif
-</span><span class='line'>&#9;/*
-</span><span class='line'>&#9; * We both use the random pool and the current TSC as a source
-</span><span class='line'>&#9; * of randomness. The TSC only matters for very early init,
-</span><span class='line'>&#9; * there it already has some randomness on most systems. Later
-</span><span class='line'>&#9; * on during the bootup the random pool has true entropy too.
-</span><span class='line'>&#9; */
-</span><span class='line'>&#9;get_random_bytes(&canary, sizeof(canary));
-</span><span class='line'>&#9;tsc = __native_read_tsc();
-</span><span class='line'>&#9;canary += tsc + (tsc &lt;&lt; 32UL);
-</span><span class='line'>
-</span><span class='line'>&#9;current-&gt;stack_canary = canary;
-</span><span class='line'>#ifdef CONFIG_X86_64
-</span><span class='line'>&#9;percpu_write(irq_stack_union.stack_canary, canary);
-</span><span class='line'>#else
-</span><span class='line'>&#9;percpu_write(stack_canary.canary, canary);
-</span><span class='line'>#endif
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>随机出了一个值赋值给每cpu变量， 32位是stack_canary, 64位是irq_stack_union。</p>
-
-<p>内核在进一步初始化cpu的时候，会调用setup_stack_canary_segment()来设置每个cpu的GDT的stack canary描述符项：</p>
-
-<p>start_kernel()->setup_per_cpu_areas()->setup_stack_canary_segment：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static inline void setup_stack_canary_segment(int cpu)
-</span><span class='line'>{
-</span><span class='line'>#ifdef CONFIG_X86_32
-</span><span class='line'>&#9;unsigned long canary = (unsigned long)&per_cpu(stack_canary, cpu);
-</span><span class='line'>&#9;struct desc_struct *gdt_table = get_cpu_gdt_table(cpu);
-</span><span class='line'>&#9;struct desc_struct desc;
-</span><span class='line'>
-</span><span class='line'>&#9;desc = gdt_table[GDT_ENTRY_STACK_CANARY];
-</span><span class='line'>&#9;set_desc_base(&desc, canary);
-</span><span class='line'>&#9;write_gdt_entry(gdt_table, GDT_ENTRY_STACK_CANARY, &desc, DESCTYPE_S);
-</span><span class='line'>#endif
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>在内核刚进入保护模式的时候, stack canary描述符的基地址被初始化为0， 现在在cpu初始化的时候要重新设置为每cpu变量stack_canary的地址， 而不是变量保存的值。通过这些设置当内核代码在访问%gs:0×14的时候， 就会访问stack canry保存的值。注意：setup_stack_canary_segment是针对32位内核做设置， 因为64位内核中的irq_stack_union是每cpu共享的， 不用针对每个cpu单独设置。 然后就可以调用switch_to_new_gdt(cpu);来加载GDT表和加载gs寄存器。</p>
-
-<p>经过上述初始化过程，在内核代码里访问%gs:0×14就可以定位stack canary的值了， 那么每个进程的stack canary是什么时候设置的呢？</p>
-
-<p>在内核启动一个进程的时候， 会把gs寄存器的值设为KERNEL_STACK_CANARY</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>--- a/arch/x86/kernel/process_32.c
-</span><span class='line'>+++ b/arch/x86/kernel/process_32.c
-</span><span class='line'>@@ -212,6 +212,7 @@ int kernel_thread(int (*fn)(void *), void *arg, unsigned long flags)
-</span><span class='line'>&#9;    regs.ds = __USER_DS;
-</span><span class='line'>&#9;    regs.es = __USER_DS;
-</span><span class='line'>&#9;    regs.fs = __KERNEL_PERCPU;
-</span><span class='line'>+       regs.gs = __KERNEL_STACK_CANARY;
-</span><span class='line'>&#9;    regs.orig_ax = -1;
-</span><span class='line'>&#9;    regs.ip = (unsigned long) kernel_thread_helper;
-</span><span class='line'>&#9;    regs.cs = __KERNEL_CS | get_kernel_rpl();</span></code></pre></td></tr></table></div></figure>
-
-
-<p>内核在fork一个进程的时候， 有如下操作：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static struct task_struct *dup_task_struct(struct task_struct *orig)
-</span><span class='line'>{
-</span><span class='line'>#ifdef CONFIG_CC_STACKPROTECTOR
-</span><span class='line'>&#9;tsk-&gt;stack_canary = get_random_int();
-</span><span class='line'>#endif
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>随机初始化了一个stack_canary保存在task_struct结构中的stack_canary变量中。当进程在切换的时候， 通过switch宏把新进程的stack canary保存在每cpu变量stack_canary中， 当前进程的stack_canary也保存在一个每cpu变量中，完成stack canary的切换。</p>
+<p>  如果所有的ioctl都失败了，用下面的rtc-test.c检查一下你的驱动吧！</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -658,754 +469,467 @@ var ss360Config = {
 <span class='line-number'>51</span>
 <span class='line-number'>52</span>
 <span class='line-number'>53</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>diff --git a/arch/x86/include/asm/system.h b/arch/x86/include/asm/system.h
-</span><span class='line'>index 79b98e5..2692ee8 100644 (file)
-</span><span class='line'>--- a/arch/x86/include/asm/system.h
-</span><span class='line'>+++ b/arch/x86/include/asm/system.h
-</span><span class='line'>@@ -23,6 +23,22 @@ struct task_struct *__switch_to(struct task_struct *prev,
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+<span class='line-number'>82</span>
+<span class='line-number'>83</span>
+<span class='line-number'>84</span>
+<span class='line-number'>85</span>
+<span class='line-number'>86</span>
+<span class='line-number'>87</span>
+<span class='line-number'>88</span>
+<span class='line-number'>89</span>
+<span class='line-number'>90</span>
+<span class='line-number'>91</span>
+<span class='line-number'>92</span>
+<span class='line-number'>93</span>
+<span class='line-number'>94</span>
+<span class='line-number'>95</span>
+<span class='line-number'>96</span>
+<span class='line-number'>97</span>
+<span class='line-number'>98</span>
+<span class='line-number'>99</span>
+<span class='line-number'>100</span>
+<span class='line-number'>101</span>
+<span class='line-number'>102</span>
+<span class='line-number'>103</span>
+<span class='line-number'>104</span>
+<span class='line-number'>105</span>
+<span class='line-number'>106</span>
+<span class='line-number'>107</span>
+<span class='line-number'>108</span>
+<span class='line-number'>109</span>
+<span class='line-number'>110</span>
+<span class='line-number'>111</span>
+<span class='line-number'>112</span>
+<span class='line-number'>113</span>
+<span class='line-number'>114</span>
+<span class='line-number'>115</span>
+<span class='line-number'>116</span>
+<span class='line-number'>117</span>
+<span class='line-number'>118</span>
+<span class='line-number'>119</span>
+<span class='line-number'>120</span>
+<span class='line-number'>121</span>
+<span class='line-number'>122</span>
+<span class='line-number'>123</span>
+<span class='line-number'>124</span>
+<span class='line-number'>125</span>
+<span class='line-number'>126</span>
+<span class='line-number'>127</span>
+<span class='line-number'>128</span>
+<span class='line-number'>129</span>
+<span class='line-number'>130</span>
+<span class='line-number'>131</span>
+<span class='line-number'>132</span>
+<span class='line-number'>133</span>
+<span class='line-number'>134</span>
+<span class='line-number'>135</span>
+<span class='line-number'>136</span>
+<span class='line-number'>137</span>
+<span class='line-number'>138</span>
+<span class='line-number'>139</span>
+<span class='line-number'>140</span>
+<span class='line-number'>141</span>
+<span class='line-number'>142</span>
+<span class='line-number'>143</span>
+<span class='line-number'>144</span>
+<span class='line-number'>145</span>
+<span class='line-number'>146</span>
+<span class='line-number'>147</span>
+<span class='line-number'>148</span>
+<span class='line-number'>149</span>
+<span class='line-number'>150</span>
+<span class='line-number'>151</span>
+<span class='line-number'>152</span>
+<span class='line-number'>153</span>
+<span class='line-number'>154</span>
+<span class='line-number'>155</span>
+<span class='line-number'>156</span>
+<span class='line-number'>157</span>
+<span class='line-number'>158</span>
+<span class='line-number'>159</span>
+<span class='line-number'>160</span>
+<span class='line-number'>161</span>
+<span class='line-number'>162</span>
+<span class='line-number'>163</span>
+<span class='line-number'>164</span>
+<span class='line-number'>165</span>
+<span class='line-number'>166</span>
+<span class='line-number'>167</span>
+<span class='line-number'>168</span>
+<span class='line-number'>169</span>
+<span class='line-number'>170</span>
+<span class='line-number'>171</span>
+<span class='line-number'>172</span>
+<span class='line-number'>173</span>
+<span class='line-number'>174</span>
+<span class='line-number'>175</span>
+<span class='line-number'>176</span>
+<span class='line-number'>177</span>
+<span class='line-number'>178</span>
+<span class='line-number'>179</span>
+<span class='line-number'>180</span>
+<span class='line-number'>181</span>
+<span class='line-number'>182</span>
+<span class='line-number'>183</span>
+<span class='line-number'>184</span>
+<span class='line-number'>185</span>
+<span class='line-number'>186</span>
+<span class='line-number'>187</span>
+<span class='line-number'>188</span>
+<span class='line-number'>189</span>
+<span class='line-number'>190</span>
+<span class='line-number'>191</span>
+<span class='line-number'>192</span>
+<span class='line-number'>193</span>
+<span class='line-number'>194</span>
+<span class='line-number'>195</span>
+<span class='line-number'>196</span>
+<span class='line-number'>197</span>
+<span class='line-number'>198</span>
+<span class='line-number'>199</span>
+<span class='line-number'>200</span>
+<span class='line-number'>201</span>
+<span class='line-number'>202</span>
+<span class='line-number'>203</span>
+<span class='line-number'>204</span>
+<span class='line-number'>205</span>
+<span class='line-number'>206</span>
+<span class='line-number'>207</span>
+<span class='line-number'>208</span>
+<span class='line-number'>209</span>
+<span class='line-number'>210</span>
+<span class='line-number'>211</span>
+<span class='line-number'>212</span>
+<span class='line-number'>213</span>
+<span class='line-number'>214</span>
+<span class='line-number'>215</span>
+<span class='line-number'>216</span>
+<span class='line-number'>217</span>
+<span class='line-number'>218</span>
+<span class='line-number'>219</span>
+<span class='line-number'>220</span>
+<span class='line-number'>221</span>
+<span class='line-number'>222</span>
+<span class='line-number'>223</span>
+<span class='line-number'>224</span>
+<span class='line-number'>225</span>
+<span class='line-number'>226</span>
+<span class='line-number'>227</span>
+<span class='line-number'>228</span>
+<span class='line-number'>229</span>
+<span class='line-number'>230</span>
+<span class='line-number'>231</span>
+<span class='line-number'>232</span>
+<span class='line-number'>233</span>
+<span class='line-number'>234</span>
+<span class='line-number'>235</span>
+<span class='line-number'>236</span>
+<span class='line-number'>237</span>
+<span class='line-number'>238</span>
+<span class='line-number'>239</span>
+<span class='line-number'>240</span>
+<span class='line-number'>241</span>
+<span class='line-number'>242</span>
+<span class='line-number'>243</span>
+<span class='line-number'>244</span>
+<span class='line-number'>245</span>
+<span class='line-number'>246</span>
+<span class='line-number'>247</span>
+<span class='line-number'>248</span>
+<span class='line-number'>249</span>
+<span class='line-number'>250</span>
+<span class='line-number'>251</span>
+<span class='line-number'>252</span>
+<span class='line-number'>253</span>
+<span class='line-number'>254</span>
+<span class='line-number'>255</span>
+<span class='line-number'>256</span>
+<span class='line-number'>257</span>
+<span class='line-number'>258</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/*
+</span><span class='line'> *      Real Time Clock Driver Test/Example Program
+</span><span class='line'> *
+</span><span class='line'> *      Compile with:
+</span><span class='line'> *             gcc -s -Wall -Wstrict-prototypes rtctest.c -o rtctest
+</span><span class='line'> *
+</span><span class='line'> *      Copyright (C) 1996, Paul Gortmaker.
+</span><span class='line'> *
+</span><span class='line'> *      Released under the GNU General Public License, version 2,
+</span><span class='line'> *      included herein by reference.
+</span><span class='line'> *
+</span><span class='line'> */
 </span><span class='line'>
-</span><span class='line'> #ifdef CONFIG_X86_32
+</span><span class='line'>#include &lt;stdio.h&gt;
+</span><span class='line'>#include &lt;linux/rtc.h&gt;
+</span><span class='line'>#include &lt;sys/ioctl.h&gt;
+</span><span class='line'>#include &lt;sys/time.h&gt;
+</span><span class='line'>#include &lt;sys/types.h&gt;
+</span><span class='line'>#include &lt;fcntl.h&gt;
+</span><span class='line'>#include &lt;unistd.h&gt;
+</span><span class='line'>#include &lt;stdlib.h&gt;
+</span><span class='line'>#include &lt;errno.h&gt;
 </span><span class='line'>
-</span><span class='line'>+#ifdef CONFIG_CC_STACKPROTECTOR
-</span><span class='line'>+#define __switch_canary                                                \
-</span><span class='line'>+       "movl "__percpu_arg([current_task])",%%ebx\n\t"                 \
-</span><span class='line'>+       "movl %P[task_canary](%%ebx),%%ebx\n\t"                         \
-</span><span class='line'>+       "movl %%ebx,"__percpu_arg([stack_canary])"\n\t"
-</span><span class='line'>+#define __switch_canary_oparam                                         \
-</span><span class='line'>+       , [stack_canary] "=m" (per_cpu_var(stack_canary))
-</span><span class='line'>+#define __switch_canary_iparam                                         \
-</span><span class='line'>+       , [current_task] "m" (per_cpu_var(current_task))                \
-</span><span class='line'>+       , [task_canary] "i" (offsetof(struct task_struct, stack_canary))
-</span><span class='line'>+#else  /* CC_STACKPROTECTOR */
-</span><span class='line'>+#define __switch_canary
-</span><span class='line'>+#define __switch_canary_oparam
-</span><span class='line'>+#define __switch_canary_iparam
-</span><span class='line'>+#endif /* CC_STACKPROTECTOR */
-</span><span class='line'>+
-</span><span class='line'> /*
-</span><span class='line'>  * Saving eflags is important. It switches not only IOPL between tasks,
-</span><span class='line'>  * it also protects other tasks from NT leaking through sysenter etc.
-</span><span class='line'>@@ -46,6 +62,7 @@ do {                                                  \
-</span><span class='line'>&#9;                 "pushl %[next_ip]\n\t"     /* restore EIP   */     \
-</span><span class='line'>&#9;                 "jmp __switch_to\n"        /* regparm call  */     \
-</span><span class='line'>&#9;                 "1:\t"                                             \
-</span><span class='line'>+                    __switch_canary                                    \
-</span><span class='line'>&#9;                 "popl %%ebp\n\t"           /* restore EBP   */     \
-</span><span class='line'>&#9;                 "popfl\n"                  /* restore flags */     \
-</span><span class='line'>&#9;                                                                    \
-</span><span class='line'>@@ -58,6 +75,8 @@ do {                                                  \
-</span><span class='line'>&#9;                   "=b" (ebx), "=c" (ecx), "=d" (edx),              \
-</span><span class='line'>&#9;                   "=S" (esi), "=D" (edi)                           \
-</span><span class='line'>&#9;                                                                    \
-</span><span class='line'>+                      __switch_canary_oparam                           \
-</span><span class='line'>+                                                                       \
-</span><span class='line'>&#9;                   /* input parameters: */                          \
-</span><span class='line'>&#9;                 : [next_sp]  "m" (next-&gt;thread.sp),                \
-</span><span class='line'>&#9;                   [next_ip]  "m" (next-&gt;thread.ip),                \
-</span><span class='line'>@@ -66,6 +85,8 @@ do {                                                  \
-</span><span class='line'>&#9;                   [prev]     "a" (prev),                           \
-</span><span class='line'>&#9;                   [next]     "d" (next)                            \
-</span><span class='line'>&#9;                                                                    \
-</span><span class='line'>+                      __switch_canary_iparam                           \
-</span><span class='line'>+                                                                       \
-</span><span class='line'>&#9;                 : /* reloaded segment registers */                 \
-</span><span class='line'>&#9;                    "memory");                                      \
-</span><span class='line'> } while (0)</span></code></pre></td></tr></table></div></figure>
-
-
-<p>前面讲过当gcc检测到堆栈溢出的时候， 会调用glibc的stack_chk_fail函数， 但是当内核堆栈发生溢出的时候，不能调用glibc的函数，所以内核自己实现了一个stack_chk_fail函数：</p>
-
-<p>kernel/panic.c</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#ifdef CONFIG_CC_STACKPROTECTOR
 </span><span class='line'>
 </span><span class='line'>/*
-</span><span class='line'> * Called when gcc's -fstack-protector feature is used, and
-</span><span class='line'> * gcc detects corruption of the on-stack canary value
+</span><span class='line'> * This expects the new RTC class driver framework, working with
+</span><span class='line'> * clocks that will often not be clones of what the PC-AT had.
+</span><span class='line'> * Use the command line to specify another RTC if you need one.
 </span><span class='line'> */
-</span><span class='line'>void __stack_chk_fail(void)
-</span><span class='line'>{
-</span><span class='line'>&#9;panic("stack-protector: Kernel stack is corrupted in: %p\n",
-</span><span class='line'>&#9;&#9; __builtin_return_address(0));
-</span><span class='line'>}
-</span><span class='line'>EXPORT_SYMBOL(__stack_chk_fail);
+</span><span class='line'>static const char default_rtc[] = "/dev/rtc0";
 </span><span class='line'>
-</span><span class='line'>#endif</span></code></pre></td></tr></table></div></figure>
-
-
-<p>当内核堆栈发生溢出的时候，就会执行stack_chk_fail函数， 内核当机。</p>
-
-<p>这就是这个补丁的原理，不懂的同学请参考：</p>
-
-<p><a href="http://git.kernel.org/?p=linux/kernel/git/next/linux-next.git;a=commitdiff;h=60a5317ff0f42dd313094b88f809f63041568b08">http://git.kernel.org/?p=linux/kernel/git/next/linux-next.git;a=commitdiff;h=60a5317ff0f42dd313094b88f809f63041568b08</a></p>
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/11/17/kernel-net-ixgbe/">ixgbe</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-11-17T15:16:00+08:00'><span class='date'>2015-11-17</span> <span class='time'>15:16:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://www.pagefault.info/?p=403">http://www.pagefault.info/?p=403</a></p>
-
-<p>这里分析的驱动代码是给予linux kernel 3.4.4</p>
-
-<p>对应的文件在drivers/net/ethernet/intel 目录下，这个分析不涉及到很细节的地方，主要目的是理解下数据在协议栈和驱动之间是如何交互的。</p>
-
-<p>首先我们知道网卡都是pci设备，因此这里每个网卡驱动其实就是一个pci驱动。并且intel这里是把好几个万兆网卡(82599/82598/x540)的驱动做在一起的。</p>
-
-<p>首先我们来看对应的pci_driver的结构体，这里每个pci驱动都是一个pci_driver的结构体，而这里是多个万兆网卡共用这个结构体ixgbe_driver.</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static struct pci_driver ixgbe_driver = {
-</span><span class='line'>&#9;.name     = ixgbe_driver_name,
-</span><span class='line'>&#9;.id_table = ixgbe_pci_tbl,
-</span><span class='line'>&#9;.probe    = ixgbe_probe,
-</span><span class='line'>&#9;.remove   = __devexit_p(ixgbe_remove),
-</span><span class='line'>#ifdef CONFIG_PM
-</span><span class='line'>&#9;.suspend  = ixgbe_suspend,
-</span><span class='line'>&#9;.resume   = ixgbe_resume,
-</span><span class='line'>#endif
-</span><span class='line'>&#9;.shutdown = ixgbe_shutdown,
-</span><span class='line'>&#9;.err_handler = &ixgbe_err_handler
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
-
-
-<p>然后是模块初始化方法,这里其实很简单，就是调用pci的驱动注册方法，把ixgbe挂载到pci设备链中。 这里不对pci设备的初始化做太多介绍，我以前的blog有这方面的介绍，想了解的可以去看看。这里我们只需要知道最终内核会调用probe回调来初始化ixgbe。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>char ixgbe_driver_name[] = "ixgbe";
-</span><span class='line'>static const char ixgbe_driver_string[] =
-</span><span class='line'>&#9;&#9;&#9;&#9;"Intel(R) 10 Gigabit PCI Express Network Driver";
-</span><span class='line'> 
-</span><span class='line'>static int __init ixgbe_init_module(void)
+</span><span class='line'>
+</span><span class='line'>int main(int argc, char **argv)
 </span><span class='line'>{
-</span><span class='line'>&#9;int ret;
-</span><span class='line'>&#9;pr_info("%s - version %s\n", ixgbe_driver_string, ixgbe_driver_version);
-</span><span class='line'>&#9;pr_info("%s\n", ixgbe_copyright);
-</span><span class='line'> 
-</span><span class='line'>#ifdef CONFIG_IXGBE_DCA
-</span><span class='line'>&#9;dca_register_notify(&dca_notifier);
-</span><span class='line'>#endif
-</span><span class='line'> 
-</span><span class='line'>&#9;ret = pci_register_driver(&ixgbe_driver);
-</span><span class='line'>&#9;return ret;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>这里不去追究具体如何调用probe的细节，我们直接来看probe函数，这个函数中通过硬件的信息来确定需要初始化那个驱动(82598/82599/x540),然后核心的驱动结构就放在下面的这个数组中。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static const struct ixgbe_info *ixgbe_info_tbl[] = {
-</span><span class='line'>&#9;[board_82598] = &ixgbe_82598_info,
-</span><span class='line'>&#9;[board_82599] = &ixgbe_82599_info,
-</span><span class='line'>&#9;[board_X540] = &ixgbe_X540_info,
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
-
-
-<p>ixgbe_probe函数很长，我们这里就不详细分析了，因为这部分就是对网卡进行初始化。不过我们关注下面几个代码片段。</p>
-
-<p>首先是根据硬件的参数来取得对应的驱动值:</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>const struct ixgbe_info *ii = ixgbe_info_tbl[ent-&gt;driver_data];</span></code></pre></td></tr></table></div></figure>
-
-
-<p>然后就是如何将不同的网卡驱动挂载到对应的回调中，这里做的很简单，就是通过对应的netdev的结构取得adapter，然后所有的核心操作都是保存在adapter中的，最后将ii的所有回调拷贝给adapter就可以了。我们来看代码：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>&#9;struct net_device *netdev;
-</span><span class='line'>&#9;struct ixgbe_adapter *adapter = NULL;
-</span><span class='line'>&#9;struct ixgbe_hw *hw;
-</span><span class='line'>&#9;.....................................
-</span><span class='line'> 
-</span><span class='line'>&#9;adapter = netdev_priv(netdev);
-</span><span class='line'>&#9;pci_set_drvdata(pdev, adapter);
-</span><span class='line'> 
-</span><span class='line'>&#9;adapter-&gt;netdev = netdev;
-</span><span class='line'>&#9;adapter-&gt;pdev = pdev;
-</span><span class='line'>&#9;hw = &adapter-&gt;hw;
-</span><span class='line'>&#9;hw-&gt;back = adapter;
-</span><span class='line'>&#9;.......................................
-</span><span class='line'>&#9;memcpy(&hw-&gt;mac.ops, ii-&gt;mac_ops, sizeof(hw-&gt;mac.ops));
-</span><span class='line'>&#9;hw-&gt;mac.type  = ii-&gt;mac;
-</span><span class='line'> 
-</span><span class='line'>&#9;/* EEPROM */
-</span><span class='line'>&#9;memcpy(&hw-&gt;eeprom.ops, ii-&gt;eeprom_ops, sizeof(hw-&gt;eeprom.ops));
-</span><span class='line'>&#9;.....................................</span></code></pre></td></tr></table></div></figure>
-
-
-<p>最后需要关注的就是设置网卡属性，这些属性一般来说都是通过ethtool 可以设置的属性(比如tso/checksum等),这里我们就截取一部分:</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>&#9;netdev-&gt;features = NETIF_F_SG |
-</span><span class='line'>&#9;&#9;&#9;   NETIF_F_IP_CSUM |
-</span><span class='line'>&#9;&#9;&#9;   NETIF_F_IPV6_CSUM |
-</span><span class='line'>&#9;&#9;&#9;   NETIF_F_HW_VLAN_TX |
-</span><span class='line'>&#9;&#9;&#9;   NETIF_F_HW_VLAN_RX |
-</span><span class='line'>&#9;&#9;&#9;   NETIF_F_HW_VLAN_FILTER |
-</span><span class='line'>&#9;&#9;&#9;   NETIF_F_TSO |
-</span><span class='line'>&#9;&#9;&#9;   NETIF_F_TSO6 |
-</span><span class='line'>&#9;&#9;&#9;   NETIF_F_RXHASH |
-</span><span class='line'>&#9;&#9;&#9;   NETIF_F_RXCSUM;
-</span><span class='line'> 
-</span><span class='line'>&#9;netdev-&gt;hw_features = netdev-&gt;features;
-</span><span class='line'> 
-</span><span class='line'>&#9;switch (adapter-&gt;hw.mac.type) {
-</span><span class='line'>&#9;case ixgbe_mac_82599EB:
-</span><span class='line'>&#9;case ixgbe_mac_X540:
-</span><span class='line'>&#9;&#9;netdev-&gt;features |= NETIF_F_SCTP_CSUM;
-</span><span class='line'>&#9;&#9;netdev-&gt;hw_features |= NETIF_F_SCTP_CSUM |
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;   NETIF_F_NTUPLE;
+</span><span class='line'>&#9;int i, fd, retval, irqcount = 0;
+</span><span class='line'>&#9;unsigned long tmp, data;
+</span><span class='line'>&#9;struct rtc_time rtc_tm;
+</span><span class='line'>&#9;const char *rtc = default_rtc;
+</span><span class='line'>
+</span><span class='line'>&#9;switch (argc) {
+</span><span class='line'>&#9;case 2:
+</span><span class='line'>&#9;&#9;rtc = argv[1];
+</span><span class='line'>&#9;&#9;/* FALLTHROUGH */
+</span><span class='line'>&#9;case 1:
 </span><span class='line'>&#9;&#9;break;
 </span><span class='line'>&#9;default:
-</span><span class='line'>&#9;&#9;break;
+</span><span class='line'>&#9;&#9;fprintf(stderr, "usage:  rtctest [rtcdev]\n");
+</span><span class='line'>&#9;&#9;return 1;
 </span><span class='line'>&#9;}
-</span><span class='line'> 
-</span><span class='line'>&#9;netdev-&gt;hw_features |= NETIF_F_RXALL;
-</span><span class='line'>&#9;..................................................
-</span><span class='line'> 
-</span><span class='line'>&#9;netdev-&gt;priv_flags |= IFF_UNICAST_FLT;
-</span><span class='line'>&#9;netdev-&gt;priv_flags |= IFF_SUPP_NOFCS;
-</span><span class='line'> 
-</span><span class='line'>&#9;if (adapter-&gt;flags & IXGBE_FLAG_SRIOV_ENABLED)
-</span><span class='line'>&#9;&#9;adapter-&gt;flags &= ~(IXGBE_FLAG_RSS_ENABLED |
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;IXGBE_FLAG_DCB_ENABLED);
-</span><span class='line'>&#9;...................................................................
-</span><span class='line'>&#9;if (pci_using_dac) {
-</span><span class='line'>&#9;&#9;netdev-&gt;features |= NETIF_F_HIGHDMA;
-</span><span class='line'>&#9;&#9;netdev-&gt;vlan_features |= NETIF_F_HIGHDMA;
+</span><span class='line'>
+</span><span class='line'>&#9;fd = open(rtc, O_RDONLY);
+</span><span class='line'>
+</span><span class='line'>&#9;if (fd ==  -1) {
+</span><span class='line'>&#9;&#9;perror(rtc);
+</span><span class='line'>&#9;&#9;exit(errno);
 </span><span class='line'>&#9;}
-</span><span class='line'> 
-</span><span class='line'>&#9;if (adapter-&gt;flags2 & IXGBE_FLAG2_RSC_CAPABLE)
-</span><span class='line'>&#9;&#9;netdev-&gt;hw_features |= NETIF_F_LRO;
-</span><span class='line'>&#9;if (adapter-&gt;flags2 & IXGBE_FLAG2_RSC_ENABLED)
-</span><span class='line'>&#9;&#9;netdev-&gt;features |= NETIF_F_LRO;</span></code></pre></td></tr></table></div></figure>
-
-
-<p>然后我们来看下中断的注册，因为万兆网卡大部分都是多对列网卡(配合msix)，因此对于上层软件来说，就好像有多个网卡一样，它们之间的数据是相互独立的，这里读的话主要是napi驱动的poll方法，后面我们会分析这个.</p>
-
-<p>到了这里或许要问那么网卡是如何挂载回调给上层，从而上层来发送数据呢，这里是这样子的，每个网络设备都有一个回调函数表(比如ndo_start_xmit)来供上层调用，而在ixgbe中的话，就是ixgbe_netdev_ops，下面就是这个结构，不过只是截取了我们很感兴趣的几个地方.</p>
-
-<p>不过这里注意，读回调并不在里面，这是因为写是软件主动的，而读则是硬件主动的。现在ixgbe是NAPI的，因此它的poll回调是ixgbe_poll，是中断注册时候通过netif_napi_add添加进去的。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static const struct net_device_ops ixgbe_netdev_ops = {
-</span><span class='line'>&#9;.ndo_open       = ixgbe_open,
-</span><span class='line'>&#9;.ndo_stop       = ixgbe_close,
-</span><span class='line'>&#9;.ndo_start_xmit     = ixgbe_xmit_frame,
-</span><span class='line'>&#9;.ndo_select_queue   = ixgbe_select_queue,
-</span><span class='line'>&#9;.ndo_set_rx_mode    = ixgbe_set_rx_mode,
-</span><span class='line'>&#9;.ndo_validate_addr  = eth_validate_addr,
-</span><span class='line'>&#9;.ndo_set_mac_address    = ixgbe_set_mac,
-</span><span class='line'>&#9;.ndo_change_mtu     = ixgbe_change_mtu,
-</span><span class='line'>&#9;.ndo_tx_timeout     = ixgbe_tx_timeout,
-</span><span class='line'>&#9;.................................................
-</span><span class='line'>&#9;.ndo_set_features = ixgbe_set_features,
-</span><span class='line'>&#9;.ndo_fix_features = ixgbe_fix_features,
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
-
-
-<p>这里我们最关注的其实就是ndo_start_xmit回调，这个回调就是驱动提供给协议栈的发送回调接口。我们来看这个函数.</p>
-
-<p>它的实现很简单，就是选取对应的队列，然后调用ixgbe_xmit_frame_ring来发送数据。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static netdev_tx_t ixgbe_xmit_frame(struct sk_buff *skb,
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;struct net_device *netdev)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct ixgbe_adapter *adapter = netdev_priv(netdev);
-</span><span class='line'>&#9;struct ixgbe_ring *tx_ring;
-</span><span class='line'> 
-</span><span class='line'>&#9;if (skb-&gt;len &lt;= 0) {
-</span><span class='line'>&#9;&#9;dev_kfree_skb_any(skb);
-</span><span class='line'>&#9;&#9;return NETDEV_TX_OK;
+</span><span class='line'>
+</span><span class='line'>&#9;fprintf(stderr, "\n\t\t\tRTC Driver Test Example.\n\n");
+</span><span class='line'>
+</span><span class='line'>&#9;/* Turn on update interrupts (one per second) */
+</span><span class='line'>&#9;retval = ioctl(fd, RTC_UIE_ON, 0);
+</span><span class='line'>&#9;if (retval == -1) {
+</span><span class='line'>&#9;&#9;if (errno == ENOTTY) {
+</span><span class='line'>&#9;&#9;&#9;fprintf(stderr,
+</span><span class='line'>&#9;&#9;&#9;&#9;"\n...Update IRQs not supported.\n");
+</span><span class='line'>&#9;&#9;&#9;goto test_READ;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;perror("RTC_UIE_ON ioctl");
+</span><span class='line'>&#9;&#9;exit(errno);
 </span><span class='line'>&#9;}
-</span><span class='line'> 
-</span><span class='line'>&#9;/*
-</span><span class='line'>&#9; * The minimum packet size for olinfo paylen is 17 so pad the skb
-</span><span class='line'>&#9; * in order to meet this minimum size requirement.
-</span><span class='line'>&#9; */
-</span><span class='line'>&#9;if (skb-&gt;len &lt; 17) {
-</span><span class='line'>&#9;&#9;if (skb_padto(skb, 17))
-</span><span class='line'>&#9;&#9;&#9;return NETDEV_TX_OK;
-</span><span class='line'>&#9;&#9;skb-&gt;len = 17;
+</span><span class='line'>
+</span><span class='line'>&#9;fprintf(stderr, "Counting 5 update (1/sec) interrupts from reading %s:",
+</span><span class='line'>&#9;&#9;&#9;rtc);
+</span><span class='line'>&#9;fflush(stderr);
+</span><span class='line'>&#9;for (i=1; i&lt;6; i++) {
+</span><span class='line'>&#9;&#9;/* This read will block */
+</span><span class='line'>&#9;&#9;retval = read(fd, &data, sizeof(unsigned long));
+</span><span class='line'>&#9;&#9;if (retval == -1) {
+</span><span class='line'>&#9;&#9;&#9;perror("read");
+</span><span class='line'>&#9;&#9;&#9;exit(errno);
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;fprintf(stderr, " %d",i);
+</span><span class='line'>&#9;&#9;fflush(stderr);
+</span><span class='line'>&#9;&#9;irqcount++;
 </span><span class='line'>&#9;}
-</span><span class='line'>&#9;//取得对应的队列
-</span><span class='line'>&#9;tx_ring = adapter-&gt;tx_ring[skb-&gt;queue_mapping];
-</span><span class='line'>&#9;//发送数据
-</span><span class='line'>&#9;return ixgbe_xmit_frame_ring(skb, adapter, tx_ring);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>而在ixgbe_xmit_frame_ring中，我们就关注两个地方，一个是tso(什么是TSO，请自行google)，一个是如何发送.</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>&#9;tso = ixgbe_tso(tx_ring, first, &hdr_len);
-</span><span class='line'>&#9;if (tso &lt; 0)
-</span><span class='line'>&#9;&#9;goto out_drop;
-</span><span class='line'>&#9;else if (!tso)
-</span><span class='line'>&#9;&#9;ixgbe_tx_csum(tx_ring, first);
-</span><span class='line'> 
-</span><span class='line'>&#9;/* add the ATR filter if ATR is on */
-</span><span class='line'>&#9;if (test_bit(__IXGBE_TX_FDIR_INIT_DONE, &tx_ring-&gt;state))
-</span><span class='line'>&#9;&#9;ixgbe_atr(tx_ring, first);
-</span><span class='line'> 
-</span><span class='line'>#ifdef IXGBE_FCOE
-</span><span class='line'>xmit_fcoe:
-</span><span class='line'>#endif /* IXGBE_FCOE */
-</span><span class='line'>&#9;ixgbe_tx_map(tx_ring, first, hdr_len);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>调用ixgbe_tso处理完tso之后，就会调用ixgbe_tx_map来发送数据。而ixgbe_tx_map所做的最主要是两步，第一步请求DMA，第二步写寄存器，通知网卡发送数据.</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>&#9;dma = dma_map_single(tx_ring-&gt;dev, skb-&gt;data, size, DMA_TO_DEVICE);
-</span><span class='line'>&#9;if (dma_mapping_error(tx_ring-&gt;dev, dma))
-</span><span class='line'>&#9;&#9;goto dma_error;
-</span><span class='line'> 
-</span><span class='line'>&#9;/* record length, and DMA address */
-</span><span class='line'>&#9;dma_unmap_len_set(first, len, size);
-</span><span class='line'>&#9;dma_unmap_addr_set(first, dma, dma);
-</span><span class='line'> 
-</span><span class='line'>&#9;tx_desc-&gt;read.buffer_addr = cpu_to_le64(dma);
-</span><span class='line'> 
-</span><span class='line'>&#9;for (;;) {
-</span><span class='line'>&#9;&#9;while (unlikely(size &gt; IXGBE_MAX_DATA_PER_TXD)) {
-</span><span class='line'>&#9;&#9;&#9;tx_desc-&gt;read.cmd_type_len =
-</span><span class='line'>&#9;&#9;&#9;&#9;cmd_type | cpu_to_le32(IXGBE_MAX_DATA_PER_TXD);
-</span><span class='line'> 
-</span><span class='line'>&#9;&#9;&#9;i++;
-</span><span class='line'>&#9;&#9;&#9;tx_desc++;
-</span><span class='line'>&#9;&#9;&#9;if (i == tx_ring-&gt;count) {
-</span><span class='line'>&#9;&#9;&#9;&#9;tx_desc = IXGBE_TX_DESC(tx_ring, 0);
-</span><span class='line'>&#9;&#9;&#9;&#9;i = 0;
+</span><span class='line'>
+</span><span class='line'>&#9;fprintf(stderr, "\nAgain, from using select(2) on /dev/rtc:");
+</span><span class='line'>&#9;fflush(stderr);
+</span><span class='line'>&#9;for (i=1; i&lt;6; i++) {
+</span><span class='line'>&#9;&#9;struct timeval tv = {5, 0};     /* 5 second timeout on select */
+</span><span class='line'>&#9;&#9;fd_set readfds;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;FD_ZERO(&readfds);
+</span><span class='line'>&#9;&#9;FD_SET(fd, &readfds);
+</span><span class='line'>&#9;&#9;/* The select will wait until an RTC interrupt happens. */
+</span><span class='line'>&#9;&#9;retval = select(fd+1, &readfds, NULL, NULL, &tv);
+</span><span class='line'>&#9;&#9;if (retval == -1) {
+</span><span class='line'>&#9;&#9;&#9;    perror("select");
+</span><span class='line'>&#9;&#9;&#9;    exit(errno);
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;/* This read won't block unlike the select-less case above. */
+</span><span class='line'>&#9;&#9;retval = read(fd, &data, sizeof(unsigned long));
+</span><span class='line'>&#9;&#9;if (retval == -1) {
+</span><span class='line'>&#9;&#9;&#9;    perror("read");
+</span><span class='line'>&#9;&#9;&#9;    exit(errno);
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;fprintf(stderr, " %d",i);
+</span><span class='line'>&#9;&#9;fflush(stderr);
+</span><span class='line'>&#9;&#9;irqcount++;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;/* Turn off update interrupts */
+</span><span class='line'>&#9;retval = ioctl(fd, RTC_UIE_OFF, 0);
+</span><span class='line'>&#9;if (retval == -1) {
+</span><span class='line'>&#9;&#9;perror("RTC_UIE_OFF ioctl");
+</span><span class='line'>&#9;&#9;exit(errno);
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>test_READ:
+</span><span class='line'>&#9;/* Read the RTC time/date */
+</span><span class='line'>&#9;retval = ioctl(fd, RTC_RD_TIME, &rtc_tm);
+</span><span class='line'>&#9;if (retval == -1) {
+</span><span class='line'>&#9;&#9;perror("RTC_RD_TIME ioctl");
+</span><span class='line'>&#9;&#9;exit(errno);
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;fprintf(stderr, "\n\nCurrent RTC date/time is %d-%d-%d, %02d:%02d:%02d.\n",
+</span><span class='line'>&#9;&#9;rtc_tm.tm_mday, rtc_tm.tm_mon + 1, rtc_tm.tm_year + 1900,
+</span><span class='line'>&#9;&#9;rtc_tm.tm_hour, rtc_tm.tm_min, rtc_tm.tm_sec);
+</span><span class='line'>
+</span><span class='line'>&#9;/* Set the alarm to 5 sec in the future, and check for rollover */
+</span><span class='line'>&#9;rtc_tm.tm_sec += 5;
+</span><span class='line'>&#9;if (rtc_tm.tm_sec &gt;= 60) {
+</span><span class='line'>&#9;&#9;rtc_tm.tm_sec %= 60;
+</span><span class='line'>&#9;&#9;rtc_tm.tm_min++;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;if (rtc_tm.tm_min == 60) {
+</span><span class='line'>&#9;&#9;rtc_tm.tm_min = 0;
+</span><span class='line'>&#9;&#9;rtc_tm.tm_hour++;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;if (rtc_tm.tm_hour == 24)
+</span><span class='line'>&#9;&#9;rtc_tm.tm_hour = 0;
+</span><span class='line'>
+</span><span class='line'>&#9;retval = ioctl(fd, RTC_ALM_SET, &rtc_tm);
+</span><span class='line'>&#9;if (retval == -1) {
+</span><span class='line'>&#9;&#9;if (errno == ENOTTY) {
+</span><span class='line'>&#9;&#9;&#9;fprintf(stderr,
+</span><span class='line'>&#9;&#9;&#9;&#9;"\n...Alarm IRQs not supported.\n");
+</span><span class='line'>&#9;&#9;&#9;goto test_PIE;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;perror("RTC_ALM_SET ioctl");
+</span><span class='line'>&#9;&#9;exit(errno);
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;/* Read the current alarm settings */
+</span><span class='line'>&#9;retval = ioctl(fd, RTC_ALM_READ, &rtc_tm);
+</span><span class='line'>&#9;if (retval == -1) {
+</span><span class='line'>&#9;&#9;perror("RTC_ALM_READ ioctl");
+</span><span class='line'>&#9;&#9;exit(errno);
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;fprintf(stderr, "Alarm time now set to %02d:%02d:%02d.\n",
+</span><span class='line'>&#9;&#9;rtc_tm.tm_hour, rtc_tm.tm_min, rtc_tm.tm_sec);
+</span><span class='line'>
+</span><span class='line'>&#9;/* Enable alarm interrupts */
+</span><span class='line'>&#9;retval = ioctl(fd, RTC_AIE_ON, 0);
+</span><span class='line'>&#9;if (retval == -1) {
+</span><span class='line'>&#9;&#9;perror("RTC_AIE_ON ioctl");
+</span><span class='line'>&#9;&#9;exit(errno);
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;fprintf(stderr, "Waiting 5 seconds for alarm...");
+</span><span class='line'>&#9;fflush(stderr);
+</span><span class='line'>&#9;/* This blocks until the alarm ring causes an interrupt */
+</span><span class='line'>&#9;retval = read(fd, &data, sizeof(unsigned long));
+</span><span class='line'>&#9;if (retval == -1) {
+</span><span class='line'>&#9;&#9;perror("read");
+</span><span class='line'>&#9;&#9;exit(errno);
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;irqcount++;
+</span><span class='line'>&#9;fprintf(stderr, " okay. Alarm rang.\n");
+</span><span class='line'>
+</span><span class='line'>&#9;/* Disable alarm interrupts */
+</span><span class='line'>&#9;retval = ioctl(fd, RTC_AIE_OFF, 0);
+</span><span class='line'>&#9;if (retval == -1) {
+</span><span class='line'>&#9;&#9;perror("RTC_AIE_OFF ioctl");
+</span><span class='line'>&#9;&#9;exit(errno);
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>test_PIE:
+</span><span class='line'>&#9;/* Read periodic IRQ rate */
+</span><span class='line'>&#9;retval = ioctl(fd, RTC_IRQP_READ, &tmp);
+</span><span class='line'>&#9;if (retval == -1) {
+</span><span class='line'>&#9;&#9;/* not all RTCs support periodic IRQs */
+</span><span class='line'>&#9;&#9;if (errno == ENOTTY) {
+</span><span class='line'>&#9;&#9;&#9;fprintf(stderr, "\nNo periodic IRQ support\n");
+</span><span class='line'>&#9;&#9;&#9;goto done;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;perror("RTC_IRQP_READ ioctl");
+</span><span class='line'>&#9;&#9;exit(errno);
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;fprintf(stderr, "\nPeriodic IRQ rate is %ldHz.\n", tmp);
+</span><span class='line'>
+</span><span class='line'>&#9;fprintf(stderr, "Counting 20 interrupts at:");
+</span><span class='line'>&#9;fflush(stderr);
+</span><span class='line'>
+</span><span class='line'>&#9;/* The frequencies 128Hz, 256Hz, ... 8192Hz are only allowed for root. */
+</span><span class='line'>&#9;for (tmp=2; tmp&lt;=64; tmp*=2) {
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;retval = ioctl(fd, RTC_IRQP_SET, tmp);
+</span><span class='line'>&#9;&#9;if (retval == -1) {
+</span><span class='line'>&#9;&#9;&#9;/* not all RTCs can change their periodic IRQ rate */
+</span><span class='line'>&#9;&#9;&#9;if (errno == ENOTTY) {
+</span><span class='line'>&#9;&#9;&#9;&#9;fprintf(stderr,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;"\n...Periodic IRQ rate is fixed\n");
+</span><span class='line'>&#9;&#9;&#9;&#9;goto done;
 </span><span class='line'>&#9;&#9;&#9;}
-</span><span class='line'> 
-</span><span class='line'>&#9;&#9;&#9;dma += IXGBE_MAX_DATA_PER_TXD;
-</span><span class='line'>&#9;&#9;&#9;size -= IXGBE_MAX_DATA_PER_TXD;
-</span><span class='line'> 
-</span><span class='line'>&#9;&#9;&#9;tx_desc-&gt;read.buffer_addr = cpu_to_le64(dma);
-</span><span class='line'>&#9;&#9;&#9;tx_desc-&gt;read.olinfo_status = 0;
+</span><span class='line'>&#9;&#9;&#9;perror("RTC_IRQP_SET ioctl");
+</span><span class='line'>&#9;&#9;&#9;exit(errno);
 </span><span class='line'>&#9;&#9;}
-</span><span class='line'> 
-</span><span class='line'>&#9;&#9;...................................................
-</span><span class='line'>&#9;&#9;data_len -= size;
-</span><span class='line'> 
-</span><span class='line'>&#9;&#9;dma = skb_frag_dma_map(tx_ring-&gt;dev, frag, 0, size,
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;   DMA_TO_DEVICE);
-</span><span class='line'>&#9;&#9;..........................................................
-</span><span class='line'> 
-</span><span class='line'>&#9;&#9;frag++;
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;.................................
-</span><span class='line'>&#9;tx_ring-&gt;next_to_use = i;
-</span><span class='line'> 
-</span><span class='line'>&#9;/* notify HW of packet */
-</span><span class='line'>&#9;writel(i, tx_ring-&gt;tail);
-</span><span class='line'>&#9;.................</span></code></pre></td></tr></table></div></figure>
-
-
-<p>上面的操作是异步的，也就是说此时内核还不能释放SKB，而是网卡硬件发送完数据之后，会再次产生中断通知内核，然后内核才能释放内存.接下来我们来看这部分代码。</p>
-
-<p>首先来看的是中断注册的代码，这里我们假设启用了MSIX,那么网卡的中断注册回调就是ixgbe_request_msix_irqs函数，这里我们可以看到调用request_irq函数来注册回调，并且每个队列都有自己的中断号。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static int ixgbe_request_msix_irqs(struct ixgbe_adapter *adapter)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct net_device *netdev = adapter-&gt;netdev;
-</span><span class='line'>&#9;int q_vectors = adapter-&gt;num_msix_vectors - NON_Q_VECTORS;
-</span><span class='line'>&#9;int vector, err;
-</span><span class='line'>&#9;int ri = 0, ti = 0;
-</span><span class='line'> 
-</span><span class='line'>&#9;for (vector = 0; vector &lt; q_vectors; vector++) {
-</span><span class='line'>&#9;&#9;struct ixgbe_q_vector *q_vector = adapter-&gt;q_vector[vector];
-</span><span class='line'>&#9;&#9;struct msix_entry *entry = &adapter-&gt;msix_entries[vector];
-</span><span class='line'>&#9;&#9;.......................................................................
-</span><span class='line'>&#9;&#9;err = request_irq(entry-&gt;vector, &ixgbe_msix_clean_rings, 0,
-</span><span class='line'>&#9;&#9;&#9;&#9;  q_vector-&gt;name, q_vector);
-</span><span class='line'>&#9;&#9;if (err) {
-</span><span class='line'>&#9;&#9;&#9;e_err(probe, "request_irq failed for MSIX interrupt "
-</span><span class='line'>&#9;&#9;&#9;&#9;  "Error: %d\n", err);
-</span><span class='line'>&#9;&#9;&#9;goto free_queue_irqs;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;fprintf(stderr, "\n%ldHz:\t", tmp);
+</span><span class='line'>&#9;&#9;fflush(stderr);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;/* Enable periodic interrupts */
+</span><span class='line'>&#9;&#9;retval = ioctl(fd, RTC_PIE_ON, 0);
+</span><span class='line'>&#9;&#9;if (retval == -1) {
+</span><span class='line'>&#9;&#9;&#9;perror("RTC_PIE_ON ioctl");
+</span><span class='line'>&#9;&#9;&#9;exit(errno);
 </span><span class='line'>&#9;&#9;}
-</span><span class='line'>&#9;&#9;/* If Flow Director is enabled, set interrupt affinity */
-</span><span class='line'>&#9;&#9;if (adapter-&gt;flags & IXGBE_FLAG_FDIR_HASH_CAPABLE) {
-</span><span class='line'>&#9;&#9;&#9;/* assign the mask for this irq */
-</span><span class='line'>&#9;&#9;&#9;irq_set_affinity_hint(entry-&gt;vector,
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;  &q_vector-&gt;affinity_mask);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;for (i=1; i&lt;21; i++) {
+</span><span class='line'>&#9;&#9;&#9;/* This blocks */
+</span><span class='line'>&#9;&#9;&#9;retval = read(fd, &data, sizeof(unsigned long));
+</span><span class='line'>&#9;&#9;&#9;if (retval == -1) {
+</span><span class='line'>&#9;&#9;&#9;&#9;perror("read");
+</span><span class='line'>&#9;&#9;&#9;&#9;exit(errno);
+</span><span class='line'>&#9;&#9;&#9;}
+</span><span class='line'>&#9;&#9;&#9;fprintf(stderr, " %d",i);
+</span><span class='line'>&#9;&#9;&#9;fflush(stderr);
+</span><span class='line'>&#9;&#9;&#9;irqcount++;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;/* Disable periodic interrupts */
+</span><span class='line'>&#9;&#9;retval = ioctl(fd, RTC_PIE_OFF, 0);
+</span><span class='line'>&#9;&#9;if (retval == -1) {
+</span><span class='line'>&#9;&#9;&#9;perror("RTC_PIE_OFF ioctl");
+</span><span class='line'>&#9;&#9;&#9;exit(errno);
 </span><span class='line'>&#9;&#9;}
 </span><span class='line'>&#9;}
-</span><span class='line'> 
-</span><span class='line'>&#9;..............................................
-</span><span class='line'> 
-</span><span class='line'>&#9;return 0;
-</span><span class='line'> 
-</span><span class='line'>free_queue_irqs:
-</span><span class='line'>&#9;...............................
-</span><span class='line'>&#9;return err;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>而对应的中断回调是ixgbe_msix_clean_rings,而这个函数呢，做的事情很简单(需要熟悉NAPI的原理，我以前的blog有介绍),就是调用napi_schedule来重新加入软中断处理.</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static irqreturn_t ixgbe_msix_clean_rings(int irq, void *data)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct ixgbe_q_vector *q_vector = data;
-</span><span class='line'> 
-</span><span class='line'>&#9;/* EIAM disabled interrupts (on this vector) for us */
-</span><span class='line'> 
-</span><span class='line'>&#9;if (q_vector-&gt;rx.ring || q_vector-&gt;tx.ring)
-</span><span class='line'>&#9;&#9;napi_schedule(&q_vector-&gt;napi);
-</span><span class='line'> 
-</span><span class='line'>&#9;return IRQ_HANDLED;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>而NAPI驱动我们知道，最终是会调用网卡驱动挂载的poll回调，在ixgbe中，对应的回调就是ixgbe_poll，那么也就是说这个函数要做两个工作，一个是处理读，一个是处理写完之后的清理.</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>int ixgbe_poll(struct napi_struct *napi, int budget)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct ixgbe_q_vector *q_vector =
-</span><span class='line'>&#9;&#9;&#9;&#9;container_of(napi, struct ixgbe_q_vector, napi);
-</span><span class='line'>&#9;struct ixgbe_adapter *adapter = q_vector-&gt;adapter;
-</span><span class='line'>&#9;struct ixgbe_ring *ring;
-</span><span class='line'>&#9;int per_ring_budget;
-</span><span class='line'>&#9;bool clean_complete = true;
-</span><span class='line'> 
-</span><span class='line'>#ifdef CONFIG_IXGBE_DCA
-</span><span class='line'>&#9;if (adapter-&gt;flags & IXGBE_FLAG_DCA_ENABLED)
-</span><span class='line'>&#9;&#9;ixgbe_update_dca(q_vector);
-</span><span class='line'>#endif
-</span><span class='line'>&#9;//清理写
-</span><span class='line'>&#9;ixgbe_for_each_ring(ring, q_vector-&gt;tx)
-</span><span class='line'>&#9;&#9;clean_complete &= !!ixgbe_clean_tx_irq(q_vector, ring);
-</span><span class='line'> 
-</span><span class='line'>&#9;/* attempt to distribute budget to each queue fairly, but don't allow
-</span><span class='line'>&#9; * the budget to go below 1 because we'll exit polling */
-</span><span class='line'>&#9;if (q_vector-&gt;rx.count &gt; 1)
-</span><span class='line'>&#9;&#9;per_ring_budget = max(budget/q_vector-&gt;rx.count, 1);
-</span><span class='line'>&#9;else
-</span><span class='line'>&#9;&#9;per_ring_budget = budget;
-</span><span class='line'>&#9;//读数据，并清理已完成的
-</span><span class='line'>&#9;ixgbe_for_each_ring(ring, q_vector-&gt;rx)
-</span><span class='line'>&#9;&#9;clean_complete &= ixgbe_clean_rx_irq(q_vector, ring,
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9; per_ring_budget);
-</span><span class='line'> 
-</span><span class='line'>&#9;/* If all work not completed, return budget and keep polling */
-</span><span class='line'>&#9;if (!clean_complete)
-</span><span class='line'>&#9;&#9;return budget;
-</span><span class='line'> 
-</span><span class='line'>&#9;/* all work done, exit the polling mode */
-</span><span class='line'>&#9;napi_complete(napi);
-</span><span class='line'>&#9;if (adapter-&gt;rx_itr_setting & 1)
-</span><span class='line'>&#9;&#9;ixgbe_set_itr(q_vector);
-</span><span class='line'>&#9;if (!test_bit(__IXGBE_DOWN, &adapter-&gt;state))
-</span><span class='line'>&#9;&#9;ixgbe_irq_enable_queues(adapter, ((u64)1 &lt;&lt; q_vector-&gt;v_idx));
-</span><span class='line'> 
+</span><span class='line'>
+</span><span class='line'>done:
+</span><span class='line'>&#9;fprintf(stderr, "\n\n\t\t\t *** Test complete ***\n");
+</span><span class='line'>
+</span><span class='line'>&#9;close(fd);
+</span><span class='line'>
 </span><span class='line'>&#9;return 0;
 </span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
@@ -1423,7 +947,7 @@ var ss360Config = {
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2015/11/17/kernel-net-cubic/">cubic</a></h2>
+      <h2 class="entry-title"><a href="/blog/2016/01/12/debug-kdump-rtc/">kdump时间错误</a></h2>
     
     
       <p class="meta">
@@ -1432,43 +956,16 @@ var ss360Config = {
 
 
 
-<time class='entry-date' datetime='2015-11-17T15:08:00+08:00'><span class='date'>2015-11-17</span> <span class='time'>15:08:00</span></time>
+<time class='entry-date' datetime='2016-01-12T15:39:00+08:00'><span class='date'>2016-01-12</span> <span class='time'>15:39:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><p><a href="http://www.pagefault.info/?p=145">http://www.pagefault.info/?p=145</a></p>
+  <div class="entry-content"><p><a href="/blog/2016/01/06/debug-mark-rtc/">CentOS 5.x安装新内核之后时钟混乱问题</a></p>
 
-<p>这次主要来看一下内核拥塞控制算法cubic的实现，在linux kernel中实现了很多种拥塞控制算法，不过新的内核(2.6.19之后)默认是cubic(想得到当前内核使用的拥塞控制算法可以察看/proc/sys/net/ipv4/tcp_congestion_control这个值).下面是最新的redhat 6的拥塞控制算法(rh5还是bic算法):</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>[root@rhel6 ~]# cat /proc/sys/net/ipv4/tcp_congestion_control 
-</span><span class='line'>cubic</span></code></pre></td></tr></table></div></figure>
-
-
-<p>这个算法的paper在这里：</p>
-
-<p><a href="http://netsrv.csc.ncsu.edu/export/cubic_a_new_tcp_2008.pdf">http://netsrv.csc.ncsu.edu/export/cubic_a_new_tcp_2008.pdf</a></p>
-
-<p>拥塞控制算法会在tcp_ack中被调用，如果是正常的ack(比如不是重复的，不是sack等等)就会进入拥塞控制算法。</p>
-
-<p>cubic会调用tcp_slow_start这个方法(基本上每种拥塞控制算法都会调用它)，这个方法主要是处理slow start，而内核中的slow start是这样子的，接收一个ack，snd_cwnd就会加1，然后当cwnd大于设置的拥塞窗口阀值snd_ssthresh的时候，就会进入拥塞避免状态。而在发送数据包的时候，会判断in_flight(可以认为是发送还没确认的数据包，它等于发送未确认的数据包－sack的数据段－丢失的数据段＋重传的数据段，我的前面的blog有详细解释这个数据段)是否大于snd_cwnd,如果大于等于则不会发送数据，如果小于才会继续发送数据。</p>
-
-<p>而进入拥塞避免状态之后，窗口的增长速度将会减缓，</p>
-
-<p>来看一下我用jprobe hook tcp_slow_start(slow start处理函数) 和 tcp_cong_avoid_ai (拥塞避免处理)的数据。</p>
-
-<p>在下面的数据中sk表示当前socket的地址， in_flight packet表示发送还未接收的包, snd_cwnd表示发送拥塞窗口。
-然后详细解释下count后面的两个值，其中第一个是snd_cwnd_cnt，表示在当前的拥塞窗口中已经发送的数据段的个数，而第二个是struct bictcp的一个域cnt，它是cubic拥塞算法的核心，主要用来控制在拥塞避免状态的时候，什么时候才能增大拥塞窗口，具体实现是通过比较它和snd_cwnd_cnt，来决定是否增大拥塞窗口，而这个值的计算，我这里不会分析，想了解的，可以去看cubic的paper。</p>
-
-<p>还有一个需要注意的地方就是ssthresh，可以看到这个值在一开始初始化为一个最大的值，然后在进入拥塞避免状态的时候被设置为前一次拥塞窗口的大小.这个处理可以看rfc2581的这段：</p>
-
-<p>  The initial value of ssthresh may be arbitrarily high (i.e., the size of the advertised window), but it may be reduced in response to congestion. When cwnd &lt; ssthresh, the slow-start algorithm is used and when cwnd > ssthresh, the congestion avoidance algorithm is used. When cwnd and ssthresh are equal, the sender may use either of them.</p>
-
-<p>我们后面会看到这个值在cubic中是如何被设置的。</p>
+<p>解决kdump的vmcore保存的目录的时间错误问题</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -1495,301 +992,31 @@ var ss360Config = {
 <span class='line-number'>23</span>
 <span class='line-number'>24</span>
 <span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>//进入slow start，可以看到拥塞窗口默认初始值是3，然后每次接收到ack，都会加1.
-</span><span class='line'>enter [slow start state] tcp_sock is 4129562112 in_flight packets is 2, snd_cwnd is 3, ssthresh is 2147483647, count is [0:0]
-</span><span class='line'>enter [slow start state] tcp_sock is 4129562112 in_flight packets is 3, snd_cwnd is 4, ssthresh is 2147483647, count is [0:0]
-</span><span class='line'>enter [slow start state] tcp_sock is 4129562112 in_flight packets is 4, snd_cwnd is 5, ssthresh is 2147483647, count is [0:0]
-</span><span class='line'>enter [slow start state] tcp_sock is 4129562112 in_flight packets is 5, snd_cwnd is 6, ssthresh is 2147483647, count is [0:0]
-</span><span class='line'>enter [slow start state] tcp_sock is 4129562112 in_flight packets is 4, snd_cwnd is 7, ssthresh is 2147483647, count is [0:0]
-</span><span class='line'>enter [slow start state] tcp_sock is 4129562112 in_flight packets is 7, snd_cwnd is 8, ssthresh is 2147483647, count is [0:0]
-</span><span class='line'>enter [slow start state] tcp_sock is 4129562112 in_flight packets is 6, snd_cwnd is 9, ssthresh is 2147483647, count is [0:0]
-</span><span class='line'>enter [slow start state] tcp_sock is 4129562112 in_flight packets is 9, snd_cwnd is 10, ssthresh is 2147483647, count is [0:0]
-</span><span class='line'>enter [slow start state] tcp_sock is 4129562112 in_flight packets is 10, snd_cwnd is 11, ssthresh is 2147483647, count is [0:0]
-</span><span class='line'>enter [slow start state] tcp_sock is 4129562112 in_flight packets is 11, snd_cwnd is 12, ssthresh is 2147483647, count is [0:0]
-</span><span class='line'>enter [slow start state] tcp_sock is 4129562112 in_flight packets is 10, snd_cwnd is 13, ssthresh is 2147483647, count is [0:0]
-</span><span class='line'>enter [slow start state] tcp_sock is 4129562112 in_flight packets is 9, snd_cwnd is 14, ssthresh is 2147483647, count is [0:0]
-</span><span class='line'>enter [slow start state] tcp_sock is 4129562112 in_flight packets is 14, snd_cwnd is 15, ssthresh is 2147483647, count is [0:0]
-</span><span class='line'>//ssthresh被更新为当前拥塞窗口的大小，后面会看到为什么是16
-</span><span class='line'>enter [slow start state] tcp_sock is 4129562112 in_flight packets is 13, snd_cwnd is 16, ssthresh is 16, count is [0:0]
-</span><span class='line'>//进入拥塞避免，可以清楚的看到，此时拥塞窗口大于对应的阀值ssthresh.
-</span><span class='line'>enter [cong avoid state] tcp_sock is 4129562112 in_flight packets is 16, snd_cwnd is 17, ssthresh is 16, count is [0:877]
-</span><span class='line'>enter [cong avoid state] tcp_sock is 4129562112 in_flight packets is 15, snd_cwnd is 17, ssthresh is 16, count is [1:877]
-</span><span class='line'>enter [cong avoid state] tcp_sock is 4129562112 in_flight packets is 16, snd_cwnd is 17, ssthresh is 16, count is [2:877]
-</span><span class='line'>enter [cong avoid state] tcp_sock is 4129562112 in_flight packets is 15, snd_cwnd is 17, ssthresh is 16, count is [3:877]
-</span><span class='line'>enter [cong avoid state] tcp_sock is 4129562112 in_flight packets is 14, snd_cwnd is 17, ssthresh is 16, count is [4:877]
-</span><span class='line'>enter [cong avoid state] tcp_sock is 4129562112 in_flight packets is 13, snd_cwnd is 17, ssthresh is 16, count is [5:877]
-</span><span class='line'>//这里注意，其中count的第一个值是一直线性增长的，也就是说下面省略了大概80条log，而在这80几次中拥塞窗口一直维持在17没有变化
-</span><span class='line'>....................................................................................................................
-</span><span class='line'>//可以看到cnt变为3，也就是说明当执行完拥塞避免就会增加窗口了。
-</span><span class='line'>enter [cong avoid state] tcp_sock is 4129562112 in_flight packets is 13, snd_cwnd is 17, ssthresh is 16, count is [91:3]
-</span><span class='line'>//增加窗口的大小，然后将snd_cwnd_cnt reset为0.
-</span><span class='line'>enter [cong avoid state] tcp_sock is 4129562112 in_flight packets is 11, snd_cwnd is 18, ssthresh is 16, count is [0:6]
-</span><span class='line'>enter [cong avoid state] tcp_sock is 4129562112 in_flight packets is 16, snd_cwnd is 18, ssthresh is 16, count is [1:6]
-</span><span class='line'>enter [cong avoid state] tcp_sock is 4129562112 in_flight packets is 14, snd_cwnd is 18, ssthresh is 16, count is [2:6]
-</span><span class='line'>enter [cong avoid state] tcp_sock is 4129562112 in_flight packets is 12, snd_cwnd is 18, ssthresh is 16, count is [3:6]
-</span><span class='line'>enter [cong avoid state] tcp_sock is 4129562112 in_flight packets is 12, snd_cwnd is 18, ssthresh is 16, count is [4:6]</span></code></pre></td></tr></table></div></figure>
-
-
-<p>可以看到在slow start的状态，发送拥塞窗口就是很简单的每次加1，而当进入拥塞避免之后，明显的拥塞窗口的增大速度变慢很多。</p>
-
-<p>接下来来看具体的代码是如何实现的.</p>
-
-<p>首先来看bictcp_cong_avoid，也就是cubic拥塞控制算法的handler(一般来说在tcp_ack中被调用)，它有3个参数，第一个是对应的sock，第二个是对应的ack序列号，而第三个就是比较重要的一个变量，表示发送还没有被ack的数据包(在linux 内核tcp拥塞处理一中详细介绍过内核中这些变量)，这个变量是拥塞控制的核心。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static void bictcp_cong_avoid(struct sock *sk, u32 ack, u32 in_flight)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
-</span><span class='line'>&#9;struct bictcp *ca = inet_csk_ca(sk);
-</span><span class='line'>&#9;//判断发送拥塞窗口是否到达限制，如果到达限制则直接返回。
-</span><span class='line'>&#9;if (!tcp_is_cwnd_limited(sk, in_flight))
-</span><span class='line'>&#9;&#9;return;
-</span><span class='line'>&#9;//开始决定进入slow start还是拥塞控制状态
-</span><span class='line'>&#9;if (tp-&gt;snd_cwnd &lt;= tp-&gt;snd_ssthresh) {
-</span><span class='line'>&#9;&#9;//是否需要reset对应的bictcp的值
-</span><span class='line'>&#9;&#9;if (hystart && after(ack, ca-&gt;end_seq))
-</span><span class='line'>&#9;&#9;&#9;bictcp_hystart_reset(sk);
-</span><span class='line'>&#9;&#9;//进入slow start状态
-</span><span class='line'>&#9;&#9;tcp_slow_start(tp);
-</span><span class='line'>&#9;} else {
-</span><span class='line'>&#9;&#9;//进入拥塞避免状态，首先会更新ca-&gt;cnt.
-</span><span class='line'>&#9;&#9;bictcp_update(ca, tp-&gt;snd_cwnd);
-</span><span class='line'>&#9;&#9;//然后进入拥塞避免
-</span><span class='line'>&#9;&#9;tcp_cong_avoid_ai(tp, ca-&gt;cnt);
-</span><span class='line'>&#9;}
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>接下来就是看tcp_is_cwnd_limited，这个函数主要是实现RFC2861中对拥塞窗口的检测。它返回1说明拥塞窗口被限制，我们需要增加拥塞窗口，否则的话，就不需要增加拥塞窗口。</p>
-
-<p>然后这里还有两个判断，先来看第一个 gso的概念，gso是Generic Segmentation Offload的简写，他的主要功能就是尽量的延迟数据包的传输，以便与在最恰当的时机传输数据包，这个机制是处于数据包离开协议栈与进入驱动之间。比如如果驱动支持TSO的话，gso就会将多个unsegmented的数据段传递给驱动。而TSO是TCP Segmentation Offload的缩写，它表示驱动支持协议栈发送大的MTU的数据段，然后硬件负责来切包，然后将数据发送出去，这样子的话，就能提高系统的吞吐。这几个东西(还有GRO)，以后我会详细分析，现在只需要大概知道他们是干什么的。</p>
-
-<p>而在这里如果支持gso，就有可能是tso defer住了数据包，因此这里会进行几个相关的判断，来看需不需要增加拥塞窗口。。</p>
-
-<p>然后是burst的概念，主要用来控制网络流量的突发性增大，也就是说当left数据(还能发送的数据段数)大于burst值的时候，我们需要暂时停止增加窗口，因为此时有可能我们这边数据发送过快。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>int tcp_is_cwnd_limited(const struct sock *sk, u32 in_flight)
-</span><span class='line'>{
-</span><span class='line'>&#9;const struct tcp_sock *tp = tcp_sk(sk);
-</span><span class='line'>&#9;u32 left;
-</span><span class='line'>&#9;//比较发送未确认和发送拥塞窗口的大小
-</span><span class='line'>&#9;if (in_flight &gt;= tp-&gt;snd_cwnd)
-</span><span class='line'>&#9;&#9;return 1;
-</span><span class='line'>&#9;//得到还能发送的数据包的段数
-</span><span class='line'>&#9;left = tp-&gt;snd_cwnd - in_flight;
-</span><span class='line'>&#9;if (sk_can_gso(sk) &&
-</span><span class='line'>&#9;&#9;left * sysctl_tcp_tso_win_divisor &lt; tp-&gt;snd_cwnd &&
-</span><span class='line'>&#9;&#9;left * tp-&gt;mss_cache &lt; sk-&gt;sk_gso_max_size)
-</span><span class='line'>&#9;&#9;return 1;
-</span><span class='line'>&#9;//看是否还能发送的数据包是否小于等于burst
-</span><span class='line'>&#9;return left &lt;= tcp_max_burst(tp);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>接下来来看snd_ssthresh是如何被设置的，这个值在加载cubic模块的时候可以传递一个我们制定的值给它，不过，默认是很大的值，我这里是2147483647,然后在接收ack期间(slow start)期间会调整这个值，在cubic中，默认是16（一般来说说当拥塞窗口到达16的时候，snd_ssthresh会被设置为16).</p>
-
-<p>在cubic中有两个可以设置snd_ssthresh的地方一个是hystart_update，一个是bictcp_recalc_ssthresh，后一个我这里就不介绍了，以后介绍拥塞状态机的时候会详细介绍，现在只需要知道，只有遇到拥塞的时候，需要调整snd_ssthres的时候，我们才需要调用bictcp_recalc_ssthresh。</p>
-
-<p>而hystart_update是在bictcp_acked中被调用，而bictcp_acked则是基本每次收到ack都会调用这个函数，我们来看在bictcp_acked中什么情况就会调用hystart_update：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/* hystart triggers when cwnd is larger than some threshold */
-</span><span class='line'>if (hystart && tp-&gt;snd_cwnd &lt;= tp-&gt;snd_ssthresh &&
-</span><span class='line'>&#9;tp-&gt;snd_cwnd &gt;= hystart_low_window)
-</span><span class='line'>&#9;hystart_update(sk, delay);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>其中hystart是hybrid slow start打开的标志，默认是开启，hystart_low_window是设置snd_ssthresh的最小拥塞窗口值，默认是16。而tp->snd_ssthresh默认是一个很大的值，因此这里就知道了，当拥塞窗口增大到16的时候我们就会进去hystart_update来更新snd_ssthresh.因此hystart_updat换句话来说也就是主要用于是否退出slow start。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static void hystart_update(struct sock *sk, u32 delay)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
-</span><span class='line'>&#9;struct bictcp *ca = inet_csk_ca(sk);
-</span><span class='line'>
-</span><span class='line'>&#9;if (!(ca-&gt;found & hystart_detect)) {
-</span><span class='line'>&#9;&#9;.................................................................
-</span><span class='line'>&#9;&#9;/*
-</span><span class='line'>&#9;&#9; * Either one of two conditions are met,
-</span><span class='line'>&#9;&#9; * we exit from slow start immediately.
-</span><span class='line'>&#9;&#9; */
-</span><span class='line'>&#9;&#9;//found是一个是否退出slow start的标记
-</span><span class='line'>&#9;&#9;if (ca-&gt;found & hystart_detect)
-</span><span class='line'>&#9;&#9;&#9;//设置snd_ssthresh
-</span><span class='line'>&#9;&#9;&#9;tp-&gt;snd_ssthresh = tp-&gt;snd_cwnd;
-</span><span class='line'>&#9;}
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>然后是slow start的处理,这里有关abc的处理，注释都很详细了，这里就不解释了，我们主要看abc关闭的部分。这里使用cnt，也是主要为了打开abc之后的slow start。</p>
-
-<p>这是abc（Appropriate Byte Counting）相关的rfc：</p>
-
-<p><a href="http://www.faqs.org/rfcs/rfc3465.html">http://www.faqs.org/rfcs/rfc3465.html</a></p>
-
-<p>Appropriate Byte Countin会导致拥塞控制算法很激进，比如打开它之后就不一定每次ack都会执行slow start，而且窗口也会增加的快很多。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>void tcp_slow_start(struct tcp_sock *tp)
-</span><span class='line'>{
-</span><span class='line'>&#9;int cnt; /* increase in packets */
-</span><span class='line'>
-</span><span class='line'>&#9;/* RFC3465: ABC Slow start
-</span><span class='line'>&#9; * Increase only after a full MSS of bytes is acked
-</span><span class='line'>&#9; *
-</span><span class='line'>&#9; * TCP sender SHOULD increase cwnd by the number of
-</span><span class='line'>&#9; * previously unacknowledged bytes ACKed by each incoming
-</span><span class='line'>&#9; * acknowledgment, provided the increase is not more than L
-</span><span class='line'>&#9; */
-</span><span class='line'>&#9;if (sysctl_tcp_abc && tp-&gt;bytes_acked &lt; tp-&gt;mss_cache)
-</span><span class='line'>&#9;&#9;return;
-</span><span class='line'>&#9;//限制slow start的cnt
-</span><span class='line'>&#9;if (sysctl_tcp_max_ssthresh &gt; 0 && tp-&gt;snd_cwnd &gt; sysctl_tcp_max_ssthresh)
-</span><span class='line'>&#9;&#9;cnt = sysctl_tcp_max_ssthresh &gt;&gt; 1; /* limited slow start */
-</span><span class='line'>&#9;else
-</span><span class='line'>&#9;&#9;cnt = tp-&gt;snd_cwnd;            /* exponential increase */
-</span><span class='line'>
-</span><span class='line'>&#9;/* RFC3465: ABC
-</span><span class='line'>&#9; * We MAY increase by 2 if discovered delayed ack
-</span><span class='line'>&#9; */
-</span><span class='line'>&#9;if (sysctl_tcp_abc &gt; 1 && tp-&gt;bytes_acked &gt;= 2*tp-&gt;mss_cache)
-</span><span class='line'>&#9;&#9;cnt &lt;&lt;= 1;
-</span><span class='line'>&#9;tp-&gt;bytes_acked = 0;
-</span><span class='line'>&#9;//更新cnt，也就是当前拥塞窗口接受的段的个数.
-</span><span class='line'>&#9;tp-&gt;snd_cwnd_cnt += cnt;
-</span><span class='line'>&#9;while (tp-&gt;snd_cwnd_cnt &gt;= tp-&gt;snd_cwnd) {
-</span><span class='line'>&#9;&#9;//这里snd_cwnd_cnt是snd_cwnd的几倍，拥塞窗口就增加几。
-</span><span class='line'>&#9;&#9;tp-&gt;snd_cwnd_cnt -= tp-&gt;snd_cwnd;
-</span><span class='line'>&#9;&#9;//如果拥塞窗口没有超过最大值，则加一
-</span><span class='line'>&#9;&#9;if (tp-&gt;snd_cwnd &lt; tp-&gt;snd_cwnd_clamp)
-</span><span class='line'>&#9;&#9;&#9;tp-&gt;snd_cwnd++;
-</span><span class='line'>&#9;}
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>最后是拥塞避免的处理。这里主要的步骤就是通过判断当前的拥塞窗口下已经发送的数据段的个数是否大于算法计算出来的值w，如果大于我们才能增加拥塞窗口值，否则之需要增加snd_cwnd_cnt。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>void tcp_cong_avoid_ai(struct tcp_sock *tp, u32 w)
-</span><span class='line'>{
-</span><span class='line'>&#9;//判断是否大于我们的标记值
-</span><span class='line'>&#9;if (tp-&gt;snd_cwnd_cnt &gt;= w) {
-</span><span class='line'>&#9;&#9;if (tp-&gt;snd_cwnd &lt; tp-&gt;snd_cwnd_clamp)
-</span><span class='line'>&#9;&#9;&#9;tp-&gt;snd_cwnd++;
-</span><span class='line'>&#9;&#9;tp-&gt;snd_cwnd_cnt = 0;
-</span><span class='line'>&#9;} else {
-</span><span class='line'>&#9;&#9;//增加计数值
-</span><span class='line'>&#9;&#9;tp-&gt;snd_cwnd_cnt++;
-</span><span class='line'>&#9;}
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>diff --git a/mkdumprd b/mkdumprd
+</span><span class='line'>index d567085..7d946f4 100755
+</span><span class='line'>--- a/mkdumprd
+</span><span class='line'>+++ b/mkdumprd
+</span><span class='line'>@@ -2279,12 +2279,19 @@ mknod /dev/systty c 4 0
+</span><span class='line'> mknod /dev/tty c 5 0
+</span><span class='line'> mknod /dev/console c 5 1
+</span><span class='line'> mknod /dev/ptmx c 5 2
+</span><span class='line'>-mknod /dev/rtc c 10 135
+</span><span class='line'> mknod /dev/urandom c 1 9
+</span><span class='line'> mknod /dev/efirtc c 10 136
+</span><span class='line'> export network_up=0
+</span><span class='line'> EOF
+</span><span class='line'> 
+</span><span class='line'>+kernelval=`echo $kernel | awk -F "[-|.]" '{print $1*65536+$2*256+$3}'`
+</span><span class='line'>+#echo "kernel=$kernel kernelval=$kernelval"
+</span><span class='line'>+if [ $kernelval -lt 132640 ]; then
+</span><span class='line'>+ emit "mknod /dev/rtc c 10 135"
+</span><span class='line'>+else
+</span><span class='line'>+ emit "mknod /dev/rtc c 254 0"
+</span><span class='line'>+fi
+</span><span class='line'>+
+</span><span class='line'> # XXX really we need to openvt too, in case someting changes the
+</span><span class='line'> # color palette and then changes vts on fbcon before gettys start.
+</span><span class='line'> # (yay, fbcon bugs!)</span></code></pre></td></tr></table></div></figure>
 
 
 
@@ -1814,7 +1041,7 @@ var ss360Config = {
   
     <section>
 <h1>Categories
-<span class='right_span'>(913)</span>
+<span class='right_span'>(925)</span>
 
 </h1>
 <head>
@@ -1845,7 +1072,7 @@ if (!document.getElementById('blog~octopress')) document.getElementById('aexp_bl
 if (!document.getElementById('blog')) document.getElementById('aexp_blog').style.visibility = 'hidden';
 if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ruby').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(142)</span></li>
+<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(151)</span></li>
 <div id='language' class='catsub'><li><a href='/blog/cats/language~c/?opendiv=language'>c</a><a href='##' onmousedown=showDiv('language~c') id='aexp_language~c'><span class='exp_style' id='exp_language~c'>[+]</span></a><span class='right_span'>32</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~c')) document.getElementById('aexp_language~c').style.visibility = 'hidden';
@@ -1862,7 +1089,7 @@ if (!document.getElementById('language~java')) document.getElementById('aexp_lan
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~jsp')) document.getElementById('aexp_language~jsp').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/language~php/?opendiv=language'>php</a><a href='##' onmousedown=showDiv('language~php') id='aexp_language~php'><span class='exp_style' id='exp_language~php'>[+]</span></a><span class='right_span'>44</span></li>
+<li><a href='/blog/cats/language~php/?opendiv=language'>php</a><a href='##' onmousedown=showDiv('language~php') id='aexp_language~php'><span class='exp_style' id='exp_language~php'>[+]</span></a><span class='right_span'>50</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~php')) document.getElementById('aexp_language~php').style.visibility = 'hidden';
 </script>
@@ -1870,7 +1097,7 @@ if (!document.getElementById('language~php')) document.getElementById('aexp_lang
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~python')) document.getElementById('aexp_language~python').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/language~web/?opendiv=language'>web</a><a href='##' onmousedown=showDiv('language~web') id='aexp_language~web'><span class='exp_style' id='exp_language~web'>[+]</span></a><span class='right_span'>45</span></li>
+<li><a href='/blog/cats/language~web/?opendiv=language'>web</a><a href='##' onmousedown=showDiv('language~web') id='aexp_language~web'><span class='exp_style' id='exp_language~web'>[+]</span></a><span class='right_span'>48</span></li>
 </div><script language='javascript' type='text/javascript'>
 if (!document.getElementById('language')) document.getElementById('aexp_language').style.visibility = 'hidden';
 if (!document.getElementById('language~web')) document.getElementById('aexp_language~web').style.visibility = 'hidden';
@@ -2009,8 +1236,8 @@ if (!document.getElementById('tools~vim')) document.getElementById('aexp_tools~v
 if (!document.getElementById('tools')) document.getElementById('aexp_tools').style.visibility = 'hidden';
 if (!document.getElementById('tools~wxwork')) document.getElementById('aexp_tools~wxwork').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/system/'>system</a><a href='##' onmousedown=showDiv('system') id='aexp_system'><span class='exp_style' id='exp_system'>[+]</span></a><span class='right_span'>(111)</span></li>
-<div id='system' class='catsub'><li><a href='/blog/cats/system~base/?opendiv=system'>base</a><a href='##' onmousedown=showDiv('system~base') id='aexp_system~base'><span class='exp_style' id='exp_system~base'>[+]</span></a><span class='right_span'>24</span></li>
+<li class='catclass'><a href='/blog/cats/system/'>system</a><a href='##' onmousedown=showDiv('system') id='aexp_system'><span class='exp_style' id='exp_system'>[+]</span></a><span class='right_span'>(114)</span></li>
+<div id='system' class='catsub'><li><a href='/blog/cats/system~base/?opendiv=system'>base</a><a href='##' onmousedown=showDiv('system~base') id='aexp_system~base'><span class='exp_style' id='exp_system~base'>[+]</span></a><span class='right_span'>25</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('system~base')) document.getElementById('aexp_system~base').style.visibility = 'hidden';
 </script>
@@ -2026,7 +1253,7 @@ if (!document.getElementById('system~cgroup')) document.getElementById('aexp_sys
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('system~docker')) document.getElementById('aexp_system~docker').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/system~fs/?opendiv=system'>fs</a><a href='##' onmousedown=showDiv('system~fs') id='aexp_system~fs'><span class='exp_style' id='exp_system~fs'>[+]</span></a><span class='right_span'>9</span></li>
+<li><a href='/blog/cats/system~fs/?opendiv=system'>fs</a><a href='##' onmousedown=showDiv('system~fs') id='aexp_system~fs'><span class='exp_style' id='exp_system~fs'>[+]</span></a><span class='right_span'>11</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('system~fs')) document.getElementById('aexp_system~fs').style.visibility = 'hidden';
 </script>
@@ -2248,7 +1475,7 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 
 <section>
 <h1>Date Categories
-<span class='right_span'>(913)</span>
+<span class='right_span'>(925)</span>
 
 </h1>
 <head>
@@ -2256,8 +1483,8 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(33)</span></li>
-<div id='2024' class='catsub'><li><a href='/blog/cats/2024~07/?opendiv=2024'>2024-07</a><span class='right_span'>10</span></li>
+<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(45)</span></li>
+<div id='2024' class='catsub'><li><a href='/blog/cats/2024~07/?opendiv=2024'>2024-07</a><span class='right_span'>22</span></li>
 <li><a href='/blog/cats/2024~06/?opendiv=2024'>2024-06</a><span class='right_span'>2</span></li>
 <li><a href='/blog/cats/2024~05/?opendiv=2024'>2024-05</a><span class='right_span'>5</span></li>
 <li><a href='/blog/cats/2024~04/?opendiv=2024'>2024-04</a><span class='right_span'>5</span></li>
@@ -2404,6 +1631,8 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 <h1>Tags</h1>
 <ul class="tag-cloud">
 <a style="font-size: 124%" href="/tags/10gb/">10gb(7)</a>
+<a style="font-size: 114%" href="/tags/lvm/">LVM(5)</a>
+<a style="font-size: 100%" href="/tags/chrome-debug/">chrome_debug(3)</a>
 <a style="font-size: 131%" href="/tags/gdb/">gdb(9)</a>
 <a style="font-size: 127%" href="/tags/git/">git(8)</a>
 <a style="font-size: 114%" href="/tags/ipv6/">ipv6(5)</a>
@@ -2424,43 +1653,43 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
   <ul id="recent_posts">
     
       <li class="post">
-        <a href="/blog/2024/07/15/tools-sqlserver-sys/">sql server系统表详细说明</a>
+        <a href="/blog/2024/07/31/lvm-attr/">LVM 输出更多信息</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/15/tools-sqlserver-cols/">SQLserver查询数据库所有字段-表名</a>
+        <a href="/blog/2024/07/31/lvm-pvmove/">LVM 缩减 VG 大小 ( pvmove )</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/15/tools-mysql-socket/">MySQL下的socket文件作用</a>
+        <a href="/blog/2024/07/31/lang-web-override/">Chrome浏览器使用Overrides调试线上代码</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/15/lang-php-iconv/">iconv与mb_convert_encoding的使用</a>
+        <a href="/blog/2024/07/31/lang-web-fetch/">fetch使用介绍, chrome如何重新提交请求并且更改参数</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/15/bat/">Linux查看电池损耗</a>
+        <a href="/blog/2024/07/31/lang-web-95598/">95598停电公告信息抓取</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/15/lang-web-box/">JavaScript的三种弹出提示框(alert、confirm、prompt)</a>
+        <a href="/blog/2024/07/30/lang-php-sm1234/">sm1、sm2、sm3、sm4简单介绍</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/15/lang-web-copy/">JavaScript复制内容到剪切板</a>
+        <a href="/blog/2024/07/30/lang-php-sm2/">php sm2</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/15/lang-web-alert/">alert 弹窗去掉上方 title 网址域名</a>
+        <a href="/blog/2024/07/30/lang-php-sm3/">php sm3</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/15/tools-sqlserver-space/">SQL Server查看所有表大小，所占空间</a>
+        <a href="/blog/2024/07/30/lang-php-bgcolor/">php spreadsheet 填充背景色</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/12/centos7-yum/">CentOS7 yum</a>
+        <a href="/blog/2024/07/30/lang-php-mb/">php统计文章字数</a>
       </li>
     
   </ul>
