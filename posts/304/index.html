@@ -34,7 +34,7 @@
 </hgroup>
 
 </header>
-  <nav role="navigation" style='white-space: nowrap; min-width=1120px;'><form action="/search" method="get">
+  <nav role="navigation" style='white-space: nowrap; min-width=1120px; position: sticky; top: 0; z-index: 999;'><form action="/search" method="get">
     <input class="search" name="query" id="query" type="text" placeholder="search..." style="height:1.5em;">
     <input id="btnSubmit" value="search" type="submit">
 </form>
@@ -131,7 +131,7 @@ var ss360Config = {
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2011/03/20/alg-mdp-source3/">插头 DP code5-6</a></h2>
+      <h2 class="entry-title"><a href="/blog/2011/11/29/tools-ptrace-i/">Playing with ptrace, Part I — 玩转ptrace(一)</a></h2>
     
     
       <p class="meta">
@@ -140,14 +140,441 @@ var ss360Config = {
 
 
 
-<time class='entry-date' datetime='2011-03-20T23:02:00+08:00'><span class='date'>2011-03-20</span> <span class='time'>23:02:00</span></time>
+<time class='entry-date' datetime='2011-11-29T19:20:00+08:00'><span class='date'>2011-11-29</span> <span class='time'>19:20:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><h5>五、zju_3256</h5>
+  <div class="entry-content"><p><a href="http://www.kgdb.info/gdb/playing_with_ptrace_part_i/">原文</a><br/>
+版权所有 © 转载时必须以链接形式注明作者和原始出处！</p>
+
+<p> Playing with ptrace, Part I<br/>
+by Pradeep Padala <code>p_padala@yahoo.com</code> <a href="http://www.cise.ufl.edu/~ppadala">http://www.cise.ufl.edu/~ppadala</a><br/>
+Created 2002-11-01 02:00</p>
+
+<p>翻译: Magic.D E-mail: <a href="&#109;&#97;&#x69;&#x6c;&#x74;&#111;&#x3a;&#97;&#100;&#x61;&#109;&#x67;&#105;&#x63;&#x40;&#x31;&#x36;&#51;&#46;&#99;&#111;&#109;">&#97;&#x64;&#97;&#x6d;&#103;&#105;&#x63;&#x40;&#x31;&#54;&#x33;&#46;&#x63;&#111;&#x6d;</a><br/>
+译者序：</p>
+
+<p>在开发Hust Online Judge的过程中，查阅了不少资料，关于调试器技术的资料在网上是很少，即便是UNIX编程巨著《UNIX环境高级编程》中，相关内容也不多，直到我在 <a href="http://www.linuxjournal.com">http://www.linuxjournal.com</a> 上找到这篇文章，如获至宝，特翻译之，作为鄙人翻译技术文档的第一次尝试，必定会有不少蹩脚之处，各位就将就一下吧，欢迎大力拍砖。</p>
+
+<p>你想过怎么实现对系统调用的拦截吗？你尝试过通过改变系统调用的参数来愚弄你的系统kernel吗？你想过调试器是如何使运行中的进程暂停并且控制它吗？</p>
+
+<p>你可能会开始考虑怎么使用复杂的kernel编程来达到目的，那么，你错了。实际上Linux提供了一种优雅的机制来完成这些：ptrace系统函数。 ptrace提供了一种使父进程得以监视和控制其它进程的方式，它还能够改变子进程中的寄存器和内核映像，因而可以实现断点调试和系统调用的跟踪。</p>
+
+<p>使用ptrace，你可以在用户层拦截和修改系统调用(sys call)</p>
+
+<p>在这篇文章中，我们将学习如何拦截一个系统调用，然后修改它的参数。在本文的第二部分我们将学习更先进的技术：设置断点，插入代码到一个正在运行的程序中；我们将潜入到机器内部，偷窥和纂改进程的寄存器和数据段。</p>
+
+<h4>基本知识</h4>
+
+<p>操作系统提供了一种标准的服务来让程序员实现对底层硬件和服务的控制（比如文件系统），叫做系统调用(system calls)。当一个程序需要作系统调用的时候，它将相关参数放进系统调用相关的寄存器，然后调用软中断0×80，这个中断就像一个让程序得以接触到内核模式的窗口，程序将参数和系统调用号交给内核，内核来完成系统调用的执行。</p>
+
+<p>在i386体系中(本文中所有的代码都是面向i386体系)，系统调用号将放入%eax,它的参数则依次放入%ebx, %ecx, %edx, %esi 和 %edi。 比如，在以下的调用</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>Write(2, “Hello”, 5)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>的汇编形式大概是这样的</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>movl $4, %eax
+</span><span class='line'>movl $2, %ebx
+</span><span class='line'>movl $hello, %ecx
+</span><span class='line'>movl $5, %edx
+</span><span class='line'>int $0×80</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这里的$hello指向的是标准字符串”Hello”。</p>
+
+<p>那么，ptrace会在什么时候出现呢？在执行系统调用之前，内核会先检查当前进程是否处于被“跟踪”(traced)的状态。如果是的话，内核暂停当前进程并将控制权交给跟踪进程，使跟踪进程得以察看或者修改被跟踪进程的寄存器。</p>
+
+<p>让我们来看一个例子，演示这个跟踪程序的过程</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;sys/ptrace.h&gt;
+</span><span class='line'>#include &lt;sys/types.h&gt;
+</span><span class='line'>#include &lt;sys/wait.h&gt;
+</span><span class='line'>#include &lt;unistd.h&gt;
+</span><span class='line'>#include &lt;linux/user.h&gt; /* For constants
+</span><span class='line'>&#9;&#9;&#9;   ORIG_EAX etc */
+</span><span class='line'>int main()
+</span><span class='line'>{
+</span><span class='line'>&#9;pid_t child;
+</span><span class='line'>&#9;long orig_eax;
+</span><span class='line'>&#9;child = fork();
+</span><span class='line'>&#9;if(child ==0){
+</span><span class='line'>&#9;&#9;ptrace(PTRACE_TRACEME,0, NULL, NULL);
+</span><span class='line'>&#9;&#9;execl("/bin/ls","ls", NULL);
+</span><span class='line'>&#9;} else {
+</span><span class='line'>&#9;&#9;wait(NULL);
+</span><span class='line'>&#9;&#9;orig_eax = ptrace(PTRACE_PEEKUSER,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;  child,4* ORIG_EAX,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;  NULL);
+</span><span class='line'>&#9;&#9;printf("The child made a "
+</span><span class='line'>&#9;&#9;&#9;"system call %ld\n", orig_eax);
+</span><span class='line'>&#9;&#9;ptrace(PTRACE_CONT, child, NULL, NULL);
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;return0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>运行这个程序，将会在输出ls命令的结果的同时，输出:
+The child made a system call 11</p>
+
+<p>说明：11是execve的系统调用号，这是该程序调用的第一个系统调用。<br/>
+想知道系统调用号的详细内容，察看 /usr/include/asm/unistd.h。</p>
+
+<p>在以上的示例中，父进程fork出了一个子进程，然后跟踪它。在调用exec函数之前，子进程用PTRACE_TRACEME作为第一个参数调用了 ptrace函数，它告诉内核：让别人跟踪我吧！然后，在子进程调用了execve()之后，它将控制权交还给父进程。当时父进程正使用wait()函数来等待来自内核的通知，现在它得到了通知，于是它可以开始察看子进程都作了些什么，比如看看寄存器的值之类。</p>
+
+<p>出现系统调用之后，内核会将eax中的值（此时存的是系统调用号）保存起来，我们可以使用PTRACE_PEEKUSER作为ptrace的第一个参数来读到这个值。<br/>
+我们察看完系统调用的信息后，可以使用PTRACE_CONT作为ptrace的第一个参数，调用ptrace使子进程继续系统调用的过程。<br/>
+ptrace函数的参数<br/>
+Ptrace有四个参数</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>long ptrace(enum __ptrace_request request,
+</span><span class='line'>&#9;pid_t pid,
+</span><span class='line'>&#9;void *addr,
+</span><span class='line'>&#9;void *data);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>第一个参数决定了ptrace的行为与其它参数的使用方法，可取的值有:</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>PTRACE_ME
+</span><span class='line'>PTRACE_PEEKTEXT
+</span><span class='line'>PTRACE_PEEKDATA
+</span><span class='line'>PTRACE_PEEKUSER
+</span><span class='line'>PTRACE_POKETEXT
+</span><span class='line'>PTRACE_POKEDATA
+</span><span class='line'>PTRACE_POKEUSER
+</span><span class='line'>PTRACE_GETREGS
+</span><span class='line'>PTRACE_GETFPREGS,
+</span><span class='line'>PTRACE_SETREGS
+</span><span class='line'>PTRACE_SETFPREGS
+</span><span class='line'>PTRACE_CONT
+</span><span class='line'>PTRACE_SYSCALL,
+</span><span class='line'>PTRACE_SINGLESTEP
+</span><span class='line'>PTRACE_DETACH</span></code></pre></td></tr></table></div></figure>
+
+
+<p>在下文中将对这些常量的用法进行说明。<br/>
+读取系统调用的参数</p>
+
+<p>通过将PTRACE_PEEKUSER作为ptrace 的第一个参数进行调用，可以取得与子进程相关的寄存器值。</p>
+
+<p>先看下面这个例子</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;sys/ptrace.h&gt;
+</span><span class='line'>#include &lt;sys/types.h&gt;
+</span><span class='line'>#include &lt;sys/wait.h&gt;
+</span><span class='line'>#include &lt;unistd.h&gt;
+</span><span class='line'>#include &lt;linux/user.h&gt;
+</span><span class='line'>#include &lt;sys/syscall.h&gt;   /* For SYS_write etc */
+</span><span class='line'>int main()
+</span><span class='line'>{
+</span><span class='line'>&#9;pid_t child;
+</span><span class='line'>&#9;long orig_eax, eax;
+</span><span class='line'>&#9;long params[3];
+</span><span class='line'>&#9;int status;
+</span><span class='line'>&#9;int insyscall =0;
+</span><span class='line'>&#9;child = fork();
+</span><span class='line'>&#9;if(child ==0){
+</span><span class='line'>&#9;&#9;ptrace(PTRACE_TRACEME,0, NULL, NULL);
+</span><span class='line'>&#9;&#9;execl("/bin/ls","ls", NULL);
+</span><span class='line'>&#9;} else {
+</span><span class='line'>&#9;&#9;while(1) {
+</span><span class='line'>&#9;&#9;&#9;wait(&status);
+</span><span class='line'>&#9;&#9;&#9;if(WIFEXITED(status))
+</span><span class='line'>&#9;&#9;&#9;break;
+</span><span class='line'>&#9;          orig_eax = ptrace(PTRACE_PEEKUSER,
+</span><span class='line'>&#9;&#9;&#9;child,4* ORIG_EAX, NULL);
+</span><span class='line'>&#9;&#9;&#9;if(orig_eax == SYS_write) {
+</span><span class='line'>&#9;&#9;&#9;&#9;if(insyscall == 0) {
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;/* Syscall entry */
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;insyscall =1;
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;params[0]= ptrace(PTRACE_PEEKUSER,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9;child,4* EBX,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9;NULL);
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;params[1]= ptrace(PTRACE_PEEKUSER,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9;child,4* ECX,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9;NULL);
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;params[2]= ptrace(PTRACE_PEEKUSER,
+</span><span class='line'>                          child,4* EDX,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9;NULL);
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;printf("Write called with "
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9;"%ld, %ld, %ld\n",
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9;params[0], params[1],
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9;params[2]);
+</span><span class='line'>&#9;&#9;&#9;&#9;} else {/* Syscall exit */
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;eax = ptrace(PTRACE_PEEKUSER,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;child,4* EAX, NULL);
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;printf("Write returned "
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;"with %ld\n", eax);
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9;insyscall =0;
+</span><span class='line'>&#9;&#9;&#9;&#9;}
+</span><span class='line'>&#9;&#9;&#9;}
+</span><span class='line'>&#9;&#9;&#9;ptrace(PTRACE_SYSCALL,
+</span><span class='line'>&#9;&#9;&#9;&#9;child, NULL, NULL);
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;return0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这个程序的输出是这样的</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>ppadala@linux:~/ptrace &gt; ls
+</span><span class='line'>a.out        dummy.s      ptrace.txt
+</span><span class='line'>libgpm.html  registers.c  syscallparams.c
+</span><span class='line'>dummy        ptrace.html  simple.c
+</span><span class='line'>ppadala@linux:~/ptrace &gt; ./a.out
+</span><span class='line'>Write called with 1,1075154944,48
+</span><span class='line'>a.out        dummy.s      ptrace.txt
+</span><span class='line'>Write returned with 48
+</span><span class='line'>Write called with 1,1075154944,59
+</span><span class='line'>libgpm.html  registers.c  syscallparams.c
+</span><span class='line'>Write returned with 59
+</span><span class='line'>Write called with 1,1075154944,30
+</span><span class='line'>dummy        ptrace.html  simple.c
+</span><span class='line'>Write returned with 30</span></code></pre></td></tr></table></div></figure>
+
+
+<p>以上的例子中我们跟踪了write系统调用，而ls命令的执行将产生三个write系统调用。使用PTRACE_SYSCALL作为ptrace的第一个参数，使内核在子进程做出系统调用或者准备退出的时候暂停它。这种行为与使用PTRACE_CONT，然后在下一个系统调用/进程退出时暂停它是等价的。</p>
+
+<p>在前一个例子中，我们用PTRACE_PEEKUSER来察看write系统调用的参数。系统调用的返回值会被放入%eax。</p>
+
+<p>wait函数使用status变量来检查子进程是否已退出。它是用来判断子进程是被ptrace暂停掉还是已经运行结束并退出。有一组宏可以通过status的值来判断进程的状态，比如WIFEXITED等，详情可以察看wait(2) man。
+读取寄存器的值</p>
+
+<p>如果你想在系统调用或者进程终止的时候读取它的寄存器，使用前面那个例子的方法是可以的，但是这是笨拙的方法。使用PRACE_GETREGS作为ptrace的第一个参数来调用，可以只需一次函数调用就取得所有的相关寄存器值。
+获得寄存器值得例子如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;sys/ptrace.h&gt;
+</span><span class='line'>#include &lt;sys/types.h&gt;
+</span><span class='line'>#include &lt;sys/wait.h&gt;
+</span><span class='line'>#include &lt;unistd.h&gt;
+</span><span class='line'>#include &lt;linux/user.h&gt;
+</span><span class='line'>#include &lt;sys/syscall.h&gt;
+</span><span class='line'>int main()
+</span><span class='line'>{
+</span><span class='line'>&#9;pid_t child;
+</span><span class='line'>&#9;long orig_eax, eax;
+</span><span class='line'>&#9;long params[3];
+</span><span class='line'>&#9;int status;
+</span><span class='line'>&#9;int insyscall =0;
+</span><span class='line'>&#9;struct user_regs_struct regs;
+</span><span class='line'>&#9;child = fork();
+</span><span class='line'>&#9;if(child == 0) {
+</span><span class='line'>&#9;&#9;ptrace(PTRACE_TRACEME,0, NULL, NULL);
+</span><span class='line'>&#9;&#9;execl("/bin/ls","ls", NULL);
+</span><span class='line'>&#9;} else {
+</span><span class='line'>&#9;&#9;while(1) {
+</span><span class='line'>&#9;&#9;&#9;wait(&status);
+</span><span class='line'>&#9;&#9;&#9;if(WIFEXITED(status))
+</span><span class='line'>&#9;&#9;&#9;break;
+</span><span class='line'>&#9;&#9;&#9;orig_eax = ptrace(PTRACE_PEEKUSER,
+</span><span class='line'>&#9;&#9;&#9;&#9;child,4* ORIG_EAX,
+</span><span class='line'>&#9;&#9;&#9;&#9;NULL);
+</span><span class='line'>&#9;&#9;&#9;if(orig_eax == SYS_write) {
+</span><span class='line'>&#9;&#9;&#9;&#9;if(insyscall == 0) {
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;/* Syscall entry */
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;insyscall =1;
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;ptrace(PTRACE_GETREGS, child,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;NULL,&regs);
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;printf("Write called with "
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;"%ld, %ld, %ld\n",
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;regs.ebx, regs.ecx,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;regs.edx);
+</span><span class='line'>&#9;&#9;&#9;&#9;} else { /* Syscall exit */
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;eax = ptrace(PTRACE_PEEKUSER,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;child,4* EAX,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;NULL);
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;printf("Write returned "
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;"with %ld\n", eax);
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;insyscall =0;
+</span><span class='line'>&#9;&#9;&#9;&#9;}
+</span><span class='line'>&#9;&#9;&#9;}
+</span><span class='line'>&#9;&#9;&#9;ptrace(PTRACE_SYSCALL, child,
+</span><span class='line'>&#9;&#9;&#9;&#9;NULL, NULL);
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;return0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这段代码与前面的例子是比较相似的，不同的是它使用了PTRACE_GETREGS。 其中的user_regs_struct结构是在中定义的。<br/>
+来点好玩的</p>
+
+<p>现在该做点有意思的事情了，我们将要把传给write系统调用的字符串给反转。</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -265,259 +692,183 @@ var ss360Config = {
 <span class='line-number'>114</span>
 <span class='line-number'>115</span>
 <span class='line-number'>116</span>
-<span class='line-number'>117</span>
-<span class='line-number'>118</span>
-<span class='line-number'>119</span>
-<span class='line-number'>120</span>
-<span class='line-number'>121</span>
-<span class='line-number'>122</span>
-<span class='line-number'>123</span>
-<span class='line-number'>124</span>
-<span class='line-number'>125</span>
-<span class='line-number'>126</span>
-<span class='line-number'>127</span>
-<span class='line-number'>128</span>
-<span class='line-number'>129</span>
-<span class='line-number'>130</span>
-<span class='line-number'>131</span>
-<span class='line-number'>132</span>
-<span class='line-number'>133</span>
-<span class='line-number'>134</span>
-<span class='line-number'>135</span>
-<span class='line-number'>136</span>
-<span class='line-number'>137</span>
-<span class='line-number'>138</span>
-<span class='line-number'>139</span>
-<span class='line-number'>140</span>
-<span class='line-number'>141</span>
-<span class='line-number'>142</span>
-<span class='line-number'>143</span>
-<span class='line-number'>144</span>
-<span class='line-number'>145</span>
-<span class='line-number'>146</span>
-<span class='line-number'>147</span>
-<span class='line-number'>148</span>
-<span class='line-number'>149</span>
-<span class='line-number'>150</span>
-<span class='line-number'>151</span>
-<span class='line-number'>152</span>
-<span class='line-number'>153</span>
-<span class='line-number'>154</span>
-<span class='line-number'>155</span>
-<span class='line-number'>156</span>
-<span class='line-number'>157</span>
-<span class='line-number'>158</span>
-<span class='line-number'>159</span>
-<span class='line-number'>160</span>
-<span class='line-number'>161</span>
-<span class='line-number'>162</span>
-<span class='line-number'>163</span>
-<span class='line-number'>164</span>
-<span class='line-number'>165</span>
-<span class='line-number'>166</span>
-<span class='line-number'>167</span>
-<span class='line-number'>168</span>
-<span class='line-number'>169</span>
-<span class='line-number'>170</span>
-<span class='line-number'>171</span>
-<span class='line-number'>172</span>
-<span class='line-number'>173</span>
-<span class='line-number'>174</span>
-<span class='line-number'>175</span>
-<span class='line-number'>176</span>
-<span class='line-number'>177</span>
-<span class='line-number'>178</span>
-<span class='line-number'>179</span>
-<span class='line-number'>180</span>
-<span class='line-number'>181</span>
-<span class='line-number'>182</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#include&lt;stdio.h&gt;
-</span><span class='line'>
-</span><span class='line'>#define N 7000 // 3^(n+1)
-</span><span class='line'>#define M 333  // all = 300+
-</span><span class='line'>
-</span><span class='line'>int n,m;
-</span><span class='line'>int val[33],s[33],b[33],all,r[M],e[N];
-</span><span class='line'>int p[M][13],kk,H[M][13];
-</span><span class='line'>
-</span><span class='line'>int A[M][M],B[M][M],tmp[M][M];
-</span><span class='line'>
-</span><span class='line'>void mul(int A[M][M], int B[M][M])
+</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;sys/ptrace.h&gt;
+</span><span class='line'>#include &lt;sys/types.h&gt;
+</span><span class='line'>#include &lt;sys/wait.h&gt;
+</span><span class='line'>#include &lt;unistd.h&gt;
+</span><span class='line'>#include &lt;linux/user.h&gt;
+</span><span class='line'>#include &lt;sys/syscall.h&gt;
+</span><span class='line'>constint long_size =sizeof(long);
+</span><span class='line'>void reverse(char*str)
 </span><span class='line'>{
-</span><span class='line'>&#9;int i,j,k;
-</span><span class='line'>&#9;long long w;
-</span><span class='line'>&#9;for(i=0;i&lt;all;i++)
-</span><span class='line'>&#9;    for(j=0;j&lt;all;j++)
-</span><span class='line'>&#9;    {
-</span><span class='line'>&#9;        w = 0;
-</span><span class='line'>&#9;        for(k=0;k&lt;all;k++) if(A[i][k] != 0 && B[k][j] != 0) w += (long long)A[i][k]*(long long)B[k][j];
-</span><span class='line'>&#9;        if(w &gt; 7777777) w = w-w/7777777*7777777;
-</span><span class='line'>&#9;        tmp[i][j] = (int)(w);
-</span><span class='line'>&#9;    }
-</span><span class='line'>&#9;for(i=0;i&lt;all;i++)
-</span><span class='line'>&#9;    for(j=0;j&lt;all;j++) A[i][j] = tmp[i][j];
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>int ok()
-</span><span class='line'>{
-</span><span class='line'>&#9;int i,l,c[33];
-</span><span class='line'>&#9;l = 0;
-</span><span class='line'>&#9;for(i=1;i&lt;=n+1;i++)
-</span><span class='line'>&#9;{
-</span><span class='line'>&#9;    b[i] = -1;
-</span><span class='line'>&#9;    if(s[i] == 1) c[++l] = i;
-</span><span class='line'>&#9;    else
-</span><span class='line'>&#9;    if(s[i] == 2) {
-</span><span class='line'>&#9;        if(l == 0) return 0;
-</span><span class='line'>&#9;        b[c[l]] = i; b[i] = c[l]; l--;
-</span><span class='line'>&#9;    }
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;if(l != 0) return 0;
-</span><span class='line'>&#9;return 1;
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>void init()
-</span><span class='line'>{
-</span><span class='line'>&#9;int i,j;
-</span><span class='line'>&#9;val[1] = 1;
-</span><span class='line'>&#9;for(i=2;i&lt;=n+2;i++) val[i] = val[i-1]*3;
-</span><span class='line'>
-</span><span class='line'>&#9;for(i=0;i&lt;=n+2;i++) s[i] = 0;
-</span><span class='line'>
-</span><span class='line'>&#9;all = 0;
-</span><span class='line'>&#9;for(i=0;i&lt;val[n+2];i++)
-</span><span class='line'>&#9;{
-</span><span class='line'>&#9;    e[i] = -1;
-</span><span class='line'>&#9;    if(ok() == 1)
-</span><span class='line'>&#9;    {
-</span><span class='line'>&#9;        for(j=1;j&lt;=n+1;j++) p[all][j] = b[j];
-</span><span class='line'>&#9;        r[all] = i; e[i] = all;
-</span><span class='line'>&#9;        all++;
-</span><span class='line'>&#9;    }
-</span><span class='line'>&#9;    s[1]++;
-</span><span class='line'>&#9;    j = 1; while(s[j] &gt; 2) { s[j] = 0; j++; s[j]++; }
+</span><span class='line'>&#9;int i, j;
+</span><span class='line'>&#9;char temp;
+</span><span class='line'>&#9;for(i =0, j = strlen(str)-2;
+</span><span class='line'>&#9;&#9;i &lt;= j;++i,--j){
+</span><span class='line'>&#9;&#9;temp = str[i];
+</span><span class='line'>&#9;&#9;str[i]= str[j];
+</span><span class='line'>&#9;&#9;str[j]= temp;
 </span><span class='line'>&#9;}
 </span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>void abc()
+</span><span class='line'>void getdata(pid_t child,long addr, char*str,int len)
 </span><span class='line'>{
-</span><span class='line'>&#9;int i,j,k,LL,UU,sta;
-</span><span class='line'>&#9;for(i=0;i&lt;all;i++) for(j=0;j&lt;all;j++) A[i][j] = (i==j)?1:0;
-</span><span class='line'>
-</span><span class='line'>&#9;for(k=0;k&lt;all;k++) for(i=1;i&lt;=n+1;i++) H[k][i] = r[k]/val[i]%3;
-</span><span class='line'>
-</span><span class='line'>&#9;for(i=1;i&lt;=n;i++)
-</span><span class='line'>&#9;{
-</span><span class='line'>&#9;    for(j=0;j&lt;all;j++) for(k=0;k&lt;all;k++) B[j][k] = 0;
-</span><span class='line'>
-</span><span class='line'>&#9;    for(k=0;k&lt;all;k++)
-</span><span class='line'>&#9;    {
-</span><span class='line'>&#9;        LL = H[k][i]; UU = H[k][i+1];
-</span><span class='line'>
-</span><span class='line'>&#9;        if(LL == 0 && UU == 0)
-</span><span class='line'>&#9;        {
-</span><span class='line'>&#9;            sta = r[k] + val[i] + val[i+1]*2;
-</span><span class='line'>&#9;            if(e[sta] != -1) B[e[sta]][k] += 1;
-</span><span class='line'>&#9;        }
-</span><span class='line'>&#9;        else
-</span><span class='line'>&#9;        if(LL == 0)
-</span><span class='line'>&#9;        {
-</span><span class='line'>&#9;            sta = r[k];
-</span><span class='line'>&#9;            if(e[sta] != -1) B[e[sta]][k] += 1;
-</span><span class='line'>
-</span><span class='line'>&#9;            sta = r[k] + UU*(val[i]-val[i+1]);
-</span><span class='line'>&#9;            if(e[sta] != -1) B[e[sta]][k] += 1;
-</span><span class='line'>&#9;        }
-</span><span class='line'>&#9;        else
-</span><span class='line'>&#9;        if(UU == 0)
-</span><span class='line'>&#9;        {
-</span><span class='line'>&#9;            sta = r[k];
-</span><span class='line'>&#9;            if(e[sta] != -1) B[e[sta]][k] += 1;
-</span><span class='line'>
-</span><span class='line'>&#9;            sta = r[k] + LL*(val[i+1]-val[i]);
-</span><span class='line'>&#9;            if(e[sta] != -1) B[e[sta]][k] += 1;
-</span><span class='line'>&#9;        }
-</span><span class='line'>&#9;        else
-</span><span class='line'>&#9;        if(LL == 2 && UU == 1)
-</span><span class='line'>&#9;        {
-</span><span class='line'>&#9;            sta = r[k] - val[i]*2 - val[i+1];
-</span><span class='line'>&#9;            if(e[sta] != -1) B[e[sta]][k] += 1;
-</span><span class='line'>&#9;        }
-</span><span class='line'>&#9;        else
-</span><span class='line'>&#9;        if(LL == 1 && UU == 1)
-</span><span class='line'>&#9;        {
-</span><span class='line'>&#9;            if(p[k][i+1] != -1)
-</span><span class='line'>&#9;            {
-</span><span class='line'>&#9;                sta = r[k]-val[i]-val[i+1]-val[p[k][i+1]];
-</span><span class='line'>&#9;                if(e[sta] != -1) B[e[sta]][k] += 1;
-</span><span class='line'>&#9;            }
-</span><span class='line'>&#9;        }
-</span><span class='line'>&#9;        else
-</span><span class='line'>&#9;        if(LL == 2 && UU == 2)
-</span><span class='line'>&#9;        {
-</span><span class='line'>&#9;            if(p[k][i] != -1)
-</span><span class='line'>&#9;            {
-</span><span class='line'>&#9;                sta = r[k]-val[i]*2-val[i+1]*2+val[p[k][i]];
-</span><span class='line'>&#9;                if(e[sta] != -1) B[e[sta]][k] += 1;
-</span><span class='line'>&#9;            }
-</span><span class='line'>&#9;        }
-</span><span class='line'>&#9;    }
-</span><span class='line'>
-</span><span class='line'>&#9;    mul(B, A);
-</span><span class='line'>&#9;    for(j=0;j&lt;all;j++) for(k=0;k&lt;all;k++) A[j][k] = B[j][k];
+</span><span class='line'>&#9;char*laddr;
+</span><span class='line'>&#9;int i, j;
+</span><span class='line'>&#9;union u {
+</span><span class='line'>&#9;&#9;long val;
+</span><span class='line'>&#9;&#9;char chars[long_size];
+</span><span class='line'>&#9;} data;
+</span><span class='line'>&#9;i =0;
+</span><span class='line'>&#9;j = len / long_size;
+</span><span class='line'>&#9;laddr = str;
+</span><span class='line'>&#9;while(i &lt; j) {
+</span><span class='line'>&#9;&#9;data.val= ptrace(PTRACE_PEEKDATA,
+</span><span class='line'>&#9;&#9;&#9;child, addr + i *4,
+</span><span class='line'>&#9;&#9;&#9;NULL);
+</span><span class='line'>&#9;&#9;memcpy(laddr, data.chars, long_size);
+</span><span class='line'>&#9;&#9;++i;
+</span><span class='line'>&#9;&#9;laddr += long_size;
 </span><span class='line'>&#9;}
-</span><span class='line'>&#9;// change
-</span><span class='line'>&#9;for(i=0;i&lt;all;i++) for(j=0;j&lt;all;j++)
-</span><span class='line'>&#9;{
-</span><span class='line'>&#9;    B[i][j] = 0;
-</span><span class='line'>&#9;    if(e[r[i]/3] != -1)
-</span><span class='line'>&#9;        B[i][j] = A[e[r[i]/3]][j];
+</span><span class='line'>&#9;j = len % long_size;
+</span><span class='line'>&#9;if(j != 0) {
+</span><span class='line'>&#9;&#9;data.val= ptrace(PTRACE_PEEKDATA,
+</span><span class='line'>&#9;&#9;&#9;child, addr + i *4,
+</span><span class='line'>&#9;&#9;&#9;NULL);
+</span><span class='line'>&#9;&#9;memcpy(laddr, data.chars, j);
 </span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;int q[M],al=0;
-</span><span class='line'>&#9;for(i=0;i&lt;all;i++) if(r[i]%3 == 0) q[al++] = r[i];
-</span><span class='line'>
-</span><span class='line'>&#9;for(i=0;i&lt;al;i++) for(j=0;j&lt;al;j++)
-</span><span class='line'>&#9;{
-</span><span class='line'>&#9;    A[i][j] = B[e[q[i]]][e[q[j]]];
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;all = al;
-</span><span class='line'>&#9;for(kk=0;;kk++) if(q[kk] == 3+val[n+1]*2) break;
-</span><span class='line'>
+</span><span class='line'>&#9;str[len]='\0';
 </span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>void solve()
+</span><span class='line'>void putdata(pid_t child,long addr, char*str,int len)
 </span><span class='line'>{
-</span><span class='line'>&#9;int i,j;
-</span><span class='line'>&#9;for(i=0;i&lt;all;i++) for(j=0;j&lt;all;j++) B[i][j]=(i==j)?1:0;
-</span><span class='line'>&#9;while(m &gt; 0)
-</span><span class='line'>&#9;{
-</span><span class='line'>&#9;    if(m%2 == 1) mul(B, A);
-</span><span class='line'>&#9;    mul(A, A);
-</span><span class='line'>&#9;    m /= 2;
+</span><span class='line'>&#9;char*laddr;
+</span><span class='line'>&#9;int i, j;
+</span><span class='line'>&#9;union u {
+</span><span class='line'>&#9;&#9;long val;
+</span><span class='line'>&#9;&#9;char chars[long_size];
+</span><span class='line'>&#9;} data;
+</span><span class='line'>&#9;i =0;
+</span><span class='line'>&#9;j = len / long_size;
+</span><span class='line'>&#9;laddr = str;
+</span><span class='line'>&#9;while(i &lt; j) {
+</span><span class='line'>&#9;&#9;memcpy(data.chars, laddr, long_size);
+</span><span class='line'>&#9;&#9;ptrace(PTRACE_POKEDATA, child,
+</span><span class='line'>&#9;&#9;&#9;addr + i *4, data.val);
+</span><span class='line'>&#9;&#9;&#9;++i;
+</span><span class='line'>&#9;&#9;laddr += long_size;
 </span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;if(B[kk][0] == 0)
-</span><span class='line'>&#9;    printf("Impossible\n");
-</span><span class='line'>&#9;else
-</span><span class='line'>&#9;    printf("%d\n",B[kk][0]);
+</span><span class='line'>&#9;j = len % long_size;
+</span><span class='line'>&#9;if(j != 0) {
+</span><span class='line'>&#9;&#9;memcpy(data.chars, laddr, j);
+</span><span class='line'>&#9;&#9;ptrace(PTRACE_POKEDATA, child,
+</span><span class='line'>&#9;&#9;addr + i *4, data.val);
+</span><span class='line'>&#9;}
 </span><span class='line'>}
-</span><span class='line'>
 </span><span class='line'>int main()
 </span><span class='line'>{
-</span><span class='line'>&#9;while(scanf("%d %d",&n,&m) != EOF)
-</span><span class='line'>&#9;{
-</span><span class='line'>&#9;    init();
-</span><span class='line'>&#9;    abc();
-</span><span class='line'>&#9;    solve();
+</span><span class='line'>&#9;pid_t child;
+</span><span class='line'>&#9;child = fork();
+</span><span class='line'>&#9;if(child ==0){
+</span><span class='line'>&#9;&#9;ptrace(PTRACE_TRACEME,0, NULL, NULL);
+</span><span class='line'>&#9;&#9;execl("/bin/ls","ls", NULL);
+</span><span class='line'>&#9;} else {
+</span><span class='line'>&#9;&#9;long orig_eax;
+</span><span class='line'>&#9;&#9;long params[3];
+</span><span class='line'>&#9;&#9;int status;
+</span><span class='line'>&#9;&#9;char*str,*laddr;
+</span><span class='line'>&#9;&#9;int toggle =0;
+</span><span class='line'>&#9;&#9;while(1) {
+</span><span class='line'>&#9;&#9;&#9;wait(&status);
+</span><span class='line'>&#9;&#9;&#9;if(WIFEXITED(status))
+</span><span class='line'>&#9;&#9;&#9;break;
+</span><span class='line'>&#9;&#9;&#9;orig_eax = ptrace(PTRACE_PEEKUSER,
+</span><span class='line'>&#9;&#9;&#9;&#9;child,4* ORIG_EAX,
+</span><span class='line'>&#9;&#9;&#9;&#9;NULL);
+</span><span class='line'>&#9;&#9;&#9;if(orig_eax == SYS_write){
+</span><span class='line'>&#9;&#9;&#9;&#9;if(toggle ==0){
+</span><span class='line'>&#9;&#9;&#9;&#9;toggle =1;
+</span><span class='line'>&#9;&#9;&#9;&#9;params[0]= ptrace(PTRACE_PEEKUSER,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;child,4* EBX,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;NULL);
+</span><span class='line'>&#9;&#9;&#9;&#9;params[1]= ptrace(PTRACE_PEEKUSER,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;child,4* ECX,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;NULL);
+</span><span class='line'>&#9;&#9;&#9;&#9;params[2]= ptrace(PTRACE_PEEKUSER,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;child,4* EDX,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;NULL);
+</span><span class='line'>&#9;&#9;&#9;&#9;str =(char*)calloc((params[2]+1) * sizeof(char));
+</span><span class='line'>&#9;&#9;&#9;&#9;getdata(child, params[1], str, params[2]);
+</span><span class='line'>&#9;&#9;&#9;&#9;reverse(str);
+</span><span class='line'>&#9;&#9;&#9;&#9;putdata(child, params[1], str, params[2]);
+</span><span class='line'>&#9;&#9;&#9;} else {
+</span><span class='line'>&#9;&#9;&#9;&#9;toggle =0;
+</span><span class='line'>&#9;&#9;&#9;}
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;ptrace(PTRACE_SYSCALL, child, NULL, NULL);
+</span><span class='line'>&#9;&#9;}
 </span><span class='line'>&#9;}
-</span><span class='line'>&#9;return 0;
+</span><span class='line'>&#9;return0;
 </span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
-<hr />
+<p>输出是这样的：</p>
 
-<h5>六、hdu_1693</h5>
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>ppadala@linux:~/ptrace &gt; ls
+</span><span class='line'>a.out dummy.s ptrace.txt
+</span><span class='line'>libgpm.html registers.c syscallparams.c
+</span><span class='line'>dummy ptrace.html simple.c
+</span><span class='line'>ppadala@linux:~/ptrace &gt; ./a.out
+</span><span class='line'>txt.ecartp s.ymmud tuo.a
+</span><span class='line'>c.sretsiger lmth.mpgbil c.llacys_egnahc
+</span><span class='line'>c.elpmis lmth.ecartp ymmud</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这个例子中涵盖了前面讨论过的所有知识点，当然还有些新的内容。这里我们用PTRACE_POKEDATA作为第一个参数，以此来改变子进程中的变量值。它以与PTRACE_PEEKDATA相似的方式工作，当然，它不只是偷窥变量的值了，它可以修改它们。</p>
+
+<h4>单步</h4>
+
+<p>ptrace 提供了对子进程进行单步的功能。 ptrace(PTRACE_SINGLESTEP, …) 会使内核在子进程的每一条指令执行前先将其阻塞，然后将控制权交给父进程。下面的例子可以查出子进程当前将要执行的指令。为了便于理解，我用汇编写了这个受控程序，而不是让你为c的库函数到底会作那些系统调用而头痛。</p>
+
+<p>以下是被控程序的代码 dummy1.s，使用gcc –o dummy1 dummy1.s来编译</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>.data
+</span><span class='line'>hello:
+</span><span class='line'>&#9;.string"hello world\n"
+</span><span class='line'>.globl main
+</span><span class='line'>main:
+</span><span class='line'>&#9;movl $4,%eax
+</span><span class='line'>&#9;movl $2,%ebx
+</span><span class='line'>&#9;movl $hello,%ecx
+</span><span class='line'>&#9;movl $12,%edx
+</span><span class='line'>int $0x80
+</span><span class='line'>&#9;movl $1,%eax
+</span><span class='line'>&#9;xorl %ebx,%ebx
+</span><span class='line'>int $0x80
+</span><span class='line'>&#9;ret</span></code></pre></td></tr></table></div></figure>
+
+
+<p>以下的程序则用来完成单步</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -564,206 +915,58 @@ var ss360Config = {
 <span class='line-number'>43</span>
 <span class='line-number'>44</span>
 <span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-<span class='line-number'>58</span>
-<span class='line-number'>59</span>
-<span class='line-number'>60</span>
-<span class='line-number'>61</span>
-<span class='line-number'>62</span>
-<span class='line-number'>63</span>
-<span class='line-number'>64</span>
-<span class='line-number'>65</span>
-<span class='line-number'>66</span>
-<span class='line-number'>67</span>
-<span class='line-number'>68</span>
-<span class='line-number'>69</span>
-<span class='line-number'>70</span>
-<span class='line-number'>71</span>
-<span class='line-number'>72</span>
-<span class='line-number'>73</span>
-<span class='line-number'>74</span>
-<span class='line-number'>75</span>
-<span class='line-number'>76</span>
-<span class='line-number'>77</span>
-<span class='line-number'>78</span>
-<span class='line-number'>79</span>
-<span class='line-number'>80</span>
-<span class='line-number'>81</span>
-<span class='line-number'>82</span>
-<span class='line-number'>83</span>
-<span class='line-number'>84</span>
-<span class='line-number'>85</span>
-<span class='line-number'>86</span>
-<span class='line-number'>87</span>
-<span class='line-number'>88</span>
-<span class='line-number'>89</span>
-<span class='line-number'>90</span>
-<span class='line-number'>91</span>
-<span class='line-number'>92</span>
-<span class='line-number'>93</span>
-<span class='line-number'>94</span>
-<span class='line-number'>95</span>
-<span class='line-number'>96</span>
-<span class='line-number'>97</span>
-<span class='line-number'>98</span>
-<span class='line-number'>99</span>
-<span class='line-number'>100</span>
-<span class='line-number'>101</span>
-<span class='line-number'>102</span>
-<span class='line-number'>103</span>
-<span class='line-number'>104</span>
-<span class='line-number'>105</span>
-<span class='line-number'>106</span>
-<span class='line-number'>107</span>
-<span class='line-number'>108</span>
-<span class='line-number'>109</span>
-<span class='line-number'>110</span>
-<span class='line-number'>111</span>
-<span class='line-number'>112</span>
-<span class='line-number'>113</span>
-<span class='line-number'>114</span>
-<span class='line-number'>115</span>
-<span class='line-number'>116</span>
-<span class='line-number'>117</span>
-<span class='line-number'>118</span>
-<span class='line-number'>119</span>
-<span class='line-number'>120</span>
-<span class='line-number'>121</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#include&lt;stdio.h&gt;
-</span><span class='line'>#include&lt;string.h&gt;
-</span><span class='line'>
-</span><span class='line'>#define N 5000 // 2^(m+1)
-</span><span class='line'>
-</span><span class='line'>long long dp[2][N];
-</span><span class='line'>int H[N][15];
-</span><span class='line'>
-</span><span class='line'>class DP {
-</span><span class='line'>
-</span><span class='line'>public:
-</span><span class='line'>&#9;int cas;
-</span><span class='line'>&#9;DP() {
-</span><span class='line'>&#9;    cas = 0;
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;int n,m,can[33][33];
-</span><span class='line'>&#9;int val[33],LL,UU,sta,next;
-</span><span class='line'>
-</span><span class='line'>&#9;void input()
-</span><span class='line'>&#9;{
-</span><span class='line'>&#9;    int i,j;
-</span><span class='line'>&#9;    scanf("%d %d",&n,&m);
-</span><span class='line'>&#9;    for(i=1;i&lt;=n;i++)
-</span><span class='line'>&#9;        for(j=1;j&lt;=m;j++) scanf("%d", &can[i][j]);
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;void abc()
-</span><span class='line'>&#9;{
-</span><span class='line'>&#9;    int i,j,k,u,y;
-</span><span class='line'>
-</span><span class='line'>&#9;    input();
-</span><span class='line'>
-</span><span class='line'>&#9;    u = 0;
-</span><span class='line'>&#9;    for(i=0;i&lt;=(1&lt;&lt;(m+1));i++) dp[u][i] = 0;
-</span><span class='line'>&#9;    dp[u][0] = 1;
-</span><span class='line'>
-</span><span class='line'>&#9;    for(i=1;i&lt;=n;i++)
-</span><span class='line'>&#9;        for(j=1;j&lt;=m;j++)
-</span><span class='line'>&#9;        {
-</span><span class='line'>&#9;            y = u; u = 1-u;
-</span><span class='line'>&#9;            if(j == 1)
-</span><span class='line'>&#9;            {
-</span><span class='line'>&#9;                for(k=(1&lt;&lt;(m+1))-1;k&gt;=0;k--)
-</span><span class='line'>&#9;                {
-</span><span class='line'>&#9;                    dp[y][k] = dp[y][k/2];
-</span><span class='line'>&#9;                    if(k%2==1) dp[y][k] = 0;
-</span><span class='line'>&#9;                }
-</span><span class='line'>&#9;            }
-</span><span class='line'>
-</span><span class='line'>&#9;            for(k=0;k&lt;(1&lt;&lt;(m+1));k++) dp[u][k] = 0;
-</span><span class='line'>
-</span><span class='line'>&#9;            for(k=0;k&lt;(1&lt;&lt;(m+1));k++)
-</span><span class='line'>&#9;            if(dp[y][k] &gt; 0)
-</span><span class='line'>&#9;            {
-</span><span class='line'>&#9;                LL = H[k][j];
-</span><span class='line'>&#9;                UU = H[k][j+1];
-</span><span class='line'>
-</span><span class='line'>&#9;                if(can[i][j] == 0)               // sta = 0
-</span><span class='line'>&#9;                {
-</span><span class='line'>&#9;                    if(LL == 0 && UU == 0)
-</span><span class='line'>&#9;                    {
-</span><span class='line'>&#9;                        dp[u][k] += dp[y][k];
-</span><span class='line'>&#9;                    }
-</span><span class='line'>&#9;                    continue;
-</span><span class='line'>&#9;                }
-</span><span class='line'>&#9;                                                 // sta = 1;
-</span><span class='line'>&#9;                if(UU == 0 && LL == 0)
-</span><span class='line'>&#9;                {
-</span><span class='line'>&#9;                    sta = k+(1&lt;&lt;(j-1))+(1&lt;&lt;j);
-</span><span class='line'>&#9;                    dp[u][sta] += dp[y][k];
-</span><span class='line'>&#9;                }
-</span><span class='line'>&#9;                else
-</span><span class='line'>&#9;                if(LL == 0)
-</span><span class='line'>&#9;                {
-</span><span class='line'>&#9;                    sta = k;
-</span><span class='line'>&#9;                    dp[u][sta] += dp[y][k];
-</span><span class='line'>
-</span><span class='line'>&#9;                    sta = k+((1&lt;&lt;(j-1)) - (1&lt;&lt;j));
-</span><span class='line'>&#9;                    dp[u][sta] += dp[y][k];
-</span><span class='line'>&#9;                }
-</span><span class='line'>&#9;                else
-</span><span class='line'>&#9;                if(UU == 0)
-</span><span class='line'>&#9;                {
-</span><span class='line'>&#9;                    sta = k;
-</span><span class='line'>&#9;                    dp[u][sta] += dp[y][k];
-</span><span class='line'>
-</span><span class='line'>&#9;                    sta = k+(-(1&lt;&lt;(j-1))+(1&lt;&lt;j));
-</span><span class='line'>&#9;                    dp[u][sta] += dp[y][k];
-</span><span class='line'>&#9;                }
-</span><span class='line'>&#9;                else
-</span><span class='line'>&#9;                if(LL == 1 && UU == 1)
-</span><span class='line'>&#9;                {
-</span><span class='line'>&#9;                    sta = k-(1&lt;&lt;(j-1))-(1&lt;&lt;j);
-</span><span class='line'>&#9;                    dp[u][sta] += dp[y][k];
-</span><span class='line'>&#9;                }
-</span><span class='line'>&#9;            }
-</span><span class='line'>&#9;        }
-</span><span class='line'>&#9;        cas++;
-</span><span class='line'>&#9;        printf("Case %d: There are %lld ways to eat the trees.\n",cas,dp[u][0]);
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;void solve()
-</span><span class='line'>&#9;{
-</span><span class='line'>&#9;    int k,j,T;
-</span><span class='line'>
-</span><span class='line'>&#9;    for(k=0;k&lt;(1&lt;&lt;(11+1));k++)
-</span><span class='line'>&#9;        for(j=1;j&lt;=11+1;j++)
-</span><span class='line'>&#9;            H[k][j] = k/(1&lt;&lt;(j-1))%2;
-</span><span class='line'>
-</span><span class='line'>&#9;    scanf("%d",&T);
-</span><span class='line'>&#9;    while(T-- &gt; 0)
-</span><span class='line'>&#9;        abc();
-</span><span class='line'>&#9;}
-</span><span class='line'>};
-</span><span class='line'>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;sys/ptrace.h&gt;
+</span><span class='line'>#include &lt;sys/types.h&gt;
+</span><span class='line'>#include &lt;sys/wait.h&gt;
+</span><span class='line'>#include &lt;unistd.h&gt;
+</span><span class='line'>#include &lt;linux/user.h&gt;
+</span><span class='line'>#include &lt;sys/syscall.h&gt;
 </span><span class='line'>int main()
 </span><span class='line'>{
-</span><span class='line'>&#9;    DP dp;
-</span><span class='line'>&#9;    dp.solve();
+</span><span class='line'>&#9;pid_t child;
+</span><span class='line'>&#9;const int long_size =sizeof(long);
+</span><span class='line'>&#9;child = fork();
+</span><span class='line'>&#9;if(child ==0){
+</span><span class='line'>&#9;&#9;ptrace(PTRACE_TRACEME,0, NULL, NULL);
+</span><span class='line'>&#9;&#9;execl("./dummy1","dummy1", NULL);
+</span><span class='line'>&#9;} else {
+</span><span class='line'>&#9;&#9;int status;
+</span><span class='line'>&#9;&#9;union u {
+</span><span class='line'>&#9;&#9;long val;
+</span><span class='line'>&#9;&#9;char chars[long_size];
+</span><span class='line'>&#9;} data;
+</span><span class='line'>&#9;struct user_regs_struct regs;
+</span><span class='line'>&#9;int start =0;
+</span><span class='line'>&#9;long ins;
+</span><span class='line'>&#9;while(1) {
+</span><span class='line'>&#9;&#9;wait(&status);
+</span><span class='line'>&#9;&#9;if(WIFEXITED(status))
+</span><span class='line'>&#9;&#9;break;
+</span><span class='line'>&#9;&#9;ptrace(PTRACE_GETREGS, child, NULL,&regs);
+</span><span class='line'>&#9;&#9;if(start ==1){
+</span><span class='line'>&#9;&#9;&#9;ins = ptrace(PTRACE_PEEKTEXT,
+</span><span class='line'>&#9;&#9;&#9;&#9;child, regs.eip,
+</span><span class='line'>&#9;&#9;&#9;&#9;NULL);
+</span><span class='line'>&#9;&#9;&#9;printf("EIP: %lx Instruction executed: %lx ",
+</span><span class='line'>&#9;&#9;&#9;&#9;regs.eip, ins);
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;if(regs.orig_eax== SYS_write){
+</span><span class='line'>&#9;&#9;&#9;start =1;
+</span><span class='line'>&#9;&#9;&#9;ptrace(PTRACE_SINGLESTEP, child, NULL, NULL);
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;else
+</span><span class='line'>&#9;&#9;&#9;ptrace(PTRACE_SYSCALL, child, NULL, NULL);
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;return0;
 </span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
+<p>程序的输出是这样的：<br/>
+你可能需要察看Intel的用户手册来了解这些指令代码的意思。<br/>
+更复杂的单步，比如设置断点，则需要很仔细的设计和更复杂的代码才可以实现。</p>
 
+<p>在第二部分，我们将会看到如何在程序中加入断点，以及将代码插入到已经在运行的程序中</p>
 </div>
   
   
@@ -776,7 +979,7 @@ var ss360Config = {
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2011/03/20/alg-mdp-source2/">插头 DP code3-4</a></h2>
+      <h2 class="entry-title"><a href="/blog/2011/11/29/tools-ptrace/">linux ptrace函数</a></h2>
     
     
       <p class="meta">
@@ -785,780 +988,29 @@ var ss360Config = {
 
 
 
-<time class='entry-date' datetime='2011-03-20T23:01:00+08:00'><span class='date'>2011-03-20</span> <span class='time'>23:01:00</span></time>
+<time class='entry-date' datetime='2011-11-29T19:05:00+08:00'><span class='date'>2011-11-29</span> <span class='time'>19:05:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><h5>三、pku_1739</h5>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+  <div class="entry-content"><figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-<span class='line-number'>58</span>
-<span class='line-number'>59</span>
-<span class='line-number'>60</span>
-<span class='line-number'>61</span>
-<span class='line-number'>62</span>
-<span class='line-number'>63</span>
-<span class='line-number'>64</span>
-<span class='line-number'>65</span>
-<span class='line-number'>66</span>
-<span class='line-number'>67</span>
-<span class='line-number'>68</span>
-<span class='line-number'>69</span>
-<span class='line-number'>70</span>
-<span class='line-number'>71</span>
-<span class='line-number'>72</span>
-<span class='line-number'>73</span>
-<span class='line-number'>74</span>
-<span class='line-number'>75</span>
-<span class='line-number'>76</span>
-<span class='line-number'>77</span>
-<span class='line-number'>78</span>
-<span class='line-number'>79</span>
-<span class='line-number'>80</span>
-<span class='line-number'>81</span>
-<span class='line-number'>82</span>
-<span class='line-number'>83</span>
-<span class='line-number'>84</span>
-<span class='line-number'>85</span>
-<span class='line-number'>86</span>
-<span class='line-number'>87</span>
-<span class='line-number'>88</span>
-<span class='line-number'>89</span>
-<span class='line-number'>90</span>
-<span class='line-number'>91</span>
-<span class='line-number'>92</span>
-<span class='line-number'>93</span>
-<span class='line-number'>94</span>
-<span class='line-number'>95</span>
-<span class='line-number'>96</span>
-<span class='line-number'>97</span>
-<span class='line-number'>98</span>
-<span class='line-number'>99</span>
-<span class='line-number'>100</span>
-<span class='line-number'>101</span>
-<span class='line-number'>102</span>
-<span class='line-number'>103</span>
-<span class='line-number'>104</span>
-<span class='line-number'>105</span>
-<span class='line-number'>106</span>
-<span class='line-number'>107</span>
-<span class='line-number'>108</span>
-<span class='line-number'>109</span>
-<span class='line-number'>110</span>
-<span class='line-number'>111</span>
-<span class='line-number'>112</span>
-<span class='line-number'>113</span>
-<span class='line-number'>114</span>
-<span class='line-number'>115</span>
-<span class='line-number'>116</span>
-<span class='line-number'>117</span>
-<span class='line-number'>118</span>
-<span class='line-number'>119</span>
-<span class='line-number'>120</span>
-<span class='line-number'>121</span>
-<span class='line-number'>122</span>
-<span class='line-number'>123</span>
-<span class='line-number'>124</span>
-<span class='line-number'>125</span>
-<span class='line-number'>126</span>
-<span class='line-number'>127</span>
-<span class='line-number'>128</span>
-<span class='line-number'>129</span>
-<span class='line-number'>130</span>
-<span class='line-number'>131</span>
-<span class='line-number'>132</span>
-<span class='line-number'>133</span>
-<span class='line-number'>134</span>
-<span class='line-number'>135</span>
-<span class='line-number'>136</span>
-<span class='line-number'>137</span>
-<span class='line-number'>138</span>
-<span class='line-number'>139</span>
-<span class='line-number'>140</span>
-<span class='line-number'>141</span>
-<span class='line-number'>142</span>
-<span class='line-number'>143</span>
-<span class='line-number'>144</span>
-<span class='line-number'>145</span>
-<span class='line-number'>146</span>
-<span class='line-number'>147</span>
-<span class='line-number'>148</span>
-<span class='line-number'>149</span>
-<span class='line-number'>150</span>
-<span class='line-number'>151</span>
-<span class='line-number'>152</span>
-<span class='line-number'>153</span>
-<span class='line-number'>154</span>
-<span class='line-number'>155</span>
-<span class='line-number'>156</span>
-<span class='line-number'>157</span>
-<span class='line-number'>158</span>
-<span class='line-number'>159</span>
-<span class='line-number'>160</span>
-<span class='line-number'>161</span>
-<span class='line-number'>162</span>
-<span class='line-number'>163</span>
-<span class='line-number'>164</span>
-<span class='line-number'>165</span>
-<span class='line-number'>166</span>
-<span class='line-number'>167</span>
-<span class='line-number'>168</span>
-<span class='line-number'>169</span>
-<span class='line-number'>170</span>
-<span class='line-number'>171</span>
-<span class='line-number'>172</span>
-<span class='line-number'>173</span>
-<span class='line-number'>174</span>
-<span class='line-number'>175</span>
-<span class='line-number'>176</span>
-<span class='line-number'>177</span>
-<span class='line-number'>178</span>
-<span class='line-number'>179</span>
-<span class='line-number'>180</span>
-<span class='line-number'>181</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#include&lt;stdio.h&gt;
-</span><span class='line'>
-</span><span class='line'>class DP {
-</span><span class='line'>
-</span><span class='line'>public:
-</span><span class='line'>&#9;int n,m,can[33][33];
-</span><span class='line'>&#9;int dp[200000],pre[200000],val[33],LL,UU,sta,next;
-</span><span class='line'>&#9;int a[33],b[33],d[33],c[33];
-</span><span class='line'>&#9;char p[200000][12];
-</span><span class='line'>
-</span><span class='line'>&#9;void input()
-</span><span class='line'>&#9;{
-</span><span class='line'>&#9;    int i,j;
-</span><span class='line'>&#9;    char ch[13];
-</span><span class='line'>
-</span><span class='line'>&#9;    for(i=1;i&lt;=n;i++)
-</span><span class='line'>&#9;    {
-</span><span class='line'>&#9;        scanf("%s",ch);
-</span><span class='line'>&#9;        for(j=1;j&lt;=m;j++) can[i][j] = ch[j-1]=='.'?1:0;
-</span><span class='line'>&#9;    }
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;int ok()
-</span><span class='line'>&#9;{
-</span><span class='line'>&#9;    int i,l;
-</span><span class='line'>&#9;    l = 0;
-</span><span class='line'>&#9;    for(i=1;i&lt;=m+1;i++)
-</span><span class='line'>&#9;    {
-</span><span class='line'>&#9;        b[i] = d[i] = -1;
-</span><span class='line'>&#9;        if(a[i] == 1) c[++l] = i;
-</span><span class='line'>&#9;        else
-</span><span class='line'>&#9;        if(a[i] == 2)
-</span><span class='line'>&#9;        {
-</span><span class='line'>&#9;            if(l == 0) return 0;
-</span><span class='line'>&#9;            b[c[l]] = i; d[i] = c[l];
-</span><span class='line'>&#9;            l--;
-</span><span class='line'>&#9;        }
-</span><span class='line'>&#9;    }
-</span><span class='line'>&#9;    if(l != 0) return 0;
-</span><span class='line'>&#9;    return 1;
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;void init()
-</span><span class='line'>&#9;{
-</span><span class='line'>&#9;    int i,j,k;
-</span><span class='line'>
-</span><span class='line'>&#9;    val[1] = 1;
-</span><span class='line'>&#9;    for(i=2;i&lt;=m+2;i++) val[i] = val[i-1]*3;
-</span><span class='line'>
-</span><span class='line'>&#9;    for(i=0;i&lt;=m+2;i++) a[i] = 0;
-</span><span class='line'>&#9;    a[1] = -1;
-</span><span class='line'>
-</span><span class='line'>&#9;    for(i=0;i&lt;=val[m+2];i++)
-</span><span class='line'>&#9;    {
-</span><span class='line'>&#9;        a[1]++;
-</span><span class='line'>&#9;        k = 1; while(k &lt;= m+1 && a[k]&gt;2) { a[k]%=3; a[k+1]++; k++; }
-</span><span class='line'>
-</span><span class='line'>&#9;        if(ok() == 0) continue;
-</span><span class='line'>
-</span><span class='line'>&#9;        for(j=1;j&lt;=m+1;j++) {
-</span><span class='line'>&#9;            p[i][j] = -1;
-</span><span class='line'>&#9;            if(b[j] != -1) p[i][j] = b[j];
-</span><span class='line'>&#9;            if(d[j] != -1) p[i][j] = d[j];
-</span><span class='line'>&#9;        }
-</span><span class='line'>&#9;    }
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;void abc()
-</span><span class='line'>&#9;{
-</span><span class='line'>&#9;    int i,j,k;
-</span><span class='line'>
-</span><span class='line'>&#9;    input();
-</span><span class='line'>&#9;    init();
-</span><span class='line'>
-</span><span class='line'>&#9;    for(i=0;i&lt;=val[m+2];i++) dp[i] = 0;
-</span><span class='line'>
-</span><span class='line'>&#9;    dp[0] = 1;
-</span><span class='line'>
-</span><span class='line'>&#9;    for(i=1;i&lt;=n;i++)
-</span><span class='line'>&#9;        for(j=1;j&lt;=m;j++)
-</span><span class='line'>&#9;        {
-</span><span class='line'>&#9;            if(j == 1)
-</span><span class='line'>&#9;            {
-</span><span class='line'>&#9;                for(k=val[m+2]-1;k&gt;=0;k--)
-</span><span class='line'>&#9;                {
-</span><span class='line'>&#9;                    dp[k] = dp[k/3];
-</span><span class='line'>&#9;                    if(k%3 != 0) dp[k] = 0;
-</span><span class='line'>&#9;                }
-</span><span class='line'>&#9;            }
-</span><span class='line'>
-</span><span class='line'>&#9;            for(k=0;k&lt;val[m+2];k++)
-</span><span class='line'>&#9;            {
-</span><span class='line'>&#9;                pre[k] = dp[k];
-</span><span class='line'>&#9;                dp[k] = 0;
-</span><span class='line'>&#9;            }
-</span><span class='line'>
-</span><span class='line'>&#9;            for(k=0;k&lt;val[m+2];k++)
-</span><span class='line'>&#9;            if(pre[k] &gt; 0)
-</span><span class='line'>&#9;            {
-</span><span class='line'>&#9;                LL = k/val[j]%3;
-</span><span class='line'>&#9;                UU = k/val[j+1]%3;
-</span><span class='line'>
-</span><span class='line'>&#9;                if(can[i][j] == 0)
-</span><span class='line'>&#9;                {
-</span><span class='line'>&#9;                    if(LL == 0 && UU == 0)
-</span><span class='line'>&#9;                    {
-</span><span class='line'>&#9;                        dp[k] += pre[k];
-</span><span class='line'>&#9;                    }
-</span><span class='line'>&#9;                    continue;
-</span><span class='line'>&#9;                }
-</span><span class='line'>
-</span><span class='line'>
-</span><span class='line'>&#9;                if(UU == 0 && LL == 0)
-</span><span class='line'>&#9;                {
-</span><span class='line'>&#9;                    sta = k+val[j]+val[j+1]+val[j+1];
-</span><span class='line'>
-</span><span class='line'>&#9;                    dp[sta] += pre[k];
-</span><span class='line'>&#9;                }
-</span><span class='line'>&#9;                else
-</span><span class='line'>&#9;                if(LL == 0)
-</span><span class='line'>&#9;                {
-</span><span class='line'>&#9;                    sta = k;
-</span><span class='line'>&#9;                    dp[sta] += pre[k];
-</span><span class='line'>
-</span><span class='line'>&#9;                    sta = k+k/val[j+1]%3*(val[j]-val[j+1]);
-</span><span class='line'>&#9;                    dp[sta] += pre[k];
-</span><span class='line'>&#9;                }
-</span><span class='line'>&#9;                else
-</span><span class='line'>&#9;                if(UU == 0)
-</span><span class='line'>&#9;                {
-</span><span class='line'>&#9;                    sta = k;
-</span><span class='line'>&#9;                    dp[sta] += pre[k];
-</span><span class='line'>
-</span><span class='line'>&#9;                    sta = k+k/val[j]%3*(-val[j]+val[j+1]);
-</span><span class='line'>&#9;                    dp[sta] += pre[k];
-</span><span class='line'>&#9;                }
-</span><span class='line'>&#9;                else
-</span><span class='line'>&#9;                if(LL == 2 && UU == 1)
-</span><span class='line'>&#9;                {
-</span><span class='line'>&#9;                    sta = k-val[j]-val[j]-val[j+1];
-</span><span class='line'>&#9;                    dp[sta] += pre[k];
-</span><span class='line'>&#9;                }
-</span><span class='line'>&#9;                else
-</span><span class='line'>&#9;                if(LL == 1 && UU == 1)
-</span><span class='line'>&#9;                {
-</span><span class='line'>&#9;                    if(p[k][j+1] &gt; 0 && p[k][j+1] &lt;= m+1)
-</span><span class='line'>&#9;                    {
-</span><span class='line'>&#9;                        sta = k-val[j]-val[j+1]-val[p[k][j+1]];
-</span><span class='line'>&#9;                        dp[sta] += pre[k];
-</span><span class='line'>&#9;                    }
-</span><span class='line'>&#9;                }
-</span><span class='line'>&#9;                else
-</span><span class='line'>&#9;                if(LL == 2 && UU == 2)
-</span><span class='line'>&#9;                {
-</span><span class='line'>&#9;                    if(p[k][j] &gt; 0)
-</span><span class='line'>&#9;                    {
-</span><span class='line'>&#9;                        sta = k-val[j]-val[j]-val[j+1]-val[j+1]+val[p[k][j]];
-</span><span class='line'>&#9;                        dp[sta] += pre[k];
-</span><span class='line'>&#9;                    }
-</span><span class='line'>&#9;                }
-</span><span class='line'>&#9;            }
-</span><span class='line'>&#9;        }
-</span><span class='line'>&#9;    printf("%d\n",dp[1+val[m]*2]);
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;void solve()
-</span><span class='line'>&#9;{
-</span><span class='line'>&#9;    while(true)
-</span><span class='line'>&#9;    {
-</span><span class='line'>&#9;        scanf("%d %d",&n,&m);
-</span><span class='line'>&#9;        if(n == 0 && m == 0) break;
-</span><span class='line'>&#9;        abc();
-</span><span class='line'>&#9;    }
-</span><span class='line'>&#9;}
-</span><span class='line'>};
-</span><span class='line'>
-</span><span class='line'>int main() {
-</span><span class='line'>&#9;    DP dp;
-</span><span class='line'>&#9;    dp.solve();
-</span><span class='line'>&#9;    return 0;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;sys/ptrace.h&gt;
+</span><span class='line'>int ptrace(int request, int pid, int addr, int data);</span></code></pre></td></tr></table></div></figure>
 
 
-<hr />
+<h5>描述</h5>
 
-<h5>四、hdu_3377</h5>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-<span class='line-number'>58</span>
-<span class='line-number'>59</span>
-<span class='line-number'>60</span>
-<span class='line-number'>61</span>
-<span class='line-number'>62</span>
-<span class='line-number'>63</span>
-<span class='line-number'>64</span>
-<span class='line-number'>65</span>
-<span class='line-number'>66</span>
-<span class='line-number'>67</span>
-<span class='line-number'>68</span>
-<span class='line-number'>69</span>
-<span class='line-number'>70</span>
-<span class='line-number'>71</span>
-<span class='line-number'>72</span>
-<span class='line-number'>73</span>
-<span class='line-number'>74</span>
-<span class='line-number'>75</span>
-<span class='line-number'>76</span>
-<span class='line-number'>77</span>
-<span class='line-number'>78</span>
-<span class='line-number'>79</span>
-<span class='line-number'>80</span>
-<span class='line-number'>81</span>
-<span class='line-number'>82</span>
-<span class='line-number'>83</span>
-<span class='line-number'>84</span>
-<span class='line-number'>85</span>
-<span class='line-number'>86</span>
-<span class='line-number'>87</span>
-<span class='line-number'>88</span>
-<span class='line-number'>89</span>
-<span class='line-number'>90</span>
-<span class='line-number'>91</span>
-<span class='line-number'>92</span>
-<span class='line-number'>93</span>
-<span class='line-number'>94</span>
-<span class='line-number'>95</span>
-<span class='line-number'>96</span>
-<span class='line-number'>97</span>
-<span class='line-number'>98</span>
-<span class='line-number'>99</span>
-<span class='line-number'>100</span>
-<span class='line-number'>101</span>
-<span class='line-number'>102</span>
-<span class='line-number'>103</span>
-<span class='line-number'>104</span>
-<span class='line-number'>105</span>
-<span class='line-number'>106</span>
-<span class='line-number'>107</span>
-<span class='line-number'>108</span>
-<span class='line-number'>109</span>
-<span class='line-number'>110</span>
-<span class='line-number'>111</span>
-<span class='line-number'>112</span>
-<span class='line-number'>113</span>
-<span class='line-number'>114</span>
-<span class='line-number'>115</span>
-<span class='line-number'>116</span>
-<span class='line-number'>117</span>
-<span class='line-number'>118</span>
-<span class='line-number'>119</span>
-<span class='line-number'>120</span>
-<span class='line-number'>121</span>
-<span class='line-number'>122</span>
-<span class='line-number'>123</span>
-<span class='line-number'>124</span>
-<span class='line-number'>125</span>
-<span class='line-number'>126</span>
-<span class='line-number'>127</span>
-<span class='line-number'>128</span>
-<span class='line-number'>129</span>
-<span class='line-number'>130</span>
-<span class='line-number'>131</span>
-<span class='line-number'>132</span>
-<span class='line-number'>133</span>
-<span class='line-number'>134</span>
-<span class='line-number'>135</span>
-<span class='line-number'>136</span>
-<span class='line-number'>137</span>
-<span class='line-number'>138</span>
-<span class='line-number'>139</span>
-<span class='line-number'>140</span>
-<span class='line-number'>141</span>
-<span class='line-number'>142</span>
-<span class='line-number'>143</span>
-<span class='line-number'>144</span>
-<span class='line-number'>145</span>
-<span class='line-number'>146</span>
-<span class='line-number'>147</span>
-<span class='line-number'>148</span>
-<span class='line-number'>149</span>
-<span class='line-number'>150</span>
-<span class='line-number'>151</span>
-<span class='line-number'>152</span>
-<span class='line-number'>153</span>
-<span class='line-number'>154</span>
-<span class='line-number'>155</span>
-<span class='line-number'>156</span>
-<span class='line-number'>157</span>
-<span class='line-number'>158</span>
-<span class='line-number'>159</span>
-<span class='line-number'>160</span>
-<span class='line-number'>161</span>
-<span class='line-number'>162</span>
-<span class='line-number'>163</span>
-<span class='line-number'>164</span>
-<span class='line-number'>165</span>
-<span class='line-number'>166</span>
-<span class='line-number'>167</span>
-<span class='line-number'>168</span>
-<span class='line-number'>169</span>
-<span class='line-number'>170</span>
-<span class='line-number'>171</span>
-<span class='line-number'>172</span>
-<span class='line-number'>173</span>
-<span class='line-number'>174</span>
-<span class='line-number'>175</span>
-<span class='line-number'>176</span>
-<span class='line-number'>177</span>
-<span class='line-number'>178</span>
-<span class='line-number'>179</span>
-<span class='line-number'>180</span>
-<span class='line-number'>181</span>
-<span class='line-number'>182</span>
-<span class='line-number'>183</span>
-<span class='line-number'>184</span>
-<span class='line-number'>185</span>
-<span class='line-number'>186</span>
-<span class='line-number'>187</span>
-<span class='line-number'>188</span>
-<span class='line-number'>189</span>
-<span class='line-number'>190</span>
-<span class='line-number'>191</span>
-<span class='line-number'>192</span>
-<span class='line-number'>193</span>
-<span class='line-number'>194</span>
-<span class='line-number'>195</span>
-<span class='line-number'>196</span>
-<span class='line-number'>197</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#include&lt;stdio.h&gt;
-</span><span class='line'>
-</span><span class='line'>int n,m,can[33][33];
-</span><span class='line'>int dp[200000],pre[200000],val[33],LL,UU,sta,next;
-</span><span class='line'>int a[33],b[33],d[33],c[33],cas=0;
-</span><span class='line'>char p[200000][12];
-</span><span class='line'>
-</span><span class='line'>
-</span><span class='line'>class DP {
-</span><span class='line'>
-</span><span class='line'>public:
-</span><span class='line'>&#9;void input()
-</span><span class='line'>&#9;{
-</span><span class='line'>&#9;    int i,j;
-</span><span class='line'>
-</span><span class='line'>&#9;    for(i=1;i&lt;=n;i++)
-</span><span class='line'>&#9;        for(j=1;j&lt;=m;j++) scanf("%d",&can[i][j]);
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;int ok()
-</span><span class='line'>&#9;{
-</span><span class='line'>&#9;    int i,l;
-</span><span class='line'>&#9;    l = 0;
-</span><span class='line'>&#9;    for(i=1+m;i&gt;=1;i--)
-</span><span class='line'>&#9;    {
-</span><span class='line'>&#9;        b[i] = d[i] = -1;
-</span><span class='line'>&#9;        if(a[i] == 2) c[++l] = i;
-</span><span class='line'>&#9;        else
-</span><span class='line'>&#9;        if(a[i] == 1)
-</span><span class='line'>&#9;        {
-</span><span class='line'>&#9;            if(l == 0) return 0;
-</span><span class='line'>&#9;            d[c[l]] = i; b[i] = c[l];
-</span><span class='line'>&#9;            l--;
-</span><span class='line'>&#9;        }
-</span><span class='line'>&#9;    }
-</span><span class='line'>&#9;    if(l != 1) return 0;
-</span><span class='line'>&#9;    return 1;
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;void init()
-</span><span class='line'>&#9;{
-</span><span class='line'>&#9;    int i,j,k;
-</span><span class='line'>
-</span><span class='line'>&#9;    for(i=0;i&lt;=12;i++) a[i] = 0;
-</span><span class='line'>&#9;    a[1] = -1;
-</span><span class='line'>
-</span><span class='line'>&#9;    for(i=0;i&lt;=val[m+2];i++)
-</span><span class='line'>&#9;    {
-</span><span class='line'>&#9;        a[1]++;
-</span><span class='line'>&#9;        k = 1; while(k &lt;= m+1 && a[k]&gt;2) { a[k]%=3; a[k+1]++; k++; }
-</span><span class='line'>
-</span><span class='line'>&#9;        if(ok() == 0) continue;
-</span><span class='line'>
-</span><span class='line'>&#9;        for(j=1;j&lt;=m+1;j++) {
-</span><span class='line'>&#9;            p[i][j] = -1;
-</span><span class='line'>&#9;            if(b[j] != -1) p[i][j] = b[j];
-</span><span class='line'>&#9;            if(d[j] != -1) p[i][j] = d[j];
-</span><span class='line'>&#9;        }
-</span><span class='line'>&#9;    }
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;void abc()
-</span><span class='line'>&#9;{
-</span><span class='line'>&#9;    int i,j,k,ans=-1000000000;
-</span><span class='line'>
-</span><span class='line'>&#9;    val[1] = 1;
-</span><span class='line'>&#9;    for(i=2;i&lt;=12;i++) val[i] = val[i-1]*3;
-</span><span class='line'>
-</span><span class='line'>&#9;    input();
-</span><span class='line'>&#9;    init();
-</span><span class='line'>
-</span><span class='line'>&#9;    for(i=0;i&lt;=val[m+2];i++) dp[i] = -1000000000;
-</span><span class='line'>
-</span><span class='line'>&#9;    //dp[0] = 0;
-</span><span class='line'>
-</span><span class='line'>&#9;    for(i=1;i&lt;=n;i++)
-</span><span class='line'>&#9;        for(j=1;j&lt;=m;j++)
-</span><span class='line'>&#9;        {
-</span><span class='line'>&#9;            if(j == 1)
-</span><span class='line'>&#9;            {
-</span><span class='line'>&#9;                for(k=val[m+2]-1;k&gt;=0;k--)
-</span><span class='line'>&#9;                {
-</span><span class='line'>&#9;                    dp[k] = dp[k/3];
-</span><span class='line'>&#9;                    if(k%3 != 0) dp[k] = -1000000000;
-</span><span class='line'>&#9;                }
-</span><span class='line'>&#9;            }
-</span><span class='line'>
-</span><span class='line'>&#9;            for(k=0;k&lt;val[m+2];k++)
-</span><span class='line'>&#9;            {
-</span><span class='line'>&#9;                pre[k] = dp[k];
-</span><span class='line'>&#9;                dp[k] = -1000000000;
-</span><span class='line'>&#9;            }
-</span><span class='line'>
-</span><span class='line'>&#9;            if(i == 1 && j == 1)
-</span><span class='line'>&#9;            {
-</span><span class='line'>&#9;                dp[2] = dp[6] = can[1][1];
-</span><span class='line'>&#9;                continue;
-</span><span class='line'>&#9;            }
-</span><span class='line'>
-</span><span class='line'>&#9;            if(i == n && j == m)
-</span><span class='line'>&#9;            {
-</span><span class='line'>&#9;                k = val[m]*2;
-</span><span class='line'>&#9;                if(ans &lt; pre[k]+can[n][m])
-</span><span class='line'>&#9;                        ans = pre[k]+can[n][m];
-</span><span class='line'>
-</span><span class='line'>&#9;                k = val[m+1]*2;
-</span><span class='line'>&#9;                if(ans &lt; pre[k]+can[n][m])
-</span><span class='line'>&#9;                        ans = pre[k]+can[n][m];
-</span><span class='line'>&#9;                continue;
-</span><span class='line'>&#9;            }
-</span><span class='line'>
-</span><span class='line'>&#9;            for(k=0;k&lt;val[m+2];k++)
-</span><span class='line'>&#9;            if(pre[k] &gt; -1000000000)
-</span><span class='line'>&#9;            {
-</span><span class='line'>&#9;                LL = k/val[j]%3;
-</span><span class='line'>&#9;                UU = k/val[j+1]%3;
-</span><span class='line'>
-</span><span class='line'>&#9;                if(UU == 0 && LL == 0)
-</span><span class='line'>&#9;                {
-</span><span class='line'>&#9;                    sta = k+val[j]+val[j+1]+val[j+1];
-</span><span class='line'>
-</span><span class='line'>&#9;                    if(pre[k] + can[i][j] &gt; dp[sta])
-</span><span class='line'>&#9;                        dp[sta] = pre[k] + can[i][j];
-</span><span class='line'>
-</span><span class='line'>&#9;                    if(dp[k] &lt; pre[k]) dp[k] = pre[k];
-</span><span class='line'>&#9;                }
-</span><span class='line'>&#9;                else
-</span><span class='line'>&#9;                if(LL == 0)
-</span><span class='line'>&#9;                {
-</span><span class='line'>&#9;                    sta = k;
-</span><span class='line'>&#9;                    if(pre[k] + can[i][j] &gt; dp[sta])
-</span><span class='line'>&#9;                        dp[sta] = pre[k] + can[i][j];
-</span><span class='line'>
-</span><span class='line'>&#9;                    sta = k+k/val[j+1]%3*(val[j]-val[j+1]);
-</span><span class='line'>&#9;                    if(pre[k] + can[i][j] &gt; dp[sta])
-</span><span class='line'>&#9;                        dp[sta] = pre[k] + can[i][j];
-</span><span class='line'>&#9;                }
-</span><span class='line'>&#9;                else
-</span><span class='line'>&#9;                if(UU == 0)
-</span><span class='line'>&#9;                {
-</span><span class='line'>&#9;                    sta = k;
-</span><span class='line'>&#9;                    if(pre[k] + can[i][j] &gt; dp[sta])
-</span><span class='line'>&#9;                        dp[sta] = pre[k] + can[i][j];
-</span><span class='line'>
-</span><span class='line'>&#9;                    sta = k+k/val[j]%3*(-val[j]+val[j+1]);
-</span><span class='line'>&#9;                    if(pre[k] + can[i][j] &gt; dp[sta])
-</span><span class='line'>&#9;                        dp[sta] = pre[k] + can[i][j];
-</span><span class='line'>&#9;                }
-</span><span class='line'>&#9;                else
-</span><span class='line'>&#9;                if(LL == 2 && UU == 1)
-</span><span class='line'>&#9;                {
-</span><span class='line'>&#9;                    sta = k-val[j]-val[j]-val[j+1];
-</span><span class='line'>&#9;                    if(pre[k] + can[i][j] &gt; dp[sta])
-</span><span class='line'>&#9;                        dp[sta] = pre[k] + can[i][j];
-</span><span class='line'>&#9;                }
-</span><span class='line'>&#9;                else
-</span><span class='line'>&#9;                if(LL == 1 && UU == 1)
-</span><span class='line'>&#9;                {
-</span><span class='line'>&#9;                    if(p[k][j+1] &gt; 0 && p[k][j+1] &lt;= m+1)
-</span><span class='line'>&#9;                    {
-</span><span class='line'>&#9;                        sta = k-val[j]-val[j+1]-val[p[k][j+1]];
-</span><span class='line'>&#9;                        if(pre[k] + can[i][j] &gt; dp[sta])
-</span><span class='line'>&#9;                          dp[sta] = pre[k] + can[i][j];
-</span><span class='line'>&#9;                    }
-</span><span class='line'>&#9;                }
-</span><span class='line'>&#9;                else
-</span><span class='line'>&#9;                if(LL == 2 && UU == 2)
-</span><span class='line'>&#9;                {
-</span><span class='line'>&#9;                    if(p[k][j] &gt; 0)
-</span><span class='line'>&#9;                    {
-</span><span class='line'>&#9;                        sta = k-val[j]-val[j]-val[j+1]-val[j+1]+val[p[k][j]];
-</span><span class='line'>&#9;                        if(pre[k] + can[i][j] &gt; dp[sta])
-</span><span class='line'>&#9;                            dp[sta] = pre[k] + can[i][j];
-</span><span class='line'>&#9;                    }
-</span><span class='line'>&#9;                }
-</span><span class='line'>&#9;            }
-</span><span class='line'>&#9;        }
-</span><span class='line'>&#9;    if(n == 1 && m == 1) ans = can[1][1];
-</span><span class='line'>
-</span><span class='line'>&#9;    printf("Case %d: %d\n",++cas,ans);
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;void solve()
-</span><span class='line'>&#9;{
-</span><span class='line'>&#9;    while(scanf("%d %d",&n,&m) != EOF)
-</span><span class='line'>&#9;    {
-</span><span class='line'>&#9;        abc();
-</span><span class='line'>&#9;    }
-</span><span class='line'>&#9;}
-</span><span class='line'>};
-</span><span class='line'>
-</span><span class='line'>int main() {
-</span><span class='line'>&#9;    DP dp;
-</span><span class='line'>&#9;    dp.solve();
-</span><span class='line'>&#9;    return 0;
-</span><span class='line'>
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+<p>Ptrace提供了一种父进程可以控制子进程运行，并可以检查和改变它的核心image。它主要用于实现断点调试。一个被跟踪的进程运行中，直到发生一个信号。则进程被中止，并且通知其父进程。在进程中止的状态下，进程的内存空间可以被读写。父进程还可以使子进程继续执行，并选择是否是否忽略引起中止的信号。</p>
 
 </div>
   
+  
+    <footer>
+      <a rel="full-article" target="_blank" href="/blog/2011/11/29/tools-ptrace/">Read on &rarr;</a>
+    </footer>
   
 
 
@@ -1569,7 +1021,7 @@ var ss360Config = {
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2011/03/20/alg-mdp-source1/">插头 DP code1-2</a></h2>
+      <h2 class="entry-title"><a href="/blog/2011/08/31/assembly-base-3/">AT&T 汇编</a></h2>
     
     
       <p class="meta">
@@ -1578,14 +1030,19 @@ var ss360Config = {
 
 
 
-<time class='entry-date' datetime='2011-03-20T23:00:00+08:00'><span class='date'>2011-03-20</span> <span class='time'>23:00:00</span></time>
+<time class='entry-date' datetime='2011-08-31T13:06:00+08:00'><span class='date'>2011-08-31</span> <span class='time'>13:06:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><h5>一、hdu_1964</h5>
+  <div class="entry-content"><p>AT&amp;T 汇编</p>
+
+<h4>1.Register Reference</h4>
+
+<p>引用寄存器要在寄存器号前加百分号%,如“movl %eax, %ebx”。<br/>
+80386 有如下寄存器:</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -1597,381 +1054,109 @@ var ss360Config = {
 <span class='line-number'>8</span>
 <span class='line-number'>9</span>
 <span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-<span class='line-number'>58</span>
-<span class='line-number'>59</span>
-<span class='line-number'>60</span>
-<span class='line-number'>61</span>
-<span class='line-number'>62</span>
-<span class='line-number'>63</span>
-<span class='line-number'>64</span>
-<span class='line-number'>65</span>
-<span class='line-number'>66</span>
-<span class='line-number'>67</span>
-<span class='line-number'>68</span>
-<span class='line-number'>69</span>
-<span class='line-number'>70</span>
-<span class='line-number'>71</span>
-<span class='line-number'>72</span>
-<span class='line-number'>73</span>
-<span class='line-number'>74</span>
-<span class='line-number'>75</span>
-<span class='line-number'>76</span>
-<span class='line-number'>77</span>
-<span class='line-number'>78</span>
-<span class='line-number'>79</span>
-<span class='line-number'>80</span>
-<span class='line-number'>81</span>
-<span class='line-number'>82</span>
-<span class='line-number'>83</span>
-<span class='line-number'>84</span>
-<span class='line-number'>85</span>
-<span class='line-number'>86</span>
-<span class='line-number'>87</span>
-<span class='line-number'>88</span>
-<span class='line-number'>89</span>
-<span class='line-number'>90</span>
-<span class='line-number'>91</span>
-<span class='line-number'>92</span>
-<span class='line-number'>93</span>
-<span class='line-number'>94</span>
-<span class='line-number'>95</span>
-<span class='line-number'>96</span>
-<span class='line-number'>97</span>
-<span class='line-number'>98</span>
-<span class='line-number'>99</span>
-<span class='line-number'>100</span>
-<span class='line-number'>101</span>
-<span class='line-number'>102</span>
-<span class='line-number'>103</span>
-<span class='line-number'>104</span>
-<span class='line-number'>105</span>
-<span class='line-number'>106</span>
-<span class='line-number'>107</span>
-<span class='line-number'>108</span>
-<span class='line-number'>109</span>
-<span class='line-number'>110</span>
-<span class='line-number'>111</span>
-<span class='line-number'>112</span>
-<span class='line-number'>113</span>
-<span class='line-number'>114</span>
-<span class='line-number'>115</span>
-<span class='line-number'>116</span>
-<span class='line-number'>117</span>
-<span class='line-number'>118</span>
-<span class='line-number'>119</span>
-<span class='line-number'>120</span>
-<span class='line-number'>121</span>
-<span class='line-number'>122</span>
-<span class='line-number'>123</span>
-<span class='line-number'>124</span>
-<span class='line-number'>125</span>
-<span class='line-number'>126</span>
-<span class='line-number'>127</span>
-<span class='line-number'>128</span>
-<span class='line-number'>129</span>
-<span class='line-number'>130</span>
-<span class='line-number'>131</span>
-<span class='line-number'>132</span>
-<span class='line-number'>133</span>
-<span class='line-number'>134</span>
-<span class='line-number'>135</span>
-<span class='line-number'>136</span>
-<span class='line-number'>137</span>
-<span class='line-number'>138</span>
-<span class='line-number'>139</span>
-<span class='line-number'>140</span>
-<span class='line-number'>141</span>
-<span class='line-number'>142</span>
-<span class='line-number'>143</span>
-<span class='line-number'>144</span>
-<span class='line-number'>145</span>
-<span class='line-number'>146</span>
-<span class='line-number'>147</span>
-<span class='line-number'>148</span>
-<span class='line-number'>149</span>
-<span class='line-number'>150</span>
-<span class='line-number'>151</span>
-<span class='line-number'>152</span>
-<span class='line-number'>153</span>
-<span class='line-number'>154</span>
-<span class='line-number'>155</span>
-<span class='line-number'>156</span>
-<span class='line-number'>157</span>
-<span class='line-number'>158</span>
-<span class='line-number'>159</span>
-<span class='line-number'>160</span>
-<span class='line-number'>161</span>
-<span class='line-number'>162</span>
-<span class='line-number'>163</span>
-<span class='line-number'>164</span>
-<span class='line-number'>165</span>
-<span class='line-number'>166</span>
-<span class='line-number'>167</span>
-<span class='line-number'>168</span>
-<span class='line-number'>169</span>
-<span class='line-number'>170</span>
-<span class='line-number'>171</span>
-<span class='line-number'>172</span>
-<span class='line-number'>173</span>
-<span class='line-number'>174</span>
-<span class='line-number'>175</span>
-<span class='line-number'>176</span>
-<span class='line-number'>177</span>
-<span class='line-number'>178</span>
-<span class='line-number'>179</span>
-<span class='line-number'>180</span>
-<span class='line-number'>181</span>
-<span class='line-number'>182</span>
-<span class='line-number'>183</span>
-<span class='line-number'>184</span>
-<span class='line-number'>185</span>
-<span class='line-number'>186</span>
-<span class='line-number'>187</span>
-<span class='line-number'>188</span>
-<span class='line-number'>189</span>
-<span class='line-number'>190</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#include&lt;stdio.h&gt;
-</span><span class='line'>#include&lt;string.h&gt;
-</span><span class='line'>#include&lt;map&gt;
-</span><span class='line'>
-</span><span class='line'>int n,m,up[33][33],le[33][33];
-</span><span class='line'>int dp[200000],pre[200000],val[33],LL,UU,sta,next;
-</span><span class='line'>int a[33],b[33],d[33],c[33];
-</span><span class='line'>char p[200000][12];
-</span><span class='line'>
-</span><span class='line'>int ok()
-</span><span class='line'>{
-</span><span class='line'>&#9;int i,l;
-</span><span class='line'>&#9;l = 0;
-</span><span class='line'>&#9;for(i=1;i&lt;=m+1;i++)
-</span><span class='line'>&#9;{
-</span><span class='line'>&#9;    b[i] = d[i] = -1;
-</span><span class='line'>&#9;    if(a[i] == 1) c[++l] = i;
-</span><span class='line'>&#9;    else
-</span><span class='line'>&#9;    if(a[i] == 2)
-</span><span class='line'>&#9;    {
-</span><span class='line'>&#9;        if(l == 0) return 0;
-</span><span class='line'>&#9;        b[c[l]] = i; d[i] = c[l];
-</span><span class='line'>&#9;        l--;
-</span><span class='line'>&#9;    }
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;if(l != 0) return 0;
-</span><span class='line'>&#9;return 1;
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>void init()
-</span><span class='line'>{
-</span><span class='line'>&#9;int i,j,k;
-</span><span class='line'>
-</span><span class='line'>&#9;val[1] = 1;
-</span><span class='line'>&#9;for(i=2;i&lt;=12;i++) val[i] = val[i-1]*3;
-</span><span class='line'>
-</span><span class='line'>&#9;for(i=0;i&lt;=12;i++) a[i] = 0;
-</span><span class='line'>&#9;a[1] = -1;
-</span><span class='line'>
-</span><span class='line'>&#9;for(i=0;i&lt;=val[m+2];i++)
-</span><span class='line'>&#9;{
-</span><span class='line'>&#9;    a[1]++;
-</span><span class='line'>&#9;    k = 1; while(k &lt;= m+1 && a[k]&gt;2) { a[k]%=3; a[k+1]++; k++; }
-</span><span class='line'>
-</span><span class='line'>&#9;    if(ok() == 0) continue;
-</span><span class='line'>
-</span><span class='line'>&#9;    for(j=1;j&lt;=m+1;j++) {
-</span><span class='line'>&#9;        p[i][j] = -1;
-</span><span class='line'>&#9;        if(b[j] != -1) p[i][j] = b[j];
-</span><span class='line'>&#9;        if(d[j] != -1) p[i][j] = d[j];
-</span><span class='line'>&#9;    }
-</span><span class='line'>&#9;}
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>void abc()
-</span><span class='line'>{
-</span><span class='line'>&#9;int i,j,k,ans = 1000000;
-</span><span class='line'>
-</span><span class='line'>&#9;for(i=0;i&lt;=val[m+2];i++) dp[i] = 1000000;
-</span><span class='line'>
-</span><span class='line'>&#9;dp[0] = 0;
-</span><span class='line'>
-</span><span class='line'>&#9;for(i=1;i&lt;=n;i++)
-</span><span class='line'>&#9;    for(j=1;j&lt;=m;j++)
-</span><span class='line'>&#9;    {
-</span><span class='line'>&#9;        if(j == 1)
-</span><span class='line'>&#9;        {
-</span><span class='line'>&#9;            for(k=val[m+2]-1;k&gt;=0;k--)
-</span><span class='line'>&#9;            {
-</span><span class='line'>&#9;                dp[k] = dp[k/3];
-</span><span class='line'>&#9;                if(k%3 != 0) dp[k] = 1000000;
-</span><span class='line'>&#9;            }
-</span><span class='line'>&#9;        }
-</span><span class='line'>
-</span><span class='line'>&#9;        for(k=0;k&lt;val[m+2];k++)
-</span><span class='line'>&#9;        {
-</span><span class='line'>&#9;            pre[k] = dp[k]; dp[k] = 1000000;
-</span><span class='line'>&#9;        }
-</span><span class='line'>
-</span><span class='line'>&#9;        for(k=0;k&lt;val[m+2];k++)
-</span><span class='line'>&#9;        if(pre[k] &lt; 1000000)
-</span><span class='line'>&#9;        {
-</span><span class='line'>&#9;            LL = k/val[j]%3;
-</span><span class='line'>&#9;            UU = k/val[j+1]%3;
-</span><span class='line'>
-</span><span class='line'>&#9;            if(UU == 0 && LL == 0)
-</span><span class='line'>&#9;            {
-</span><span class='line'>&#9;                sta = k+val[j]+val[j+1]+val[j+1];
-</span><span class='line'>&#9;                next = pre[k]+le[i][j+1]+up[i+1][j];
-</span><span class='line'>&#9;                if(dp[sta] &gt; next) dp[sta] = next;
-</span><span class='line'>&#9;            }
-</span><span class='line'>&#9;            else
-</span><span class='line'>&#9;            if(LL == 0)
-</span><span class='line'>&#9;            {
-</span><span class='line'>&#9;                sta = k;
-</span><span class='line'>&#9;                next = pre[k]+le[i][j+1];
-</span><span class='line'>&#9;                if(dp[sta] &gt; next) dp[sta] = next;
-</span><span class='line'>
-</span><span class='line'>&#9;                sta = k+k/val[j+1]%3*(val[j]-val[j+1]);
-</span><span class='line'>&#9;                next = pre[k]+up[i+1][j];
-</span><span class='line'>&#9;                if(dp[sta] &gt; next) dp[sta] = next;
-</span><span class='line'>&#9;            }
-</span><span class='line'>&#9;            else
-</span><span class='line'>&#9;            if(UU == 0)
-</span><span class='line'>&#9;            {
-</span><span class='line'>&#9;                sta = k;
-</span><span class='line'>&#9;                next = pre[k]+up[i+1][j];
-</span><span class='line'>&#9;                if(dp[sta] &gt; next) dp[sta] = next;
-</span><span class='line'>
-</span><span class='line'>&#9;                sta = k+k/val[j]%3*(-val[j]+val[j+1]);
-</span><span class='line'>&#9;                next = pre[k]+le[i][j+1];
-</span><span class='line'>&#9;                if(dp[sta] &gt; next) dp[sta] = next;
-</span><span class='line'>&#9;            }
-</span><span class='line'>&#9;            else
-</span><span class='line'>&#9;            if(LL == 2 && UU == 1)
-</span><span class='line'>&#9;            {
-</span><span class='line'>&#9;                sta = k-val[j]-val[j]-val[j+1];
-</span><span class='line'>&#9;                next = pre[k];
-</span><span class='line'>&#9;                if(dp[sta] &gt; next) dp[sta] = next;
-</span><span class='line'>&#9;            }
-</span><span class='line'>&#9;            else
-</span><span class='line'>&#9;            if(LL == 1 && UU == 1)
-</span><span class='line'>&#9;            {
-</span><span class='line'>&#9;                if(p[k][j+1] &gt; 0 && p[k][j+1] &lt;= m+1)
-</span><span class='line'>&#9;                {
-</span><span class='line'>&#9;                    sta = k-val[j]-val[j+1]-val[p[k][j+1]];
-</span><span class='line'>&#9;                    next = pre[k];
-</span><span class='line'>&#9;                    if(dp[sta] &gt; next) dp[sta] = next;
-</span><span class='line'>&#9;                }
-</span><span class='line'>&#9;            }
-</span><span class='line'>&#9;            else
-</span><span class='line'>&#9;            if(LL == 2 && UU == 2)
-</span><span class='line'>&#9;            {
-</span><span class='line'>&#9;                if(p[k][j] &gt; 0)
-</span><span class='line'>&#9;                {
-</span><span class='line'>&#9;                    sta = k-val[j]-val[j]-val[j+1]-val[j+1]+val[p[k][j]];
-</span><span class='line'>&#9;                    next = pre[k];
-</span><span class='line'>&#9;                    if(dp[sta] &gt; next) dp[sta] = next;
-</span><span class='line'>&#9;                }
-</span><span class='line'>&#9;            }
-</span><span class='line'>&#9;            else
-</span><span class='line'>&#9;            if(LL == 1 && UU == 2)
-</span><span class='line'>&#9;            {
-</span><span class='line'>&#9;                if(i == n && j == m)
-</span><span class='line'>&#9;                {
-</span><span class='line'>&#9;                    sta = k-val[j]-val[j+1]-val[j+1];
-</span><span class='line'>&#9;                    next = pre[k];
-</span><span class='line'>
-</span><span class='line'>&#9;                    if(dp[sta] &gt; next) dp[sta] = next;
-</span><span class='line'>
-</span><span class='line'>&#9;                    if(dp[sta] &lt; ans) ans = dp[sta];
-</span><span class='line'>&#9;                }
-</span><span class='line'>&#9;            }
-</span><span class='line'>
-</span><span class='line'>&#9;        }
-</span><span class='line'>&#9;    }
-</span><span class='line'>
-</span><span class='line'>&#9;printf("%d\n",ans);
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>int main()
-</span><span class='line'>{
-</span><span class='line'>&#9;int i,j,T;
-</span><span class='line'>&#9;char ch[1111];
-</span><span class='line'>
-</span><span class='line'>&#9;scanf("%d",&T);
-</span><span class='line'>&#9;while(T--)
-</span><span class='line'>&#9;{
-</span><span class='line'>&#9;    scanf("%d %d",&n,&m);
-</span><span class='line'>&#9;    gets(ch);
-</span><span class='line'>&#9;    gets(ch);
-</span><span class='line'>
-</span><span class='line'>&#9;    for(i=0;i&lt;=n+1;i++) for(j=0;j&lt;=m+1;j++) up[i][j] = le[i][j] = 1000000;
-</span><span class='line'>
-</span><span class='line'>&#9;    for(i=1;i&lt;=n;i++)
-</span><span class='line'>&#9;    {
-</span><span class='line'>&#9;        gets(ch);
-</span><span class='line'>&#9;        for(j=2;j&lt;=m;j++) le[i][j] = ch[j+j-2]-48;
-</span><span class='line'>&#9;        gets(ch);
-</span><span class='line'>
-</span><span class='line'>&#9;        if(i&lt;n)
-</span><span class='line'>&#9;        {
-</span><span class='line'>&#9;            for(j=1;j&lt;=m;j++) up[i+1][j] = ch[j+j-1]-48;
-</span><span class='line'>&#9;        }
-</span><span class='line'>&#9;    }
-</span><span class='line'>&#9;    init();
-</span><span class='line'>&#9;    abc();
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;return 0;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>[1] 8 个 32-bit 寄存器 %eax,%ebx,%ecx,%edx,%edi,%esi,%ebp,%esp;
+</span><span class='line'>( 8 个 16-bit 寄存器,它们事实上是上面 8 个 32-bit 寄存器的低 16 位:%ax,%bx,
+</span><span class='line'>%cx,%dx,%di,%si,%bp,%sp;
+</span><span class='line'>8 个 8-bit 寄存器:%ah,%al,%bh,%bl,%ch,%cl,%dh,%dl。它们事实上
+</span><span class='line'>是寄存器%ax,%bx,%cx,%dx 的高 8 位和低 8 位;)
+</span><span class='line'>[2] 6 个段寄存器:%cs(code),%ds(data),%ss(stack), %es,%fs,%gs;
+</span><span class='line'>[3] 3 个控制寄存器:%cr0,%cr2,%cr3;
+</span><span class='line'>[4] 6 个 debug 寄存器:%db0,%db1,%db2,%db3,%db6,%db7;
+</span><span class='line'>[5] 2 个测试寄存器:%tr6,%tr7;
+</span><span class='line'>[6] 8 个浮点寄存器栈:%st(0),%st(1),%st(2),%st(3),%st(4),%st(5),%st(6),%st(7)。</span></code></pre></td></tr></table></div></figure>
 
 
-<hr />
+<h4>2. Operator Sequence</h4>
 
-<h5>二、timus_1519</h5>
+<p>操作数排列是从源(左)到目的(右),如“movl %eax(源), %ebx(目的)”</p>
+
+<h4>3. Immediately Operator</h4>
+
+<p>使用立即数,要在数前面加符号$, 如“movl $0x04, %ebx”<br/>
+或者:</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>para = 0x04
+</span><span class='line'>movl $para, %ebx</span></code></pre></td></tr></table></div></figure>
+
+
+<p>指令执行的结果是将立即数 0x04 装入寄存器 ebx。</p>
+
+<h4>4. Symbol Constant</h4>
+
+<p>符号常数直接引用 如</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>value: .long 0x12a3f2de
+</span><span class='line'>movl value , %ebx</span></code></pre></td></tr></table></div></figure>
+
+
+<p>指令执行的结果是将常数 0x12a3f2de 装入寄存器 ebx。<br/>
+引用符号地址在符号前加符号$, 如“movl $value, % ebx”则是将符号 value 的地址装入寄存器 ebx。</p>
+
+<h4>5. Length of Operator</h4>
+
+<p>操作数的长度用加在指令后的符号表示 b(byte, 8-bit), w(word, 16-bits), l(long,32-bits) ,如“movb %al, %bl” ,“movw
+%ax, %bx”,“movl %eax, %ebx ”。<br/>
+如 果没有指定操作数长度的话,编译器将按照目标操作数的长度来设置。比如指令“mov %ax, %bx”,由于目标操作数 bx 的长度为
+word , 那 么 编 译 器 将 把 此 指 令 等 同 于 “ movw %ax,%bx” 。 同 样 道 理 , 指 令 “ mov $4, %ebx” 等 同 于 指 令 “ movl $4,
+%ebx”,“push %al”等同于“pushb %al”。对于没有指定操作数长度,但编译器又无法猜测的指令,编译器将会报错,比如指令
+“push $4”。</p>
+
+<h4>6. Sign and Zero Extension</h4>
+
+<p>绝大多数面向 80386 的 AT&amp;T 汇编指令与 Intel 格式的汇编指令都是相同的,但符号扩展指令和零扩展指令有不同格式。符号扩展指令
+和零扩展指令需要指定源操作数长度和目的操作数长度,即使在某些指令中这些操作数是隐含的。</p>
+
+<p>在 AT&amp;T 语法中,符号扩展和零扩展指令的格式为,基本部分"movs"和"movz"(对应 Intel 语法的 movsx 和 movzx),后面跟
+上源操作数长度和目的操作数长度。 movsbl 意味着 movs (from)byte (to)long;movbw 意味着 movs (from)byte
+(to)word;movswl 意味着 movs (from)word (to)long。对于 movz 指令也一样。比如指令“movsbl %al,%edx”意味着将
+al 寄存器的内容进行符号扩展后放置到 edx 寄存器中。</p>
+
+<p>其它的 Intel 格式的符号扩展指令还有:</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>cbw -- sign-extend byte in %al to word in %ax;
+</span><span class='line'>cwde -- sign-extend word in %ax to long in %eax;
+</span><span class='line'>cwd -- sign-extend word in %ax to long in %dx:%ax;
+</span><span class='line'>cdq -- sign-extend dword in %eax to quad in %edx:%eax;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>对应的 AT&amp;T 语法的指令为 cbtw,cwtl,cwtd,cltd。</p>
+
+<h4>7. Call and Jump</h4>
+
+<p>段内调用和跳转指令为 &ldquo;call&rdquo; , &ldquo;ret&rdquo; 和 &ldquo;jmp&rdquo;,段间调用和跳转指令为 &ldquo;lcall&rdquo; , &ldquo;lret&rdquo; 和 &ldquo;ljmp&rdquo; 。段间调用和跳转指令的格式为<br/>
+“lcall/ljmp $SECTION, $OFFSET”,而段间返回指令则为“lret $STACK-ADJUST”。</p>
+
+<h4>8. Prefix</h4>
+
+<p>操作码前缀被用在下列的情况:</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>[1]字符串重复操作指令(rep,repne);
+</span><span class='line'>[2]指定被操作的段(cs,ds,ss,es,fs,gs);
+</span><span class='line'>[3]进行总线加锁(lock);
+</span><span class='line'>[4]指定地址和操作的大小(data16,addr16);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>在 AT&amp;T 汇编语法中,操作码前缀通常被单独放在一行,后面不跟任何操作数。例如,对于重复 scas 指令,其写法为:</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>repne
+</span><span class='line'>scas</span></code></pre></td></tr></table></div></figure>
+
+
+<p>上述操作码前缀的意义和用法如下:</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -1982,414 +1167,65 @@ var ss360Config = {
 <span class='line-number'>7</span>
 <span class='line-number'>8</span>
 <span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-<span class='line-number'>58</span>
-<span class='line-number'>59</span>
-<span class='line-number'>60</span>
-<span class='line-number'>61</span>
-<span class='line-number'>62</span>
-<span class='line-number'>63</span>
-<span class='line-number'>64</span>
-<span class='line-number'>65</span>
-<span class='line-number'>66</span>
-<span class='line-number'>67</span>
-<span class='line-number'>68</span>
-<span class='line-number'>69</span>
-<span class='line-number'>70</span>
-<span class='line-number'>71</span>
-<span class='line-number'>72</span>
-<span class='line-number'>73</span>
-<span class='line-number'>74</span>
-<span class='line-number'>75</span>
-<span class='line-number'>76</span>
-<span class='line-number'>77</span>
-<span class='line-number'>78</span>
-<span class='line-number'>79</span>
-<span class='line-number'>80</span>
-<span class='line-number'>81</span>
-<span class='line-number'>82</span>
-<span class='line-number'>83</span>
-<span class='line-number'>84</span>
-<span class='line-number'>85</span>
-<span class='line-number'>86</span>
-<span class='line-number'>87</span>
-<span class='line-number'>88</span>
-<span class='line-number'>89</span>
-<span class='line-number'>90</span>
-<span class='line-number'>91</span>
-<span class='line-number'>92</span>
-<span class='line-number'>93</span>
-<span class='line-number'>94</span>
-<span class='line-number'>95</span>
-<span class='line-number'>96</span>
-<span class='line-number'>97</span>
-<span class='line-number'>98</span>
-<span class='line-number'>99</span>
-<span class='line-number'>100</span>
-<span class='line-number'>101</span>
-<span class='line-number'>102</span>
-<span class='line-number'>103</span>
-<span class='line-number'>104</span>
-<span class='line-number'>105</span>
-<span class='line-number'>106</span>
-<span class='line-number'>107</span>
-<span class='line-number'>108</span>
-<span class='line-number'>109</span>
-<span class='line-number'>110</span>
-<span class='line-number'>111</span>
-<span class='line-number'>112</span>
-<span class='line-number'>113</span>
-<span class='line-number'>114</span>
-<span class='line-number'>115</span>
-<span class='line-number'>116</span>
-<span class='line-number'>117</span>
-<span class='line-number'>118</span>
-<span class='line-number'>119</span>
-<span class='line-number'>120</span>
-<span class='line-number'>121</span>
-<span class='line-number'>122</span>
-<span class='line-number'>123</span>
-<span class='line-number'>124</span>
-<span class='line-number'>125</span>
-<span class='line-number'>126</span>
-<span class='line-number'>127</span>
-<span class='line-number'>128</span>
-<span class='line-number'>129</span>
-<span class='line-number'>130</span>
-<span class='line-number'>131</span>
-<span class='line-number'>132</span>
-<span class='line-number'>133</span>
-<span class='line-number'>134</span>
-<span class='line-number'>135</span>
-<span class='line-number'>136</span>
-<span class='line-number'>137</span>
-<span class='line-number'>138</span>
-<span class='line-number'>139</span>
-<span class='line-number'>140</span>
-<span class='line-number'>141</span>
-<span class='line-number'>142</span>
-<span class='line-number'>143</span>
-<span class='line-number'>144</span>
-<span class='line-number'>145</span>
-<span class='line-number'>146</span>
-<span class='line-number'>147</span>
-<span class='line-number'>148</span>
-<span class='line-number'>149</span>
-<span class='line-number'>150</span>
-<span class='line-number'>151</span>
-<span class='line-number'>152</span>
-<span class='line-number'>153</span>
-<span class='line-number'>154</span>
-<span class='line-number'>155</span>
-<span class='line-number'>156</span>
-<span class='line-number'>157</span>
-<span class='line-number'>158</span>
-<span class='line-number'>159</span>
-<span class='line-number'>160</span>
-<span class='line-number'>161</span>
-<span class='line-number'>162</span>
-<span class='line-number'>163</span>
-<span class='line-number'>164</span>
-<span class='line-number'>165</span>
-<span class='line-number'>166</span>
-<span class='line-number'>167</span>
-<span class='line-number'>168</span>
-<span class='line-number'>169</span>
-<span class='line-number'>170</span>
-<span class='line-number'>171</span>
-<span class='line-number'>172</span>
-<span class='line-number'>173</span>
-<span class='line-number'>174</span>
-<span class='line-number'>175</span>
-<span class='line-number'>176</span>
-<span class='line-number'>177</span>
-<span class='line-number'>178</span>
-<span class='line-number'>179</span>
-<span class='line-number'>180</span>
-<span class='line-number'>181</span>
-<span class='line-number'>182</span>
-<span class='line-number'>183</span>
-<span class='line-number'>184</span>
-<span class='line-number'>185</span>
-<span class='line-number'>186</span>
-<span class='line-number'>187</span>
-<span class='line-number'>188</span>
-<span class='line-number'>189</span>
-<span class='line-number'>190</span>
-<span class='line-number'>191</span>
-<span class='line-number'>192</span>
-<span class='line-number'>193</span>
-<span class='line-number'>194</span>
-<span class='line-number'>195</span>
-<span class='line-number'>196</span>
-<span class='line-number'>197</span>
-<span class='line-number'>198</span>
-<span class='line-number'>199</span>
-<span class='line-number'>200</span>
-<span class='line-number'>201</span>
-<span class='line-number'>202</span>
-<span class='line-number'>203</span>
-<span class='line-number'>204</span>
-<span class='line-number'>205</span>
-<span class='line-number'>206</span>
-<span class='line-number'>207</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#include&lt;stdio.h&gt;
-</span><span class='line'>
-</span><span class='line'>long long dp[60000],pre[60000];
-</span><span class='line'>int all,r[60000],e[1600000];
-</span><span class='line'>int p[60000][13];
-</span><span class='line'>
-</span><span class='line'>class DP {
-</span><span class='line'>
-</span><span class='line'>public:
-</span><span class='line'>&#9;int n,m,can[33][33],last;
-</span><span class='line'>&#9;int val[33],LL,UU,sta,next;
-</span><span class='line'>&#9;int a[33],b[33],d[33],c[33];
-</span><span class='line'>
-</span><span class='line'>&#9;void input()
-</span><span class='line'>&#9;{
-</span><span class='line'>&#9;    int i,j;
-</span><span class='line'>&#9;    char ch[15];
-</span><span class='line'>&#9;    last = 0;
-</span><span class='line'>&#9;    for(i=1;i&lt;=n;i++)
-</span><span class='line'>&#9;    {
-</span><span class='line'>&#9;        scanf("%s",ch);
-</span><span class='line'>&#9;        for(j=1;j&lt;=m;j++)
-</span><span class='line'>&#9;        {
-</span><span class='line'>&#9;            can[i][j] = ch[j-1]=='.'?(++last):-1;
-</span><span class='line'>&#9;        }
-</span><span class='line'>&#9;    }
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;int ok()
-</span><span class='line'>&#9;{
-</span><span class='line'>&#9;    int i,l;
-</span><span class='line'>&#9;    l = 0;
-</span><span class='line'>&#9;    for(i=1;i&lt;=m+1;i++)
-</span><span class='line'>&#9;    {
-</span><span class='line'>&#9;        b[i] = d[i] = -1;
-</span><span class='line'>&#9;        if(a[i] == 1) c[++l] = i;
-</span><span class='line'>&#9;        else
-</span><span class='line'>&#9;        if(a[i] == 2)
-</span><span class='line'>&#9;        {
-</span><span class='line'>&#9;            if(l == 0) return 0;
-</span><span class='line'>&#9;            b[c[l]] = i; d[i] = c[l];
-</span><span class='line'>&#9;            l--;
-</span><span class='line'>&#9;        }
-</span><span class='line'>&#9;    }
-</span><span class='line'>&#9;    if(l != 0) return 0;
-</span><span class='line'>&#9;    return 1;
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;void init()
-</span><span class='line'>&#9;{
-</span><span class='line'>&#9;    int i,j,k;
-</span><span class='line'>
-</span><span class='line'>&#9;    val[1] = 1;
-</span><span class='line'>&#9;    for(i=2;i&lt;=m+2;i++) val[i] = val[i-1]*3;;
-</span><span class='line'>
-</span><span class='line'>&#9;    for(i=0;i&lt;=m+2;i++) a[i] = 0;
-</span><span class='line'>&#9;    a[1] = -1;
-</span><span class='line'>
-</span><span class='line'>&#9;    all = 0;
-</span><span class='line'>
-</span><span class='line'>&#9;    for(i=0;i&lt;=val[m+2];i++)
-</span><span class='line'>&#9;    {
-</span><span class='line'>&#9;        a[1]++;
-</span><span class='line'>&#9;        k = 1; while(k &lt;= m+1 && a[k]&gt;2) { a[k]%=3; a[k+1]++; k++; }
-</span><span class='line'>
-</span><span class='line'>&#9;        e[i] = -1;
-</span><span class='line'>
-</span><span class='line'>&#9;        if(ok() == 0) continue;
-</span><span class='line'>
-</span><span class='line'>&#9;        r[all] = i; e[i] = all;
-</span><span class='line'>
-</span><span class='line'>&#9;        for(j=1;j&lt;=m+1;j++) {
-</span><span class='line'>&#9;            p[all][j] = -1;
-</span><span class='line'>&#9;            if(b[j] != -1) p[all][j] = b[j];
-</span><span class='line'>&#9;            if(d[j] != -1) p[all][j] = d[j];
-</span><span class='line'>&#9;        }
-</span><span class='line'>
-</span><span class='line'>&#9;        all++;
-</span><span class='line'>&#9;    }
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;void abc()
-</span><span class='line'>&#9;{
-</span><span class='line'>&#9;    int i,j,k,l;
-</span><span class='line'>
-</span><span class='line'>&#9;    input();
-</span><span class='line'>&#9;    init();
-</span><span class='line'>
-</span><span class='line'>&#9;    for(i=0;i&lt;all;i++) dp[i] = 0;
-</span><span class='line'>
-</span><span class='line'>&#9;    dp[r[0]] = 1;
-</span><span class='line'>
-</span><span class='line'>&#9;    for(i=1;i&lt;=n;i++)
-</span><span class='line'>&#9;        for(j=1;j&lt;=m;j++)
-</span><span class='line'>&#9;        {
-</span><span class='line'>&#9;            if(j == 1)
-</span><span class='line'>&#9;            {
-</span><span class='line'>&#9;                for(k=all-1;k&gt;=0;k--)
-</span><span class='line'>&#9;                {
-</span><span class='line'>&#9;                    l = r[k]; l = l/3; l = e[l];
-</span><span class='line'>
-</span><span class='line'>&#9;                    if(l != -1)
-</span><span class='line'>&#9;                    {
-</span><span class='line'>&#9;                        dp[k] = dp[l];
-</span><span class='line'>&#9;                        if(r[k]%3 != 0) dp[k] = 0;
-</span><span class='line'>&#9;                    }
-</span><span class='line'>&#9;                    else
-</span><span class='line'>&#9;                        dp[k] = 0;
-</span><span class='line'>&#9;                }
-</span><span class='line'>&#9;            }
-</span><span class='line'>
-</span><span class='line'>&#9;            for(k=0;k&lt;all;k++)
-</span><span class='line'>&#9;            {
-</span><span class='line'>&#9;                pre[k] = dp[k]; dp[k] = 0;
-</span><span class='line'>&#9;            }
-</span><span class='line'>
-</span><span class='line'>&#9;            for(k=0;k&lt;all;k++)
-</span><span class='line'>&#9;            if(pre[k] &gt; 0)
-</span><span class='line'>&#9;            {
-</span><span class='line'>&#9;                LL = r[k]/val[j]%3;
-</span><span class='line'>&#9;                UU = r[k]/val[j+1]%3;
-</span><span class='line'>
-</span><span class='line'>&#9;                if(can[i][j] == -1)
-</span><span class='line'>&#9;                {
-</span><span class='line'>&#9;                    if(LL == 0 && UU == 0)
-</span><span class='line'>&#9;                    {
-</span><span class='line'>&#9;                        dp[k] += pre[k];
-</span><span class='line'>&#9;                    }
-</span><span class='line'>&#9;                    continue;
-</span><span class='line'>&#9;                }
-</span><span class='line'>
-</span><span class='line'>&#9;                if(UU == 0 && LL == 0)
-</span><span class='line'>&#9;                {
-</span><span class='line'>&#9;                    sta = r[k]+val[j]+val[j+1]+val[j+1];
-</span><span class='line'>
-</span><span class='line'>&#9;                    dp[e[sta]] += pre[k];
-</span><span class='line'>&#9;                }
-</span><span class='line'>&#9;                else
-</span><span class='line'>&#9;                if(LL == 0)
-</span><span class='line'>&#9;                {
-</span><span class='line'>&#9;                    sta = r[k];
-</span><span class='line'>&#9;                    dp[e[sta]] += pre[k];
-</span><span class='line'>
-</span><span class='line'>&#9;                    sta = r[k]+r[k]/val[j+1]%3*(val[j]-val[j+1]);
-</span><span class='line'>&#9;                    dp[e[sta]] += pre[k];
-</span><span class='line'>&#9;                }
-</span><span class='line'>&#9;                else
-</span><span class='line'>&#9;                if(UU == 0)
-</span><span class='line'>&#9;                {
-</span><span class='line'>&#9;                    sta = r[k];
-</span><span class='line'>&#9;                    dp[e[sta]] += pre[k];
-</span><span class='line'>
-</span><span class='line'>&#9;                    sta = r[k]+r[k]/val[j]%3*(-val[j]+val[j+1]);
-</span><span class='line'>&#9;                    dp[e[sta]] += pre[k];
-</span><span class='line'>&#9;                }
-</span><span class='line'>&#9;                else
-</span><span class='line'>&#9;                if(LL == 2 && UU == 1)
-</span><span class='line'>&#9;                {
-</span><span class='line'>&#9;                    sta = r[k]-val[j]-val[j]-val[j+1];
-</span><span class='line'>&#9;                    dp[e[sta]] += pre[k];
-</span><span class='line'>&#9;                }
-</span><span class='line'>&#9;                else
-</span><span class='line'>&#9;                if(LL == 1 && UU == 1)
-</span><span class='line'>&#9;                {
-</span><span class='line'>&#9;                    if(p[k][j+1] &gt; 0 && p[k][j+1] &lt;= m+1)
-</span><span class='line'>&#9;                    {
-</span><span class='line'>&#9;                        sta = r[k]-val[j]-val[j+1]-val[p[k][j+1]];
-</span><span class='line'>&#9;                        dp[e[sta]] += pre[k];
-</span><span class='line'>&#9;                    }
-</span><span class='line'>&#9;                }
-</span><span class='line'>&#9;                else
-</span><span class='line'>&#9;                if(LL == 2 && UU == 2)
-</span><span class='line'>&#9;                {
-</span><span class='line'>&#9;                    if(p[k][j] &gt; 0)
-</span><span class='line'>&#9;                    {
-</span><span class='line'>&#9;                        sta = r[k]-val[j]-val[j]-val[j+1]-val[j+1]+val[p[k][j]];
-</span><span class='line'>&#9;                        dp[e[sta]] += pre[k];
-</span><span class='line'>&#9;                    }
-</span><span class='line'>&#9;                }
-</span><span class='line'>&#9;                else
-</span><span class='line'>&#9;                if(LL == 1 && UU == 2)
-</span><span class='line'>&#9;                {
-</span><span class='line'>&#9;                    if(can[i][j] == last)
-</span><span class='line'>&#9;                    {
-</span><span class='line'>&#9;                        sta = r[k]-val[j]-val[j+1]-val[j+1];
-</span><span class='line'>&#9;                        dp[e[sta]] += pre[k];
-</span><span class='line'>&#9;                    }
-</span><span class='line'>&#9;                }
-</span><span class='line'>&#9;            }
-</span><span class='line'>&#9;        }
-</span><span class='line'>&#9;    printf("%lld\n",dp[r[0]]);
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;void solve()
-</span><span class='line'>&#9;{
-</span><span class='line'>&#9;    while(scanf("%d %d",&n,&m) != EOF)
-</span><span class='line'>&#9;    {
-</span><span class='line'>&#9;        abc();
-</span><span class='line'>&#9;    }
-</span><span class='line'>&#9;}
-</span><span class='line'>};
-</span><span class='line'>
-</span><span class='line'>int main() {
-</span><span class='line'>&#9;    DP dp;
-</span><span class='line'>&#9;    dp.solve();
-</span><span class='line'>&#9;    return 0;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>[1]指定被操作的段前缀为 cs,ds,ss,es,fs,和 gs。在 AT&T 语法中,只需要按照
+</span><span class='line'>section:memory-operand 的格式就指定了相应的段前缀。比如:
+</span><span class='line'>lcall %cs:realmode_swtch
+</span><span class='line'>[2]操作数/地址大小前缀是“data16”和"addr16",它们被用来在 32-bit 操作数/地址代码中指定 16-bit 的操作数/地址。
+</span><span class='line'>[3]总线加锁前缀“lock”,它是为了在多处理器环境中,保证在当前指令执行期间禁止一切中断。这个前缀仅仅对 ADD, ADC, AND,
+</span><span class='line'>BTC, BTR, BTS, CMPXCHG,DEC,
+</span><span class='line'>INC, NEG, NOT, OR, SBB, SUB, XOR, XADD,XCHG 指令有效,如果将 Lock 前
+</span><span class='line'>缀用在其它指令之前,将会引起异常。
+</span><span class='line'>[4]字符串重复操作前缀"rep","repe","repne"用来让字符串操作重复“%ecx”次。</span></code></pre></td></tr></table></div></figure>
 
 
+<h4>9. Memory Reference</h4>
 
+<p>Intel 语法的间接内存引用的格式为:</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>section:[base+index*scale+displacement]</span></code></pre></td></tr></table></div></figure>
+
+
+<p>而在 AT&amp;T 语法中对应的形式为:</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>section:displacement(base,index,scale)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>其中,base 和 index 是任意的 32-bit base 和 index 寄存器。scale 可以取值 1,2,4,8。如果不指定 scale 值,则默认值为 1。
+section 可以指定任意的段寄存器作为段前缀,默认的段寄存器在不同的情况下不一样。如果在指令中指定了默认的段前缀,则编译器在
+目标代码中不会产生此段前缀代码。</p>
+
+<p>下面是一些例子:<br/>
+-4(%ebp):base=%ebp,displacement=-4,section 没有指定,由于 base=%ebp,所以默认的 section=%ss,index,scale
+没有指定,则 index 为 0。<br/>
+foo(,%eax,4):index=%eax,scale=4,displacement=foo。其它域没有指定。这里默认的 section=%ds。<br/>
+foo(,1):这个表达式引用的是指针 foo 指向的地址所存放的值。注意这个表达式中没有 base 和 index,并且只有一个逗号,这是一种
+异常语法,但却合法。<br/>
+%gs:foo:这个表达式引用的是放置于%gs 段里变量 foo 的值。<br/>
+如果 call 和 jump 操作在操作数前指定前缀“<em>”,则表示是一个绝对地址调用/跳转,也就是说 jmp/call 指令指定的是一个绝对地址。<br/>
+如果没有指定"</em>&ldquo;,则操作数是一个相对地址。<br/>
+任何指令如果其操作数是一个内存操作, 则指令必须指定它的操作尺寸<br/>
+(byte,word,long),也就是说必须带有指令后缀(b,w,l)。<br/>
+Linux 工作在保护模式下,用的是 32 位线性地址,所以在计算地址时不用考虑段基址和偏移量,而是采用如下的地<br/>
+址计算方法:<br/>
+disp + base + index * scale<br/>
+下面是一些内存操作数的例子:</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>AT&T 格式
+</span><span class='line'>movl -4(%ebp), %eax
+</span><span class='line'>movl array(, %eax, 4), %eax
+</span><span class='line'>movw array(%ebx, %eax, 4), %cx
+</span><span class='line'>movb $4, %fs:(%eax)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>其中下面这些省略了浮点数及 IA-32 如 SSE FPU 等特殊的指令集部分, 我觉得重要的是学习
+linux 汇编的语法及编译原理和程序控制流程, 具体的指令细节就不那么重要了。</p>
 </div>
   
   
@@ -2411,7 +1247,7 @@ var ss360Config = {
   
     <section>
 <h1>Categories
-<span class='right_span'>(925)</span>
+<span class='right_span'>(943)</span>
 
 </h1>
 <head>
@@ -2442,8 +1278,8 @@ if (!document.getElementById('blog~octopress')) document.getElementById('aexp_bl
 if (!document.getElementById('blog')) document.getElementById('aexp_blog').style.visibility = 'hidden';
 if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ruby').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(151)</span></li>
-<div id='language' class='catsub'><li><a href='/blog/cats/language~c/?opendiv=language'>c</a><a href='##' onmousedown=showDiv('language~c') id='aexp_language~c'><span class='exp_style' id='exp_language~c'>[+]</span></a><span class='right_span'>32</span></li>
+<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(161)</span></li>
+<div id='language' class='catsub'><li><a href='/blog/cats/language~c/?opendiv=language'>c</a><a href='##' onmousedown=showDiv('language~c') id='aexp_language~c'><span class='exp_style' id='exp_language~c'>[+]</span></a><span class='right_span'>33</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~c')) document.getElementById('aexp_language~c').style.visibility = 'hidden';
 </script>
@@ -2459,7 +1295,7 @@ if (!document.getElementById('language~java')) document.getElementById('aexp_lan
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~jsp')) document.getElementById('aexp_language~jsp').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/language~php/?opendiv=language'>php</a><a href='##' onmousedown=showDiv('language~php') id='aexp_language~php'><span class='exp_style' id='exp_language~php'>[+]</span></a><span class='right_span'>50</span></li>
+<li><a href='/blog/cats/language~php/?opendiv=language'>php</a><a href='##' onmousedown=showDiv('language~php') id='aexp_language~php'><span class='exp_style' id='exp_language~php'>[+]</span></a><span class='right_span'>53</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~php')) document.getElementById('aexp_language~php').style.visibility = 'hidden';
 </script>
@@ -2467,7 +1303,7 @@ if (!document.getElementById('language~php')) document.getElementById('aexp_lang
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~python')) document.getElementById('aexp_language~python').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/language~web/?opendiv=language'>web</a><a href='##' onmousedown=showDiv('language~web') id='aexp_language~web'><span class='exp_style' id='exp_language~web'>[+]</span></a><span class='right_span'>48</span></li>
+<li><a href='/blog/cats/language~web/?opendiv=language'>web</a><a href='##' onmousedown=showDiv('language~web') id='aexp_language~web'><span class='exp_style' id='exp_language~web'>[+]</span></a><span class='right_span'>54</span></li>
 </div><script language='javascript' type='text/javascript'>
 if (!document.getElementById('language')) document.getElementById('aexp_language').style.visibility = 'hidden';
 if (!document.getElementById('language~web')) document.getElementById('aexp_language~web').style.visibility = 'hidden';
@@ -2496,7 +1332,7 @@ if (!document.getElementById('assembly~base')) document.getElementById('aexp_ass
 if (!document.getElementById('assembly')) document.getElementById('aexp_assembly').style.visibility = 'hidden';
 if (!document.getElementById('assembly~win')) document.getElementById('aexp_assembly~win').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(198)</span></li>
+<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(199)</span></li>
 <div id='tools' class='catsub'><li><a href='/blog/cats/tools~apache2/?opendiv=tools'>apache2</a><a href='##' onmousedown=showDiv('tools~apache2') id='aexp_tools~apache2'><span class='exp_style' id='exp_tools~apache2'>[+]</span></a><span class='right_span'>9</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~apache2')) document.getElementById('aexp_tools~apache2').style.visibility = 'hidden';
@@ -2513,7 +1349,7 @@ if (!document.getElementById('tools~ci')) document.getElementById('aexp_tools~ci
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~cloud')) document.getElementById('aexp_tools~cloud').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/tools~command/?opendiv=tools'>command</a><a href='##' onmousedown=showDiv('tools~command') id='aexp_tools~command'><span class='exp_style' id='exp_tools~command'>[+]</span></a><span class='right_span'>30</span></li>
+<li><a href='/blog/cats/tools~command/?opendiv=tools'>command</a><a href='##' onmousedown=showDiv('tools~command') id='aexp_tools~command'><span class='exp_style' id='exp_tools~command'>[+]</span></a><span class='right_span'>31</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~command')) document.getElementById('aexp_tools~command').style.visibility = 'hidden';
 </script>
@@ -2606,8 +1442,8 @@ if (!document.getElementById('tools~vim')) document.getElementById('aexp_tools~v
 if (!document.getElementById('tools')) document.getElementById('aexp_tools').style.visibility = 'hidden';
 if (!document.getElementById('tools~wxwork')) document.getElementById('aexp_tools~wxwork').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/system/'>system</a><a href='##' onmousedown=showDiv('system') id='aexp_system'><span class='exp_style' id='exp_system'>[+]</span></a><span class='right_span'>(114)</span></li>
-<div id='system' class='catsub'><li><a href='/blog/cats/system~base/?opendiv=system'>base</a><a href='##' onmousedown=showDiv('system~base') id='aexp_system~base'><span class='exp_style' id='exp_system~base'>[+]</span></a><span class='right_span'>25</span></li>
+<li class='catclass'><a href='/blog/cats/system/'>system</a><a href='##' onmousedown=showDiv('system') id='aexp_system'><span class='exp_style' id='exp_system'>[+]</span></a><span class='right_span'>(121)</span></li>
+<div id='system' class='catsub'><li><a href='/blog/cats/system~base/?opendiv=system'>base</a><a href='##' onmousedown=showDiv('system~base') id='aexp_system~base'><span class='exp_style' id='exp_system~base'>[+]</span></a><span class='right_span'>31</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('system~base')) document.getElementById('aexp_system~base').style.visibility = 'hidden';
 </script>
@@ -2623,7 +1459,7 @@ if (!document.getElementById('system~cgroup')) document.getElementById('aexp_sys
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('system~docker')) document.getElementById('aexp_system~docker').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/system~fs/?opendiv=system'>fs</a><a href='##' onmousedown=showDiv('system~fs') id='aexp_system~fs'><span class='exp_style' id='exp_system~fs'>[+]</span></a><span class='right_span'>11</span></li>
+<li><a href='/blog/cats/system~fs/?opendiv=system'>fs</a><a href='##' onmousedown=showDiv('system~fs') id='aexp_system~fs'><span class='exp_style' id='exp_system~fs'>[+]</span></a><span class='right_span'>12</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('system~fs')) document.getElementById('aexp_system~fs').style.visibility = 'hidden';
 </script>
@@ -2845,7 +1681,7 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 
 <section>
 <h1>Date Categories
-<span class='right_span'>(925)</span>
+<span class='right_span'>(943)</span>
 
 </h1>
 <head>
@@ -2853,8 +1689,9 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(45)</span></li>
-<div id='2024' class='catsub'><li><a href='/blog/cats/2024~07/?opendiv=2024'>2024-07</a><span class='right_span'>22</span></li>
+<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(63)</span></li>
+<div id='2024' class='catsub'><li><a href='/blog/cats/2024~08/?opendiv=2024'>2024-08</a><span class='right_span'>14</span></li>
+<li><a href='/blog/cats/2024~07/?opendiv=2024'>2024-07</a><span class='right_span'>26</span></li>
 <li><a href='/blog/cats/2024~06/?opendiv=2024'>2024-06</a><span class='right_span'>2</span></li>
 <li><a href='/blog/cats/2024~05/?opendiv=2024'>2024-05</a><span class='right_span'>5</span></li>
 <li><a href='/blog/cats/2024~04/?opendiv=2024'>2024-04</a><span class='right_span'>5</span></li>
@@ -3001,7 +1838,7 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 <h1>Tags</h1>
 <ul class="tag-cloud">
 <a style="font-size: 124%" href="/tags/10gb/">10gb(7)</a>
-<a style="font-size: 114%" href="/tags/lvm/">LVM(5)</a>
+<a style="font-size: 119%" href="/tags/lvm/">LVM(6)</a>
 <a style="font-size: 100%" href="/tags/chrome-debug/">chrome_debug(3)</a>
 <a style="font-size: 131%" href="/tags/gdb/">gdb(9)</a>
 <a style="font-size: 127%" href="/tags/git/">git(8)</a>
@@ -3023,43 +1860,43 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
   <ul id="recent_posts">
     
       <li class="post">
-        <a href="/blog/2024/07/31/lvm-attr/">LVM 输出更多信息</a>
+        <a href="/blog/2024/08/15/lang-web-js-copy/">禁止网页内容复制另存为</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/31/lvm-pvmove/">LVM 缩减 VG 大小 ( pvmove )</a>
+        <a href="/blog/2024/08/15/lang-web-iframe/">iframe网页嵌套</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/31/lang-web-override/">Chrome浏览器使用Overrides调试线上代码</a>
+        <a href="/blog/2024/08/15/lang-web-auto-textarea/">textarea自动调整高宽</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/31/lang-web-fetch/">fetch使用介绍, chrome如何重新提交请求并且更改参数</a>
+        <a href="/blog/2024/08/09/ntpd-log/">NTP log 记录每次发包</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/31/lang-web-95598/">95598停电公告信息抓取</a>
+        <a href="/blog/2024/08/09/ntpd/">NTP服务配置</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/30/lang-php-sm1234/">sm1、sm2、sm3、sm4简单介绍</a>
+        <a href="/blog/2024/08/09/lang-date/">unix时间戳, excel date, 儒略日julian date</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/30/lang-php-sm2/">php sm2</a>
+        <a href="/blog/2024/08/09/lang-web-times/">&amp;times被替换成x</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/30/lang-php-sm3/">php sm3</a>
+        <a href="/blog/2024/08/09/lang-c-localtime/">localtime函数</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/30/lang-php-bgcolor/">php spreadsheet 填充背景色</a>
+        <a href="/blog/2024/08/02/ups-webpower/">山特UPS NMC卡 USHA卡</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/30/lang-php-mb/">php统计文章字数</a>
+        <a href="/blog/2024/08/01/lang-web-holiday/">节假日 API</a>
       </li>
     
   </ul>

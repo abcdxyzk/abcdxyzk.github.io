@@ -34,7 +34,7 @@
 </hgroup>
 
 </header>
-  <nav role="navigation" style='white-space: nowrap; min-width=1120px;'><form action="/search" method="get">
+  <nav role="navigation" style='white-space: nowrap; min-width=1120px; position: sticky; top: 0; z-index: 999;'><form action="/search" method="get">
     <input class="search" name="query" id="query" type="text" placeholder="search..." style="height:1.5em;">
     <input id="btnSubmit" value="search" type="submit">
 </form>
@@ -131,7 +131,7 @@ var ss360Config = {
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2013/11/29/debug-debuger-1/">调试器工作原理之一——基础篇</a></h2>
+      <h2 class="entry-title"><a href="/blog/2014/02/28/debug-vm-ttys/">vmware 串口调试</a></h2>
     
     
       <p class="meta">
@@ -140,37 +140,212 @@ var ss360Config = {
 
 
 
-<time class='entry-date' datetime='2013-11-29T09:33:00+08:00'><span class='date'>2013-11-29</span> <span class='time'>09:33:00</span></time>
+<time class='entry-date' datetime='2014-02-28T17:48:00+08:00'><span class='date'>2014-02-28</span> <span class='time'>17:48:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><p>英文原文：<a href="http://eli.thegreenplace.net/2011/01/23/how-debuggers-work-part-1/">Eli Bendersky</a>  编译：<a href="http://blog.jobbole.com/23463/">陈舸</a><br/>
-调试器工作原理之一——基础篇<br/>
-<a href="/blog/2013/11/29/debug-debuger-2/">调试器工作原理之二——实现断点</a><br/>
-<a href="/blog/2013/11/29/debug-debuger-3/">调试器工作原理之三——调试信息</a></p>
+  <div class="entry-content"><p>  在系统内核开发中，经常会用到串口调试，利用VMware的Virtual Machine更是为调试系统内核如虎添翼。那么怎么搭建串口调试环境呢？</p>
 
-<p>  本文是一系列探究调试器工作原理的文章的第一篇。我还不确定这个系列需要包括多少篇文章以及它们所涵盖的主题，但我打算从基础知识开始说起。</p>
+<p>Virtual Machine 主要有三种串口调试技术，可以在serial port的配置界面找到：</p>
 
-<h4>关于本文</h4>
+<ol>
+<li>Use physical serial port      即使用物理机串口，当用串口线盒另一台电脑连接时，就用这种方式</li>
+<li>Use output file                   即把串口数据输出到宿主机某文件中，当只需要看输出结果的时候可以用这种方式，简单方便</li>
+<li>Use named pipe                把串口输出到命名管道，命名管道可读可写，也就可以交互，进行一些debug工作，而不是简单的看结果</li>
+</ol>
 
-<p>  我打算在这篇文章中介绍关于Linux下的调试器实现的主要组成部分——ptrace系统调用。本文中出现的代码都在32位的Ubuntu系统上开发。请注意，这里出现的代码是同平台紧密相关的，但移植到别的平台上应该不会太难。</p>
 
-<h4>动机</h4>
+<p>  因为前两种相对简单易用就不具体介绍了，这里主要说第三种用命名管道调试方法。命名管道，在Linux中是进程间通信(IPC)的一种方式，两个进 程可以通过读写管道来交换数据。这里就是运用了这种技术，通过把串口绑定一个有名管道，对有名管道的读写交换串口数据。也有两种方式：1. 宿主机与虚拟机之间， 2. 在同一宿主机上，两虚拟机间通过绑定同一个宿主机上的有名管道。问题的关键在于如何把虚拟机串口绑定到宿主机的某一有名管道，而第一种方式则需要找到一种 方式使得主机如何读写有名管道来交互，经过一阵Google终于找到分别在Linux和Windows分别试验成功的工具。</p>
 
-<p> 要想理解我们究竟要做什么，试着想象一下调试器是如何工作的。调试器可以启动某些进程，然后对其进行调试，或者 将自己本身关联到一个已存在的进程之上。它可以单步运行代码，设置断点然后运行程序，检查变量的值以及跟踪调用栈。许多调试器已经拥有了一些高级特性，比 如执行表达式并在被调试进程的地址空间中调用函数，甚至可以直接修改进程的代码并观察修改后的程序行为。</p>
+<p>  在Windows中有名管道式通过路径//./pipe/namedpipe来创建的，当然你可以指定到其他机子如//192.168.1.10 /pipe/namedpipe，而在Linux中，/tmp/mypipe就可以了。创建好有名管道后，就是如何和管道交互了。目前，无论是 Windows还是Linux，似乎都没有一款工具可以直接读写有名管道的，而我找到的两个工具都是通过把有名管道和Socket绑定，通过读写 Socket来间接读写管道。</p>
 
-<p>  尽管现代的调试器都是复杂的大型程序，但令人惊讶的是构建调试器的基础确是如此的简单。调试器只用到了几个由操作系统以及编译器/链接器提供的基础服务，剩下的仅仅就是简单的编程问题了。（可查阅维基百科中关于这个词条的解释，作者是在反讽）</p>
+<h4>下面我就简要介绍一下在Windows和Linux下如何配置：</h4>
 
-<h4>Linux下的调试——ptrace</h4>
+<h5>Linux Host:</h5>
 
-<p>  Linux下调试器拥有一个瑞士军刀般的工具，这就是ptrace系统调用。这是一个功能众多且相当复杂的工 具，能允许一个进程控制另一个进程的运行，而且可以监视和渗入到进程内部。ptrace本身需要一本中等篇幅的书才能对其进行完整的解释，这就是为什么我 只打算通过例子把重点放在它的实际用途上。让我们继续深入探寻。</p>
+<h6>Host  ~  Virtual Machine</h6>
 
-<h4>遍历进程的代码</h4>
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>1. configure VM
+</span><span class='line'>a. add hardware -&gt; Serial port
+</span><span class='line'>b. using named pipe
+</span><span class='line'>c. /tmp/isocket
+</span><span class='line'>d. this end is server & far end is application
+</span><span class='line'>e. check Yield CPU on poll
+</span><span class='line'>f. start Virtual Machine
+</span><span class='line'>
+</span><span class='line'>2. socat /tmp/isocket tcp4-listen:9001 &
+</span><span class='line'>/tmp/socket: VMware call it 'named piped', actually it is Unix Daemon Socket, so you shouldn't use pipe:/tmp/socket
+</span><span class='line'>3. telnet 127.0.0.1 9001</span></code></pre></td></tr></table></div></figure>
 
-<p>  我现在要写一个在“跟踪”模式下运行的进程的例子，这里我们要单步遍历这个进程的代码——由CPU所执行的机器 码（汇编指令）。我会在这里给出例子代码，解释每个部分，本文结尾处你可以通过链接下载一份完整的C程序文件，可以自行编译执行并研究。从高层设计来说， 我们要写一个程序，它产生一个子进程用来执行一个用户指定的命令，而父进程跟踪这个子进程。首先，main函数是这样的：</p>
+
+<p>Trouble Shoot: 有时候会遇到错误Connection closed by foreign host，或者telnet一开，socat就能退出，很可能是你没power on虚拟机，有名管道还没创建，你就socat，这样也会创建一个名为isocket的文件但只是普通文件。具体的细节请看socat help<br/>
+start Virtual Machine first, than run the socat, and telnet<br/>
+(Note you must have permission to all resource, /tmp/socket, VM and so on)</p>
+
+<h6>Vritual Machine ~ Virtual Machine</h6>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>1. configure VM
+</span><span class='line'>a. add hardware --&gt;　serial port
+</span><span class='line'>b. Using named pipe, configure /tmp/isocket 
+</span><span class='line'>c.  this end is server & far end is Virtual Machine
+</span><span class='line'>d. check Yield CPU on poll
+</span><span class='line'>e. start VM
+</span><span class='line'>
+</span><span class='line'>2. Another VM
+</span><span class='line'>a. add hardware  --&gt;  Serial Port
+</span><span class='line'>b. Using named pipe, configure /tmp/isocket 
+</span><span class='line'>c.  this end is client & far end is Virtual Machine 
+</span><span class='line'>d. check Yield CPU on poll
+</span><span class='line'>e. start VMs</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>Windows Host:</h5>
+
+<h6>Host ~ Virtual Machine</h6>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>1. configure VM
+</span><span class='line'>a. add hardware --&gt; serial port
+</span><span class='line'>b. using named pipe
+</span><span class='line'>c. //./pipe/vmwaredebug
+</span><span class='line'>d. this end is client & far end is application
+</span><span class='line'>e. check Yield CPU on poll
+</span><span class='line'>
+</span><span class='line'>2. using 3rd-party tool to communicate with named pipe
+</span><span class='line'>a. down the tool 
+</span><span class='line'>b. install service
+</span><span class='line'>cmd&gt;vmwaregateway.exe /r
+</span><span class='line'>c. start service
+</span><span class='line'>c:/&gt; net start vmwaregateway
+</span><span class='line'>d. telnet 127.0.0.1 567
+</span><span class='line'>3. start Virtual Machine</span></code></pre></td></tr></table></div></figure>
+
+
+<p>如果你使用的是vmwaregateway.exe这个小工具，这里的管道名就必须是vmwaredebug，除非你把它的源代码download下来自己改改。</p>
+
+<h6>Vritual Machine ~ Virtual Machine</h6>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>1. configure VM
+</span><span class='line'>a. add hardware --&gt;　serial port
+</span><span class='line'>b. Using named pipe, //./pipe/vmwaredebug
+</span><span class='line'>c.  this end is server & far end is Virtual Machine
+</span><span class='line'>d. check Yield CPU on poll
+</span><span class='line'>e. start VM
+</span><span class='line'>
+</span><span class='line'>2. Another VM
+</span><span class='line'>a. add hardware  --&gt;  Serial Port
+</span><span class='line'>b. Using named pipe, //./pipe/vmwaredebug
+</span><span class='line'>c.  this end is client & far end is Virtual Machine 
+</span><span class='line'>d. check Yield CPU on poll
+</span><span class='line'>e. start VMs</span></code></pre></td></tr></table></div></figure>
+
+
+
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2014/02/21/debug-base-objdump-apply/">独立的调试符号文件</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2014-02-21T14:13:00+08:00'><span class='date'>2014-02-21</span> <span class='time'>14:13:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p>  这种将可执行程序与调试符号分离的方案好处多多。一方面，缩减了可执行程序的文件大小，在一定程度上提高了程序的执行性能，另一方面，对应的调试符号文件也方便了一些不时之需。本文就来看一下与此相关的两个问题。</p>
+
+<h4>一 如何给应用程序创建对应的调试符号文件？</h4>
+
+<p>这很简单，看个演示实例。有代码如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>[root@lenky gdb]# cat t.c
+</span><span class='line'>#include &lt;stdio.h&gt; 
+</span><span class='line'>int main(int argc, char *argv[])
+</span><span class='line'>{
+</span><span class='line'>  printf("Hello world!\n");
+</span><span class='line'>  return 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>依次执行命令如下：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -188,75 +363,42 @@ var ss360Config = {
 <span class='line-number'>14</span>
 <span class='line-number'>15</span>
 <span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>int main(int argc, char** argv)
-</span><span class='line'>{
-</span><span class='line'>&#9;pid_t child_pid;
-</span><span class='line'> 
-</span><span class='line'>&#9;if (argc &lt; 2) {
-</span><span class='line'>&#9;&#9;fprintf(stderr, "Expected a program name as argument\n");
-</span><span class='line'>&#9;&#9;return -1;
-</span><span class='line'>&#9;}
-</span><span class='line'> 
-</span><span class='line'>&#9;child_pid = fork();
-</span><span class='line'>&#9;if (child_pid == 0)
-</span><span class='line'>&#9;&#9;run_target(argv[1]);
-</span><span class='line'>&#9;else if (child_pid &gt; 0)
-</span><span class='line'>&#9;&#9;run_debugger(child_pid);
-</span><span class='line'>&#9;else {
-</span><span class='line'>&#9;&#9;perror("fork");
-</span><span class='line'>&#9;&#9;return -1;
-</span><span class='line'>&#9;}
-</span><span class='line'> 
-</span><span class='line'>&#9;return 0;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>[root@lenky gdb]# ls -l
+</span><span class='line'>total 4
+</span><span class='line'>-rw-r--r--. 1 root root 103 Mar 20 07:52 t.c
+</span><span class='line'>[root@lenky gdb]# gcc -g t.c -o t
+</span><span class='line'>[root@lenky gdb]# ls -l
+</span><span class='line'>total 12
+</span><span class='line'>-rwxr-xr-x. 1 root root 7717 Mar 20 07:58 t
+</span><span class='line'>-rw-r--r--. 1 root root  103 Mar 20 07:52 t.c
+</span><span class='line'>[root@lenky gdb]# objcopy --only-keep-debug t t.debuginfo
+</span><span class='line'>[root@lenky gdb]# objcopy --strip-debug t
+</span><span class='line'>[root@lenky gdb]# objcopy --add-gnu-debuglink=t.debuginfo t
+</span><span class='line'>[root@lenky gdb]# ls -l
+</span><span class='line'>total 20
+</span><span class='line'>-rwxr-xr-x. 1 root root 6470 Mar 20 07:58 t
+</span><span class='line'>-rw-r--r--. 1 root root  103 Mar 20 07:52 t.c
+</span><span class='line'>-rwxr-xr-x. 1 root root 6109 Mar 20 07:58 t.debuginfo</span></code></pre></td></tr></table></div></figure>
 
 
-<p>  代码相当简单，我们通过fork产生一个新的子进程。随后的if语句块处理子进程（这里称为“目标进程”），而else if语句块处理父进程（这里称为“调试器”）。下面是目标进程：</p>
+<p>OK，可执行程序t和对应的调试符号文件t.debuginfo就生成了。</p>
 
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>void run_target(const char* programname)
-</span><span class='line'>{
-</span><span class='line'>&#9;procmsg("target started. will run '%s'\n", programname);
-</span><span class='line'> 
-</span><span class='line'>&#9;/* Allow tracing of this process */
-</span><span class='line'>&#9;if (ptrace(PTRACE_TRACEME, 0, 0, 0) &lt; 0) {
-</span><span class='line'>&#9;&#9;perror("ptrace");
-</span><span class='line'>&#9;&#9;return;
-</span><span class='line'>&#9;}
-</span><span class='line'> 
-</span><span class='line'>&#9;/* Replace this process's image with the given program */
-</span><span class='line'>&#9;execl(programname, programname, 0);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+<p>几条命令，给以分别解释一下：  <br/>
+1. gcc -g t.c -o t  <br/>
+  这个无需多说，值得注意的是，-g和-O2可以同时使用。  <br/>
+2. objcopy –only-keep-debug t t.debuginfo  <br/>
+  将可执行程序文件t内的与调试相关的信息拷贝到文件t.debuginfo内。也可以这样：<br/>
+cp t t.debuginfo<br/>
+strip &ndash;only-keep-debug t.debuginfo<br/>
+3. objcopy –strip-debug t  <br/>
+  删除可执行程序文件t内的调试相关信息。也可以直接使用strip命令，不过strip命令会把symtab也删除掉，导致在没有debuginfo文件的情况下，打印堆栈信息会受到影响，比如变得不那么清晰。  <br/>
+4. objcopy –add-gnu-debuglink=t.debuginfo t  <br/>
+  在可执行程序文件t内添加一个名为.gnu_debuglink的section段，该段内包含有debuginfo文件的name名称和checksum校验和，以确保后续在进行实际调试时，可执行程序和对应的调试符号文件是一致的。</p>
 
+<h4>二 如何使用gdb调试带有调试符号文件的应用程序？</h4>
 
-<p>这部分最有意思的地方在ptrace调用。ptrace的原型是（在sys/ptrace.h）：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>long ptrace(enum __ptrace_request request,  pid_t pid, void *addr,  void *data);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>  第一个参数是request，可以是预定义的以PTRACE_打头的常量值。第二个参数指定了进程id，第三以及第四个参数是地址和指向数据的指 针，用来对内存做操作。上面代码段中的ptrace调用使用了PTRACE_TRACEME请求，这表示这个子进程要求操作系统内核允许它的父进程对其跟 踪。这个请求在man手册中解释的非常清楚：<br/>
-  “表明这个进程由它的父进程来跟踪。任何发给这个进程的信号（除了SIGKILL）将导致该进程停止运行，而它的父进程会通过wait()获得通知。另外，该进程之后所有对exec()的调用都将使操作系统产生一个SIGTRAP信号发送给它，这让父进程有机会在新程序开始执行之前获得对子进程的控制权。如果不希望由父进程来跟踪的话，那就不应该使用这个请求。（pid、addr、data被忽略）”</p>
-
-<p>  我已经把这个例子中我们感兴趣的地方高亮显示了。注意，run_target在ptrace调用之后紧接着做的是通过execl来调用我们指定的程 序。这里就会像我们高亮显示的部分所解释的那样，操作系统内核会在子进程开始执行execl中指定的程序之前停止该进程，并发送一个信号给父进程。
-因此，是时候看看父进程需要做些什么了：</p>
+<p>  其实想想也知道，这只需解决一个问题，即如何把应用程序与调试符号文件关联起来。  <br/>
+  gdb会按照一定的规则去搜索对应路径，找寻应用程序的调试符号文件，比如gdb会自动查找可执行程序所在目录下的.debug文件夹：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -264,57 +406,15 @@ var ss360Config = {
 <span class='line-number'>4</span>
 <span class='line-number'>5</span>
 <span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>void run_debugger(pid_t child_pid)
-</span><span class='line'>{
-</span><span class='line'>&#9;int wait_status;
-</span><span class='line'>&#9;unsigned icounter = 0;
-</span><span class='line'>&#9;procmsg("debugger started\n");
-</span><span class='line'> 
-</span><span class='line'>&#9;/* Wait for child to stop on its first instruction */
-</span><span class='line'>&#9;wait(&wait_status);
-</span><span class='line'> 
-</span><span class='line'>&#9;while (WIFSTOPPED(wait_status)) {
-</span><span class='line'>&#9;&#9;icounter++;
-</span><span class='line'>&#9;&#9;/* Make the child execute another instruction */
-</span><span class='line'>&#9;&#9;if (ptrace(PTRACE_SINGLESTEP, child_pid, 0, 0) &lt; 0) {
-</span><span class='line'>&#9;&#9;&#9;perror("ptrace");
-</span><span class='line'>&#9;&#9;&#9;return;
-</span><span class='line'>&#9;&#9;}
-</span><span class='line'> 
-</span><span class='line'>&#9;&#9;/* Wait for child to stop on its next instruction */
-</span><span class='line'>&#9;&#9;wait(&wait_status);
-</span><span class='line'>&#9;}
-</span><span class='line'> 
-</span><span class='line'>&#9;procmsg("the child executed %u instructions\n", icounter);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>[root@lenky ~]# pwd
+</span><span class='line'>/root
+</span><span class='line'>[root@lenky ~]# gdb /home/work/gdb/t -q
+</span><span class='line'>Reading symbols from /home/work/gdb/t...Reading symbols from /home/work/gdb/.debug/t.debug...done.
+</span><span class='line'>done.
+</span><span class='line'>(gdb)</span></code></pre></td></tr></table></div></figure>
 
 
-<p>  通过上面的代码我们可以回顾一下，一旦子进程开始执行exec调用，它就会停止然后接收到一个SIGTRAP信号。父进程通过第一个wait调用正 在等待这个事件发生。一旦子进程停止（如果子进程由于发送的信号而停止运行，WIFSTOPPED就返回true），父进程就去检查这个事件。</p>
-
-<p>  父进程接下来要做的是本文中最有意思的地方。父进程通过PTRACE_SINGLESTEP以及子进程的id号来调用ptrace。这么做是告诉操 作系统——请重新启动子进程，但当子进程执行了下一条指令后再将其停止。然后父进程再次等待子进程的停止，整个循环继续得以执行。当从wait中得到的不 是关于子进程停止的信号时，循环结束。在正常运行这个跟踪程序时，会得到子进程正常退出（WIFEXITED会返回true）的信号。</p>
-
-<p>  icounter会统计子进程执行的指令数量。因此我们这个简单的例子实际上还是做了点有用的事情——通过在命令行上指定一个程序名，我们的例子会执行这个指定的程序，然后统计出从开始到结束该程序执行过的CPU指令总数。让我们看看实际运行的情况。</p>
-
-<h4>实际测试</h4>
-
-<p>我编译了下面这个简单的程序，然后在我们的跟踪程序下执行：</p>
+<p>把调试符号文件放到同一个目录也可以：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -322,79 +422,61 @@ var ss360Config = {
 <span class='line-number'>4</span>
 <span class='line-number'>5</span>
 <span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;stdio.h&gt;
-</span><span class='line'>int main()
-</span><span class='line'>{
-</span><span class='line'>&#9;printf(“Hello, world!\n”);
-</span><span class='line'>&#9;return 0;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>[root@lenky ~]# rm -fr /tmp/.debug/
+</span><span class='line'>[root@lenky ~]# cp /home/work/gdb/.debug/t.debug /tmp/
+</span><span class='line'>[root@lenky ~]# gdb /tmp/t -q
+</span><span class='line'>Reading symbols from /tmp/t...Reading symbols from /tmp/t.debug...done.
+</span><span class='line'>done.
+</span><span class='line'>(gdb)</span></code></pre></td></tr></table></div></figure>
 
 
-<p>  令我惊讶的是，我们的跟踪程序运行了很长的时间然后报告显示一共有超过100000条指令得到了执行。仅仅只是一个简单的printf调用，为什么 会这样？答案非常有意思。默认情况下，Linux中的gcc编译器会动态链接到C运行时库。这意味着任何程序在运行时首先要做的事情是加载动态库。这需要 很多代码实现——记住，我们这个简单的跟踪程序会针对每一条被执行的指令计数，不仅仅是main函数，而是整个进程。</p>
+<h4>下面再介绍另外几种主动设置方法：</h4>
 
-<p>  因此，当我采用-static标志静态链接这个测试程序时（注意到可执行文件因此增加了500KB的大小，因为它静态链接了C运行时库），我们的跟 踪程序报告显示只有7000条左右的指令被执行了。这还是非常多，但如果你了解到libc的初始化工作仍然先于main的执行，而清理工作会在main之 后执行，那么这就完全说得通了。而且，printf也是一个复杂的函数。</p>
+<h5>1，通过gdb启动参数-s指定：</h5>
 
-<p>  我们还是不满足于此，我希望能看到一些可检测的东西，例如我可以从整体上看到每一条需要被执行的指令是什么。这一点我们可以通过汇编代码来得到。因此我把这个“Hello，world”程序汇编（gcc -S）为如下的汇编码：</p>
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>[root@lenky ~]# gdb -s /home/work/gdb/.debug/t.debug -e /tmp/t -q
+</span><span class='line'>Reading symbols from /home/work/gdb/.debug/t.debug...done.
+</span><span class='line'>(gdb)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>注意：可执行程序必须通过-e指定，否则貌似gdb会拿它覆盖-s参数，比如如下：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
 <span class='line-number'>3</span>
 <span class='line-number'>4</span>
 <span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>section  .text
-</span><span class='line'>&#9;; The _start symbol must be declared for the linker (ld)
-</span><span class='line'>&#9;global _start
-</span><span class='line'> 
-</span><span class='line'>_start:
-</span><span class='line'> 
-</span><span class='line'>&#9;; Prepare arguments for the sys_write system call:
-</span><span class='line'>&#9;;   - eax: system call number (sys_write)
-</span><span class='line'>&#9;;   - ebx: file descriptor (stdout)
-</span><span class='line'>&#9;;   - ecx: pointer to string
-</span><span class='line'>&#9;;   - edx: string length
-</span><span class='line'>&#9;mov   edx, len
-</span><span class='line'>&#9;mov   ecx, msg
-</span><span class='line'>&#9;mov   ebx, 1
-</span><span class='line'>&#9;mov   eax, 4
-</span><span class='line'> 
-</span><span class='line'>&#9;; Execute the sys_write system call
-</span><span class='line'>&#9;int   0x80
-</span><span class='line'> 
-</span><span class='line'>&#9;; Execute sys_exit
-</span><span class='line'>&#9;mov   eax, 1
-</span><span class='line'>&#9;int   0x80
-</span><span class='line'> 
-</span><span class='line'>section   .data
-</span><span class='line'>msg db    'Hello, world!', 0xa
-</span><span class='line'>len equ   $ - msg</span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>[root@lenky ~]# gdb -s /home/work/gdb/.debug/t.debug /tmp/t -q
+</span><span class='line'>Reading symbols from /tmp/t...Missing separate debuginfo for /tmp/t
+</span><span class='line'>Try: yum --disablerepo='*' --enablerepo='*-debuginfo' install /usr/lib/debug/.build-id/01/f1df7f4971caacd934aca9523c4e4b5ae95332.debug
+</span><span class='line'>(no debugging symbols found)...done.
+</span><span class='line'>(gdb)</span></code></pre></td></tr></table></div></figure>
 
 
-<p>这就足够了。现在跟踪程序会报告有7条指令得到了执行，我可以很容易地从汇编代码来验证这一点。</p>
+<p>可以看到，gdb直接尝试从文件/tmp/t内读取符号了，而不是文件t.debug。</p>
 
-<h4>深入指令流</h4>
+<h5>2，利用gdb的命令设置搜索路径：set debug-file-directory directories</h5>
 
-<p>汇编码程序得以让我为大家介绍ptrace的另一个强大的功能——详细检查被跟踪进程的状态。下面是run_debugger函数的另一个版本：</p>
+<p>  这是gdb官方文档提到的，可以设置搜索路径的命令，但是貌似并没有起作用，或者是我漏掉了什么。具体不说了，请看参考5。</p>
+
+<h4>参考：</h4>
+
+<ol>
+<li>How to generate gcc debug symbol outside the build target?  <br/>
+<a href="http://stackoverflow.com/questions/866721/how-to-generate-gcc-debug-symbol-outside-the-build-target">http://stackoverflow.com/questions/866721/how-to-generate-gcc-debug-symbol-outside-the-build-target</a></li>
+<li>Creating separate debug info  <br/>
+<a href="https://blogs.oracle.com/dbx/entry/creating_separate_debug_info">https://blogs.oracle.com/dbx/entry/creating_separate_debug_info</a></li>
+<li>man objcopy</li>
+<li>.gnu_debuglink or Debugging system libraries with source code  <br/>
+<a href="https://blogs.oracle.com/dbx/entry/gnu_debuglink_or_debugging_system">https://blogs.oracle.com/dbx/entry/gnu_debuglink_or_debugging_system</a></li>
+<li>18.2 Debugging Information in Separate Files  <br/>
+<a href="http://sourceware.org/gdb/onlinedocs/gdb/Separate-Debug-Files.html">http://sourceware.org/gdb/onlinedocs/gdb/Separate-Debug-Files.html</a></li>
+<li><a href="http://www.technovelty.org/code/separate-debug-info.html">http://www.technovelty.org/code/separate-debug-info.html</a></li>
+</ol>
+
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -426,122 +508,47 @@ var ss360Config = {
 <span class='line-number'>28</span>
 <span class='line-number'>29</span>
 <span class='line-number'>30</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>void run_debugger(pid_t child_pid)
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#!/bin/sh
+</span><span class='line'># 可以改成：将要提取的文件加到参数中
+</span><span class='line'>
+</span><span class='line'>#set -x
+</span><span class='line'>
+</span><span class='line'>objcopyout()
 </span><span class='line'>{
-</span><span class='line'>&#9;int wait_status;
-</span><span class='line'>&#9;unsigned icounter = 0;
-</span><span class='line'>&#9;procmsg("debugger started\n");
-</span><span class='line'> 
-</span><span class='line'>&#9;/* Wait for child to stop on its first instruction */
-</span><span class='line'>&#9;wait(&wait_status);
-</span><span class='line'> 
-</span><span class='line'>&#9;while (WIFSTOPPED(wait_status)) {
-</span><span class='line'>&#9;&#9;icounter++;
-</span><span class='line'>&#9;&#9;struct user_regs_struct regs;
-</span><span class='line'>&#9;&#9;ptrace(PTRACE_GETREGS, child_pid, 0, ®s);
-</span><span class='line'>&#9;&#9;unsigned instr = ptrace(PTRACE_PEEKTEXT, child_pid, regs.eip, 0);
-</span><span class='line'> 
-</span><span class='line'>&#9;&#9;procmsg("icounter = %u.  EIP = 0x%08x.  instr = 0x%08x\n",
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;icounter, regs.eip, instr);
-</span><span class='line'> 
-</span><span class='line'>&#9;&#9;/* Make the child execute another instruction */
-</span><span class='line'>&#9;&#9;if (ptrace(PTRACE_SINGLESTEP, child_pid, 0, 0) &lt; 0) {
-</span><span class='line'>&#9;&#9;&#9;perror("ptrace");
-</span><span class='line'>&#9;&#9;&#9;return;
-</span><span class='line'>&#9;&#9;}
-</span><span class='line'> 
-</span><span class='line'>&#9;&#9;/* Wait for child to stop on its next instruction */
-</span><span class='line'>&#9;&#9;wait(&wait_status);
-</span><span class='line'>&#9;}
-</span><span class='line'> 
-</span><span class='line'>&#9;procmsg("the child executed %u instructions\n", icounter);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+</span><span class='line'>#       if [ -f `file -N $1 | sed -n -e 's/^\(.*\):[   ]*.*ELF.*, not stripped/\1/p'` ]; then
+</span><span class='line'>&#9;    val=`objdump -s -j .gnu_debuglink "$1" | grep 'Contents of section .gnu_debuglink:'`
+</span><span class='line'>&#9;    if [ -z "$val" ]; then
+</span><span class='line'>&#9;            #debug_out=".debug/$1.debug".`date +%s`
+</span><span class='line'>&#9;            tmp_name=`echo "$1" | awk -F/ '{ print $NF}'`
+</span><span class='line'>&#9;            debug_out=".debug/$tmp_name.debug".`date +%s`
+</span><span class='line'>&#9;            objcopy --only-keep-debug "$1" "$debug_out"
+</span><span class='line'>&#9;            objcopy --strip-debug "$1"
+</span><span class='line'>&#9;            objcopy --add-gnu-debuglink="$debug_out" "$1"
+</span><span class='line'>&#9;    fi
+</span><span class='line'>#       objdump -s -j .gnu_debuglink "$1"
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>mkdir -p .debug/
+</span><span class='line'>
+</span><span class='line'>while [ $# -gt 0 ]; do
+</span><span class='line'>&#9;    if [ -f "$1" ]; then
+</span><span class='line'>&#9;            objcopyout "$1"
+</span><span class='line'>&#9;    fi
+</span><span class='line'>&#9;    shift
+</span><span class='line'>done
+</span><span class='line'>
+</span><span class='line'>#find . -name *.ko -print |
+</span><span class='line'>#while read f
+</span><span class='line'>#do
+</span><span class='line'>#       objcopyout "$f"
+</span><span class='line'>#done</span></code></pre></td></tr></table></div></figure>
 
 
-<p>  同前个版本相比，唯一的不同之处在于while循环的开始几行。这里有两个新的ptrace调用。第一个读取进程的寄存器值到一个结构体中。结构体 user_regs_struct定义在sys/user.h中。这儿有个有趣的地方——如果你打开这个头文件看看，靠近文件顶端的地方有一条这样的注 释：<br/>
-1<br/>
-/<em> 本文件的唯一目的是为GDB，且只为GDB所用。对于这个文件，不要看的太多。除了GDB以外不要用于任何其他目的，除非你知道你正在做什么。</em>/<br/>
-现在，我不知道你是怎么想的，但我感觉我们正处于正确的跑道上。无论如何，回到我们的例子上来。一旦我们将所有的寄存器值获取到regs中，我们就 可以通过PTRACE_PEEKTEXT标志以及将regs.eip（x86架构上的扩展指令指针）做参数传入ptrace来调用。我们所得到的就是指 令。让我们在汇编代码上运行这个新版的跟踪程序。</p>
 
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>$ simple_tracer traced_helloworld
-</span><span class='line'>[5700] debugger started
-</span><span class='line'>[5701] target started. will run 'traced_helloworld'
-</span><span class='line'>[5700] icounter = 1.  EIP = 0x08048080.  instr = 0x00000eba
-</span><span class='line'>[5700] icounter = 2.  EIP = 0x08048085.  instr = 0x0490a0b9
-</span><span class='line'>[5700] icounter = 3.  EIP = 0x0804808a.  instr = 0x000001bb
-</span><span class='line'>[5700] icounter = 4.  EIP = 0x0804808f.  instr = 0x000004b8
-</span><span class='line'>[5700] icounter = 5.  EIP = 0x08048094.  instr = 0x01b880cd
-</span><span class='line'>Hello, world!
-</span><span class='line'>[5700] icounter = 6.  EIP = 0x08048096.  instr = 0x000001b8
-</span><span class='line'>[5700] icounter = 7.  EIP = 0x0804809b.  instr = 0x000080cd
-</span><span class='line'>[5700] the child executed 7 instructions</span></code></pre></td></tr></table></div></figure>
-
-
-<p>OK，所以现在除了icounter以外，我们还能看到指令指针以及每一步的指令。如何验证这是否正确呢？可以通过在可执行文件上执行objdump –d来实现：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>$ objdump -d traced_helloworld
-</span><span class='line'> 
-</span><span class='line'>traced_helloworld:    file format elf32-i386
-</span><span class='line'> 
-</span><span class='line'>Disassembly of section .text:
-</span><span class='line'> 
-</span><span class='line'>08048080 &lt;.text&gt;:
-</span><span class='line'> 8048080: ba 0e 00 00 00      mov    $0xe,%edx
-</span><span class='line'> 8048085: b9 a0 90 04 08      mov    $0x80490a0,%ecx
-</span><span class='line'> 804808a: bb 01 00 00 00      mov    $0x1,%ebx
-</span><span class='line'> 804808f: b8 04 00 00 00      mov    $0x4,%eax
-</span><span class='line'> 8048094: cd 80               int    $0x80
-</span><span class='line'> 8048096: b8 01 00 00 00      mov    $0x1,%eax
-</span><span class='line'> 804809b: cd 80               int    $0x80</span></code></pre></td></tr></table></div></figure>
-
-
-<p>用这份输出对比我们的跟踪程序输出，应该很容易观察到相同的地方。</p>
-
-<h4>关联到运行中的进程上</h4>
-
-<p>你已经知道了调试器也可以关联到已经处于运行状态的进程上。看到这里，你应该不会感到惊讶，这也是通过ptrace来实现的。这需要通过 PTRACE_ATTACH请求。这里我不会给出一段样例代码，因为通过我们已经看到的代码，这应该很容易实现。基于教学的目的，这里采用的方法更为便捷 （因为我们可以在子进程刚启动时立刻将它停止）。</p>
-
-<h4>代码</h4>
-
-<p>本文给出的这个简单的跟踪程序的完整代码（更高级一点，可以将具体指令打印出来）可以在这里找到。程序通过-Wall –pedantic –std=c99编译选项在4.4版的gcc上编译。</p>
-
-<h4>结论及下一步要做的</h4>
-
-<p>诚然，本文并没有涵盖太多的内容——我们离一个真正可用的调试器还差的很远。但是，我希望这篇文章至少已经揭开了调试过程的神秘面纱。ptrace是一个拥有许多功能的系统调用，目前我们只展示了其中少数几种功能。
-能够单步执行代码是很有用处的，但作用有限。以“Hello， world”为例，要到达main函数，需要先遍历好几千条初始化C运行时库的指令。这就不太方便了。我们所希望的理想方案是可以在main函数入口处设 置一个断点，从断点处开始单步执行。下一篇文章中我将向您展示该如何实现断点机制。</p>
-
-<h4>参考文献</h4>
-
-<p>写作本文时我发现下面这些文章很有帮助：<br/>
-<a href="http://www.linuxjournal.com/article/6100?page=0,1">Playing with ptrace, Part I</a><br/>
-<a href="http://linuxgazette.net/81/sandeep.html">Process tracing using ptrace</a><br/>
-<a href="http://www.alexonlinux.com/how-debugger-works">How debugger works</a></p>
 </div>
   
   
@@ -554,7 +561,7 @@ var ss360Config = {
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2013/11/21/freebsd/">freeBSD9.2 安装 && 允许root用户用SSH登录</a></h2>
+      <h2 class="entry-title"><a href="/blog/2014/02/21/debug-base-objcopy/">objcopy命令介绍</a></h2>
     
     
       <p class="meta">
@@ -563,19 +570,53 @@ var ss360Config = {
 
 
 
-<time class='entry-date' datetime='2013-11-21T16:15:00+08:00'><span class='date'>2013-11-21</span> <span class='time'>16:15:00</span></time>
+<time class='entry-date' datetime='2014-02-21T14:12:00+08:00'><span class='date'>2014-02-21</span> <span class='time'>14:12:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><h4>一</h4>
+  <div class="entry-content"><p>objcopy把一种目标文件中的内容复制到另一种类型的目标文件中.</p>
 
-<p><a href="http://forums.freebsd.org/showthread.php?t=36579">http://forums.freebsd.org/showthread.php?t=36579</a></p>
+<h4>(1)将图像编译到可执行文件内</h4>
 
-<p>Issue:<br/>
-Here is the error message that I&rsquo;ve got:</p>
+<p>Q: 如何将一个二进制文件，比如图片，词典一类的东西做为.o文件，直接链接到可执行文件内部呢？<br/>
+A:</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>$ objcopy -I binary -O elf32-i386 -B i386 14_95_13.jpg image.o
+</span><span class='line'>$ gcc image.o tt.o -o tt
+</span><span class='line'>$ nm tt | grep 14_95
+</span><span class='line'>0805d6c7 D _binary_14_95_13_jpg_end
+</span><span class='line'>00014213 A _binary_14_95_13_jpg_size
+</span><span class='line'>080494b4 D _binary_14_95_13_jpg_start</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>(2)使用objcopy把不用的信息去掉：</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>$ objcopy -R .comment -R .note halo halo.min</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>(3)</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>$ objcopy -R .note -R .comment -S -O binary xyb xyb.bin
+</span><span class='line'>-R .note -R .comment 表示移掉 .note 与 .comment 段
+</span><span class='line'>-S 表示移出所有的标志及重定位信息
+</span><span class='line'>-O binary xyb xyb.bin 表示由xyb生成二进制文件xyb.bin</span></code></pre></td></tr></table></div></figure>
+
+
+<h3>objcopy工具使用指南</h3>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -595,203 +636,210 @@ Here is the error message that I&rsquo;ve got:</p>
 <span class='line-number'>16</span>
 <span class='line-number'>17</span>
 <span class='line-number'>18</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>Code:
-</span><span class='line'>
-</span><span class='line'>cd0 at umass-sim0 bus 0 scbus3 target 0 lun 0
-</span><span class='line'>cd0: &lt;ASUS SDRW-08D2S-U B302&gt; Removable CD-ROM SCSI-0 device
-</span><span class='line'>cd0: 40.000MB/s transfers
-</span><span class='line'>cd0: cd present [1166275 x 2048 byte records]Mounting from cd9660:/dev/iso9660/FREEBSD_INSTALL failed with error 19.
-</span><span class='line'>
-</span><span class='line'>Loader variables:
-</span><span class='line'>&#9;vfs.root.mountfrom=cd9660:/dev/iso9660/FREEBSD_INSTALL
-</span><span class='line'>&#9;vfs.root.mountfrom.option=ro
-</span><span class='line'>
-</span><span class='line'>Manual root filesystem specification:
-</span><span class='line'>&#9;&lt;fstype&gt;:&lt;device&gt; [option]
-</span><span class='line'>&#9;    Mount &lt;device&gt; using filesystem &lt;fstype&gt;
-</span><span class='line'>&#9;    and with the specified (optional) option list.
-</span><span class='line'>
-</span><span class='line'>&#9;eg. ufs:/dev/da0s1a
-</span><span class='line'>&#9;    zf:tank
-</span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>objcopy Utility
+</span><span class='line'>objcopy [ -F bfdname | --target=bfdname ]
+</span><span class='line'>[ -I bfdname | --input-target=bfdname ]
+</span><span class='line'>[ -O bfdname | --output-target= bfdname ]
+</span><span class='line'>[ -S | --strip-all ] [ -g | --strip-debug ]
+</span><span class='line'>[ -K symbolname | --keep-symbol= symbolname ]
+</span><span class='line'>[ -N symbolname | --strip-symbol= symbolname ]
+</span><span class='line'>[ -L symbolname | --localize-symbol= symbolname ]
+</span><span class='line'>[ -W symbolname | --weaken-symbol= symbolname ]
+</span><span class='line'>[ -x | --discard-all ] [ -X | --discard-locals ]
+</span><span class='line'>[ -b byte | --byte= byte ]
+</span><span class='line'>[ -i interleave | --interleave= interleave ]
+</span><span class='line'>[ -R sectionname | --remove-section= sectionname ]
+</span><span class='line'>[ -p | --preserve-dates ] [ --debugging ]
+</span><span class='line'>[ --gap-fill= val ] [ --pad-to= address ]
+</span><span class='line'>[ --set-start= val ] [ --adjust-start= incr ]
+</span><span class='line'>[ --change-address= incr ]
+</span><span class='line'>[ --change-section-address= section{=,+,-} val ]
+</span><span class='line'>[ --change-warnings ] [ --no-change-warnings ]
+</span><span class='line'>[ --set-section-flags= section= flags ]
+</span><span class='line'>[ --add-section= sectionname= filename ]
+</span><span class='line'>[ --change-leading char ] [--remove-leading-char ]
+</span><span class='line'>[ --weaken ]
+</span><span class='line'>[ -v | --verbose ] [ -V | --version ] [ --help ]
+</span><span class='line'>input-file [ outfile ]  </span></code></pre></td></tr></table></div></figure>
 
 
-<p>The system seems to recognize the DVD drive but is unable to mount the media correctly.</p>
+<p>  GNU实用工具程序objcopy的作用是拷贝一个目标文件的内容到另一个目标文件中。Objcopy使用GNU BFD库去读或写目标文件。Objcopy可以使用不同于源目标文件的格式来写目的目标文件（也即是说可以将一种格式的目标文件转换成另一种格式的目标文 件）。通过以上命令行选项可以控制Objcopy的具体操作。</p>
 
-<p>You need to get a boot prompt and disable ACPI support before booting:<br/>
-这两句好像没效果</p>
+<p>  Objcopy在进行目标文件的转换时，将生成一个临时文件，转换完成后就将这个临 时文件删掉。Objcopy使用BFD做转换工作。如果没有明确地格式要求，则Objcopy将访问所有在BFD库中已经描述了的并且它可以识别的格式， 请参见《GNUpro Decelopment Tools》中“using ld”一章中“BFD库”部分和“BFD库中规范的目标文件格式”部分。</p>
 
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'># set debug.acpi.disabled ="hostres"
-</span><span class='line'># boot</span></code></pre></td></tr></table></div></figure>
+<p>  通过使用srec作为输出目标（使用命令行选项-o srec），Objcopy可以产生S记录格式文件。</p>
 
+<p>  通过使用binary作为输出目标（使用命令行选项-o binary），Objcopy可以产生原始的二进制文件。使用Objcopy产生一个原始的二进制文件，实质上是进行了一回输入目标文件内容的内存转 储。所有的符号和重定位信息都将被丢弃。内存转储起始于输入目标文件中那些将要拷贝到输出目标文件去的部分的最小虚地址处。</p>
 
-<p>The solution is actually in the FreeBSD 9 errata (section 3)</p>
+<p>  使用Objcopy生成S记录格式文件或者原始的二进制文件的过程中，-S选项和-R选项可能会比较有用。-S选项是用来删掉包含调试信息的部分，-R选项是用来删掉包含了二进制文件不需要的内容的那些部分。</p>
 
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>mountroot&gt; cd9660:/dev/cd0  用这句通过</span></code></pre></td></tr></table></div></figure>
+<p>input-file<br/>
+outfile<br/>
+  参数input-file和outfile分别表示输入目标文件（源目标文件）和输出目标 文件（目的目标文件）。如果在命令行中没有明确地指定outfile，那么Objcopy将创建一个临时文件来存放目标结果，然后使用input- file的名字来重命名这个临时文件（这时候，原来的input-file将被覆盖）。</p>
 
+<p>-I bfdname<br/>
+&ndash;input-target=bfdname<br/>
+  明确告诉Objcopy，源文件的格式是什么，bfdname是BFD库中描述的标准格式名。这样做要比“让Objcopy自己去分析源文件的格式，然后去和BFD中描述的各种格式比较，通过而得知源文件的目标格式名”的方法要高效得多。</p>
 
-<p>这句不只道可不可以：</p>
+<p>-O bfdname<br/>
+&ndash;output-target= bfdname<br/>
+  使用指定的格式来写输出文件（即目标文件），bfdname是BFD库中描述的标准格式名。</p>
 
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>mountroot&gt; cd9660:/iso9660/FREEBSD_INSTALL</span></code></pre></td></tr></table></div></figure>
+<p>-F bfdname<br/>
+&ndash;target= bfdname<br/>
+明确告诉Objcopy，源文件的格式是什么，同时也使用这个格式来写输出文件（即目标文件），也就是说将源目标文件中的内容拷贝到目的目标文件的过程中，只进行拷贝不做格式转换，源目标文件是什么格式，目的目标文件就是什么格式。</p>
 
+<p>-R sectionname<br/>
+&ndash;remove-section= sectionname<br/>
+从输出文件中删掉所有名为sectionname的段。这个选项可以多次使用。<br/>
+注意：不恰当地使用这个选项可能会导致输出文件不可用。</p>
 
-<h4>二 FreeBSD 允许root用户用SSH登录</h4>
+<p>-S<br/>
+&ndash;strip-all （strip 剥去、剥）<br/>
+不从源文件中拷贝重定位信息和符号信息到输出文件（目的文件）中去。</p>
 
-<p>修改freebsd可以用sshd权限用户登录ssh<br/>
-在/etc/ssh/sshd_config最后中加入</p>
+<p>-g<br/>
+&ndash;strip-debug<br/>
+不从源文件中拷贝调试符号到输出文件（目的文件）中去。</p>
 
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>PermitRootLogin yes #允许root登录
-</span><span class='line'>PermitEmptyPasswords no #不允许空密码登录
-</span><span class='line'>PasswordAuthentication yes # 设置是否使用口令验证。</span></code></pre></td></tr></table></div></figure>
+<p>&ndash;strip-undeeded<br/>
+剥去所有在重定位处理时所不需要的符号。</p>
 
+<p>-K symbolname<br/>
+&ndash;keep-symbol= symbolname<br/>
+仅从源文件中拷贝名为symbolname的符号。这个选项可以多次使用。</p>
 
-<hr />
+<p>-N symbolname<br/>
+&ndash;strip-symbol= symbolname<br/>
+不从源文件中拷贝名为symbolname的符号。这个选项可以多次使用。它可以和其他的strip选项联合起来使用（除了-K symbolname | &ndash;keep-symbol= symbolname外）。</p>
 
-<p>FreeBSD SSH配置详解
-首先vi编辑/etc/inetd.conf,去掉ssh前的#，保存退出 (开启监听ssh服务)<br/>
-编辑/etc/rc.conf<br/>
-最后加入:sshd_enable=&ldquo;yes"即可</p>
+<p>-L symbolname<br/>
+&ndash;localize-symbol= symbolname<br/>
+使名为symbolname的符号在文件内局部化，以便该符号在该文件外部是不可见的。这个选项可以多次使用。</p>
 
-<p>激活sshd服务：</p>
+<p>-W symbolname<br/>
+-weaken-symbol= symbolname<br/>
+弱化名为symbolname的符号。这个选项可以多次使用。</p>
 
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#/etc/rc.d/sshd start</span></code></pre></td></tr></table></div></figure>
+<p>-x<br/>
+&ndash;discard-all （discard 丢弃、抛弃）<br/>
+不从源文件中拷贝非全局符号。</p>
 
+<p>-X<br/>
+&ndash;discard-locals<br/>
+不从源文件中拷贝又编译器生成的局部符号（这些符号通常是L或 . 开头的）。</p>
 
-<p>用下面命令检查服务是否启动，在22端口应该有监听。</p>
+<p>-b byte<br/>
+&ndash;byte= byte<br/>
+Keep only every byte of the input file (header data is not affected). byte can be<br/>
+in the range from 0 to interleave-1, where interleave is given by the -i or<br/>
+&ndash;interleave option, or the default of 4. This option is useful for creating files to<br/>
+program ROM . It is typically used with an srec output target.</p>
 
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#netstat -an ## check port number 22</span></code></pre></td></tr></table></div></figure>
+<p>-i interleave<br/>
+&ndash;interleave= interleave （interleave 隔行、交叉）<br/>
+Only copy one out of every interleave bytes. Select which byte to copy with the<br/>
+-b or &ndash;byte option. The default is 4. objcopy ignores this option if you do not<br/>
+specify either -b or &ndash;byte.</p>
 
+<p>-p<br/>
+&ndash;preserve-dates (preserve 保存、保持)<br/>
+设置输出文件的访问和修改日期和输入文件相同。</p>
 
-<p>最后</p>
+<p>[ &ndash;debugging ]<br/>
+如果可能的话，转换调试信息。因为只有特定的调试格式被支持，以及这个转换过程要耗费一定的时间，所以这个选项不是默认的。</p>
 
-<p>vi /etc/ssh/sshd_config</p>
+<p>&ndash;gap-fill= val<br/>
+使用内容val填充段与段之间的空隙。通过增加段的大小，在地址较低的一段附加空间中填充内容val来完成这一选项的功能。</p>
 
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>...
-</span><span class='line'>Subsystem sftp /usr/libexec/sftp-server
-</span><span class='line'>IgnoreRhosts yes
-</span><span class='line'>IgnoreUserKnownHosts yes
-</span><span class='line'>PrintMotd yes
-</span><span class='line'>StrictModes no
-</span><span class='line'>RSAAuthentication yes
-</span><span class='line'>PermitRootLogin yes #允许root登录
-</span><span class='line'>PermitEmptyPasswords no #不允许空密码登录
-</span><span class='line'>PasswordAuthentication yes # 设置是否使用口令验证。</span></code></pre></td></tr></table></div></figure>
+<p>&ndash;pad-to= address<br/>
+填充输出文件到虚拟地址address。通过增加输出文件中最后一个段的大小，在输出文件中最后一 段的末尾和address之间的这段附加空间中，用&ndash;gap-fill= val选项中指定的内容val来填充（默认内容是0，即没有使用&ndash;gap-fill= val选项的情况下）。</p>
 
+<p>&ndash;set-start= val<br/>
+设置新文件（应该是输出文件吧？）的起始地址为val。不是所有的目标文件格式都支持设置起始地址。</p>
 
-<hr />
+<p>&ndash;change-start = incr<br/>
+&ndash;adjust-start= incr<br/>
+通过增加值incr来改变起始地址。不是所有的目标文件格式都支持设置起始地址。</p>
 
-<p>记得修改完配置文件后，重新启动sshd服务器(/etc/rc.d/sshd restart)即可。<br/>
-几点补充说明</p>
+<p>&ndash;change-addresses incr<br/>
+&ndash;adjust-vma incr<br/>
+Change the VMA and LMA addresses of all sections, section., as well as the<br/>
+start address, by adding incr. Some object file formats do not permit section<br/>
+addresses to be changed arbitrarily.</p>
 
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>1,如果重启后还是不行请重新载入sshd_config 文件
-</span><span class='line'>/etc/rc.d/sshd reload
-</span><span class='line'>2,如果出现using keyboard-interactive authentication
-</span><span class='line'>password:
-</span><span class='line'>请确认PasswordAuthentication是否已经改成yes
-</span><span class='line'>另外如果客户端是putty那么请确认"尝试'智能键盘'认证（SSH-2）"的勾是否有去掉
-</span><span class='line'>3,如果是使用root帐号登陆
-</span><span class='line'>请确认密码是否为空
-</span><span class='line'>空密码无法登陆
-</span><span class='line'>4请确认是否有安装SSH
-</span><span class='line'>sysinstall&gt;&gt;&gt;configure&gt;&gt;&gt;networking&gt;&gt;&gt;sshd是否的勾是否有打上</span></code></pre></td></tr></table></div></figure>
+<p>通过加上一个值incr，改变所有段的VMA（Virtual Memory Address运行时地址）和LMA（Load Memory Address装载地址），以及起始地址。某些目标文件格式不允许随便更改段的地址。</p>
 
+<p>&ndash;change-section-address section{=,+,-} val<br/>
+&ndash;adjust-section-vma section{=,+,-} val<br/>
+  设置或者改变名为section的段的VMA（Virtual Memory Address运行时地址）和LMA（Load Memory Address装载地址）。如果这个选项中使用的是“=”，那么名为section的段的VMA（Virtual Memory Address运行时地址）和LMA（Load Memory Address装载地址）将被设置成val；如果这个选项中使用的是“-”或者“+”，那么上述两个地址将被设置或者改变成这两个地址的当前值减去或加上 val后的值。如果在输入文件中名为section的段不存在，那么Objcopy将发出一个警告，除非&ndash;no-change-warnings选项被 使用。</p>
 
+<p>这里的段地址设置和改变都是输出文件中的段相对于输入文件中的段而言的。例如：<br/>
+（1）&ndash;change-section-address .text = 10000<br/>
+这里是指将输入文件（即源文件）中名为.text的段拷贝到输出文件中后，输出文件中的.text段的VMA（Virtual Memory Address运行时地址）和LMA（Load Memory Address装载地址）将都被设置成10000。<br/>
+（2）&ndash;change-section-address .text + 100<br/>
+这 里是指将输入文件（即源文件）中名为.text的段拷贝到输出文件中后，输出文件中的.text段的VMA（Virtual Memory Address运行时地址）和LMA（Load Memory Address装载地址）将都被设置成以前输入文件中.text段的地址（当前地址）加上100后的值。</p>
 
-</div>
-  
-  
+<p>&ndash;change-section-lma section{=,+,-} val<br/>
+  仅设置或者改变名为section的段的 LMA（Load Memory Address装载地址）。一个段的LMA是程序被加载时，该段将被加载到的一段内存空间的首地址。通常LMA和VMA（Virtual Memory Address运行时地址）是相同的，但是在某些系统中，特别是在那些程序放在ROM的系统中，LMA和VMA是不相同的。如果这个选项中使用的是 “=”，那么名为section的段的LMA（Load Memory Address装载地址）将被设置成val；如果这个选项中使用的是“-”或者“+”，那么LMA将被设置或者改变成这两个地址的当前值减去或加上val 后的值。如果在输入文件中名为section的段不存在，那么Objcopy将发出一个警告，除非&ndash;no-change-warnings选项被使用。</p>
 
+<p>&ndash;change-section-vma section{=,+,-} val<br/>
+  仅设置或者改变名为section的段的 VMA（Load Memory Address装载地址）。一个段的VMA是程序运行时，该段的定位地址。通常VMA和LMA（Virtual Memory Address运行时地址）是相同的，但是在某些系统中，特别是在那些程序放在ROM的系统中，LMA和VMA是不相同的。如果这个选项中使用的是 “=”，那么名为section的段的LMA（Load Memory Address装载地址）将被设置成val；如果这个选项中使用的是“-”或者“+”，那么LMA将被设置或者改变成这两个地址的当前值减去或加上val 后的值。如果在输入文件中名为section的段不存在，那么Objcopy将发出一个警告，除非&ndash;no-change-warnings选项被使用。</p>
 
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2013/11/20/lang-c-buildin-addr/">__builtin_return_address获得程序运行栈</a></h2>
-    
-    
-      <p class="meta">
-        
+<p>&ndash;change-warnings<br/>
+&ndash;adjust-warnings<br/>
+  如果命令行中使用了&ndash;change- section-address section{=,+,-} val或者&ndash;adjust-section-vma section{=,+,-} val，又或者&ndash;change-section-lma section{=,+,-} val，又或者&ndash;change-section-vma section{=,+,-} val，并且输入文件中名为section的段不存在，则Objcopy发出警告。这是默认的选项。</p>
 
+<p>&ndash;no-chagne-warnings<br/>
+&ndash;no-adjust-warnings<br/>
+  如果命令行中使用了&ndash;change- section-address section{=,+,-} val或者&ndash;adjust-section-vma section{=,+,-} val，又或者&ndash;change-section-lma section{=,+,-} val，又或者&ndash;change-section-vma section{=,+,-} val，即使输入文件中名为section的段不存在， Objcopy也不会发出警告。</p>
 
+<p>&ndash;set-section-flags section=flags<br/>
+  为section的段设置一个标识。这个flags变量的可以取逗号分隔的多个标识名字符串（这些标识名字符串是能够被Objcopy程序所识别的），合法的标识名有alloc，load，readonly，code，data和rom。
+You can set the contents flag for a section which does not havecontents, but it is not meaningful to clear the contents flag of a section which does have contents; just remove the section instead. Not all flags are meaningful for all object file formats.</p>
 
+<p>&ndash;add-section sectionname=filename<br/>
+  进行目标文件拷贝的过程中，在输出文件中增加一个名为 sectionname的新段。这个新增加的段的内容从文件filename得到。这个新增加的段的大小就是这个文件filename的大小。只要输出文 件的格式允许该文件的段可以有任意的段名（段名不是标准的，固定的），这个选项才能使用。</p>
 
-<time class='entry-date' datetime='2013-11-20T18:34:00+08:00'><span class='date'>2013-11-20</span> <span class='time'>18:34:00</span></time>
-        
-      </p>
-    
-  </header>
+<p>&ndash;change-leading-char<br/>
+Some object file formats use special characters at the start of symbols. The most<br/>
+common such character is underscore, which compilers often add before every<br/>
+symbol. This option tells objcopy to change the leading character of every<br/>
+symbol when it converts between object file formats. If the object file formats use<br/>
+the same leading character, this option has no effect. Otherwise, it will add a<br/>
+character, or remove a character, or change a character, as appropriate.</p>
 
+<p>&ndash;remove-leading-char<br/>
+If the first character of a global symbol is a special symbol leading character used<br/>
+by the object file format, remove the character. The most common symbol leading<br/>
+character is underscore. This option will remove a leading underscore from all<br/>
+global symbols. This can be useful if you want to link together objects of different<br/>
+file formats with different conventions for symbol names.</p>
 
-  <div class="entry-content"><p>  gcc的编译特性使用<code>__builtin_return_address(level)</code>打印出一个函数的堆栈地址。其中 level代表是堆栈中第几层调用地址，<code>__builtin_return_address(0)</code>表示第一层调用地址，即当前函数，<code>__builtin_return_address(1)</code>表示第二层。如代码</p>
+<p>&ndash;weaken<br/>
+Change all global symbols in the file to be weak. This can be useful when building<br/>
+an object that will be linked against other objects using the -R option to the linker.<br/>
+This option is only effective when using an object file format that supports weak<br/>
+symbols.</p>
 
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;stdio.h&gt;
-</span><span class='line'>
-</span><span class='line'>void f()
-</span><span class='line'>{
-</span><span class='line'>&#9;printf("%p,%p" , __builtin_return_address(0), __builtin_return_address(1));
-</span><span class='line'>&#9;//printk("Caller is %pS\n", __builtin_return_address(0));
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>void g()
-</span><span class='line'>{
-</span><span class='line'>&#9;f();
-</span><span class='line'>}
-</span><span class='line'>int main()
-</span><span class='line'>{
-</span><span class='line'>&#9;g();
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+<p>-V<br/>
+&ndash;version<br/>
+Show the version number of objcopy.</p>
 
+<p>-v<br/>
+&ndash;verbose<br/>
+Verbose output: list all object files modified. In the case of archives, objcopy -V<br/>
+lists all members of the archive.</p>
 
-<p>分别打印出函数f()和g() 的函数地址，我们通过objdump 出来的文件去查找打印出来的函数地址，这样就能看到调用的函数名了。</p>
+<p>&ndash;help<br/>
+Show a summary of the options to objcopy.</p>
 </div>
   
   
@@ -813,7 +861,7 @@ Here is the error message that I&rsquo;ve got:</p>
   
     <section>
 <h1>Categories
-<span class='right_span'>(925)</span>
+<span class='right_span'>(943)</span>
 
 </h1>
 <head>
@@ -844,8 +892,8 @@ if (!document.getElementById('blog~octopress')) document.getElementById('aexp_bl
 if (!document.getElementById('blog')) document.getElementById('aexp_blog').style.visibility = 'hidden';
 if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ruby').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(151)</span></li>
-<div id='language' class='catsub'><li><a href='/blog/cats/language~c/?opendiv=language'>c</a><a href='##' onmousedown=showDiv('language~c') id='aexp_language~c'><span class='exp_style' id='exp_language~c'>[+]</span></a><span class='right_span'>32</span></li>
+<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(161)</span></li>
+<div id='language' class='catsub'><li><a href='/blog/cats/language~c/?opendiv=language'>c</a><a href='##' onmousedown=showDiv('language~c') id='aexp_language~c'><span class='exp_style' id='exp_language~c'>[+]</span></a><span class='right_span'>33</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~c')) document.getElementById('aexp_language~c').style.visibility = 'hidden';
 </script>
@@ -861,7 +909,7 @@ if (!document.getElementById('language~java')) document.getElementById('aexp_lan
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~jsp')) document.getElementById('aexp_language~jsp').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/language~php/?opendiv=language'>php</a><a href='##' onmousedown=showDiv('language~php') id='aexp_language~php'><span class='exp_style' id='exp_language~php'>[+]</span></a><span class='right_span'>50</span></li>
+<li><a href='/blog/cats/language~php/?opendiv=language'>php</a><a href='##' onmousedown=showDiv('language~php') id='aexp_language~php'><span class='exp_style' id='exp_language~php'>[+]</span></a><span class='right_span'>53</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~php')) document.getElementById('aexp_language~php').style.visibility = 'hidden';
 </script>
@@ -869,7 +917,7 @@ if (!document.getElementById('language~php')) document.getElementById('aexp_lang
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~python')) document.getElementById('aexp_language~python').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/language~web/?opendiv=language'>web</a><a href='##' onmousedown=showDiv('language~web') id='aexp_language~web'><span class='exp_style' id='exp_language~web'>[+]</span></a><span class='right_span'>48</span></li>
+<li><a href='/blog/cats/language~web/?opendiv=language'>web</a><a href='##' onmousedown=showDiv('language~web') id='aexp_language~web'><span class='exp_style' id='exp_language~web'>[+]</span></a><span class='right_span'>54</span></li>
 </div><script language='javascript' type='text/javascript'>
 if (!document.getElementById('language')) document.getElementById('aexp_language').style.visibility = 'hidden';
 if (!document.getElementById('language~web')) document.getElementById('aexp_language~web').style.visibility = 'hidden';
@@ -898,7 +946,7 @@ if (!document.getElementById('assembly~base')) document.getElementById('aexp_ass
 if (!document.getElementById('assembly')) document.getElementById('aexp_assembly').style.visibility = 'hidden';
 if (!document.getElementById('assembly~win')) document.getElementById('aexp_assembly~win').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(198)</span></li>
+<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(199)</span></li>
 <div id='tools' class='catsub'><li><a href='/blog/cats/tools~apache2/?opendiv=tools'>apache2</a><a href='##' onmousedown=showDiv('tools~apache2') id='aexp_tools~apache2'><span class='exp_style' id='exp_tools~apache2'>[+]</span></a><span class='right_span'>9</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~apache2')) document.getElementById('aexp_tools~apache2').style.visibility = 'hidden';
@@ -915,7 +963,7 @@ if (!document.getElementById('tools~ci')) document.getElementById('aexp_tools~ci
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~cloud')) document.getElementById('aexp_tools~cloud').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/tools~command/?opendiv=tools'>command</a><a href='##' onmousedown=showDiv('tools~command') id='aexp_tools~command'><span class='exp_style' id='exp_tools~command'>[+]</span></a><span class='right_span'>30</span></li>
+<li><a href='/blog/cats/tools~command/?opendiv=tools'>command</a><a href='##' onmousedown=showDiv('tools~command') id='aexp_tools~command'><span class='exp_style' id='exp_tools~command'>[+]</span></a><span class='right_span'>31</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~command')) document.getElementById('aexp_tools~command').style.visibility = 'hidden';
 </script>
@@ -1008,8 +1056,8 @@ if (!document.getElementById('tools~vim')) document.getElementById('aexp_tools~v
 if (!document.getElementById('tools')) document.getElementById('aexp_tools').style.visibility = 'hidden';
 if (!document.getElementById('tools~wxwork')) document.getElementById('aexp_tools~wxwork').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/system/'>system</a><a href='##' onmousedown=showDiv('system') id='aexp_system'><span class='exp_style' id='exp_system'>[+]</span></a><span class='right_span'>(114)</span></li>
-<div id='system' class='catsub'><li><a href='/blog/cats/system~base/?opendiv=system'>base</a><a href='##' onmousedown=showDiv('system~base') id='aexp_system~base'><span class='exp_style' id='exp_system~base'>[+]</span></a><span class='right_span'>25</span></li>
+<li class='catclass'><a href='/blog/cats/system/'>system</a><a href='##' onmousedown=showDiv('system') id='aexp_system'><span class='exp_style' id='exp_system'>[+]</span></a><span class='right_span'>(121)</span></li>
+<div id='system' class='catsub'><li><a href='/blog/cats/system~base/?opendiv=system'>base</a><a href='##' onmousedown=showDiv('system~base') id='aexp_system~base'><span class='exp_style' id='exp_system~base'>[+]</span></a><span class='right_span'>31</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('system~base')) document.getElementById('aexp_system~base').style.visibility = 'hidden';
 </script>
@@ -1025,7 +1073,7 @@ if (!document.getElementById('system~cgroup')) document.getElementById('aexp_sys
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('system~docker')) document.getElementById('aexp_system~docker').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/system~fs/?opendiv=system'>fs</a><a href='##' onmousedown=showDiv('system~fs') id='aexp_system~fs'><span class='exp_style' id='exp_system~fs'>[+]</span></a><span class='right_span'>11</span></li>
+<li><a href='/blog/cats/system~fs/?opendiv=system'>fs</a><a href='##' onmousedown=showDiv('system~fs') id='aexp_system~fs'><span class='exp_style' id='exp_system~fs'>[+]</span></a><span class='right_span'>12</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('system~fs')) document.getElementById('aexp_system~fs').style.visibility = 'hidden';
 </script>
@@ -1247,7 +1295,7 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 
 <section>
 <h1>Date Categories
-<span class='right_span'>(925)</span>
+<span class='right_span'>(943)</span>
 
 </h1>
 <head>
@@ -1255,8 +1303,9 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(45)</span></li>
-<div id='2024' class='catsub'><li><a href='/blog/cats/2024~07/?opendiv=2024'>2024-07</a><span class='right_span'>22</span></li>
+<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(63)</span></li>
+<div id='2024' class='catsub'><li><a href='/blog/cats/2024~08/?opendiv=2024'>2024-08</a><span class='right_span'>14</span></li>
+<li><a href='/blog/cats/2024~07/?opendiv=2024'>2024-07</a><span class='right_span'>26</span></li>
 <li><a href='/blog/cats/2024~06/?opendiv=2024'>2024-06</a><span class='right_span'>2</span></li>
 <li><a href='/blog/cats/2024~05/?opendiv=2024'>2024-05</a><span class='right_span'>5</span></li>
 <li><a href='/blog/cats/2024~04/?opendiv=2024'>2024-04</a><span class='right_span'>5</span></li>
@@ -1403,7 +1452,7 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 <h1>Tags</h1>
 <ul class="tag-cloud">
 <a style="font-size: 124%" href="/tags/10gb/">10gb(7)</a>
-<a style="font-size: 114%" href="/tags/lvm/">LVM(5)</a>
+<a style="font-size: 119%" href="/tags/lvm/">LVM(6)</a>
 <a style="font-size: 100%" href="/tags/chrome-debug/">chrome_debug(3)</a>
 <a style="font-size: 131%" href="/tags/gdb/">gdb(9)</a>
 <a style="font-size: 127%" href="/tags/git/">git(8)</a>
@@ -1425,43 +1474,43 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
   <ul id="recent_posts">
     
       <li class="post">
-        <a href="/blog/2024/07/31/lvm-attr/">LVM 输出更多信息</a>
+        <a href="/blog/2024/08/15/lang-web-js-copy/">禁止网页内容复制另存为</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/31/lvm-pvmove/">LVM 缩减 VG 大小 ( pvmove )</a>
+        <a href="/blog/2024/08/15/lang-web-iframe/">iframe网页嵌套</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/31/lang-web-override/">Chrome浏览器使用Overrides调试线上代码</a>
+        <a href="/blog/2024/08/15/lang-web-auto-textarea/">textarea自动调整高宽</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/31/lang-web-fetch/">fetch使用介绍, chrome如何重新提交请求并且更改参数</a>
+        <a href="/blog/2024/08/09/ntpd-log/">NTP log 记录每次发包</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/31/lang-web-95598/">95598停电公告信息抓取</a>
+        <a href="/blog/2024/08/09/ntpd/">NTP服务配置</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/30/lang-php-sm1234/">sm1、sm2、sm3、sm4简单介绍</a>
+        <a href="/blog/2024/08/09/lang-date/">unix时间戳, excel date, 儒略日julian date</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/30/lang-php-sm2/">php sm2</a>
+        <a href="/blog/2024/08/09/lang-web-times/">&amp;times被替换成x</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/30/lang-php-sm3/">php sm3</a>
+        <a href="/blog/2024/08/09/lang-c-localtime/">localtime函数</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/30/lang-php-bgcolor/">php spreadsheet 填充背景色</a>
+        <a href="/blog/2024/08/02/ups-webpower/">山特UPS NMC卡 USHA卡</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/30/lang-php-mb/">php统计文章字数</a>
+        <a href="/blog/2024/08/01/lang-web-holiday/">节假日 API</a>
       </li>
     
   </ul>

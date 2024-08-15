@@ -34,7 +34,7 @@
 </hgroup>
 
 </header>
-  <nav role="navigation" style='white-space: nowrap; min-width=1120px;'><form action="/search" method="get">
+  <nav role="navigation" style='white-space: nowrap; min-width=1120px; position: sticky; top: 0; z-index: 999;'><form action="/search" method="get">
     <input class="search" name="query" id="query" type="text" placeholder="search..." style="height:1.5em;">
     <input id="btnSubmit" value="search" type="submit">
 </form>
@@ -131,7 +131,7 @@ var ss360Config = {
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2015/06/01/kernel-net-shark-hand/">TCP三次握手源码详解</a></h2>
+      <h2 class="entry-title"><a href="/blog/2015/06/12/kernel-net-socket-signal/">Socket层实现系列 — 信号驱动的异步等待</a></h2>
     
     
       <p class="meta">
@@ -140,90 +140,31 @@ var ss360Config = {
 
 
 
-<time class='entry-date' datetime='2015-06-01T14:24:00+08:00'><span class='date'>2015-06-01</span> <span class='time'>14:24:00</span></time>
+<time class='entry-date' datetime='2015-06-12T17:13:00+08:00'><span class='date'>2015-06-12</span> <span class='time'>17:13:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><p><a href="http://blog.csdn.net/qy532846454/article/details/7882819">http://blog.csdn.net/qy532846454/article/details/7882819</a></p>
+  <div class="entry-content"><p><a href="http://blog.csdn.net/zhangskd/article/details/45932775">http://blog.csdn.net/zhangskd/article/details/45932775</a></p>
 
-<p><a href="http://m.bianceng.cn/OS/Linux/201301/35179_6.htm">http://m.bianceng.cn/OS/Linux/201301/35179_6.htm</a></p>
+<p>主要内容：Socket的异步通知机制。</p>
 
-<p>内核：2.6.34</p>
+<p>内核版本：3.15.2</p>
 
-<p>TCP是应用最广泛的传输层协议，其提供了面向连接的、可靠的字节流服务，但也正是因为这些特性，使得TCP较之UDP异常复杂，还是分两部分[创建与使用]来进行分析。这篇主要包括TCP的创建及三次握手的过程。</p>
+<h4>概述</h4>
 
-<p>编程时一般用如下语句创建TCP Socket：</p>
+<p>socket上定义了几个IO事件：状态改变事件、有数据可读事件、有发送缓存可写事件、有IO错误事件。对于这些事件，socket中分别定义了相应的事件处理函数，也称回调函数。</p>
 
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>socket(AF_INET, SOCK_DGRAM, IPPROTO_TCP)  </span></code></pre></td></tr></table></div></figure>
+<p>Socket I/O事件的处理过程中，要使用到sock上的两个队列：等待队列和异步通知队列，这两个队列中都保存着等待该Socket I/O事件的进程。</p>
 
+<p>Q：为什么要使用两个队列，等待队列和异步通知队列有什么区别呢？<br/>
+A：等待队列上的进程会睡眠，直到Socket I/O事件的发生，然后在事件处理函数中被唤醒。异步通知队列上的进程则不需要睡眠，Socket I/O事件发时，事件处理函数会给它们发送到信号，这些进程事先注册的信号处理函数就能够被执行。</p>
 
-<p>由此开始分析，调用接口[net/socket.c]: SYSCALL_DEFINE3(socket)</p>
+<h4>异步通知队列</h4>
 
-<p>其中执行两步关键操作：sock_create()与sock_map_fd()</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>retval = sock_create(family, type, protocol, &sock);  
-</span><span class='line'>if (retval &lt; 0)  
-</span><span class='line'>&#9;goto out;  
-</span><span class='line'>retval = sock_map_fd(sock, flags & (O_CLOEXEC | O_NONBLOCK));  
-</span><span class='line'>if (retval &lt; 0)  
-</span><span class='line'>&#9;goto out_release;  </span></code></pre></td></tr></table></div></figure>
-
-
-<p>  sock_create()用于创建socket，sock_map_fd()将之映射到文件描述符，使socket能通过fd进行访问，着重分析sock_create()的创建过程。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>sock_create() -&gt; __sock_create()</span></code></pre></td></tr></table></div></figure>
-
-
-<p>  从__sock_create()代码看到创建包含两步：sock_alloc()和pf->create()。sock_alloc()分配了sock内存空间并初始化inode；pf->create()初始化了sk。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>sock = sock_alloc();  
-</span><span class='line'>sock-&gt;type = type;  
-</span><span class='line'>……  
-</span><span class='line'>pf = rcu_dereference(net_families[family]);  
-</span><span class='line'>……  
-</span><span class='line'>pf-&gt;create(net, sock, protocol, kern);  </span></code></pre></td></tr></table></div></figure>
-
-
-<h4>sock_alloc()</h4>
-
-<p>  分配空间，通过new_inode()分配了节点(包括socket)，然后通过SOCKET_I宏获得sock，实际上inode和sock是在new_inode()中一起分配的，结构体叫作sock_alloc。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>inode = new_inode(sock_mnt-&gt;mnt_sb);  
-</span><span class='line'>sock = SOCKET_I(inode);  </span></code></pre></td></tr></table></div></figure>
-
-
-<p>  设置inode的参数，并返回sock。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>inode-&gt;i_mode = S_IFSOCK | S_IRWXUGO;  
-</span><span class='line'>inode-&gt;i_uid = current_fsuid();  
-</span><span class='line'>inode-&gt;i_gid = current_fsgid();  
-</span><span class='line'>return sock;  </span></code></pre></td></tr></table></div></figure>
-
-
-<p>  继续往下看具体的创建过程：new_inode()，在分配后，会设置i_ino和i_state的值。</p>
+<p>Socket层使用异步通知队列来实现异步等待，此时等待Socket I/O事件的进程不用睡眠。</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -237,80 +178,66 @@ var ss360Config = {
 <span class='line-number'>10</span>
 <span class='line-number'>11</span>
 <span class='line-number'>12</span>
-<span class='line-number'>13</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct inode *new_inode(struct super_block *sb)  
-</span><span class='line'>{  
-</span><span class='line'>&#9;……  
-</span><span class='line'>&#9;inode = alloc_inode(sb);  
-</span><span class='line'>&#9;if (inode) {  
-</span><span class='line'>&#9;&#9;spin_lock(&inode_lock);  
-</span><span class='line'>&#9;&#9;__inode_add_to_lists(sb, NULL, inode);  
-</span><span class='line'>&#9;&#9;inode-&gt;i_ino = ++last_ino;  
-</span><span class='line'>&#9;&#9;inode-&gt;i_state = 0;  
-</span><span class='line'>&#9;&#9;spin_unlock(&inode_lock);  
-</span><span class='line'>&#9;}  
-</span><span class='line'>&#9;return inode;  
-</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
-
-
-<p>  其中的alloc_inode() -> sb->s_op->alloc_inode()，sb是sock_mnt->mnt_sb，所以alloc_inode()指向的是sockfs的操作函数sock_alloc_inode。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static const struct super_operations sockfs_ops = {  
-</span><span class='line'>&#9;.alloc_inode = sock_alloc_inode,  
-</span><span class='line'>&#9;.destroy_inode =sock_destroy_inode,  
-</span><span class='line'>&#9;.statfs = simple_statfs,  
-</span><span class='line'>};  </span></code></pre></td></tr></table></div></figure>
-
-
-<p>  sock_alloc_inode()中通过kmem_cache_alloc()分配了struct socket_alloc结构体大小的空间，而struct socket_alloc结构体定义如下，但只返回了inode，实际上socket和inode都已经分配了空间，在之后就可以通过container_of取到socket。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static struct inode *sock_alloc_inode(struct super_block *sb)  
-</span><span class='line'>{  
-</span><span class='line'>&#9;struct socket_alloc *ei;  
-</span><span class='line'>&#9;ei = kmem_cache_alloc(sock_inode_cachep, GFP_KERNEL);  
-</span><span class='line'>&#9;......  
-</span><span class='line'>&#9;return &ei-&gt;vfs_inode;  
-</span><span class='line'>}  
-</span><span class='line'>struct socket_alloc {  
-</span><span class='line'>&#9;struct socket socket;  
-</span><span class='line'>&#9;struct inode vfs_inode;  
-</span><span class='line'>};  
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct sock {
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;struct socket_wq __rcu *sk_wq; /* socket的等待队列和异步通知队列 */
+</span><span class='line'>&#9;...
+</span><span class='line'>}
 </span><span class='line'>
-</span><span class='line'>net_families[AF_INET]:  
-</span><span class='line'>static const struct net_proto_family inet_family_ops = {  
-</span><span class='line'>&#9;.family = PF_INET,  
-</span><span class='line'>&#9;.create = inet_create,  
-</span><span class='line'>&#9;.owner = THIS_MODULE,  
-</span><span class='line'>};  </span></code></pre></td></tr></table></div></figure>
+</span><span class='line'>struct socket_wq {
+</span><span class='line'>&#9;/* Note: wait MUST be first field of socket_wq */
+</span><span class='line'>&#9;wait_queue_head_t wait; /* 等待队列头 */
+</span><span class='line'>&#9;struct fasync_struct *fasync_list; /* 异步通知队列 */
+</span><span class='line'>&#9;struct rcu_head *rcu;
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
 
 
-<p>err = pf->create(net, sock, protocol, kern); ==> inet_create()
-这段代码就是从inetsw[]中取到适合的协议类型answer，sock->type就是传入socket()函数的type参数SOCK_DGRAM，最终取得结果answer->ops==inet_stream_ops，从上面这段代码还可以看出以下问题：</p>
 
-<p>  socket(AF_INET, SOCK_RAW, IPPROTO_IP)这样是不合法的，因为SOCK_RAW没有默认的协议类型；同样socket(AF_INET, SOCK_DGRAM, IPPROTO_IP)与socket(AF_INET, SOCK_DGRAM, IPPROTO_TCP)是一样的，因为TCP的默认协议类型是IPPTOTO_TCP；SOCK_STREAM与IPPROTO_UDP同上。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct fasync_struct {
+</span><span class='line'>&#9;spinlock_t fa_lock;
+</span><span class='line'>&#9;int magic;
+</span><span class='line'>&#9;int fa_fd; /* 文件描述符 */
+</span><span class='line'>&#9;struct fasync_struct *fa_next; /* 用于链入单向链表 */
+</span><span class='line'>&#9;struct file *fa_file; /* fa_file-&gt;f_owner记录接收信号的进程 */
+</span><span class='line'>&#9;struct rcu_head fa_rcu;
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>通过之前的blog《linux的异步通知机制》，我们知道为了能处理协议栈发出的SIGIO信号，</p>
+
+<p>用户程序需要做的事情有：<br/>
+1. 通过signal()指定SIGIO的处理函数。<br/>
+2. 设置sockfd的拥有者为本进程，如此一来本进程才能收到协议栈发出的SIGIO信号。<br/>
+3. 设置sockfd支持异步通知，即设置O_ASYNC标志。</p>
+
+<p>对应的用户程序函数调用大概如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>signal(SIGIO, my_handler); /* set new SIGIO handler */
+</span><span class='line'>fcntl(sockfd, F_SETOWN, getpid()); /* set sockfd's owner process */
+</span><span class='line'>oflags = fcntl(sockfd, F_GETFL); /* get old sockfd flags */
+</span><span class='line'>fcntl(sockfd, F_SETFL, oflags | O_ASYNC); /* set new sockfd flags */</span></code></pre></td></tr></table></div></figure>
+
+
+<p>下文关注的是内核层面的一些工作：<br/>
+1. 如何把进程加入Socket的异步通知队列，或者把进程从Socket的异步通知队列中删除。<br/>
+2. 协议栈何时发送信号给Socket异步通知队列上的进程。</p>
+
+<h4>插入和删除</h4>
+
+<p>首先来看下fcntl()的系统调用。</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -330,83 +257,37 @@ var ss360Config = {
 <span class='line-number'>16</span>
 <span class='line-number'>17</span>
 <span class='line-number'>18</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>sock-&gt;state = SS_UNCONNECTED;  
-</span><span class='line'>list_for_each_entry_rcu(answer, &inetsw[sock-&gt;type], list) {  
-</span><span class='line'>&#9;err = 0;  
-</span><span class='line'>&#9;/* Check the non-wild match. */  
-</span><span class='line'>&#9;if (protocol == answer-&gt;protocol) {  
-</span><span class='line'>&#9;&#9;if (protocol != IPPROTO_IP)  
-</span><span class='line'>&#9;&#9;&#9;break;  
-</span><span class='line'>&#9;} else {  
-</span><span class='line'>&#9;&#9;/* Check for the two wild cases. */  
-</span><span class='line'>&#9;&#9;if (IPPROTO_IP == protocol) {  
-</span><span class='line'>&#9;&#9;&#9;protocol = answer-&gt;protocol;  
-</span><span class='line'>&#9;&#9;&#9;break;  
-</span><span class='line'>&#9;&#9;}  
-</span><span class='line'>&#9;&#9;if (IPPROTO_IP == answer-&gt;protocol)  
-</span><span class='line'>&#9;&#9;&#9;break;  
-</span><span class='line'>&#9;}  
-</span><span class='line'>&#9;err = -EPROTONOSUPPORT;  
-</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>SYSCALL_DEFINE3(fcntl, unsigned int, fd, unsigned int, cmd, unsigned long, arg)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct fd f = fdget_raw(fd);
+</span><span class='line'>&#9;long err = -EBADF; /* Bad file number */
+</span><span class='line'>
+</span><span class='line'>&#9;if (! f.file)
+</span><span class='line'>&#9;&#9;goto out;
+</span><span class='line'>
+</span><span class='line'>&#9;/* File is opened with O_PATH, almost nothing can be done with it */
+</span><span class='line'>&#9;if (unlikely(f.file-&gt;f_mode & FMODE_PATH)) {
+</span><span class='line'>&#9;&#9;if (! check_fcntl_cmd(cmd))
+</span><span class='line'>&#9;&#9;&#9;goto out1;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;err = security_file_fcntl(f.file, cmd, arg);
+</span><span class='line'>&#9;if (! err)
+</span><span class='line'>&#9;&#9;err = do_fcntl(fd, cmd, arg, f.file); /* 实际的处理函数 */
+</span><span class='line'>
+</span><span class='line'>out1:
+</span><span class='line'>&#9;fdput(f);
+</span><span class='line'>out:
+</span><span class='line'>&#9;return err;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
-<p>sock->ops指向inet_stream_ops，然后创建sk，sk->proto指向tcp_prot，注意这里分配的大小是struct tcp_sock，而不仅仅是struct sock大小</p>
 
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>sock-&gt;ops = answer-&gt;ops;  
-</span><span class='line'>answer_prot = answer-&gt;prot;  
-</span><span class='line'>……  
-</span><span class='line'>sk = sk_alloc(net, PF_INET, GFP_KERNEL, answer_prot);  </span></code></pre></td></tr></table></div></figure>
-
-
-<p>然后设置inet的一些参数，这里直接将sk类型转换为inet，因为在sk_alloc()中分配的是struct tcp_sock结构大小，返回的是struct sock，利用了第一个成员的特性，三者之间的关系如下图：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>inet = inet_sk(sk);  
-</span><span class='line'>……  
-</span><span class='line'>inet-&gt;inet_id = 0;  
-</span><span class='line'>sock_init_data(sock, sk);  </span></code></pre></td></tr></table></div></figure>
-
-
-<p>其中有些设置是比较重要的，如</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>sk-&gt;sk_state = TCP_CLOSE;  
-</span><span class='line'>sk_set_socket(sk, sock);  
-</span><span class='line'>sk-&gt;sk_protocol = protocol;  
-</span><span class='line'>sk-&gt;sk_backlog_rcv = sk-&gt;sk_prot-&gt;backlog_rcv;  </span></code></pre></td></tr></table></div></figure>
-
-
-<p>创建socket后，接下来的流程会因为客户端或服务器的不同而有所差异，下面着重于分析建立连接的三次握手过程。典型的客户端流程：<br/>
-connect() -> send() -> recv()</p>
-
-<p>典型的服务器流程：<br/>
-bind() -> listen() -> accept() -> recv() -> send()</p>
-
-<h4>客户端流程</h4>
-
-<p>发送SYN报文，向服务器发起tcp连接</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>&#9;&#9;connect(fd, servaddr, addrlen);
-</span><span class='line'>&#9;&#9;&#9;-&gt; SYSCALL＿DEFINE3() 
-</span><span class='line'>&#9;&#9;&#9;-&gt; sock-&gt;ops-&gt;connect() == inet_stream_connect (sock-&gt;ops即inet_stream_ops)
-</span><span class='line'>&#9;&#9;&#9;-&gt; tcp_v4_connect()</span></code></pre></td></tr></table></div></figure>
-
-
-<p>查找到达[daddr, dport]的路由项，路由项的查找与更新与”路由表”章节所述一样。要注意的是由于是作为客户端调用，创建socket后调用connect，因而saddr, sport都是0，同样在未查找路由前，要走的出接口oif也是不知道的，因此也是0。在查找完路由表后(注意不是路由缓存)，可以得知出接口，但并未存储到sk中。因此插入的路由缓存是特别要注意的：它的键值与实际值是不相同的，这个不同点就在于oif与saddr，键值是[saddr=0, sport=0, daddr, dport, oif=0]，而缓存项值是[saddr, sport=0, daddr, dport, oif]。</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -417,46 +298,36 @@ bind() -> listen() -> accept() -> recv() -> send()</p>
 <span class='line-number'>7</span>
 <span class='line-number'>8</span>
 <span class='line-number'>9</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>tmp = ip_route_connect(&rt, nexthop, inet-&gt;inet_saddr,  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;RT_CONN_FLAGS(sk), sk-&gt;sk_bound_dev_if,  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;IPPROTO_TCP,  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;inet-&gt;inet_sport, usin-&gt;sin_port, sk, 1);  
-</span><span class='line'>if (tmp &lt; 0) {  
-</span><span class='line'>&#9;if (tmp == -ENETUNREACH)  
-</span><span class='line'>&#9;&#9;IP_INC_STATS_BH(sock_net(sk), IPSTATS_MIB_OUTNOROUTES);  
-</span><span class='line'>&#9;return tmp;  
-</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static long do_fcntl(int fd, unsigned int cmd, unsigned long arg, struct fil *filp)
+</span><span class='line'>{
+</span><span class='line'>&#9;long err = -EINVAL;
+</span><span class='line'>
+</span><span class='line'>&#9;switch(cmd) {
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;case F_SETFL: /* 在这里设置O_ASYNC标志 */
+</span><span class='line'>&#9;&#9;err = setfl(fd, filp, arg);
+</span><span class='line'>&#9;&#9;break;
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;case F_SETOWN: /* 在这里设置所有者进程 */
+</span><span class='line'>&#9;&#9;err = f_setown(filp, arg, 1);
+</span><span class='line'>&#9;&#9;break;
+</span><span class='line'>&#9;....
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;return err;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
-<p>通过查找到的路由项，对inet进行赋值，可以看到，除了sport，都赋予了值，sport的选择复杂点，因为它要随机从未使用的本地端口中选择一个。</p>
 
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if (!inet-&gt;inet_saddr)  
-</span><span class='line'>&#9;inet-&gt;inet_saddr = rt_rt_src;   
-</span><span class='line'>inet-&gt;inet_rcv_addr = inet-&gt;inet_saddr;  
-</span><span class='line'>……  
-</span><span class='line'>inet-&gt;inet_dport = usin-&gt;sin_port;  
-</span><span class='line'>inet-&gt;inet_daddr = daddr;  </span></code></pre></td></tr></table></div></figure>
-
-
-<p>状态从CLOSING转到TCP_SYN_SENT，也就是我们熟知的TCP的状态转移图。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>tcp_set_state(sk, TCP_SYN_SENT);  </span></code></pre></td></tr></table></div></figure>
-
-
-<p>插入到bind链表中</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>err = inet_hash_connect(&tcp_death_row, sk); //== &gt; __inet_hash_connect()  </span></code></pre></td></tr></table></div></figure>
-
-
-<p>当snum==0时，表明此时源端口没有指定，此时会随机选择一个空闲端口作为此次连接的源端口。low和high分别表示可用端口的下限和上限，remaining表示可用端口的数，注意这里的可用只是指端口可以用作源端口，其中部分端口可能已经作为其它socket的端口号在使用了，所以要循环1~remaining，直到查找到空闲的源端口。</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -466,17 +337,43 @@ bind() -> listen() -> accept() -> recv() -> send()</p>
 <span class='line-number'>6</span>
 <span class='line-number'>7</span>
 <span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if (!snum) {  
-</span><span class='line'>&#9;inet_get_local_port_range(&low, &high);  
-</span><span class='line'>&#9;remaining = (high - low) + 1;  
-</span><span class='line'>&#9;……  
-</span><span class='line'>&#9;for (i = 1; i &lt;= remaining; i++) {  
-</span><span class='line'>&#9;&#9;……// choose a valid port  
-</span><span class='line'>&#9;}  
-</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int setfl(int fd, struct file *filp, unsigned long arg)
+</span><span class='line'>{
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;/* -&gt;fasync() is responsible for setting the FASYNC bit. */
+</span><span class='line'>&#9;if (((arg ^ filp-&gt;f_flags) & FASYNC) && filp-&gt;f_op-&gt;fasync) {
+</span><span class='line'>&#9;&#9;error = filp-&gt;f_op-&gt;fasync(fd, filp, (arg & FASYNC) != 0);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (error &lt; 0)
+</span><span class='line'>&#9;&#9;&#9;goto out;
+</span><span class='line'>&#9;&#9;if (error &gt; 0)
+</span><span class='line'>&#9;&#9;&#9;error = 0;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;...
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
-<p>下面来看下对每个端口的检查，即//choose a valid port部分的代码。这里要先了解下tcp的内核表组成，udp的表内核表udptable只是一张hash表，tcp的表则稍复杂，它的名字是tcp_hashinfo，在tcp_init()中被初始化，这个数据结构定义如下(省略了不相关的数据)：</p>
+<p>Socket文件的操作函数集为socket_file_ops。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static const struct file_operations socket_file_ops = {
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;.fasync = sock_fasync,
+</span><span class='line'>&#9;...
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -486,22 +383,133 @@ bind() -> listen() -> accept() -> recv() -> send()</p>
 <span class='line-number'>6</span>
 <span class='line-number'>7</span>
 <span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct inet_hashinfo {  
-</span><span class='line'>&#9;struct inet_ehash_bucket *ehash;  
-</span><span class='line'>&#9;……  
-</span><span class='line'>&#9;struct inet_bind_hashbucket *bhash;  
-</span><span class='line'>&#9;……  
-</span><span class='line'>&#9;struct inet_listen_hashbucket  listening_hash[INET_LHTABLE_SIZE]  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;____cacheline_aligned_in_smp;  
-</span><span class='line'>};  </span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* Update the socket async list. */
+</span><span class='line'>static int sock_fasync(int fd, struct file *filp, int on)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct socket *sock = filp-&gt;private_data;
+</span><span class='line'>&#9;struct sock *sk = sock-&gt;sk;
+</span><span class='line'>&#9;struct socket_wq *wq; /* Socket的等待队列和异步通知队列 */
+</span><span class='line'>
+</span><span class='line'>&#9;if (sk == NULL)
+</span><span class='line'>&#9;&#9;return -EINVAL;
+</span><span class='line'>
+</span><span class='line'>&#9;lock_sock(sk);
+</span><span class='line'>&#9;wq = rcu_dereference_protected(sock-&gt;wq, sock_owned_by_user(sk));
+</span><span class='line'>
+</span><span class='line'>&#9;fasync_helper(fd, filp, on, &wq-&gt;fasync_list); /* 使用此函数来插入或删除 */
+</span><span class='line'>
+</span><span class='line'>&#9;/* 设置或取消SOCK_FASYNC标志 */
+</span><span class='line'>&#9;if (! wq-&gt;fasync_list)
+</span><span class='line'>&#9;&#9;sock_reset_flag(sk, SOCK_FASYNC);
+</span><span class='line'>&#9;else
+</span><span class='line'>&#9;&#9;sock_set_flag(sk, SOCK_FASYNC);
+</span><span class='line'>
+</span><span class='line'>&#9;release_sock(sk);
+</span><span class='line'>
+</span><span class='line'>&#9;return 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
-<p>从定义可以看出，tcp表又分成了三张表ehash, bhash, listening_hash，其中ehash, listening_hash对应于socket处在TCP的ESTABLISHED, LISTEN状态，bhash对应于socket已绑定了本地地址。三者间并不互斥，如一个socket可同时在bhash和ehash中，由于TIME_WAIT是一个比较特殊的状态，所以ehash又分成了chain和twchain，为TIME_WAIT的socket单独形成一张表。</p>
+<p>和设备驱动一样，最终调用fasync_helper()来把进程插入异步通知队列，或者把进程从异步通知队列中删除。</p>
 
-<p>回到刚才的代码，现在还只是建立socket连接，使用的就应该是tcp表中的bhash。首先取得内核tcp表的bind表 – bhash，查看是否已有socket占用：<br/>
-  如果没有，则调用inet_bind_bucket_create()创建一个bind表项tb，并插入到bind表中，跳转至goto ok代码段；<br/>
-  如果有，则跳转至goto ok代码段。<br/>
-  进入ok代码段表明已找到合适的bind表项(无论是创建的还是查找到的)，调用inet_bind_hash()赋值源端口inet_num。</p>
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/*
+</span><span class='line'> * fasync_helper() is used by almost all character device drivers to set up the fasync
+</span><span class='line'> * queue, and for regular files by the file lease code. It returns negative on error, 0 if
+</span><span class='line'> * it did no changes and positive if it added / deleted the entry.
+</span><span class='line'> */
+</span><span class='line'>
+</span><span class='line'>int fasync_helper(int fd, struct file *filp, int on, struct fasync_struct **fapp)
+</span><span class='line'>{
+</span><span class='line'>&#9;if (! on)
+</span><span class='line'>&#9;&#9;return fasync_remove_entry(filp, fapp); /* 插入 */
+</span><span class='line'>
+</span><span class='line'>&#9;return fasync_add_entry(fd, filp, fapp); /* 删除 */
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>发送信号</h4>
+
+<p>当Socket I/O事件触发时，协议栈会调用sk_wake_async()来进行异步通知。</p>
+
+<p>函数的处理方式：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>enum {
+</span><span class='line'>&#9;SOCK_WAKE_IO, /* 直接发送SIGIO信号 */
+</span><span class='line'>&#9;SOCK_WAKE_WAITD, /* 检测应用程序是否通过recv()类调用来等待接收数据，如果没有才发送SIGIO信号 */
+</span><span class='line'>&#9;SOCK_WAKE_SPACE, /* 检测sock的发送队列是否曾经到达上限，如果有的话发送SIGIO信号 */
+</span><span class='line'>&#9;SOCK_WAKE_URG, /* 直接发送SIGURG信号 */
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>通告的IO类型，常用的有：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define __SI_POLL 0
+</span><span class='line'>#define POLL_IN (__SI_POLL | 1) /* data input available, 有接收数据可读 */
+</span><span class='line'>#define POLL_OUT (__SI_POLL | 2) /* output buffers available, 有输出缓存可写 */
+</span><span class='line'>#define POLL_MSG (__SI_POLL | 3) /* input message available, 有输入消息可读 */
+</span><span class='line'>#define POLL_ERR (__SI_POLL | 4) /* i/0 error, I/O错误 */
+</span><span class='line'>#define POLL_PRI (__SI_POLL | 5) /* high priority input available, 有紧急数据可读 */
+</span><span class='line'>#define POLL_HUP (__SI_POLL | 6) /* device disconnected, 设备关闭或文件关闭，无法继续读写 */</span></code></pre></td></tr></table></div></figure>
+
+
+<p>how为函数的处理方式，band为通告的IO类型。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static inline void sk_wake_async(struct sock *sk, int how, int band)
+</span><span class='line'>{
+</span><span class='line'>&#9;if (sock_flag(sk, SOCK_FASYNC)) /* sock需要支持异步通知 */
+</span><span class='line'>&#9;&#9;sock_wake_async(sk-&gt;sk_socket, how, band);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -529,123 +537,67 @@ bind() -> listen() -> accept() -> recv() -> send()</p>
 <span class='line-number'>24</span>
 <span class='line-number'>25</span>
 <span class='line-number'>26</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>for (i = 1; i &lt;= remaining; i++) {  
-</span><span class='line'>&#9;port = low + (i + offset) % remaining;  
-</span><span class='line'>&#9;head = &hinfo-&gt;bhash[inet_bhashfn(net, port, hinfo-&gt;bhash_size)];  
-</span><span class='line'>&#9;……  
-</span><span class='line'>&#9;inet_bind_bucket_for_each(tb, node, &head-&gt;chain) {  
-</span><span class='line'>&#9;&#9;if (net_eq(ib_net(tb), net) && tb-&gt;port == port) {  
-</span><span class='line'>&#9;&#9;&#9;if (tb-&gt;fastreuse &gt;= 0)  
-</span><span class='line'>&#9;&#9;&#9;&#9;goto next_port;  
-</span><span class='line'>&#9;&#9;&#9;WARN_ON(hlist_empty(&tb-&gt;owners));  
-</span><span class='line'>&#9;&#9;&#9;if (!check_established(death_row, sk, port, &tw))  
-</span><span class='line'>&#9;&#9;&#9;&#9;goto ok;  
-</span><span class='line'>&#9;&#9;&#9;goto next_port;  
-</span><span class='line'>&#9;&#9;}  
-</span><span class='line'>&#9;}  
-</span><span class='line'>&#9;&#9;
-</span><span class='line'>&#9;tb = inet_bind_bucket_create(hinfo-&gt;bind_bucket_cachep, net, head, port);  
-</span><span class='line'>&#9;……  
-</span><span class='line'>&#9;next_port:  
-</span><span class='line'>&#9;&#9;spin_unlock(&head-&gt;lock);  
-</span><span class='line'>}  
-</span><span class='line'>&#9;&#9;
-</span><span class='line'>ok:  
-</span><span class='line'>&#9;……  
-</span><span class='line'>inet_bind_hash(sk, tb, port);  
-</span><span class='line'>&#9;……  
-</span><span class='line'>&#9;goto out;  </span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int sock_wake_async(struct socket *sock, int how, int band)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct socket_wq *wq;
+</span><span class='line'>
+</span><span class='line'>&#9;if (! sock)
+</span><span class='line'>&#9;&#9;return -1;
+</span><span class='line'>
+</span><span class='line'>&#9;rcu_read_lock();
+</span><span class='line'>&#9;wq = rcu_dereference(sock-&gt;wq); /* socket的等待队列和异步通知队列 */
+</span><span class='line'>
+</span><span class='line'>&#9;if (! wq || !wq-&gt;fasync_list) { /* 如果有队列没有实例 */
+</span><span class='line'>&#9;&#9;rcu_read_unlock();
+</span><span class='line'>&#9;&#9;return -1;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;switch(how) {
+</span><span class='line'>&#9;/* 检测应用程序是否通过recv()类调用来等待接收数据，如果没有才发送SIGIO信号 */
+</span><span class='line'>&#9;case SOCK_WAKE_WAITD:
+</span><span class='line'>&#9;&#9;if (test_bit(SOCK_ASYNC_WAITDATA, &sock-&gt;flags))
+</span><span class='line'>&#9;&#9;&#9;break;
+</span><span class='line'>&#9;&#9;goto call_kill;
+</span><span class='line'>
+</span><span class='line'>&#9;/* 检测sock的发送队列是否曾经到达上限，如果有的话发送SIGIO信号 */
+</span><span class='line'>&#9;case SOCK_WAKE_SPACE:
+</span><span class='line'>&#9;&#9;if (! test_and_clear_bit(SOCK_ASYNC_NOSPACE, &sock-&gt;flags))
+</span><span class='line'>&#9;&#9;&#9;break;
+</span><span class='line'>&#9;/* fall_through */
+</span><span class='line'>
+</span><span class='line'>&#9;case SOCK_WAKE_IO: /* 直接发送SIGIO信号 */
+</span><span class='line'>call_kill:
+</span><span class='line'>&#9;&#9;&#9;/* 发送SIGIO信号给异步通知队列上的进程，告知IO消息 */
+</span><span class='line'>&#9;&#9;&#9;kill_fasync(&wq-&gt;fasync_list, SIGIO, band);
+</span><span class='line'>&#9;&#9;&#9;break;
+</span><span class='line'>
+</span><span class='line'>&#9;case SOCK_WAKE_URG:
+</span><span class='line'>&#9;&#9;&#9;/* 发送SIGURG信号给异步通知队列上的进程 */
+</span><span class='line'>&#9;&#9;&#9;kill_fasync(&wq-&gt;fasync_list, SIGURG, band);
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;rcu_read_unlock();
+</span><span class='line'>&#9;return 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
-<p>在获取到合适的源端口号后，会重建路由项来进行更新：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>err = ip_route_newports(&rt, IPPROTO_TCP, inet-&gt;inet_sport, inet-&gt;inet_dport, sk);  </span></code></pre></td></tr></table></div></figure>
-
-
-<p>函数比较简单，在获取sport前已经查找过一次路由表，并插入了key=[saddr=0, sport=0, daddr, dport, oif=0]的路由缓存项；现在获取到了sport，调用ip_route_output_flow()再次更新路由缓存表，它会添加key=[saddr=0, sport, daddr, dport, oif=0]的路由缓存项。这里可以看出一个策略选择，查询路由表->获取sport->查询路由表，为什么不是获取sport->查询路由表的原因可能是效率的问题。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if (sport != (*rp)-&gt;fl.fl_ip_sport ||  
-</span><span class='line'>&#9;&#9;&#9;&#9;dport != (*rp)-&gt;fl.fl_ip_dport) {  
-</span><span class='line'>&#9;struct flowi fl;  
-</span><span class='line'>&#9;&#9;
-</span><span class='line'>&#9;memcpy(&fl, &(*rp)-&gt;fl, sizeof(fl));  
-</span><span class='line'>&#9;fl.fl_ip_sport = sport;  
-</span><span class='line'>&#9;fl.fl_ip_dport = dport;  
-</span><span class='line'>&#9;fl.proto = protocol;  
-</span><span class='line'>&#9;ip_rt_put(*rp);  
-</span><span class='line'>&#9;*rp = NULL;  
-</span><span class='line'>&#9;security_sk_classify_flow(sk, &fl);  
-</span><span class='line'>&#9;return ip_route_output_flow(sock_net(sk), rp, &fl, sk, 0);  
-</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
-
-
-<p>write_seq相当于第一次发送TCP报文的ISN，如果为0，则通过计算获取初始值，否则延用上次的值。在获取完源端口号，并查询过路由表后，TCP正式发送SYN报文，注意在这之前TCP状态已经更新成了TCP_SYN_SENT，而在函数最后才调用tcp_connect(sk)发送SYN报文，这中间是有时差的。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if (!tp-&gt;write_seq)  
-</span><span class='line'>&#9;tp-&gt;write_seq = secure_tcp_sequence_number(inet-&gt;inet_saddr,  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9;&#9;&#9;inet-&gt;inet_daddr,  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9;&#9;&#9;inet-&gt;inet_sport,  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9;&#9;&#9;usin-&gt;sin_port);  
-</span><span class='line'>inet-&gt;inet_id = tp-&gt;write_seq ^ jiffies;  
-</span><span class='line'>err = tcp_connect(sk);  </span></code></pre></td></tr></table></div></figure>
-
-
-<h5>tcp_connect()　发送SYN报文</h5>
-
-<p>几步重要的代码如下，tcp_connect_init()中设置了tp->rcv_nxt=0，tcp_transmit_skb()负责发送报文，其中seq=tcb->seq=tp->write_seq，ack_seq=tp->rcv_nxt。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>tcp_connect_init(sk);  
-</span><span class='line'>tp-&gt;snd_nxt = tp-&gt;write_seq;  
-</span><span class='line'>……  
-</span><span class='line'>tcp_transmit_skb(sk, buff, 1, sk-&gt;sk_allocation);  </span></code></pre></td></tr></table></div></figure>
-
-
-<h5>收到服务端的SYN+ACK，发送ACK</h5>
-
-<h5>tcp_rcv_synsent_state_process()</h5>
-
-<p>此时已接收到对方的ACK，状态变迁到TCP_ESTABLISHED。最后发送对方SYN的ACK报文。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>tcp_set_state(sk, TCP_ESTABLISHED);  
-</span><span class='line'>tcp_send_ack(sk);  </span></code></pre></td></tr></table></div></figure>
-
-
-<h4>服务端流程</h4>
-
-<h5>bind() -> inet_bind()</h5>
-
-<p>  bind操作的主要作用是将创建的socket与给定的地址相绑定，这样创建的服务才能公开的让外部调用。当然对于socket服务器的创建来说，这一步不是必须的，在listen()时如果没有绑定地址，系统会选择一个随机可用地址作为服务器地址。</p>
-
-<p>  一个socket地址分为ip和port，inet->inet_saddr赋值了传入的ip，snum是传入的port，对于端口，要检查它是否已被占用，这是由sk->sk_prot->get_port()完成的(这个函数前面已经分析过，在传入port时它检查是否被占用；传入port=0时它选择未用的端口)。如果没有被占用，inet->inet_sport被赋值port，因为是服务监听端，不需要远端地址，inet_daddr和inet_dport都置0。</p>
-
-<p>  注意bind操作不会改变socket的状态，仍为创建时的TCP_CLOSE。</p>
+<p>和设备驱动一样，最终调用kill_fasync()来发送信号给用户进程。</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -656,90 +608,18 @@ bind() -> listen() -> accept() -> recv() -> send()</p>
 <span class='line-number'>7</span>
 <span class='line-number'>8</span>
 <span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>snum = ntohs(addr-&gt;sin_port);  
-</span><span class='line'>……  
-</span><span class='line'>inet-&gt;inet_rcv_saddr = inet-&gt;inet_saddr = addr-&gt;sin_addr.s_addr;  
-</span><span class='line'>if (sk-&gt;sk_prot-&gt;get_port(sk, snum)) {  
-</span><span class='line'>&#9;inet-&gt;inet_saddr = inet-&gt;inet_rcv_saddr = 0;  
-</span><span class='line'>&#9;err = -EADDRINUSE;  
-</span><span class='line'>&#9;goto out_release_sock;  
-</span><span class='line'>}  
-</span><span class='line'>……  
-</span><span class='line'>inet-&gt;inet_sport = htons(inet-&gt;inet_num);  
-</span><span class='line'>inet-&gt;inet_daddr = 0;  
-</span><span class='line'>inet-&gt;inet_dport = 0;  </span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void kill_fasync(struct fasync_struct **fp, int sig, int band)
+</span><span class='line'>{
+</span><span class='line'>&#9;/* First a quick test without locking: usually the list is empty. */
+</span><span class='line'>&#9;if (*f) {
+</span><span class='line'>&#9;&#9;rcu_read_lock();
+</span><span class='line'>&#9;&#9;kill_fasync_rcu(rcu_dereference(*fp), sig, band);
+</span><span class='line'>&#9;&#9;rcu_read_unlock();
+</span><span class='line'>&#9;}
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
-<h5>listen() -> inet_listen()</h5>
 
-<p>  listen操作开始服务器的监听，此时服务就可以接受到外部连接了。在开始监听前，要检查状态是否正确，sock->state==SS_UNCONNECTED确保仍是未连接的socket，sock->type==SOCK_STREAM确保是TCP协议，old_state确保此时状态是TCP_CLOSE或TCP_LISTEN，在其它状态下进行listen都是错误的。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if (sock-&gt;state != SS_UNCONNECTED || sock-&gt;type != SOCK_STREAM)  
-</span><span class='line'>&#9;goto out;  
-</span><span class='line'>old_state = sk-&gt;sk_state;  
-</span><span class='line'>if (!((1 &lt;&lt; old_state) & (TCPF_CLOSE | TCPF_LISTEN)))  
-</span><span class='line'>&#9;goto out;  </span></code></pre></td></tr></table></div></figure>
-
-
-<p>  如果已是TCP_LISTEN态，则直接跳过，不用再执行listen了，而只是重新设置listen队列长度sk_max_ack_backlog，改变listen队列长也是多次执行listen的作用。如果还没有执行listen，则还要调用inet_csk_listen_start()开始监听。</p>
-
-<p>  inet_csk_listen_start()变迁状态至TCP_LISTEN，分配监听队列，如果之前没有调用bind()绑定地址，则这里会分配一个随机地址。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if (old_state != TCP_LISTEN) {  
-</span><span class='line'>&#9;err = inet_csk_listen_start(sk, backlog);  
-</span><span class='line'>&#9;if (err)  
-</span><span class='line'>&#9;&#9;goto out;  
-</span><span class='line'>}  
-</span><span class='line'>sk-&gt;sk_max_ack_backlog = backlog;  </span></code></pre></td></tr></table></div></figure>
-
-
-<h5>accept()</h5>
-
-<p>accept() -> sys_accept4() -> inet_accept() -> inet_csk_accept()</p>
-
-<p>  accept()实际要做的事件并不多，它的作用是返回一个已经建立连接的socket(即经过了三次握手)，这个过程是异步的，accept()并不亲自去处理三次握手过程，而只是监听icsk_accept_queue队列，当有socket经过了三次握手，它就会被加到icsk_accept_queue中，所以accept要做的就是等待队列中插入socket，然后被唤醒并返回这个socket。而三次握手的过程完全是协议栈本身去完成的。换句话说，协议栈相当于写者，将socket写入队列，accept()相当于读者，将socket从队列读出。这个过程从listen就已开始，所以即使不调用accept()，客户仍可以和服务器建立连接，但由于没有处理，队列很快会被占满。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if (reqsk_queue_empty(&icsk-&gt;icsk_accept_queue)) {  
-</span><span class='line'>&#9;long timeo = sock_rcvtimeo(sk, flags & O_NONBLOCK);  
-</span><span class='line'>&#9;……  
-</span><span class='line'>&#9;error = inet_csk_wait_for_connect(sk, timeo);  
-</span><span class='line'>&#9;……  
-</span><span class='line'>}  
-</span><span class='line'>&#9;&#9;
-</span><span class='line'>newsk = reqsk_queue_get_child(&icsk-&gt;icsk_accept_queue, sk);  </span></code></pre></td></tr></table></div></figure>
-
-
-<p>  协议栈向队列中加入socket的过程就是完成三次握手的过程，客户端通过向已知的listen fd发起连接请求，对于到来的每个连接，都会创建一个新的sock，当它经历了TCP_SYN_RCV -> TCP_ESTABLISHED后，就会被添加到icsk_accept_queue中，而监听的socket状态始终为TCP_LISTEN，保证连接的建立不会影响socket的接收。</p>
-
-<h4>接收客户端发来的SYN，发送SYN+ACK</h4>
-
-<h5>tcp_v4_do_rcv()</h5>
-
-<p>  tcp_v4_do_rcv()是TCP模块接收的入口函数，客户端发起请求的对象是listen fd，所以sk->sk_state == TCP_LISTEN，调用tcp_v4_hnd_req()来检查是否处于半连接，只要三次握手没有完成，这样的连接就称为半连接，具体而言就是收到了SYN，但还没有收到ACK的连接，所以对于这个查找函数，如果是SYN报文，则会返回listen的socket(连接尚未创建)；如果是ACK报文，则会返回SYN报文处理中插入的半连接socket。其中存储这些半连接的数据结构是syn_table，它在listen()调用时被创建，大小由sys_ctl_max_syn_backlog和listen()传入的队列长度决定。</p>
-
-<p>此时是收到SYN报文，tcp_v4_hnd_req()返回的仍是sk，调用tcp_rcv_state_process()来接收SYN报文，并发送SYN+ACK报文，同时向syn_table中插入一项表明此次连接的sk。</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -758,26 +638,75 @@ bind() -> listen() -> accept() -> recv() -> send()</p>
 <span class='line-number'>15</span>
 <span class='line-number'>16</span>
 <span class='line-number'>17</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if (sk-&gt;sk_state == TCP_LISTEN) {  
-</span><span class='line'>&#9;struct sock *nsk = tcp_v4_hnd_req(sk, skb);  
-</span><span class='line'>&#9;if (!nsk)  
-</span><span class='line'>&#9;&#9;goto discard;  
-</span><span class='line'>&#9;if (nsk != sk) {  
-</span><span class='line'>&#9;&#9;if (tcp_child_process(sk, nsk, skb)) {  
-</span><span class='line'>&#9;&#9;&#9;rsk = nsk;  
-</span><span class='line'>&#9;&#9;&#9;goto reset;  
-</span><span class='line'>&#9;&#9;}  
-</span><span class='line'>&#9;&#9;return 0;  
-</span><span class='line'>&#9;}  
-</span><span class='line'>}  
-</span><span class='line'>TCP_CHECK_TIMER(sk);  
-</span><span class='line'>if (tcp_rcv_state_process(sk, skb, tcp_hdr(skb), skb-&gt;len)) {  
-</span><span class='line'>&#9;rsk = sk;  
-</span><span class='line'>&#9;goto reset;  
-</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void kill_fasync_rcu(struct fasync_struct *fa, int sig, int band)
+</span><span class='line'>{
+</span><span class='line'>&#9;while (fa) {
+</span><span class='line'>&#9;&#9;struct fown_struct *fown;
+</span><span class='line'>&#9;&#9;unsigned long flags;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (fa-&gt;magic != FASYNC_MAGIC) {
+</span><span class='line'>&#9;&#9;&#9;printk(KERN_ERR "kill_fasync: bad magic number in fasync_struct!\n");
+</span><span class='line'>&#9;&#9;&#9;return;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;spin_lock_irqsave(&fa-&gt;fa_lock, flags);
+</span><span class='line'>&#9;&#9;if (fa-&gt;fa_file) {
+</span><span class='line'>&#9;&#9;&#9;fown = &fa-&gt;file-&gt;f_owner; /* 持有文件的进程 */
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;/* Don't send SIGURG to processes which have not set a queued signum:
+</span><span class='line'>&#9;&#9;&#9; * SIGURG has its own default signalling mechanism. */
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;if (! (sig == SIGURG && fown-&gt;signum == 0))
+</span><span class='line'>&#9;&#9;&#9;&#9;send_sigio(fown, fa-&gt;fa_fd, band); /* 发送信号给持有文件的进程 */
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;spin_unlock_irqrestore(&fa-&gt;fa_lock, flags);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;fa = rcu_dereference(fa-&gt;fa_next); /* 指向下一个异步通知结构体 */
+</span><span class='line'>&#9;}
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
-<p>  tcp_rcv_state_process()处理各个状态上socket的情况。下面是处于TCP_LISTEN的代码段，处于TCP_LISTEN的socket不会再向其它状态变迁，它负责监听，并在连接建立时创建新的socket。实际上，当收到第一个SYN报文时，会执行这段代码，conn_request() => tcp_v4_conn_request。</p>
+
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2015/06/12/kernel-net-sock-socket/">socket和sock的一些分析</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-06-12T16:55:00+08:00'><span class='date'>2015-06-12</span> <span class='time'>16:55:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://blog.csdn.net/wolongzhumeng/article/details/8900414">http://blog.csdn.net/wolongzhumeng/article/details/8900414</a></p>
+
+<p>1、每一个打开的文件、socket等等都用一个file数据结构代表，这样文件和socket就通过inode->u(union)中的各个成员来区别：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -787,31 +716,25 @@ bind() -> listen() -> accept() -> recv() -> send()</p>
 <span class='line-number'>6</span>
 <span class='line-number'>7</span>
 <span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>case TCP_LISTEN:  
-</span><span class='line'>……  
-</span><span class='line'>&#9;if (th-&gt;syn) {  
-</span><span class='line'>&#9;&#9;if (icsk-&gt;icsk_af_ops-&gt;conn_request(sk, skb) &lt; 0)  
-</span><span class='line'>&#9;&#9;&#9;return 1;  
-</span><span class='line'>&#9;&#9;kfree_skb(skb);  
-</span><span class='line'>&#9;&#9;return 0;  
-</span><span class='line'>&#9;}  </span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>9</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct inode {
+</span><span class='line'>&#9;.....................
+</span><span class='line'>&#9;union {
+</span><span class='line'>&#9;&#9;struct ext2_inode_info ext2_i;
+</span><span class='line'>&#9;&#9;struct ext3_inode_info ext3_i;
+</span><span class='line'>&#9;&#9;struct socket socket_i;
+</span><span class='line'>&#9;&#9;.....................
+</span><span class='line'>&#9;} u;
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
 
 
-<p>  tcp_v4_conn_request()中注意两个函数就可以了：tcp_v4_send_synack()向客户端发送了SYN+ACK报文，inet_csk_reqsk_queue_hash_add()将sk添加到了syn_table中，填充了该客户端相关的信息。这样，再次收到客户端的ACK报文时，就可以在syn_table中找到相应项了。</p>
+<p>2、每个socket数据结构都有一个sock数据结构成员，sock是对socket的扩充，两者一一对应，socket->sk指向对应的sock，sock->socket 指向对应的socket；</p>
 
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if (tcp_v4_send_synack(sk, dst, req, (struct request_values *)&tmp_ext) || want_cookie)  
-</span><span class='line'>&#9;goto drop_and_free;  
-</span><span class='line'>inet_csk_reqsk_queue_hash_add(sk, req, TCP_TIMEOUT_INIT);  </span></code></pre></td></tr></table></div></figure>
-
-
-<h4>接收客户端发来的ACK</h4>
-
-<h5>tcp_v4_do_rcv()</h5>
-
-<p>  过程与收到SYN报文相同，不同点在于syn_table中已经插入了有关该连接的条目，tcp_v4_hnd_req()会返回一个新的sock: nsk，然后会调用tcp_child_process()来进行处理。在tcp_v4_hnd_req()中会创建新的sock，下面详细看下这个函数。</p>
+<p>3、socket和sock是同一事物的两个侧面，为什么不把两个数据结构合并成一个呢？这是因为socket是inode结构中的一部分，即把inode结
+构内部的一个union用作socket结构。由于插口操作的特殊性，这个数据结构中需要有大量的结构成分，如果把这些成分全部放到socket
+结构中，则inode结构中的这个union就会变得很大，从而inode结构也会变得很大，而对于其他文件系统这个union是不需要这么大的，
+所以会造成巨大浪费，系统中使用inode结构的数量要远远超过使用socket的数量，故解决的办法就是把插口分成两部分，把与文件系
+统关系密切的放在socket结构中，把与通信关系密切的放在另一个单独结构sock中；</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -825,73 +748,881 @@ bind() -> listen() -> accept() -> recv() -> send()</p>
 <span class='line-number'>10</span>
 <span class='line-number'>11</span>
 <span class='line-number'>12</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if (sk-&gt;sk_state == TCP_LISTEN) {  
-</span><span class='line'>&#9;struct sock *nsk = tcp_v4_hnd_req(sk, skb);  
-</span><span class='line'>&#9;if (!nsk)  
-</span><span class='line'>&#9;&#9;goto discard;  
-</span><span class='line'>&#9;if (nsk != sk) {  
-</span><span class='line'>&#9;&#9;if (tcp_child_process(sk, nsk, skb)) {  
-</span><span class='line'>&#9;&#9;&#9;rsk = nsk;  
-</span><span class='line'>&#9;&#9;&#9;goto reset;  
-</span><span class='line'>&#9;&#9;}  
-</span><span class='line'>&#9;&#9;return 0;  
-</span><span class='line'>&#9;}  
-</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+<span class='line-number'>82</span>
+<span class='line-number'>83</span>
+<span class='line-number'>84</span>
+<span class='line-number'>85</span>
+<span class='line-number'>86</span>
+<span class='line-number'>87</span>
+<span class='line-number'>88</span>
+<span class='line-number'>89</span>
+<span class='line-number'>90</span>
+<span class='line-number'>91</span>
+<span class='line-number'>92</span>
+<span class='line-number'>93</span>
+<span class='line-number'>94</span>
+<span class='line-number'>95</span>
+<span class='line-number'>96</span>
+<span class='line-number'>97</span>
+<span class='line-number'>98</span>
+<span class='line-number'>99</span>
+<span class='line-number'>100</span>
+<span class='line-number'>101</span>
+<span class='line-number'>102</span>
+<span class='line-number'>103</span>
+<span class='line-number'>104</span>
+<span class='line-number'>105</span>
+<span class='line-number'>106</span>
+<span class='line-number'>107</span>
+<span class='line-number'>108</span>
+<span class='line-number'>109</span>
+<span class='line-number'>110</span>
+<span class='line-number'>111</span>
+<span class='line-number'>112</span>
+<span class='line-number'>113</span>
+<span class='line-number'>114</span>
+<span class='line-number'>115</span>
+<span class='line-number'>116</span>
+<span class='line-number'>117</span>
+<span class='line-number'>118</span>
+<span class='line-number'>119</span>
+<span class='line-number'>120</span>
+<span class='line-number'>121</span>
+<span class='line-number'>122</span>
+<span class='line-number'>123</span>
+<span class='line-number'>124</span>
+<span class='line-number'>125</span>
+<span class='line-number'>126</span>
+<span class='line-number'>127</span>
+<span class='line-number'>128</span>
+<span class='line-number'>129</span>
+<span class='line-number'>130</span>
+<span class='line-number'>131</span>
+<span class='line-number'>132</span>
+<span class='line-number'>133</span>
+<span class='line-number'>134</span>
+<span class='line-number'>135</span>
+<span class='line-number'>136</span>
+<span class='line-number'>137</span>
+<span class='line-number'>138</span>
+<span class='line-number'>139</span>
+<span class='line-number'>140</span>
+<span class='line-number'>141</span>
+<span class='line-number'>142</span>
+<span class='line-number'>143</span>
+<span class='line-number'>144</span>
+<span class='line-number'>145</span>
+<span class='line-number'>146</span>
+<span class='line-number'>147</span>
+<span class='line-number'>148</span>
+<span class='line-number'>149</span>
+<span class='line-number'>150</span>
+<span class='line-number'>151</span>
+<span class='line-number'>152</span>
+<span class='line-number'>153</span>
+<span class='line-number'>154</span>
+<span class='line-number'>155</span>
+<span class='line-number'>156</span>
+<span class='line-number'>157</span>
+<span class='line-number'>158</span>
+<span class='line-number'>159</span>
+<span class='line-number'>160</span>
+<span class='line-number'>161</span>
+<span class='line-number'>162</span>
+<span class='line-number'>163</span>
+<span class='line-number'>164</span>
+<span class='line-number'>165</span>
+<span class='line-number'>166</span>
+<span class='line-number'>167</span>
+<span class='line-number'>168</span>
+<span class='line-number'>169</span>
+<span class='line-number'>170</span>
+<span class='line-number'>171</span>
+<span class='line-number'>172</span>
+<span class='line-number'>173</span>
+<span class='line-number'>174</span>
+<span class='line-number'>175</span>
+<span class='line-number'>176</span>
+<span class='line-number'>177</span>
+<span class='line-number'>178</span>
+<span class='line-number'>179</span>
+<span class='line-number'>180</span>
+<span class='line-number'>181</span>
+<span class='line-number'>182</span>
+<span class='line-number'>183</span>
+<span class='line-number'>184</span>
+<span class='line-number'>185</span>
+<span class='line-number'>186</span>
+<span class='line-number'>187</span>
+<span class='line-number'>188</span>
+<span class='line-number'>189</span>
+<span class='line-number'>190</span>
+<span class='line-number'>191</span>
+<span class='line-number'>192</span>
+<span class='line-number'>193</span>
+<span class='line-number'>194</span>
+<span class='line-number'>195</span>
+<span class='line-number'>196</span>
+<span class='line-number'>197</span>
+<span class='line-number'>198</span>
+<span class='line-number'>199</span>
+<span class='line-number'>200</span>
+<span class='line-number'>201</span>
+<span class='line-number'>202</span>
+<span class='line-number'>203</span>
+<span class='line-number'>204</span>
+<span class='line-number'>205</span>
+<span class='line-number'>206</span>
+<span class='line-number'>207</span>
+<span class='line-number'>208</span>
+<span class='line-number'>209</span>
+<span class='line-number'>210</span>
+<span class='line-number'>211</span>
+<span class='line-number'>212</span>
+<span class='line-number'>213</span>
+<span class='line-number'>214</span>
+<span class='line-number'>215</span>
+<span class='line-number'>216</span>
+<span class='line-number'>217</span>
+<span class='line-number'>218</span>
+<span class='line-number'>219</span>
+<span class='line-number'>220</span>
+<span class='line-number'>221</span>
+<span class='line-number'>222</span>
+<span class='line-number'>223</span>
+<span class='line-number'>224</span>
+<span class='line-number'>225</span>
+<span class='line-number'>226</span>
+<span class='line-number'>227</span>
+<span class='line-number'>228</span>
+<span class='line-number'>229</span>
+<span class='line-number'>230</span>
+<span class='line-number'>231</span>
+<span class='line-number'>232</span>
+<span class='line-number'>233</span>
+<span class='line-number'>234</span>
+<span class='line-number'>235</span>
+<span class='line-number'>236</span>
+<span class='line-number'>237</span>
+<span class='line-number'>238</span>
+<span class='line-number'>239</span>
+<span class='line-number'>240</span>
+<span class='line-number'>241</span>
+<span class='line-number'>242</span>
+<span class='line-number'>243</span>
+<span class='line-number'>244</span>
+<span class='line-number'>245</span>
+<span class='line-number'>246</span>
+<span class='line-number'>247</span>
+<span class='line-number'>248</span>
+<span class='line-number'>249</span>
+<span class='line-number'>250</span>
+<span class='line-number'>251</span>
+<span class='line-number'>252</span>
+<span class='line-number'>253</span>
+<span class='line-number'>254</span>
+<span class='line-number'>255</span>
+<span class='line-number'>256</span>
+<span class='line-number'>257</span>
+<span class='line-number'>258</span>
+<span class='line-number'>259</span>
+<span class='line-number'>260</span>
+<span class='line-number'>261</span>
+<span class='line-number'>262</span>
+<span class='line-number'>263</span>
+<span class='line-number'>264</span>
+<span class='line-number'>265</span>
+<span class='line-number'>266</span>
+<span class='line-number'>267</span>
+<span class='line-number'>268</span>
+<span class='line-number'>269</span>
+<span class='line-number'>270</span>
+<span class='line-number'>271</span>
+<span class='line-number'>272</span>
+<span class='line-number'>273</span>
+<span class='line-number'>274</span>
+<span class='line-number'>275</span>
+<span class='line-number'>276</span>
+<span class='line-number'>277</span>
+<span class='line-number'>278</span>
+<span class='line-number'>279</span>
+<span class='line-number'>280</span>
+<span class='line-number'>281</span>
+<span class='line-number'>282</span>
+<span class='line-number'>283</span>
+<span class='line-number'>284</span>
+<span class='line-number'>285</span>
+<span class='line-number'>286</span>
+<span class='line-number'>287</span>
+<span class='line-number'>288</span>
+<span class='line-number'>289</span>
+<span class='line-number'>290</span>
+<span class='line-number'>291</span>
+<span class='line-number'>292</span>
+<span class='line-number'>293</span>
+<span class='line-number'>294</span>
+<span class='line-number'>295</span>
+<span class='line-number'>296</span>
+<span class='line-number'>297</span>
+<span class='line-number'>298</span>
+<span class='line-number'>299</span>
+<span class='line-number'>300</span>
+<span class='line-number'>301</span>
+<span class='line-number'>302</span>
+<span class='line-number'>303</span>
+<span class='line-number'>304</span>
+<span class='line-number'>305</span>
+<span class='line-number'>306</span>
+<span class='line-number'>307</span>
+<span class='line-number'>308</span>
+<span class='line-number'>309</span>
+<span class='line-number'>310</span>
+<span class='line-number'>311</span>
+<span class='line-number'>312</span>
+<span class='line-number'>313</span>
+<span class='line-number'>314</span>
+<span class='line-number'>315</span>
+<span class='line-number'>316</span>
+<span class='line-number'>317</span>
+<span class='line-number'>318</span>
+<span class='line-number'>319</span>
+<span class='line-number'>320</span>
+<span class='line-number'>321</span>
+<span class='line-number'>322</span>
+<span class='line-number'>323</span>
+<span class='line-number'>324</span>
+<span class='line-number'>325</span>
+<span class='line-number'>326</span>
+<span class='line-number'>327</span>
+<span class='line-number'>328</span>
+<span class='line-number'>329</span>
+<span class='line-number'>330</span>
+<span class='line-number'>331</span>
+<span class='line-number'>332</span>
+<span class='line-number'>333</span>
+<span class='line-number'>334</span>
+<span class='line-number'>335</span>
+<span class='line-number'>336</span>
+<span class='line-number'>337</span>
+<span class='line-number'>338</span>
+<span class='line-number'>339</span>
+<span class='line-number'>340</span>
+<span class='line-number'>341</span>
+<span class='line-number'>342</span>
+<span class='line-number'>343</span>
+<span class='line-number'>344</span>
+<span class='line-number'>345</span>
+<span class='line-number'>346</span>
+<span class='line-number'>347</span>
+<span class='line-number'>348</span>
+<span class='line-number'>349</span>
+<span class='line-number'>350</span>
+<span class='line-number'>351</span>
+<span class='line-number'>352</span>
+<span class='line-number'>353</span>
+<span class='line-number'>354</span>
+<span class='line-number'>355</span>
+<span class='line-number'>356</span>
+<span class='line-number'>357</span>
+<span class='line-number'>358</span>
+<span class='line-number'>359</span>
+<span class='line-number'>360</span>
+<span class='line-number'>361</span>
+<span class='line-number'>362</span>
+<span class='line-number'>363</span>
+<span class='line-number'>364</span>
+<span class='line-number'>365</span>
+<span class='line-number'>366</span>
+<span class='line-number'>367</span>
+<span class='line-number'>368</span>
+<span class='line-number'>369</span>
+<span class='line-number'>370</span>
+<span class='line-number'>371</span>
+<span class='line-number'>372</span>
+<span class='line-number'>373</span>
+<span class='line-number'>374</span>
+<span class='line-number'>375</span>
+<span class='line-number'>376</span>
+<span class='line-number'>377</span>
+<span class='line-number'>378</span>
+<span class='line-number'>379</span>
+<span class='line-number'>380</span>
+<span class='line-number'>381</span>
+<span class='line-number'>382</span>
+<span class='line-number'>383</span>
+<span class='line-number'>384</span>
+<span class='line-number'>385</span>
+<span class='line-number'>386</span>
+<span class='line-number'>387</span>
+<span class='line-number'>388</span>
+<span class='line-number'>389</span>
+<span class='line-number'>390</span>
+<span class='line-number'>391</span>
+<span class='line-number'>392</span>
+<span class='line-number'>393</span>
+<span class='line-number'>394</span>
+<span class='line-number'>395</span>
+<span class='line-number'>396</span>
+<span class='line-number'>397</span>
+<span class='line-number'>398</span>
+<span class='line-number'>399</span>
+<span class='line-number'>400</span>
+<span class='line-number'>401</span>
+<span class='line-number'>402</span>
+<span class='line-number'>403</span>
+<span class='line-number'>404</span>
+<span class='line-number'>405</span>
+<span class='line-number'>406</span>
+<span class='line-number'>407</span>
+<span class='line-number'>408</span>
+<span class='line-number'>409</span>
+<span class='line-number'>410</span>
+<span class='line-number'>411</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct socket
+</span><span class='line'>{
+</span><span class='line'>&#9;socket_state state;      // 该state用来表明该socket的当前状态
+</span><span class='line'>&#9;typedef enum {
+</span><span class='line'>&#9;&#9;SS_FREE = 0,         /* not allocated */
+</span><span class='line'>&#9;&#9;SS_UNCONNECTED,      /* unconnected to any socket */
+</span><span class='line'>&#9;&#9;SS_CONNECTING,       /* in process of connecting */
+</span><span class='line'>&#9;&#9;SS_CONNECTED,        /* connected to socket */
+</span><span class='line'>&#9;&#9;SS_DISCONNECTING     /* in process of disconnecting */
+</span><span class='line'>&#9;} socket_state;
+</span><span class='line'>&#9;unsigned long flags;     //该成员可能的值如下，该标志用来设置socket是否正在忙碌
+</span><span class='line'>&#9;#define SOCK_ASYNC_NOSPACE 0
+</span><span class='line'>&#9;#define SOCK_ASYNC_WAITDATA 1
+</span><span class='line'>&#9;#define SOCK_NOSPACE 2
+</span><span class='line'>&#9;struct proto_ops *ops;   //依据协议邦定到该socket上的特定的协议族的操作函数指针，例如IPv4 TCP就是inet_stream_ops
+</span><span class='line'>&#9;struct inode *inode;     //表明该socket所属的inode
+</span><span class='line'>&#9;struct fasync_struct *fasync_list; //异步唤醒队列
+</span><span class='line'>&#9;struct file *file;       //file回指指针
+</span><span class='line'>&#9;struct sock *sk;         //sock指针
+</span><span class='line'>&#9;wait_queue_head_t wait;  //sock的等待队列，在TCP需要等待时就sleep在这个队列上
+</span><span class='line'>&#9;short type;              //表示该socket在特定协议族下的类型例如SOCK_STREAM,
+</span><span class='line'>&#9;unsigned char passcred;  //在TCP分析中无须考虑
+</span><span class='line'>};
+</span><span class='line'>
+</span><span class='line'>struct sock {
+</span><span class='line'>&#9;/* socket用来对进入的包进行匹配的5大因素 */
+</span><span class='line'>&#9;__u32 daddr;        // dip，Foreign IPv4 addr
+</span><span class='line'>&#9;__u32 rcv_saddr;    // 记录套接字所绑定的地址 Bound local IPv4 addr
+</span><span class='line'>&#9;__u16 dport;        // dport
+</span><span class='line'>&#9;unsigned short num; /* 套接字所在的端口号, 端口号小于1024的为特权端口, 只有特权用户才能绑定,当用户指定的端
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9; * 口号为零时, 系统将提供一个未分配的用户端口，如果对于raw socket的话，该num又可以用来
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9; * 保存socket(int family, int type, int protocol)中的protocol，而不是端口号了；在bind时候，会首先
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9; * 将邦定的源端口号赋予该成员，最终sport成员从该成员出获取源端口号__tcp_v4_hash主要就
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9; * 是利用了该成员来hash从而排出hash链
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9; */
+</span><span class='line'>&#9;int bound_dev_if;   // Bound device index if != 0
+</span><span class='line'>
+</span><span class='line'>&#9;/* 主hash链，系统已分配的端口用tcp_hashinfo.__tcp_bhash来索引, 索引槽结构为tcp_bind_hashbucket, 端口绑定结构用tcp_bind_bucket描述,
+</span><span class='line'>&#9;它包含指向绑定到该端口套接字的指针(owners), 套接字的sk-&gt;prev指针指向该绑定结构 */
+</span><span class='line'>&#9;struct sock *next;
+</span><span class='line'>&#9;struct sock **pprev;
+</span><span class='line'>&#9;/* sk-&gt;bind_next和sk-&gt;bind_pprev用来描述绑定到同一端口的套接字，例如http服务器 */
+</span><span class='line'>&#9;struct sock *bind_next;
+</span><span class='line'>&#9;struct sock **bind_pprev;
+</span><span class='line'>&#9;struct sock *prev;
+</span><span class='line'>
+</span><span class='line'>&#9;volatile unsigned char state, zapped; // Connection state，zapped在TCP分析中无须考虑
+</span><span class='line'>&#9;__u16 sport;                   // 源端口，见num
+</span><span class='line'>
+</span><span class='line'>&#9;unsigned short family;         // 协议族，例如PF_INET
+</span><span class='line'>&#9;unsigned char reuse;           // 地址是否可重用，只有RAW才使用
+</span><span class='line'>&#9;unsigned char shutdown;        // 判断该socket连接在某方向或者双向方向上都已经关闭
+</span><span class='line'>&#9;#define SHUTDOWN_MASK 3
+</span><span class='line'>&#9;#define RCV_SHUTDOWN 1
+</span><span class='line'>&#9;#define SEND_SHUTDOWN 2
+</span><span class='line'>&#9;atomic_t refcnt;               // 引用计数
+</span><span class='line'>&#9;socket_lock_t lock;            // 锁标志， 每个socket都有一个自旋锁，该锁在用户上下文和软中断处理时提供了同步机制
+</span><span class='line'>&#9;typedef struct {
+</span><span class='line'>&#9;&#9;spinlock_t slock;
+</span><span class='line'>&#9;&#9;unsigned int users;
+</span><span class='line'>&#9;&#9;wait_queue_head_t wq;
+</span><span class='line'>&#9;} socket_lock_t;
+</span><span class='line'>&#9;wait_queue_head_t *sleep;      // Sock所属线程的自身休眠等待队列
+</span><span class='line'>&#9;struct dst_entry *dst_cache;   // 目的地的路由缓存
+</span><span class='line'>&#9;rwlock_t dst_lock;             // 为该socket赋dst_entry值时的锁
+</span><span class='line'>
+</span><span class='line'>&#9;/* sock的收发都是要占用内存的，即发送缓冲区和接收缓冲区。 系统对这些内存的使用是有限制的。 通常，每个sock都会从配额里
+</span><span class='line'>&#9;&#9;预先分配一些，这就是forward_alloc， 具体分配时：
+</span><span class='line'>&#9;&#9;1）比如收到一个skb，则要计算到rmem_alloc中，并从forward_alloc中扣除。 接收处理完成后（如用户态读取），则释放skb，并利
+</span><span class='line'>&#9;&#9;&#9;用tcp_rfree()把该skb的内存反还给forward_alloc。
+</span><span class='line'>&#9;&#9;2）发送一个skb，也要暂时放到发送缓冲区，这也要计算到wmem_queued中，并从forward_alloc中扣除。真正发送完成后，也释放
+</span><span class='line'>&#9;&#9;&#9;skb，并反还forward_alloc。 当从forward_alloc中扣除的时候，有可能forward_alloc不够，此时就要调用tcp_mem_schedule()来增
+</span><span class='line'>&#9;&#9;&#9;加forward_alloc，当然，不是随便想加就可以加的，系统对整个TCP的内存使用有总的限制，即sysctl_tcp_mem[3]。也对每个sock
+</span><span class='line'>&#9;&#9;&#9;的内存使用分别有限制，即sysctl_tcp_rmem[3]和sysctl_tcp_wmem[3]。只有满足这些限制（有一定的灵活性），forward_alloc才
+</span><span class='line'>&#9;&#9;&#9;能增加。 当发现内存紧张的时候，还会调用tcp_mem_reclaim()来回收forward_alloc预先分配的配额。
+</span><span class='line'>&#9;*/
+</span><span class='line'>&#9;int rcvbuf;                    // 接受缓冲区的大小（按字节）
+</span><span class='line'>&#9;int sndbuf;                    // 发送缓冲区的大小（按字节）
+</span><span class='line'>&#9;atomic_t rmem_alloc;           // 接受队列中存放的数据的字节数
+</span><span class='line'>&#9;atomic_t wmem_alloc;           // 发送队列中存放的数据的字节数
+</span><span class='line'>&#9;int wmem_queued;               // 所有已经发送的数据的总字节数
+</span><span class='line'>&#9;int forward_alloc;             // 预分配剩余字节数
+</span><span class='line'>
+</span><span class='line'>&#9;struct sk_buff_head receive_queue; // 接受队列
+</span><span class='line'>&#9;struct sk_buff_head write_queue;   // 发送队列
+</span><span class='line'>&#9;atomic_t omem_alloc;               // 在TCP分析中无须考虑 * "o" is "option" or "other" */
+</span><span class='line'>
+</span><span class='line'>&#9;__u32 saddr; /* 指真正的发送地址，这里需要注意的是，rcv_saddr是记录套接字所绑定的地址，其可能是广播或者
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;多播，对于我们要发送的包来说，只能使用接口的IP地址，而不能使用广播或者多播地址 */
+</span><span class='line'>&#9;unsigned int allocation;       // 分配该sock之skb时选择的模式，GFP_ATOMIC还是GFP_KERNEL等等
+</span><span class='line'>
+</span><span class='line'>&#9;volatile char dead,            // tcp_close.tcp_listen_stop.inet_sock_release调用sock_orphan将该值置1，表示该socket已经和进程分开，变成孤儿
+</span><span class='line'>&#9;&#9;&#9;&#9;done,              // 用于判断该socket是否已经收到 fin，如果收到则将该成员置1
+</span><span class='line'>&#9;&#9;&#9;&#9;urginline,         // 如果该值被设置为1，表示将紧急数据放于普通数据流中一起处理，而不在另外处理
+</span><span class='line'>&#9;&#9;&#9;&#9;keepopen,          // 是否启动保活定时器
+</span><span class='line'>&#9;&#9;&#9;&#9;linger,            // lingertime一起，指明了close()后保留的时间
+</span><span class='line'>&#9;&#9;&#9;&#9;destroy,           // 在TCP分析中无须考虑
+</span><span class='line'>&#9;&#9;&#9;&#9;no_check,          // 是否对发出的skb做校验和，仅对UDP有效
+</span><span class='line'>&#9;&#9;&#9;&#9;broadcast,         // 是否允许广播，仅对UPD有效
+</span><span class='line'>&#9;&#9;&#9;&#9;bsdism;            // 在TCP分析中无须考虑
+</span><span class='line'>&#9;unsigned char debug;           // 在TCP分析中无须考虑
+</span><span class='line'>&#9;unsigned char rcvtstamp;       // 是否将收到skb的时间戳发送给app
+</span><span class='line'>&#9;unsigned char use_write_queue; // 在init中该值被初始化为1，该值一直没有变化
+</span><span class='line'>&#9;unsigned char userlocks;       // 包括如下几种值的组合，从而改变收包等操作的执行顺序
+</span><span class='line'>&#9;#define SOCK_SNDBUF_LOCK 1
+</span><span class='line'>&#9;#define SOCK_RCVBUF_LOCK 2
+</span><span class='line'>&#9;#define SOCK_BINDADDR_LOCK 4
+</span><span class='line'>&#9;#define SOCK_BINDPORT_LOCK 8
+</span><span class='line'>&#9;int route_caps;                // 指示本sock用到的路由的信息
+</span><span class='line'>&#9;int proc;                      // 保存用户线程的pid
+</span><span class='line'>&#9;unsigned long lingertime;      // lingertime一起，指明了close()后保留的时间
+</span><span class='line'>&#9;int hashent;                   // 存放4元的hash值
+</span><span class='line'>&#9;struct sock *pair;             // 在TCP分析中无须考虑
+</span><span class='line'>
+</span><span class='line'>&#9;/* 一个进程也许会锁住socket导致该socket不能被改变。特别是这点意味着其甚至不能被驱动中断所改变，例如，
+</span><span class='line'>&#9;&#9;到达的报会被堵塞，导致我们无法获取新的数据或者任何的状态改变。所以在这里，当socket被锁住的时候，中
+</span><span class='line'>&#9;&#9;断处理可以将包往下面的backlog中添加*/
+</span><span class='line'>&#9;struct {
+</span><span class='line'>&#9;&#9;struct sk_buff *head;
+</span><span class='line'>&#9;&#9;struct sk_buff *tail;
+</span><span class='line'>&#9;} backlog;
+</span><span class='line'>
+</span><span class='line'>&#9;rwlock_t callback_lock;          // sock相关函数内部操作的保护锁
+</span><span class='line'>&#9;struct sk_buff_head error_queue; // 错误报文的队列，很少使用
+</span><span class='line'>&#9;struct proto *prot;              // 例如指向tcp_prot
+</span><span class='line'>
+</span><span class='line'>&#9;union {       // 私有TCP相关数据保存
+</span><span class='line'>&#9;&#9;struct tcp_opt af_tcp;
+</span><span class='line'>&#9;&#9;.............
+</span><span class='line'>&#9;} tp_pinfo;
+</span><span class='line'>
+</span><span class='line'>&#9;int err,      // 保存各种错误，例如ECONNRESET Connection reset by peer，从而会影响到后续流程的处理
+</span><span class='line'>&#9;&#9;err_soft; // 保存各种软错误，例如EPROTO Protocol error，从而会影响到后续流程的处理
+</span><span class='line'>&#9;unsigned short ack_backlog;       // 当前已经accept的数目
+</span><span class='line'>&#9;unsigned short max_ack_backlog;   // 当前listen sock能保留多少个待处理TCP连接.
+</span><span class='line'>&#9;__u32 priority;                   /* Packet queueing priority，Used to set the TOS field. Packets with a higher priority may be processed first, depending on the device’s queueing discipline. See SO_PRIORITY */
+</span><span class='line'>&#9;unsigned short type;              // 例如SOCK_STREAM，SOCK_DGRAM或者SOCK_RAW等
+</span><span class='line'>&#9;unsigned char localroute;         // Route locally only if set – set by SO_DONTROUTE option.
+</span><span class='line'>&#9;unsigned char protocol;           // socket(int family, int type, int protocol)中的protocol
+</span><span class='line'>&#9;struct ucred peercred;            // 在TCP分析中无须考虑
+</span><span class='line'>&#9;int rcvlowat;                     /* 声明在开始发送 数据 (SO_SNDLOWAT) 或正在接收数据的用户 (SO_RCVLOWAT) 传递数据之
+</span><span class='line'>&#9;前缓冲区内的最小字节数. 在 Linux 中这两个值是不可改变的, 固定为 1 字节. */
+</span><span class='line'>&#9;long rcvtimeo;                    // 接收时的超时设定, 并在超时时报错
+</span><span class='line'>&#9;long sndtimeo;                    // 发送时的超时设定, 并在超时时报错
+</span><span class='line'>
+</span><span class='line'>&#9;union {       // 私有inet相关数据保存
+</span><span class='line'>&#9;&#9;struct inet_opt af_inet;
+</span><span class='line'>&#9;&#9;.................
+</span><span class='line'>&#9;} protinfo;
+</span><span class='line'>
+</span><span class='line'>&#9;/* the timer is used for SO_KEEPALIVE (i.e. sending occasional keepalive probes to a remote site – by default, set to 2 hours in
+</span><span class='line'>&#9;stamp is simply the time that the last packet was received. */
+</span><span class='line'>&#9;struct timer_list timer;
+</span><span class='line'>&#9;struct timeval stamp;
+</span><span class='line'>&#9;struct socket *socket; // 对应的socket
+</span><span class='line'>&#9;void *user_data;       // 私有数据，在TCP分析中无须考虑
+</span><span class='line'>
+</span><span class='line'>&#9;/* The state_change operation is called whenever the status of the socket is changed. Similarly, data_ready is called
+</span><span class='line'>&#9;&#9;when data have been received, write_space when free memory available for writing has increased and error_report
+</span><span class='line'>&#9;&#9;when an error occurs, backlog_rcv when socket locked, putting skb to backlog, destruct for release this sock*/
+</span><span class='line'>&#9;void (*state_change)(struct sock *sk);
+</span><span class='line'>&#9;void (*data_ready)(struct sock *sk,int bytes);
+</span><span class='line'>&#9;void (*write_space)(struct sock *sk);
+</span><span class='line'>&#9;void (*error_report)(struct sock *sk);
+</span><span class='line'>&#9;int (*backlog_rcv) (struct sock *sk, struct sk_buff *skb);
+</span><span class='line'>&#9;void (*destruct)(struct sock *sk);
+</span><span class='line'>};
+</span><span class='line'>
+</span><span class='line'>
+</span><span class='line'>struct inet_opt
+</span><span class='line'>{
+</span><span class='line'>&#9;int ttl;                    // IP的TTL设置
+</span><span class='line'>&#9;int tos;                    // IP的TOS设置
+</span><span class='line'>&#9;unsigned cmsg_flags;        // 该标志用来决定是否向应用层打印相关信息，包括如下可能的值
+</span><span class='line'>&#9;#define IP_CMSG_PKTINFO 1
+</span><span class='line'>&#9;#define IP_CMSG_TTL 2
+</span><span class='line'>&#9;#define IP_CMSG_TOS 4
+</span><span class='line'>&#9;#define IP_CMSG_RECVOPTS 8
+</span><span class='line'>&#9;#define IP_CMSG_RETOPTS 16
+</span><span class='line'>&#9;struct ip_options *opt;     // IP选项，包括安全和处理限制、记录路径、时间戳、宽松的源站选路、严格的源站选路
+</span><span class='line'>&#9;unsigned char hdrincl;      // 用于RAW
+</span><span class='line'>&#9;__u8 mc_ttl;                // 多播TTL
+</span><span class='line'>&#9;__u8 mc_loop;               // 多播回环
+</span><span class='line'>&#9;unsigned recverr : 1,       // 是否允许传递扩展的可靠的错误信息.
+</span><span class='line'>&#9;freebind : 1;               // 是否允许socket被绑定
+</span><span class='line'>&#9;__u16 id;                   // 用于禁止分片的IP包的ID计数
+</span><span class='line'>&#9;__u8 pmtudisc;              // 路径MTU发现
+</span><span class='line'>&#9;int mc_index;               // 多播设备索引
+</span><span class='line'>&#9;__u32 mc_addr;              // 自己的多播地址
+</span><span class='line'>&#9;struct ip_mc_socklist *mc_list; // 多播组
+</span><span class='line'>};
+</span><span class='line'>
+</span><span class='line'>struct tcp_opt {
+</span><span class='line'>&#9;int tcp_header_len;         // tcp首部长度（包括选项）
+</span><span class='line'>&#9;__u32 pred_flags; /* 首部预测标志，在syn_rcv、syn_sent、更新窗口或其他恰当的时候，设置pred_flags（主要
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;是创建出不符合快速路径的条件，一般值为0x??10 &lt;&lt; 16 + snd_wnd）?所对应的值不确定，
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;在连接完毕之后，根据pred_flags以及其他因素来确定是否走快速路径。*/
+</span><span class='line'>
+</span><span class='line'>&#9;__u32 rcv_nxt;              // 期望接受到的下一个tcp包的seq
+</span><span class='line'>&#9;__u32 snd_nxt;              // 要发送的下一个tcp包的seq
+</span><span class='line'>&#9;__u32 snd_una;              // 表示最近一个尚未确认的但是已经发送过的报文的seq
+</span><span class='line'>&#9;__u32 snd_sml;              // 最近发送的小包的最后一个字节数，主要用于Nagle算法
+</span><span class='line'>&#9;__u32 rcv_tstamp;           // 最近收到的ACK的时间，用于保活
+</span><span class='line'>&#9;__u32 lsndtime;             // 最近发送的数据包的时间，用于窗口restart
+</span><span class='line'>
+</span><span class='line'>&#9;/* 经受时延的确认的控制 */
+</span><span class='line'>&#9;struct {
+</span><span class='line'>&#9;&#9;__u8 pending;           /* 正处于ACK延时状态，包括如下几种状态 ACK is pending */
+</span><span class='line'>&#9;&#9;enum tcp_ack_state_t
+</span><span class='line'>&#9;&#9;{
+</span><span class='line'>&#9;&#9;&#9;TCP_ACK_SCHED = 1,
+</span><span class='line'>&#9;&#9;&#9;TCP_ACK_TIMER = 2,
+</span><span class='line'>&#9;&#9;&#9;TCP_ACK_PUSHED= 4
+</span><span class='line'>&#9;&#9;};
+</span><span class='line'>&#9;&#9;__u8 quick;            /* 快速恢复算法时，用于决定是否需要重传的收到的重复ACK的最大数目 Scheduled number of quick acks */
+</span><span class='line'>&#9;&#9;__u8 pingpong;         /* 当前该TCP会话处于交互状态（非延时ACK状态）The session is interactive */
+</span><span class='line'>&#9;&#9;__u8 blocked;          /* 当前socket被锁住了，这时候延时的ACK不再等待，而是立即发送 Delayed ACK was blocked by socket lock*/]
+</span><span class='line'>&#9;&#9;/*Adaptive Time-Out (ATO) is the time that must elapse before an acknowledgment is considered lost. RFC 2637*/
+</span><span class='line'>&#9;&#9;__u32 ato;             /* 软件时钟的预测嘀嗒数目 Predicted tick of soft clock */
+</span><span class='line'>&#9;&#9;unsigned long timeout; /* 当前延时确认的定时器时间 Currently scheduled timeout */
+</span><span class='line'>&#9;&#9;__u32 lrcvtime;        /* 最后收到的数据报的时间戳 timestamp of last received data packet*/
+</span><span class='line'>&#9;&#9;__u16 last_seg_size;   /* 最后收到的数据报的大小 Size of last incoming segment */
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;/*
+</span><span class='line'>&#9;&#9;1. tp-&gt;advmss：The MSS advertised by the host. This is initialised in the function tcp_advertise_mss, from the routing table's destination cache(dst-&gt;advmss).
+</span><span class='line'>Given that the cached entry is calculated from the MTU (maximum transfer unit) of the next hop, this will have a value of 1460 over Ethernet.
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;2. tp-&gt;ack.rcv_mss：A lower-bound estimate of the peer's MSS. This is initiated in tcp_initialize_rcv mss, and updated whenever a segment is received by
+</span><span class='line'>tcp measure rcv mss.
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;3. tp-&gt;mss_cache：The current effective sending MSS, which is calculated in the function tcp_sync_mss. When the socket is created, it is initialised to 536 by
+</span><span class='line'>tcp_v4_init_sock. Note that these are the only functions that alter the value of tp-&gt;mss cache.
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;4. tp-&gt;mss clamp：An upper-bound value of the MSS of the connection. This is negotiated at connect(), such that it is the minimum of the MSS values advertised
+</span><span class='line'>by the two hosts.We will never see a segment larger than this.
+</span><span class='line'>*/
+</span><span class='line'>&#9;&#9;__u16 rcv_mss;    /* 属于点到点的mss，用于延时确认 MSS used for delayed ACK decisions */
+</span><span class='line'>&#9;} ack;
+</span><span class='line'>
+</span><span class='line'>&#9;__u16 mss_cache;      // 当前提供的有效mss， /* Cached effective mss, not including SACKS */
+</span><span class='line'>&#9;__u16 mss_clamp;      // 最大mss，连接建立时协商的mss或者用户通过ioctl指定的mss的两者之中最大值
+</span><span class='line'>&#9;/* Maximal mss, negotiated at connection setup */
+</span><span class='line'>&#9;__u16 advmss;         /* MTU包括路径MTU，这里的advmss是本机告知周围网关的我自身的mss */
+</span><span class='line'>
+</span><span class='line'>&#9;/* 用于直接拷贝给应用层的数据，当用户正在读取该套接字时, TCP包将被排入套接字的预备队列(tcp_prequeue ())，将其
+</span><span class='line'>&#9;传递到该用户线程上下文中进行处理. */
+</span><span class='line'>&#9;struct {
+</span><span class='line'>&#9;&#9;struct sk_buff_head prequeue; // 当前预备队列
+</span><span class='line'>&#9;&#9;struct task_struct *task;     // 当前线程
+</span><span class='line'>&#9;&#9;struct iovec *iov;            // 用户空间接受数据的地址
+</span><span class='line'>&#9;&#9;int memory;                   // 当前预备队列中的包总字节数目
+</span><span class='line'>&#9;&#9;int len;                      // 用户进程从预备队列中读取的数据字节数
+</span><span class='line'>&#9;} ucopy;
+</span><span class='line'>
+</span><span class='line'>&#9;__u32 snd_wl1;        // 收到对方返回的skb，记下该包的seq号，用于判断窗口是否需要更新 /* Sequence for window update */
+</span><span class='line'>&#9;__u32 snd_wnd;        // 记录对方提供的窗口大小 /* The window we expect to receive */
+</span><span class='line'>&#9;__u32 max_window;     // 对方曾经提供的最大窗口 /* Maximal window ever seen from peer */
+</span><span class='line'>&#9;__u32 pmtu_cookie;    // 将发送mss和当前的pmtu/exthdr设置同步 /* Last pmtu seen by socket */
+</span><span class='line'>&#9;__u16 ext_header_len; // 网络层协议选项长度 /* Network protocol overhead (IP/IPv6 options) */
+</span><span class='line'>&#9;__u8 ca_state;        // 快速重传状态机 /* State of fast-retransmit machine */
+</span><span class='line'>&#9;enum tcp_ca_state
+</span><span class='line'>&#9;{
+</span><span class='line'>&#9;&#9;TCP_CA_Open = 0,
+</span><span class='line'>&#9;&#9;TCP_CA_Disorder = 1,
+</span><span class='line'>&#9;&#9;TCP_CA_CWR = 2,
+</span><span class='line'>&#9;&#9;TCP_CA_Recovery = 3,
+</span><span class='line'>&#9;&#9;TCP_CA_Loss = 4
+</span><span class='line'>&#9;};
+</span><span class='line'>&#9;/* RFC 1122指出，TCP实现必须包括Karn和Jacobson实现计算重传超时（retransmission timeout：RTO）的算法 */
+</span><span class='line'>&#9;__u8 retransmits; // 某个还没有被确认的发送TCP包重传的次数 /* Number of unrecovered RTO timeouts. */
+</span><span class='line'>
+</span><span class='line'>&#9;/* 当收到下面数量的重复ack时，快速重传开始，而无需等待重传定时器超时 */
+</span><span class='line'>&#9;__u8 reordering; /* Packet reordering metric. */
+</span><span class='line'>
+</span><span class='line'>&#9;/* 当我们发出一个tcp包之后，并不立刻释放掉该包，而是等待其对应的ack到来，如果这时候ack来了，那么我们将从
+</span><span class='line'>&#9;write_queue队列中释放掉该包，同时将该事件的标志记录在tp-&gt;queue_shrunk中，如果原来进程由于write_queue中没
+</span><span class='line'>&#9;有足够的空间继续发送数据而休眠的话，那么此时将会唤醒其对应的sock，从而进程可以继续发送数据 */
+</span><span class='line'>&#9;__u8 queue_shrunk; /* Write queue has been shrunk recently.*/
+</span><span class='line'>&#9;__u8 defer_accept; // 请参考附录1 /* User waits for some data after accept() */
+</span><span class='line'>
+</span><span class='line'>&#9;/* 往返时间测量 RTT，有关RTT的侧量这里不再详细讨论measurement ：Round-Trip Time (RTT) is the estimated round-trip time for an Acknowledgment to be received for a
+</span><span class='line'>given transmitted packet. When the network link is a local network, this delay will be minimal (if not zero). When the network link is
+</span><span class='line'>the Internet, this delay could be substantial and vary widely. RTT is adaptive. */
+</span><span class='line'>&#9;__u8 backoff;         /* backoff */
+</span><span class='line'>&#9;__u32 srtt;           /* smothed round trip time &lt;&lt; 3 */
+</span><span class='line'>&#9;__u32 mdev;           /* medium deviation */
+</span><span class='line'>&#9;__u32 mdev_max;       /* maximal mdev for the last rtt period */
+</span><span class='line'>&#9;__u32 rttvar;         /* smoothed mdev_max */
+</span><span class='line'>&#9;__u32 rtt_seq;        /* sequence number to update rttvar */
+</span><span class='line'>&#9;__u32 rto;            /* 重传超时时间 retransmit timeout */
+</span><span class='line'>
+</span><span class='line'>&#9;__u32 packets_out;    /* 已经发出去的数目 Packets which are "in flight" */
+</span><span class='line'>&#9;__u32 left_out;       /* 发出去已经被确认的数目 Packets which leaved network */
+</span><span class='line'>&#9;__u32 retrans_out;    /* 重传的发出去的包数目 Retransmitted packets out */
+</span><span class='line'>
+</span><span class='line'>&#9;// 慢启动和拥塞控制 Slow start and congestion control (see also Nagle, and Karn & Partridge)
+</span><span class='line'>&#9;__u32 snd_ssthresh;   // 拥塞控制时的慢启动门限 /* Slow start size threshold */
+</span><span class='line'>&#9;__u32 snd_cwnd;       // 当前采用的拥塞窗口 /* Sending congestion window */
+</span><span class='line'>&#9;__u16 snd_cwnd_cnt;   // 线形增加的拥塞窗口计数器 /* Linear increase counter */
+</span><span class='line'>&#9;__u16 snd_cwnd_clamp; // 拥塞窗口的最大值（一般为对方通告的窗口大小） /* Do not allow snd_cwnd to grow above this */
+</span><span class='line'>&#9;__u32 snd_cwnd_used;  // 慢启动，每发出去一个包，snd_cwnd_used++
+</span><span class='line'>&#9;__u32 snd_cwnd_stamp; // 该参数可以保证在重传模式下不会改变拥塞窗口的大小 */
+</span><span class='line'>
+</span><span class='line'>&#9;/* 重传定时器和延时确认定时器 Two commonly used timers in both sender and receiver paths. */
+</span><span class='line'>&#9;unsigned long timeout;// 用于重传
+</span><span class='line'>&#9;struct timer_list retransmit_timer;     /* Resend (no ack) */
+</span><span class='line'>&#9;struct timer_list delack_timer;         /* Ack delay */
+</span><span class='line'>&#9;struct sk_buff_head out_of_order_queue; // 乱序的TCP报都存放在该队列中 /* Out of order segments go here */
+</span><span class='line'>
+</span><span class='line'>&#9;struct tcp_func *af_specific;           // ipv4/ipv6 相关特定处理函数 /* Operations which are AF_INET{4,6} specific */
+</span><span class='line'>&#9;struct tcp_func ipv4_specific = {
+</span><span class='line'>&#9;&#9;ip_queue_xmit,
+</span><span class='line'>&#9;&#9;tcp_v4_send_check,
+</span><span class='line'>&#9;&#9;tcp_v4_rebuild_header,
+</span><span class='line'>&#9;&#9;tcp_v4_conn_request,
+</span><span class='line'>&#9;&#9;tcp_v4_syn_recv_sock,
+</span><span class='line'>&#9;&#9;tcp_v4_remember_stamp,
+</span><span class='line'>&#9;&#9;sizeof(struct iphdr),
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;ip_setsockopt,
+</span><span class='line'>&#9;&#9;ip_getsockopt,
+</span><span class='line'>&#9;&#9;v4_addr2sockaddr,
+</span><span class='line'>&#9;&#9;sizeof(struct sockaddr_in)
+</span><span class='line'>&#9;};
+</span><span class='line'>&#9;struct sk_buff *send_head;  // 最先要发送的TCP报文 /* Front of stuff to transmit */
+</span><span class='line'>&#9;struct page *sndmsg_page;   // sendmsg所使用的缓冲内存页面 /* Cached page for sendmsg */
+</span><span class='line'>&#9;u32 sndmsg_off;             // sendmsg所使用的缓冲偏移 /* Cached offset for sendmsg */
+</span><span class='line'>
+</span><span class='line'>&#9;__u32 rcv_wnd;              // 当前接受窗口 /* Current receiver window */
+</span><span class='line'>&#9;__u32 rcv_wup;              // 对方窗口最后一次更新时的rcv_nxt /* rcv_nxt on last window update sent */
+</span><span class='line'>&#9;__u32 write_seq;            // tcp发送总数据字节量+1 /* Tail(+1) of data held in tcp send buffer */
+</span><span class='line'>&#9;__u32 pushed_seq;           // 上次发送带PSH标志的TCP包的seq /* Last pushed seq, required to talk to windows */
+</span><span class='line'>&#9;__u32 copied_seq;           // 尚未读取的数据第一个字节位置 /* Head of yet unread data */
+</span><span class='line'>
+</span><span class='line'>&#9;// Options received (usually on last packet, some only on SYN packets).
+</span><span class='line'>&#9;char tstamp_ok,        /* syn包上的时间戳 TIMESTAMP seen on SYN packet */
+</span><span class='line'>&#9;wscale_ok,             /* SACK选项处理Kind=5不再详细叙说 Wscale seen on SYN packet */
+</span><span class='line'>&#9;sack_ok;               /* SACK选项处理Kind=5不再详细叙说 SACK seen on SYN packet */
+</span><span class='line'>&#9;char saw_tstamp;       /* 最后一个TCP包的时间戳 Saw TIMESTAMP on last packet */
+</span><span class='line'>&#9;__u8 snd_wscale;       /* 接受窗口扩大因子 Window scaling received from sender */
+</span><span class='line'>&#9;__u8 rcv_wscale;       /* 发送窗口扩大因子 Window scaling to send to receiver */
+</span><span class='line'>&#9;__u8 nonagle;          /* 是否允许Nagle算法 Disable Nagle algorithm? */
+</span><span class='line'>&#9;__u8 keepalive_probes; /* 保活探测的数量 num of allowed keep alive probes */
+</span><span class='line'>
+</span><span class='line'>&#9;/* PAWS：防止回绕的序号，不再详细叙说 PAWS/RTTM data */
+</span><span class='line'>&#9;__u32 rcv_tsval;       /* Time stamp value */
+</span><span class='line'>&#9;__u32 rcv_tsecr;       /* Time stamp echo reply */
+</span><span class='line'>&#9;__u32 ts_recent;       /* Time stamp to echo next */
+</span><span class='line'>&#9;long ts_recent_stamp;  /* Time we stored ts_recent (for aging) */
+</span><span class='line'>
+</span><span class='line'>&#9;/* SACK选项处理Kind=5不再详细叙说 SACKs data1 */
+</span><span class='line'>&#9;__u16 user_mss;        /* 用户通过ioctl指定的mssmss requested by user in ioctl */
+</span><span class='line'>&#9;__u8 dsack;            /* D-SACK is scheduled */
+</span><span class='line'>&#9;__u8 eff_sacks;        /* Size of SACK array to send with next packet */
+</span><span class='line'>&#9;struct tcp_sack_block duplicate_sack[1]; /* D-SACK block */
+</span><span class='line'>&#9;struct tcp_sack_block selective_acks[4]; /* The SACKS themselves*/
+</span><span class='line'>
+</span><span class='line'>&#9;/* 通告窗口(advertised window，tp-&gt;tcv_wnd)，window_clamp是最大的通告窗口，说白了就是
+</span><span class='line'>&#9;应用程序的缓冲区真实大小。rcv_ssthresh是更为严格的window_clamp，主要用于慢启动期间
+</span><span class='line'>&#9;预测连接的行为 */
+</span><span class='line'>&#9;__u32 window_clamp;   /* Maximal window to advertise */
+</span><span class='line'>&#9;__u32 rcv_ssthresh;   /* Current window clamp */
+</span><span class='line'>
+</span><span class='line'>&#9;__u8 probes_out;      /* 用于零窗口探测 unanswered 0 window probes */
+</span><span class='line'>&#9;__u8 num_sacks;       /* Number of SACK blocks */
+</span><span class='line'>
+</span><span class='line'>&#9;__u8 syn_retries;     /* syn重试次数 num of allowed syn retries */
+</span><span class='line'>&#9;__u8 ecn_flags;       /* 显式拥塞通知状态位，不再详叙 ECN status bits. */
+</span><span class='line'>&#9;__u16 prior_ssthresh; /* 在经过重传后恢复时的ssthresh保存值 ssthresh saved at recovery start */
+</span><span class='line'>
+</span><span class='line'>&#9;/* SACK选项处理Kind=5不再详细叙说 SACKs data2 */
+</span><span class='line'>&#9;__u32 lost_out;       /* Lost packets */
+</span><span class='line'>&#9;__u32 sacked_out;     /* SACK'd packets */
+</span><span class='line'>&#9;__u32 fackets_out;    /* FACK'd packets */
+</span><span class='line'>&#9;__u32 high_seq;       /* snd_nxt at onset of congestion */
+</span><span class='line'>
+</span><span class='line'>&#9;__u32 retrans_stamp;  // 上次重传的时间，其也会记住第一个syn的时间戳
+</span><span class='line'>&#9;__u32 undo_marker;    /* 开始跟踪重传的标示符 tracking retrans started here. */
+</span><span class='line'>&#9;int undo_retrans;     /* 用于Undo冗余的重传 number of undoable retransmissions. */
+</span><span class='line'>&#9;__u32 urg_seq;        /* 紧急指针的seq Seq of received urgent pointer */
+</span><span class='line'>&#9;__u16 urg_data;       /* 紧急指针的相关控制标志保存 Saved octet of OOB data and control flags */
+</span><span class='line'>&#9;__u8 pending;         /* 确定定时器的事件 Scheduled timer event，包括如下四种情况 */
+</span><span class='line'>&#9;#define TCP_TIME_RETRANS 1  /* Retransmit timer */
+</span><span class='line'>&#9;#define TCP_TIME_DACK 2     /* Delayed ack timer */
+</span><span class='line'>&#9;#define TCP_TIME_PROBE0 3   /* Zero window probe timer */
+</span><span class='line'>&#9;#define TCP_TIME_KEEPOPEN 4 /* Keepalive timer */
+</span><span class='line'>
+</span><span class='line'>&#9;__u8 urg_mode;        /* 是否处于紧急模式 In urgent mode */
+</span><span class='line'>&#9;__u32 snd_up;         /* 紧急指针位置 Urgent pointer */
+</span><span class='line'>
+</span><span class='line'>&#9;/* The syn_wait_lock is necessary only to avoid tcp_get_info having to grab the main lock sock while browsing the listening hash
+</span><span class='line'>&#9; * (otherwise it's deadlock prone). This lock is acquired in read mode only from tcp_get_info() and it's acquired in write mode _only_ from
+</span><span class='line'>&#9; * code that is actively changing the syn_wait_queue. All readers that are holding the master sock lock don't need to grab this lock in read
+</span><span class='line'>&#9; * mode too as the syn_wait_queue writes are always protected from the main sock lock.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;rwlock_t syn_wait_lock;
+</span><span class='line'>&#9;struct tcp_listen_opt *listen_opt;
+</span><span class='line'>
+</span><span class='line'>&#9;/* 服务器段listening socket的已经建立的子socket FIFO队列 FIFO of established children */
+</span><span class='line'>&#9;struct open_request *accept_queue;
+</span><span class='line'>&#9;struct open_request *accept_queue_tail;
+</span><span class='line'>
+</span><span class='line'>&#9;int write_pending;             /* 是否有对socket的写请求 A write to socket waits to start. */
+</span><span class='line'>&#9;unsigned int keepalive_time;   /* 保活定时器启动的时间阀值 time before keep alive takes place */
+</span><span class='line'>&#9;unsigned int keepalive_intvl;  /* 保活探测时间间隔 time interval between keep alive probes */
+</span><span class='line'>&#9;int linger2;                   // lingertime一起，指明了close()后保留的时间
+</span><span class='line'>&#9;int frto_counter;              /* 开始重传后的新的ack数目 Number of new acks after RTO */
+</span><span class='line'>&#9;__u32 frto_highmark;           /* 重传发生时的要发送的下一个tcp包的seq snd_nxt when RTO occurred */
+</span><span class='line'>
+</span><span class='line'>&#9;unsigned long last_synq_overflow; // 用于syn_cookie处理
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
 
 
-<h5>tcp_v4_hnd_req()</h5>
+<p>/*
+附录1：
+The first option we&rsquo;ll consider is TCP_DEFER_ACCEPT. (This is what it&rsquo;s called in Linux; other OSs offer the same option but use different names.)
+To understand the idea of the TCP_DEFER_ACCEPT option, it is necessary to picture a typical process of the HTTP client-server interaction. Consider
+how the TCP establishes a connection with the goal of transferring data. On a network, information travels in discrete units called IP packets (or IP
+datagrams). A packet always has a header that carries service information, used for internal protocol handling, and it may also carry payload data. A
+typical example of service information is a set of so-called flags, which mark the packets as having special meaning to a TCP/IP stack, such as
+acknowledgement of successful packet receiving. Often, it&rsquo;s possible to carry payload in the “marked” packet, but sometimes, internal logic forces a
+TCP/IP stack to send out packets with just a header. These packets often introduce unwanted delays and increased overhead and result in overall
+performance degradation.</p>
 
-<p>之前已经分析过，inet_csk_search_req()会在syn_table中找到req，此时进入tcp_check_req()</p>
+<p>The server has now created a socket and is waiting for a connection. The connection procedure in TCP/IP is a so-called “three-way handshake.” First,
+a client sends a TCP packet with a SYN flag set and no payload (a SYN packet). The server replies by sending a packet with SYN/ACK flags set (a
+SYN/ACK packet) to acknowledge receipt of the initial packet. The client then sends an ACK packet to acknowledge receipt of the second packet and to
+finalize the connection procedure. After receiving the SYN/ACK, the packet server wakes up a receiver process while waiting for data. When the three-way
+handshake is completed, the client starts to send “useful” data to be transferred to the server. Usually, an HTTP request is quite small and fits into a single
+packet. But in this case, at least four packets will be sent in both directions, adding considerable delay times. Note also that the receiver has already been
+waiting for the information—since before the data was ever sent.</p>
 
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct request_sock *req = inet_csk_search_req(sk, &prev, th-&gt;source, iph-&gt;saddr, iph-&gt;daddr);  
-</span><span class='line'>if (req)  
-</span><span class='line'>&#9;return tcp_check_req(sk, skb, req, prev);  </span></code></pre></td></tr></table></div></figure>
+<p>To alleviate these problems, Linux (along with some other OSs) includes a TCP_DEFER_ACCEPT option in its TCP implementation. Set on a server-side
+listening socket, it instructs the kernel not to wait for the final ACK packet and not to initiate the process until the first packet of real data has arrived. After
+sending the SYN/ACK, the server will then wait for a data packet from a client. Now, only three packets will be sent over the network, and the connection
+establishment delay will be significantly reduced, which is typical for HTTP.</p>
 
-
-<h5>tcp_check_req()</h5>
-
-<p>  syn_recv_sock() -> tcp_v4_syn_recv_sock()会创建一个新的sock并返回，创建的sock状态被直接设置为TCP_SYN_RECV，然后因为此时socket已经建立，将它添加到icsk_accept_queue中。</p>
-
-<p>  状态TCP_SYN_RECV的设置可能比较奇怪，按照TCP的状态转移图，在服务端收到SYN报文后变迁为TCP_SYN_RECV，但看到在实现中收到ACK后才有了状态TCP_SYN_RECV，并且马上会变为TCP_ESTABLISHED，所以这个状态变得无足轻重。这样做的原因是listen和accept返回的socket是不同的，而只有真正连接建立时才会创建这个新的socket，在收到SYN报文时新的socket还没有建立，就无从谈状态变迁了。这里同样是一个平衡的存在，你也可以在收到SYN时创建一个新的socket，代价就是无用的socket大大增加了。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>child = inet_csk(sk)-&gt;icsk_af_ops-&gt;syn_recv_sock(sk, skb, req, NULL);  
-</span><span class='line'>if (child == NULL)  
-</span><span class='line'>&#9;goto listen_overflow;  
-</span><span class='line'>inet_csk_reqsk_queue_unlink(sk, req, prev);  
-</span><span class='line'>inet_csk_reqsk_queue_removed(sk, req);  
-</span><span class='line'>inet_csk_reqsk_queue_add(sk, req, child);  </span></code></pre></td></tr></table></div></figure>
-
-
-<h5>tcp_child_process()</h5>
-
-<p>如果此时sock: child被用户进程锁住了，那么就先添加到backlog中__sk_add_backlog()，待解锁时再处理backlog上的sock；如果此时没有被锁住，则先调用tcp_rcv_state_process()进行处理，处理完后，如果child状态到达TCP_ESTABLISHED，则表明其已就绪，调用sk_data_ready()唤醒等待在isck_accept_queue上的函数accept()。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if (!sock_owned_by_user(child)) {  
-</span><span class='line'>&#9;ret = tcp_rcv_state_process(child, skb, tcp_hdr(skb), skb-&gt;len);  
-</span><span class='line'>&#9;if (state == TCP_SYN_RECV && child-&gt;sk_state != state)  
-</span><span class='line'>&#9;&#9;parent-&gt;sk_data_ready(parent, 0);  
-</span><span class='line'>} else {  
-</span><span class='line'>&#9;__sk_add_backlog(child, skb);  
-</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
+<p>This feature, called an “accept filter” , is used in different ways, although in all cases, the effect is the same as TCP_DEFER_ACCEPT—the server
+will not wait for the final ACK packet, waiting only for a packet carrying a payload. More information about this option and its significance for a high-performance
+Web server is available in the Apache documentation.
+*/</p>
+</div>
+  
+  
 
 
-<p>  tcp_rcv_state_process()处理各个状态上socket的情况。下面是处于TCP_SYN_RECV的代码段，注意此时传入函数的sk已经是新创建的sock了(在tcp_v4_hnd_req()中)，并且状态是TCP_SYN_RECV，而不再是listen socket，在收到ACK后，sk状态变迁为TCP_ESTABLISHED，而在tcp_v4_hnd_req()中也已将sk插入到了icsk_accept_queue上，此时它就已经完全就绪了，回到tcp_child_process()便可执行sk_data_ready()。</p>
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2015/06/09/kernel-net-listen/">socket监听连接 sys_listen</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-06-09T17:50:00+08:00'><span class='date'>2015-06-09</span> <span class='time'>17:50:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://blog.csdn.net/justlinux2010/article/details/8597498">http://blog.csdn.net/justlinux2010/article/details/8597498</a></p>
+
+<p>listen()函数仅在TCP服务器端调用，它做两个事情：将套接字转换到LISTEN状态和设置套接上的最大连接队列。listen()对应的内核实现为sys_listen()，下面开始对其实现作具体的分析。</p>
+
+<h4>一、sys_listen()函数</h4>
+
+<p>sys_listen()的源码实现及分析如下所示：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -904,214 +1635,524 @@ bind() -> listen() -> accept() -> recv() -> send()</p>
 <span class='line-number'>9</span>
 <span class='line-number'>10</span>
 <span class='line-number'>11</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>case TCP_SYN_RECV:  
-</span><span class='line'>&#9;if (acceptable) {  
-</span><span class='line'>&#9;&#9;……  
-</span><span class='line'>&#9;&#9;tcp_set_state(sk, TCP_ESTABLISHED);  
-</span><span class='line'>&#9;&#9;sk-&gt;sk_state_change(sk);  
-</span><span class='line'>&#9;&#9;……  
-</span><span class='line'>&#9;&#9;tp-&gt;snd_una = TCP_SKB_CB(skb)-&gt;ack_seq;  
-</span><span class='line'>&#9;&#9;tp-&gt;snd_wnd = ntohs(th-&gt;window) &lt;&lt; tp-&gt;rx_opt.snd_wscale;  
-</span><span class='line'>&#9;&#9;tcp_init_wl(tp, TCP_SKB_CB(skb)-&gt;seq);   
-</span><span class='line'>&#9;&#9;……  
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* 
+</span><span class='line'> *  Perform a listen. Basically, we allow the protocol to do anything 
+</span><span class='line'> *  necessary for a listen, and if that works, we mark the socket as 
+</span><span class='line'> *  ready for listening. 
+</span><span class='line'> */  
+</span><span class='line'>
+</span><span class='line'>SYSCALL_DEFINE2(listen, int, fd, int, backlog)  
+</span><span class='line'>{  
+</span><span class='line'>&#9;struct socket *sock;  
+</span><span class='line'>&#9;int err, fput_needed;  
+</span><span class='line'>&#9;int somaxconn;  
+</span><span class='line'>  
+</span><span class='line'>&#9;sock = sockfd_lookup_light(fd, &err, &fput_needed);  
+</span><span class='line'>&#9;if (sock) {  
+</span><span class='line'>&#9;&#9;/* 
+</span><span class='line'>&#9;&#9; * sysctl_somaxconn存储的是服务器监听时，允许每个套接字连接队列长度  
+</span><span class='line'>&#9;&#9; * 的最大值，默认值是SOMAXCONN，即128，在sysctl_core_net_init()函数中初始化。 
+</span><span class='line'>&#9;&#9; * 在proc文件系统中可以通过修改/proc/sys/net/core/somaxconn文件来修改这个值。 
+</span><span class='line'>&#9;&#9; */  
+</span><span class='line'>&#9;&#9;somaxconn = sock_net(sock-&gt;sk)-&gt;core.sysctl_somaxconn;  
+</span><span class='line'>&#9;&#9;/* 
+</span><span class='line'>&#9;&#9; * 如果指定的最大连接数超过系统限制，则使用系统当前允许的连接队列 
+</span><span class='line'>&#9;&#9; * 中连接的最大数。 
+</span><span class='line'>&#9;&#9; */  
+</span><span class='line'>&#9;&#9;if ((unsigned)backlog &gt; somaxconn)  
+</span><span class='line'>&#9;&#9;&#9;backlog = somaxconn;  
+</span><span class='line'>  
+</span><span class='line'>&#9;&#9;err = security_socket_listen(sock, backlog);  
+</span><span class='line'>&#9;&#9;if (!err)  
+</span><span class='line'>&#9;&#9;&#9;/* 
+</span><span class='line'>&#9;&#9;&#9; * 如果是TCP套接字，sock-&gt;ops指向的是inet_stream_ops， 
+</span><span class='line'>&#9;&#9;&#9; * sock-&gt;ops是在inet_create()函数中初始化，所以listen接口 
+</span><span class='line'>&#9;&#9;&#9; * 调用的是inet_listen()函数。 
+</span><span class='line'>&#9;&#9;&#9; */  
+</span><span class='line'>&#9;&#9;&#9;err = sock-&gt;ops-&gt;listen(sock, backlog);  
+</span><span class='line'>  
+</span><span class='line'>&#9;&#9;fput_light(sock-&gt;file, fput_needed);  
+</span><span class='line'>&#9;}  
+</span><span class='line'>&#9;return err;  
 </span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
 
 
-<p>最后总结三次握手的过程</p>
-
-<p><img src="/images/kernel/2015-06-01.png" alt="" /></p>
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/05/29/system-base-ext/">RHEL5/CentOS5 上支持 Ext4</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-05-29T15:40:00+08:00'><span class='date'>2015-05-29</span> <span class='time'>15:40:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><ul>
-<li><p>记住，只能改数据分区，<code>/</code> 和 <code>/boot</code> 分区不要试，至少我没成功，启动参数加rootfstype=ext4也起不来。</p></li>
-<li><p><code>/</code> 分区要改成ext4的话，可以直接改<code>/etc/fstab</code>文件，ext3支持以ext4形式挂载。</p></li>
-<li><p>extents属性加上后去不掉，所以该不会ext3的，除非不加这个属性？？，去掉属性<code>tune4fs -O ^flex_bg /dev/sdb1</code></p></li>
-</ul>
-
-
-<hr />
-
-<p><a href="http://www.php-oa.com/2010/08/04/linux-rhel5-centos5-ext4.html">http://www.php-oa.com/2010/08/04/linux-rhel5-centos5-ext4.html</a></p>
-
-<p>根据我以前的测试 Ext4 的性能好过 Ext3,在 RHEL5 上的 2.6.18-110 也有加入 Ext4 了.但默认没有让我们使用,怎么样才能不重起,能使用这个啦.
-其实我们只要加入一个包e4fsprogs 就行,它其实和 e2fsprogs 是一样的功能,这 RHEL-6 中,会变成一个默认的包的.所以我们目前还只能使用这个包来调整和设置Ext4.</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>yum -y install e4fsprogs</span></code></pre></td></tr></table></div></figure>
-
-
-<p>在 RHEL 和 Centos5 中使用 Ext4 前,很多想可能想先给现有的文件系统转换成 Ext4 ,只要运行下面的命令就行了</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>tune4fs -O extents,uninit_bg,dir_index,flex_bg /dev/sdb1</span></code></pre></td></tr></table></div></figure>
-
-
-<p>记住，转换成 ext4 后必须用 fsck 扫描，否则不能 mount，-p 参数说明 “自动修复” 文件系统：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>fsck -pf /dev/sdb1 或 fsck -y /dev/sdb1</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>下面这个好像不需要</h5>
-
-<p>在重起前,我还要让内核支持 Ext4 的文件系统,需要修改 initrd 的文件本身的内容.如下命令来生成 支持 Ext4 的 initrd.</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>mkinitrd --with=ext4 --with=ext3 -f /boot/initrd-2.6.18-404.el5.img 2.6.18-404.el5</span></code></pre></td></tr></table></div></figure>
-
-
-
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/05/29/system-base-net-nfs/">网络硬盘NFS的安装与配置</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-05-29T14:23:00+08:00'><span class='date'>2015-05-29</span> <span class='time'>14:23:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://www.linuxidc.com/Linux/2014-11/109637.htm">http://www.linuxidc.com/Linux/2014-11/109637.htm</a></p>
-
-<p>NFS 是共享文件的服务的一种协议 下面给大家介绍一下这个服务器的的安装和配置。</p>
-
-<h4>安装</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>sudo apt-get install nfs-common nfs-kernel-server</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>配置</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>vim /etc/exprots</span></code></pre></td></tr></table></div></figure>
-
-
-<p>在正文的最下面输入一行</p>
+<p>sys_listen()的代码流程图如下所示：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
 <span class='line-number'>3</span>
 <span class='line-number'>4</span>
 <span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/srv/nfs_share *(rw)
-</span><span class='line'>
-</span><span class='line'>/srv/nfs_share 表示的是我们要共享的文件目录
-</span><span class='line'>* 表示互联网上任何主机都可以访问 
-</span><span class='line'>(rw) 表示对服务器进行访问的主机可以进行的操作 也就是可读可写</span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>&#9;sys_listen()
+</span><span class='line'>&#9;&#9;|
+</span><span class='line'>&#9;&#9;|---&gt; sockfd_lookup_light()
+</span><span class='line'>&#9;&#9;|
+</span><span class='line'>&#9;&#9;|---&gt; 确定最大连接队列
+</span><span class='line'>&#9;&#9;|
+</span><span class='line'>&#9;&#9; ---&gt; inet_listen()</span></code></pre></td></tr></table></div></figure>
 
 
-<p>如果我们只想让我们本地局域网上的主机对我们的服务器进行访问的话  可以这样写</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/srv/nfs_share 192.168.*.*(rw)</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>访问</h4>
-
-<p>本机访问</p>
+<p>sys_listen()的代码流程和sys_bind()很像，都是先调用sockfd_lookup_light()获取描述符对应的socket实例，然后通过调用sock->ops中的操作接口来完成真正的操作。接下来看这段代码：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>sudo mount -o rw locahost:/srv/nfs_share /mnt/nfs</span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if ((unsigned)backlog &gt; somaxconn)  
+</span><span class='line'>&#9;&#9;&#9;backlog = somaxconn;  </span></code></pre></td></tr></table></div></figure>
 
 
-<p>上面的意思是把本地的目录/srv/nfs_share 挂载到 目录/mnt/nfs上 ，这时候我们体会不到挂载点发生了变化 我们可以自己用相关的命令查询，我就不多介绍了</p>
+<p>这里可以看出，如果指定的最大连接队列数超过系统限制，会使用系统中设置的最大连接队列数。所以，如果想扩大套接字的连接队列，只调整listen()的backlog参数是没用的，还要修改系统的设置才行。</p>
 
-<p>非本地的主机</p>
+<h4>二、inet_listen()函数</h4>
 
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>sudo mount -o rw 域名:/srv/nfs_share /mnt/nfs</span></code></pre></td></tr></table></div></figure>
-
-
-<p>这个时候我们会发现NFS太简单了，所以系统管理员就麻烦了</p>
-
-<h5>假如在共享的目录中有我们的重要的文件，怎么办？</h5>
+<p>inet_listen()的源码实现及分析如下所示：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/srv/nfs_share/secret (noaccess)</span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* 
+</span><span class='line'> *  Move a socket into listening state. 
+</span><span class='line'> */  
+</span><span class='line'>/* 
+</span><span class='line'> * inet_listen()函数为listen系统调用套接字层的实现。 
+</span><span class='line'> */  
+</span><span class='line'>int inet_listen(struct socket *sock, int backlog)  
+</span><span class='line'>{  
+</span><span class='line'>&#9;struct sock *sk = sock-&gt;sk;  
+</span><span class='line'>&#9;unsigned char old_state;  
+</span><span class='line'>&#9;int err;  
+</span><span class='line'>  
+</span><span class='line'>&#9;lock_sock(sk);  
+</span><span class='line'>  
+</span><span class='line'>&#9;err = -EINVAL;  
+</span><span class='line'>&#9;/* 
+</span><span class='line'>&#9; * 检测调用listen的套接字的当前状态和类型。如果套接字状态 
+</span><span class='line'>&#9; * 不是SS_UNCONNECTED，或套接字类型不是SOCK_STREAM，则不 
+</span><span class='line'>&#9; * 允许进行监听操作，返回相应错误码 
+</span><span class='line'>&#9; */  
+</span><span class='line'>&#9;if (sock-&gt;state != SS_UNCONNECTED || sock-&gt;type != SOCK_STREAM)  
+</span><span class='line'>&#9;&#9;goto out;  
+</span><span class='line'>  
+</span><span class='line'>&#9;old_state = sk-&gt;sk_state;  
+</span><span class='line'>&#9;/* 
+</span><span class='line'>&#9; * 检查进行listen调用的传输控制块的状态。如果该传输控制块不在 
+</span><span class='line'>&#9; * 在TCPF_CLOSE或TCPF_LISTEN状态，则不能进行监听操作，返回 
+</span><span class='line'>&#9; * 相应错误码 
+</span><span class='line'>&#9; */  
+</span><span class='line'>&#9;if (!((1 &lt;&lt; old_state) & (TCPF_CLOSE | TCPF_LISTEN)))  
+</span><span class='line'>&#9;&#9;goto out;  
+</span><span class='line'>  
+</span><span class='line'>&#9;/* Really, if the socket is already in listen state 
+</span><span class='line'>&#9; * we can only allow the backlog to be adjusted. 
+</span><span class='line'>&#9; */  
+</span><span class='line'>&#9;/* 
+</span><span class='line'>&#9; * 如果传输控制块不在LISTEN状态，则调用inet_csk_listen_start() 
+</span><span class='line'>&#9; * 进行监听操作。最后，无论是否在LISTEN状态都需要设置传输控制块 
+</span><span class='line'>&#9; * 的连接队列长度的上限。从这里可以看出，可以通过调用listen() 
+</span><span class='line'>&#9; * 来修改最大连接队列的长度。 
+</span><span class='line'>&#9; */  
+</span><span class='line'>&#9;if (old_state != TCP_LISTEN) {  
+</span><span class='line'>&#9;&#9;err = inet_csk_listen_start(sk, backlog);  
+</span><span class='line'>&#9;&#9;if (err)  
+</span><span class='line'>&#9;&#9;&#9;goto out;  
+</span><span class='line'>&#9;}  
+</span><span class='line'>&#9;sk-&gt;sk_max_ack_backlog = backlog;  
+</span><span class='line'>&#9;err = 0;  
+</span><span class='line'>  
+</span><span class='line'>out:  
+</span><span class='line'>&#9;release_sock(sk);  
+</span><span class='line'>&#9;return err;  
+</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
 
 
-<p>就是任何主机都不能访问/srv/nfs_share/secret 这个子目录</p>
+<p>inet_listen()首先检查套接字的状态及类型，如果状态和类型不适合进行listen操作，则返回EINVAL错误。如果套接字的当前状态不是LISTEN状态，则调用inet_csk_listen_start()来分配管理接收队列的内存，并且将套接字状态转换为LISTEN状态。如果套接字状态已经是LISTEN状态，则只修改套接字中sk_max_ack_backlog成员，即连接队列的上限。从这里可以看出，可以通过调用listen()来修改连接队列的上限。但是这里有一个问题，假设套接的当前状态是LISTEN状态，连接队列的长度是100，这时调用listen()来将连接队列的长度修改为1024（假设已修改/proc/sys/net/core/somaxconn文件提高系统限制），但从代码看来并没有调用inet_csk_listen_start()来重新分配管理连接队列的内存，管理连接队列的内存没有变化，是不是会没有效果呢？其实不然，inet_csk_listen_start()中分配的内存除了listen_sock管理结构外，用作半连接队列的哈希表槽位。哈希表中可以容纳的元素个数和listen()中的backlog参数有关（和系统设置有关，还会对齐到2的整数次幂），和哈希表的槽位个数是没有关系的，参见reqsk_queue_alloc()函数。</p>
 
-<h5>如何限制root的权限</h5>
+<p>下面来看这行代码：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/srv/nfs_share 192.168.*。*（rw,root-aquash）</span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>sk-&gt;sk_max_ack_backlog = backlog;  </span></code></pre></td></tr></table></div></figure>
 
 
-<h5>查看客户端挂载共享目录的状态</h5>
+<p>其中sk_max_ack_backlog存储的是套接字的连接队列的上限，即accept队列的上限，但是这个上限值并不意味着连接队列中只能有sk_max_ack_backlog指定的数量。还有一个地方需要说明的是，《Unix网络编程》中讲到listen()时，说第二个参数的值是半连接队列和连接队列的个数之和，但是在linux中不是这样的，简单地说，listen()的第二个参数既是半连接队列的长度，也是连接队列的长度，并不是两者的和。这样说不太准确，后面会专门写一篇关于listen()的第二个参数backlog的分析。</p>
 
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>$ nfsstat -c</span></code></pre></td></tr></table></div></figure>
+<h4>三、inet_csk_listen_start()函数</h4>
 
-
-<h5>查看服务器的状态</h5>
+<p>inet_csk_listen_start()的源码实现及分析如下：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>$ nfsstat -s</span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* 
+</span><span class='line'> * 使TCP传输控制块进入监听状态，实现监听状态:为管理连接 
+</span><span class='line'> * 请求块的散列表分配存储空间，接着使TCP传输控制块的状态 
+</span><span class='line'> * 迁移到LISTEN状态，然后将传输控制块添加到监听散列表中。 
+</span><span class='line'> * @nr_table_entries:允许连接的队列长度上限，通过此值 
+</span><span class='line'> *                   合理计算出存储连接请求块的散列表大小 
+</span><span class='line'> */  
+</span><span class='line'>int inet_csk_listen_start(struct sock *sk, const int nr_table_entries)  
+</span><span class='line'>{  
+</span><span class='line'>&#9;struct inet_sock *inet = inet_sk(sk);  
+</span><span class='line'>&#9;struct inet_connection_sock *icsk = inet_csk(sk);  
+</span><span class='line'>&#9;/* 
+</span><span class='line'>&#9; * 为管理连接请求块的散列表分配存储空间，如果分配失败则返回 
+</span><span class='line'>&#9; * 相应错误码 
+</span><span class='line'>&#9; */  
+</span><span class='line'>&#9;int rc = reqsk_queue_alloc(&icsk-&gt;icsk_accept_queue, nr_table_entries);  
+</span><span class='line'>  
+</span><span class='line'>&#9;if (rc != 0)  
+</span><span class='line'>&#9;&#9;return rc;  
+</span><span class='line'>  
+</span><span class='line'>&#9;/* 
+</span><span class='line'>&#9; * 初始化连接队列长度上限，清除当前已建立连接数 
+</span><span class='line'>&#9; */  
+</span><span class='line'>&#9;sk-&gt;sk_max_ack_backlog = 0;  
+</span><span class='line'>&#9;sk-&gt;sk_ack_backlog = 0;  
+</span><span class='line'>&#9;/* 
+</span><span class='line'>&#9; * 初始化传输控制块中与延时发送ACK段有关的控制数据结构icsk_ack 
+</span><span class='line'>&#9; */  
+</span><span class='line'>&#9;inet_csk_delack_init(sk);  
+</span><span class='line'>  
+</span><span class='line'>&#9;/* There is race window here: we announce ourselves listening, 
+</span><span class='line'>&#9; * but this transition is still not validated by get_port(). 
+</span><span class='line'>&#9; * It is OK, because this socket enters to hash table only 
+</span><span class='line'>&#9; * after validation is complete. 
+</span><span class='line'>&#9; */  
+</span><span class='line'>&#9;/* 
+</span><span class='line'>&#9; * 设置传输控制块状态为监听状态 
+</span><span class='line'>&#9; */  
+</span><span class='line'>&#9;sk-&gt;sk_state = TCP_LISTEN;  
+</span><span class='line'>&#9;/* 
+</span><span class='line'>&#9; * 调用的是inet_csk_get_port()，如果没有绑定端口，则进行绑定 
+</span><span class='line'>&#9; * 端口操作；如果已经绑定了端口，则对绑定的端口进行校验。绑定 
+</span><span class='line'>&#9; * 或校验端口成功后，根据端口号在传输控制块中设置网络字节序的 
+</span><span class='line'>&#9; * 端口号成员，然后再清除缓存在传输控制块中的目的路由缓存，最后 
+</span><span class='line'>&#9; * 调用hash接口inet_hash()将该传输控制块添加到监听散列表listening_hash 
+</span><span class='line'>&#9; * 中，完成监听 
+</span><span class='line'>&#9; */  
+</span><span class='line'>&#9;if (!sk-&gt;sk_prot-&gt;get_port(sk, inet-&gt;num)) {  
+</span><span class='line'>&#9;&#9;inet-&gt;sport = htons(inet-&gt;num);  
+</span><span class='line'>  
+</span><span class='line'>&#9;&#9;sk_dst_reset(sk);  
+</span><span class='line'>&#9;&#9;sk-&gt;sk_prot-&gt;hash(sk);  
+</span><span class='line'>  
+</span><span class='line'>&#9;&#9;return 0;  
+</span><span class='line'>&#9;}  
+</span><span class='line'>  
+</span><span class='line'>&#9;/* 
+</span><span class='line'>&#9; * 如果绑定或校验端口失败，则说明监听失败，设置传输控制块状态 
+</span><span class='line'>&#9; * 为TCP_CLOSE状态 
+</span><span class='line'>&#9; */  
+</span><span class='line'>&#9;sk-&gt;sk_state = TCP_CLOSE;  
+</span><span class='line'>&#9;/* 
+</span><span class='line'>&#9; * 释放之前分配的inet_bind_bucket实例 
+</span><span class='line'>&#9; */  
+</span><span class='line'>&#9;__reqsk_queue_destroy(&icsk-&gt;icsk_accept_queue);  
+</span><span class='line'>&#9;return -EADDRINUSE;  
+</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
 
 
-<hr />
+<p>inet_csk_listen_start()首先调用reqsk_queue_alloc()来分配管理连接队的内存，如果分配成功，则开始初始化sock结构中与连接队列相关的成员，并将套接字的状态设置为LISTEN状态。在上述工作完成后，该函数还要检查当前套接字是否已经绑定本地协议地址，如果没有绑定，则内核会自动为套接字分配一个可用端口，当前这种情况一般不会发生，如果发生那就是你的服务器程序忘记调用bind()了。</p>
 
-<p><a href="http://stevenz.blog.hexun.com/16127677_d.html">http://stevenz.blog.hexun.com/16127677_d.html</a></p>
+<h4>四、reqsk_queue_alloc()函数</h4>
 
-<p>服务器IP：172.0.0.1，主机名：p470-1, 通过NFS共享/disk1目录</p>
-
-<p>在客户端使用 <code>mount -t nfs p470-1:/disk1 /disk1</code> 时出现</p>
+<p>reqsk_queue_alloc()的源码实现及分析如下所示：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>mount: mount to NFS server 'p470-1' failed: RPC Error: Program not registered.</span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* 
+</span><span class='line'> * 用来分配连接请求块散列表，然后将其连接到所在传输控制块的请求 
+</span><span class='line'> * 块容器中。 
+</span><span class='line'> */  
+</span><span class='line'>int reqsk_queue_alloc(struct request_sock_queue *queue,  
+</span><span class='line'>&#9;&#9;&#9;  unsigned int nr_table_entries)  
+</span><span class='line'>{  
+</span><span class='line'>&#9;size_t lopt_size = sizeof(struct listen_sock);  
+</span><span class='line'>&#9;struct listen_sock *lopt;  
+</span><span class='line'>  
+</span><span class='line'>&#9;/* 
+</span><span class='line'>&#9; * 取用户设定的连接队列长度最大值参数nr_table_entries和系统最多 
+</span><span class='line'>&#9; * 可同时存在未完成三次握手SYN请求数sysctl_max_syn_backlog两者的 
+</span><span class='line'>&#9; * 最小值，他们都用来控制连接队列的长度，只是前者针对某传输控制 
+</span><span class='line'>&#9; * 块，而后者控制的是全局的 
+</span><span class='line'>&#9; */  
+</span><span class='line'>&#9;nr_table_entries = min_t(u32, nr_table_entries, sysctl_max_syn_backlog);  
+</span><span class='line'>&#9;nr_table_entries = max_t(u32, nr_table_entries, 8);  
+</span><span class='line'>&#9;/* 
+</span><span class='line'>&#9; * 调用roundup_pow_of_two以确保nr_table_entries的值为2的n次方 
+</span><span class='line'>&#9; */  
+</span><span class='line'>&#9;nr_table_entries = roundup_pow_of_two(nr_table_entries + 1);  
+</span><span class='line'>&#9;/* 
+</span><span class='line'>&#9; * 计算用来保存SYN请求连接的listen_sock结构的大小 
+</span><span class='line'>&#9; */  
+</span><span class='line'>&#9;lopt_size += nr_table_entries * sizeof(struct request_sock *);  
+</span><span class='line'>&#9;if (lopt_size &gt; PAGE_SIZE)  
+</span><span class='line'>&#9;&#9;/* 
+</span><span class='line'>&#9;&#9; * 如果用于保存SYN请求连接的listen_sock结构大于一个页面， 
+</span><span class='line'>&#9;&#9; * 则调用__vmalloc()从高位内存中分配虚拟内存，并且清零 
+</span><span class='line'>&#9;&#9; */  
+</span><span class='line'>&#9;&#9;lopt = __vmalloc(lopt_size,  
+</span><span class='line'>&#9;&#9;&#9;GFP_KERNEL | __GFP_HIGHMEM | __GFP_ZERO,  
+</span><span class='line'>&#9;&#9;&#9;PAGE_KERNEL);  
+</span><span class='line'>&#9;else  
+</span><span class='line'>&#9;&#9;/* 
+</span><span class='line'>&#9;&#9; * 如果小于一个页面，则在常规内存中分配内存并清零。kzalloc() 
+</span><span class='line'>&#9;&#9; * 封装了kmalloc()及memset() 
+</span><span class='line'>&#9;&#9; */  
+</span><span class='line'>&#9;&#9;lopt = kzalloc(lopt_size, GFP_KERNEL);  
+</span><span class='line'>&#9;if (lopt == NULL)  
+</span><span class='line'>&#9;&#9;return -ENOMEM;  
+</span><span class='line'>&#9;/* 
+</span><span class='line'>&#9; * 从nr_table_entries = max_t(u32, nr_table_entries, 8);中可以看出 
+</span><span class='line'>&#9; * nr_table_entries最小值为8，所以这里从3开始 
+</span><span class='line'>&#9; */  
+</span><span class='line'>&#9;for (lopt-&gt;max_qlen_log = 3;  
+</span><span class='line'>&#9;&#9; (1 &lt;&lt; lopt-&gt;max_qlen_log) &lt; nr_table_entries;  
+</span><span class='line'>&#9;&#9; lopt-&gt;max_qlen_log++);  
+</span><span class='line'>  
+</span><span class='line'>&#9;/* 
+</span><span class='line'>&#9; * 初始化listen_sock结构中的一些成员，如用于生成连接请求块 
+</span><span class='line'>&#9; * 散列表的hash_rnd等 
+</span><span class='line'>&#9; */  
+</span><span class='line'>&#9;get_random_bytes(&lopt-&gt;hash_rnd, sizeof(lopt-&gt;hash_rnd));  
+</span><span class='line'>&#9;rwlock_init(&queue-&gt;syn_wait_lock);  
+</span><span class='line'>&#9;queue-&gt;rskq_accept_head = NULL;  
+</span><span class='line'>&#9;lopt-&gt;nr_table_entries = nr_table_entries;  
+</span><span class='line'>  
+</span><span class='line'>&#9;/* 
+</span><span class='line'>&#9; * 将散列表连接到所在传输控制块的请求块容器中 
+</span><span class='line'>&#9; */  
+</span><span class='line'>&#9;write_lock_bh(&queue-&gt;syn_wait_lock);  
+</span><span class='line'>&#9;queue-&gt;listen_opt = lopt;  
+</span><span class='line'>&#9;write_unlock_bh(&queue-&gt;syn_wait_lock);  
+</span><span class='line'>  
+</span><span class='line'>&#9;return 0;  
+</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
 
 
-<p>错误提示。</p>
+<p>从上面的代码中可以看到半连接队列长度的计算过程，nr_table_entries的值存储的就是计算的结果，这个值是基于listen()的第二个参数的值计算得到的。半连接队列的上限值的以2为底的对数存储在lopt的max_qlen_log成员中，对数的计算是通过下面的代码完成的，如下所示：</p>
 
-<p>出错原因：p470-1由于网络原因nfs服务被中断，重新开启p470-1的nfs服务然后在客户端重新mount disk1即可</p>
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>for (lopt-&gt;max_qlen_log = 3;  
+</span><span class='line'>&#9;&#9; (1 &lt;&lt; lopt-&gt;max_qlen_log) &lt; nr_table_entries;  
+</span><span class='line'>&#9;&#9; lopt-&gt;max_qlen_log++);  </span></code></pre></td></tr></table></div></figure>
 
-<p>service nfs restart 或 /etc/rc.d/init.d/nfs restart</p>
+
+<h4>五、结束语</h4>
+
+<p>在listen()系统调用中，第二个参数backlog对服务器的程序影响是很大的，而且不同的系统对这个参数的使用可能有所不同。前面我们也提到了，《Unix网络编程》中对第二参数backlog的描述是连接队列和半连接队列的长度之和不超过backlog，但是在Linux中并不是这样，限于篇幅，后面会单独写一篇关于backlog参数的分析文章来详细介绍。</p>
 </div>
   
   
@@ -1133,7 +2174,7 @@ bind() -> listen() -> accept() -> recv() -> send()</p>
   
     <section>
 <h1>Categories
-<span class='right_span'>(925)</span>
+<span class='right_span'>(943)</span>
 
 </h1>
 <head>
@@ -1164,8 +2205,8 @@ if (!document.getElementById('blog~octopress')) document.getElementById('aexp_bl
 if (!document.getElementById('blog')) document.getElementById('aexp_blog').style.visibility = 'hidden';
 if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ruby').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(151)</span></li>
-<div id='language' class='catsub'><li><a href='/blog/cats/language~c/?opendiv=language'>c</a><a href='##' onmousedown=showDiv('language~c') id='aexp_language~c'><span class='exp_style' id='exp_language~c'>[+]</span></a><span class='right_span'>32</span></li>
+<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(161)</span></li>
+<div id='language' class='catsub'><li><a href='/blog/cats/language~c/?opendiv=language'>c</a><a href='##' onmousedown=showDiv('language~c') id='aexp_language~c'><span class='exp_style' id='exp_language~c'>[+]</span></a><span class='right_span'>33</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~c')) document.getElementById('aexp_language~c').style.visibility = 'hidden';
 </script>
@@ -1181,7 +2222,7 @@ if (!document.getElementById('language~java')) document.getElementById('aexp_lan
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~jsp')) document.getElementById('aexp_language~jsp').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/language~php/?opendiv=language'>php</a><a href='##' onmousedown=showDiv('language~php') id='aexp_language~php'><span class='exp_style' id='exp_language~php'>[+]</span></a><span class='right_span'>50</span></li>
+<li><a href='/blog/cats/language~php/?opendiv=language'>php</a><a href='##' onmousedown=showDiv('language~php') id='aexp_language~php'><span class='exp_style' id='exp_language~php'>[+]</span></a><span class='right_span'>53</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~php')) document.getElementById('aexp_language~php').style.visibility = 'hidden';
 </script>
@@ -1189,7 +2230,7 @@ if (!document.getElementById('language~php')) document.getElementById('aexp_lang
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~python')) document.getElementById('aexp_language~python').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/language~web/?opendiv=language'>web</a><a href='##' onmousedown=showDiv('language~web') id='aexp_language~web'><span class='exp_style' id='exp_language~web'>[+]</span></a><span class='right_span'>48</span></li>
+<li><a href='/blog/cats/language~web/?opendiv=language'>web</a><a href='##' onmousedown=showDiv('language~web') id='aexp_language~web'><span class='exp_style' id='exp_language~web'>[+]</span></a><span class='right_span'>54</span></li>
 </div><script language='javascript' type='text/javascript'>
 if (!document.getElementById('language')) document.getElementById('aexp_language').style.visibility = 'hidden';
 if (!document.getElementById('language~web')) document.getElementById('aexp_language~web').style.visibility = 'hidden';
@@ -1218,7 +2259,7 @@ if (!document.getElementById('assembly~base')) document.getElementById('aexp_ass
 if (!document.getElementById('assembly')) document.getElementById('aexp_assembly').style.visibility = 'hidden';
 if (!document.getElementById('assembly~win')) document.getElementById('aexp_assembly~win').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(198)</span></li>
+<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(199)</span></li>
 <div id='tools' class='catsub'><li><a href='/blog/cats/tools~apache2/?opendiv=tools'>apache2</a><a href='##' onmousedown=showDiv('tools~apache2') id='aexp_tools~apache2'><span class='exp_style' id='exp_tools~apache2'>[+]</span></a><span class='right_span'>9</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~apache2')) document.getElementById('aexp_tools~apache2').style.visibility = 'hidden';
@@ -1235,7 +2276,7 @@ if (!document.getElementById('tools~ci')) document.getElementById('aexp_tools~ci
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~cloud')) document.getElementById('aexp_tools~cloud').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/tools~command/?opendiv=tools'>command</a><a href='##' onmousedown=showDiv('tools~command') id='aexp_tools~command'><span class='exp_style' id='exp_tools~command'>[+]</span></a><span class='right_span'>30</span></li>
+<li><a href='/blog/cats/tools~command/?opendiv=tools'>command</a><a href='##' onmousedown=showDiv('tools~command') id='aexp_tools~command'><span class='exp_style' id='exp_tools~command'>[+]</span></a><span class='right_span'>31</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~command')) document.getElementById('aexp_tools~command').style.visibility = 'hidden';
 </script>
@@ -1328,8 +2369,8 @@ if (!document.getElementById('tools~vim')) document.getElementById('aexp_tools~v
 if (!document.getElementById('tools')) document.getElementById('aexp_tools').style.visibility = 'hidden';
 if (!document.getElementById('tools~wxwork')) document.getElementById('aexp_tools~wxwork').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/system/'>system</a><a href='##' onmousedown=showDiv('system') id='aexp_system'><span class='exp_style' id='exp_system'>[+]</span></a><span class='right_span'>(114)</span></li>
-<div id='system' class='catsub'><li><a href='/blog/cats/system~base/?opendiv=system'>base</a><a href='##' onmousedown=showDiv('system~base') id='aexp_system~base'><span class='exp_style' id='exp_system~base'>[+]</span></a><span class='right_span'>25</span></li>
+<li class='catclass'><a href='/blog/cats/system/'>system</a><a href='##' onmousedown=showDiv('system') id='aexp_system'><span class='exp_style' id='exp_system'>[+]</span></a><span class='right_span'>(121)</span></li>
+<div id='system' class='catsub'><li><a href='/blog/cats/system~base/?opendiv=system'>base</a><a href='##' onmousedown=showDiv('system~base') id='aexp_system~base'><span class='exp_style' id='exp_system~base'>[+]</span></a><span class='right_span'>31</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('system~base')) document.getElementById('aexp_system~base').style.visibility = 'hidden';
 </script>
@@ -1345,7 +2386,7 @@ if (!document.getElementById('system~cgroup')) document.getElementById('aexp_sys
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('system~docker')) document.getElementById('aexp_system~docker').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/system~fs/?opendiv=system'>fs</a><a href='##' onmousedown=showDiv('system~fs') id='aexp_system~fs'><span class='exp_style' id='exp_system~fs'>[+]</span></a><span class='right_span'>11</span></li>
+<li><a href='/blog/cats/system~fs/?opendiv=system'>fs</a><a href='##' onmousedown=showDiv('system~fs') id='aexp_system~fs'><span class='exp_style' id='exp_system~fs'>[+]</span></a><span class='right_span'>12</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('system~fs')) document.getElementById('aexp_system~fs').style.visibility = 'hidden';
 </script>
@@ -1567,7 +2608,7 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 
 <section>
 <h1>Date Categories
-<span class='right_span'>(925)</span>
+<span class='right_span'>(943)</span>
 
 </h1>
 <head>
@@ -1575,8 +2616,9 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(45)</span></li>
-<div id='2024' class='catsub'><li><a href='/blog/cats/2024~07/?opendiv=2024'>2024-07</a><span class='right_span'>22</span></li>
+<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(63)</span></li>
+<div id='2024' class='catsub'><li><a href='/blog/cats/2024~08/?opendiv=2024'>2024-08</a><span class='right_span'>14</span></li>
+<li><a href='/blog/cats/2024~07/?opendiv=2024'>2024-07</a><span class='right_span'>26</span></li>
 <li><a href='/blog/cats/2024~06/?opendiv=2024'>2024-06</a><span class='right_span'>2</span></li>
 <li><a href='/blog/cats/2024~05/?opendiv=2024'>2024-05</a><span class='right_span'>5</span></li>
 <li><a href='/blog/cats/2024~04/?opendiv=2024'>2024-04</a><span class='right_span'>5</span></li>
@@ -1723,7 +2765,7 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 <h1>Tags</h1>
 <ul class="tag-cloud">
 <a style="font-size: 124%" href="/tags/10gb/">10gb(7)</a>
-<a style="font-size: 114%" href="/tags/lvm/">LVM(5)</a>
+<a style="font-size: 119%" href="/tags/lvm/">LVM(6)</a>
 <a style="font-size: 100%" href="/tags/chrome-debug/">chrome_debug(3)</a>
 <a style="font-size: 131%" href="/tags/gdb/">gdb(9)</a>
 <a style="font-size: 127%" href="/tags/git/">git(8)</a>
@@ -1745,43 +2787,43 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
   <ul id="recent_posts">
     
       <li class="post">
-        <a href="/blog/2024/07/31/lvm-attr/">LVM 输出更多信息</a>
+        <a href="/blog/2024/08/15/lang-web-js-copy/">禁止网页内容复制另存为</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/31/lvm-pvmove/">LVM 缩减 VG 大小 ( pvmove )</a>
+        <a href="/blog/2024/08/15/lang-web-iframe/">iframe网页嵌套</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/31/lang-web-override/">Chrome浏览器使用Overrides调试线上代码</a>
+        <a href="/blog/2024/08/15/lang-web-auto-textarea/">textarea自动调整高宽</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/31/lang-web-fetch/">fetch使用介绍, chrome如何重新提交请求并且更改参数</a>
+        <a href="/blog/2024/08/09/ntpd-log/">NTP log 记录每次发包</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/31/lang-web-95598/">95598停电公告信息抓取</a>
+        <a href="/blog/2024/08/09/ntpd/">NTP服务配置</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/30/lang-php-sm1234/">sm1、sm2、sm3、sm4简单介绍</a>
+        <a href="/blog/2024/08/09/lang-date/">unix时间戳, excel date, 儒略日julian date</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/30/lang-php-sm2/">php sm2</a>
+        <a href="/blog/2024/08/09/lang-web-times/">&amp;times被替换成x</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/30/lang-php-sm3/">php sm3</a>
+        <a href="/blog/2024/08/09/lang-c-localtime/">localtime函数</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/30/lang-php-bgcolor/">php spreadsheet 填充背景色</a>
+        <a href="/blog/2024/08/02/ups-webpower/">山特UPS NMC卡 USHA卡</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/30/lang-php-mb/">php统计文章字数</a>
+        <a href="/blog/2024/08/01/lang-web-holiday/">节假日 API</a>
       </li>
     
   </ul>

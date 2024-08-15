@@ -34,7 +34,7 @@
 </hgroup>
 
 </header>
-  <nav role="navigation" style='white-space: nowrap; min-width=1120px;'><form action="/search" method="get">
+  <nav role="navigation" style='white-space: nowrap; min-width=1120px; position: sticky; top: 0; z-index: 999;'><form action="/search" method="get">
     <input class="search" name="query" id="query" type="text" placeholder="search..." style="height:1.5em;">
     <input id="btnSubmit" value="search" type="submit">
 </form>
@@ -131,7 +131,7 @@ var ss360Config = {
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2015/02/09/system-base-attr/">隐藏权限--无法添加用户和组等</a></h2>
+      <h2 class="entry-title"><a href="/blog/2015/03/19/kernel-net-rcv_wnd/">TCP接收窗口的调整算法</a></h2>
     
     
       <p class="meta">
@@ -140,35 +140,30 @@ var ss360Config = {
 
 
 
-<time class='entry-date' datetime='2015-02-09T15:59:00+08:00'><span class='date'>2015-02-09</span> <span class='time'>15:59:00</span></time>
+<time class='entry-date' datetime='2015-03-19T17:42:00+08:00'><span class='date'>2015-03-19</span> <span class='time'>17:42:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><p>执行命令：</p>
+  <div class="entry-content"><p><a href="http://blog.csdn.net/zhangskd/article/details/8588202">TCP接收窗口的调整算法（上）</a><br/>
+<a href="http://blog.csdn.net/zhangskd/article/details/8602493">TCP接收窗口的调整算法（中）</a><br/>
+<a href="http://blog.csdn.net/zhangskd/article/details/8603099">TCP接收窗口的调整算法（下）</a></p>
 
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>[root@localhost softwaretools]# groupadd mysql
-</span><span class='line'>groupadd：无法打开组文件（groupadd: unable to open group file）</span></code></pre></td></tr></table></div></figure>
+<hr />
 
+<h3>TCP接收窗口的调整算法（上）</h3>
 
-<p>此时就奇怪了，当前用的明明是root用户，为什么没有创建组和用户的权限呢。</p>
+<p>我们知道TCP首部中有一个16位的接收窗口字段，它可以告诉对端：我现在能接收多少数据。TCP的流控制主要就是通过调整接收窗口的大小来进行的。</p>
 
-<p>结论：
-  1，添加用户需要用到passwd和shadow这两个文件<br/>
-  2，添加组需要用到shadow和gshadow这两个文件</p>
+<p>本文内容：分析TCP接收窗口的调整算法，包括一些相关知识和初始接收窗口的取值。</p>
 
-<p>使用 ls -l 命令发现权限正常。</p>
+<p>内核版本：3.2.12</p>
 
-<p>最终发现问题，找到了2个命令（lsattr和chattr），是因为隐藏权限在作怪：<br/>
-对这2个命令的简单做下说明：<br/>
-  对于某些有特殊要求的档案(如服务器日志)还可以追加隐藏权限的设定。这些隐藏权限包括： Append only (a), compressed &copy;, no dump (d), immutable (i), data journalling (j),secure deletion (s), no tail-merging (t), undeletable (u), no atime updates (A), synchronous directory updates (D), synchronous updates (S), and top of directory hierarchy (T).  <br/>
-  lsattr命令是查看隐藏权限设定情况的，chattr是变更隐藏权限的命令。</p>
+<h4>数据结构</h4>
 
-<p>首先使用使用lsattr查看了一下这几个文件：</p>
+<p>以下是涉及到的数据结构。</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -178,84 +173,39 @@ var ss360Config = {
 <span class='line-number'>6</span>
 <span class='line-number'>7</span>
 <span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>[root@localhost ~]# lsattr /etc/passwd  
-</span><span class='line'>------------- /etc/passwd  
-</span><span class='line'>[root@localhost ~]# lsattr /etc/group  
-</span><span class='line'>----i-------- /etc/group  
-</span><span class='line'>[root@localhost ~]# lsattr /etc/shadow  
-</span><span class='line'>------------- /etc/shadow  
-</span><span class='line'>[root@localhost ~]# lsattr /etc/gshadow  
-</span><span class='line'>----i-------- /etc/gshadow  </span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct tcp_sock {  
+</span><span class='line'>&#9;...  
+</span><span class='line'>&#9;/* 最早接收但未确认的段的序号，即当前接收窗口的左端*/  
+</span><span class='line'>&#9;u32 rcv_wup; /* rcv_nxt on last window update sent */  
+</span><span class='line'>&#9;u16 advmss; /* Advertised MSS. 本端能接收的MSS上限，建立连接时用来通告对端*/  
+</span><span class='line'>&#9;u32 rcv_ssthresh; /* Current window clamp. 当前接收窗口大小的阈值*/  
+</span><span class='line'>&#9;u32 rcv_wnd; /* Current receiver window，当前的接收窗口大小*/  
+</span><span class='line'>&#9;u32 window_clamp; /* 接收窗口的最大值，这个值也会动态调整*/  
+</span><span class='line'>&#9;...  
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
-<p>可以看到文件被设置的 i 这个隐藏权限，<br/>
-i：设定文件不能被删除、改名、设定链接关系，同时不能写入或新增内容。<br/>
-i参数对于文件 系统的安全设置有很大帮助。</p>
 
-<p>既然这样只要把i权限去掉就应该好了。</p>
-
-<p>使用命令chattr命令修改文件隐藏权限，执行如下命令：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>chattr -i /etc/gshadow
-</span><span class='line'>chattr -i /etc/group</span></code></pre></td></tr></table></div></figure>
-
-
-<p>然后可以正常执行了。</p>
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/02/09/kernel-mm-shm3/">Linux的IPC命令 查看共享内存</a></h2>
-    
-    
-      <p class="meta">
-        
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct tcp_options_received {  
+</span><span class='line'>&#9;...  
+</span><span class='line'>&#9;&#9;snd_wscale : 4, /* Window scaling received from sender, 对端接收窗口扩大因子 */  
+</span><span class='line'>&#9;&#9;rcv_wscale : 4; /* Window scaling to send to receiver, 本端接收窗口扩大因子 */  
+</span><span class='line'>&#9;u16 user_mss; /* mss requested by user in ioctl */  
+</span><span class='line'>&#9;u16 mss_clamp; /* Maximal mss, negotiated at connection setup，对端的最大mss */  
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
 
-
-<time class='entry-date' datetime='2015-02-09T15:46:00+08:00'><span class='date'>2015-02-09</span> <span class='time'>15:46:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://www.cnblogs.com/cocowool/archive/2012/05/22/2513027.html">http://www.cnblogs.com/cocowool/archive/2012/05/22/2513027.html</a></p>
-
-<h4>进程间通信概述</h4>
-
-<p>进程间通信有如下的目的：<br/>
-1、数据传输，一个进程需要将它的数据发送给另一个进程，发送的数据量在一个字节到几M之间；<br/>
-2、共享数据，多个进程想要操作共享数据，一个进程对数据的修改，其他进程应该立刻看到；<br/>
-3、通知事件，一个进程需要向另一个或一组进程发送消息，通知它们发生了某件事情；<br/>
-4、资源共享，多个进程之间共享同样的资源。为了做到这一点，需要内核提供锁和同步机制；<br/>
-5、进程控制，有些进程希望完全控制另一个进程的执行（如Debug进程），此时控制进程希望能够拦截另一个进程的所有陷入和异常，并能够及时知道它的状态改变。</p>
-
-<p>Linux进程间通信由以下几部分发展而来：<br/>
-早期UNIX进程间通信：包括管道、FIFO、信号。<br/>
-基于System V的进程间通信：包括System V消息队列、System V信号灯（Semaphore）、System V共享内存。<br/>
-基于Socket进程间通信。<br/>
-基于POSIX进程间通信：包括POSIX消息队列、POSIX信号灯、POSIX共享内存。<br/>
-Linux中，与IPC相关的命令包括：ipcs、ipcrm（释放IPC）、</p>
-
-<p>IPCS命令是Linux下显示进程间通信设施状态的工具。我们知道，系统进行进程间通信（IPC）的时候，可用的方式包括信号量、共享内存、消息队列、管道、信号（signal）、套接字等形式[2]。使用IPCS可以查看共享内存、信号量、消息队列的状态。</p>
-
-<p>例如在CentOS6.0上执行ipcs</p>
-
-<p><img src="/images/kernel/2015-02-09-2.png" alt="" /></p>
-
-<p>具体的用法总结如下：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -284,70 +234,43 @@ Linux中，与IPC相关的命令包括：ipcs、ipcrm（释放IPC）、</p>
 <span class='line-number'>25</span>
 <span class='line-number'>26</span>
 <span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>1、显示所有的IPC设施
-</span><span class='line'># ipcs -a
-</span><span class='line'>
-</span><span class='line'>2、显示所有的消息队列Message Queue
-</span><span class='line'># ipcs -q
-</span><span class='line'>
-</span><span class='line'>3、显示所有的信号量
-</span><span class='line'># ipcs -s
-</span><span class='line'>
-</span><span class='line'>4、显示所有的共享内存
-</span><span class='line'># ipcs -m
-</span><span class='line'>
-</span><span class='line'>5、显示IPC设施的详细信息
-</span><span class='line'># ipcs -q -i id
-</span><span class='line'>id 对应shmid、semid、msgid等。-q对应设施的类型（队列），查看信号量详细情况使用-s，查看共享内存使用-m。
-</span><span class='line'>
-</span><span class='line'>6、显示IPC设施的限制大小
-</span><span class='line'># ipcs -m -l
-</span><span class='line'>-m对应设施类型，可选参数包括-q、-m、-s。
-</span><span class='line'>
-</span><span class='line'>7、显示IPC设施的权限关系
-</span><span class='line'># ipcs -c
-</span><span class='line'># ipcs -m -c
-</span><span class='line'># ipcs -q -c
-</span><span class='line'># ipcs -s -c
-</span><span class='line'>
-</span><span class='line'>8、显示最近访问过IPC设施的进程ID。
-</span><span class='line'># ipcs -p
-</span><span class='line'># ipcs -m -p
-</span><span class='line'># ipcs -q -p
-</span><span class='line'>
-</span><span class='line'>9、显示IPC设施的最后操作时间
-</span><span class='line'># ipcs -t
-</span><span class='line'># ipcs -q -t
-</span><span class='line'># ipcs -m -t
-</span><span class='line'># ipcs -s -t
-</span><span class='line'>
-</span><span class='line'>10、显示IPC设施的当前状态
-</span><span class='line'># ipcs -u</span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/** 
+</span><span class='line'> * struct sock - network layer representation of sockets 
+</span><span class='line'> * @sk_rcvbuf: size of receive buffer in bytes 
+</span><span class='line'> * @sk_receive_queue: incoming packets 
+</span><span class='line'> * @sk_write_queue: packet sending queue 
+</span><span class='line'> * @sk_sndbuf: size of send buffer in bytes 
+</span><span class='line'> */  
+</span><span class='line'>struct sock {  
+</span><span class='line'>&#9;...  
+</span><span class='line'>&#9;struct sk_buff_head sk_receive_queue;  
+</span><span class='line'>&#9;/* 表示接收队列sk_receive_queue中所有段的数据总长度*/  
+</span><span class='line'>#define sk_rmem_alloc sk_backlog.rmem_alloc  
+</span><span class='line'>  
+</span><span class='line'>&#9;int sk_rcvbuf; /* 接收缓冲区长度的上限*/  
+</span><span class='line'>&#9;int sk_sndbuf; /* 发送缓冲区长度的上限*/  
+</span><span class='line'>  
+</span><span class='line'>&#9;struct sk_buff_head sk_write_queue;  
+</span><span class='line'>&#9;...  
+</span><span class='line'>}  
+</span><span class='line'>  
+</span><span class='line'>struct sk_buff_head {  
+</span><span class='line'>&#9;/* These two members must be first. */  
+</span><span class='line'>&#9;struct sk_buff *next;  
+</span><span class='line'>&#9;struct sk_buff *prev;  
+</span><span class='line'>&#9;__u32 qlen;  
+</span><span class='line'>&#9;spinlock_t lock;  
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
 
 
-<p>Linux上的ipcs命令，不支持UNIX上的-b、-o指令，同样UNIX中不支持-l、-u指令，所以在编写跨平台的脚本时，需要注意这个问题。</p>
 
-<h4>参考资料：</h4>
 
-<p>1、<a href="http://wenku.baidu.com/view/58048caddd3383c4bb4cd26f.html">Linux下IPCS的用法详解</a><br/>
-2、<a href="http://www.cnblogs.com/linshui91/archive/2010/09/29/1838770.html">Linux进程间通信</a><br/>
-3、<a href="http://blog.csdn.net/bonny95/article/details/6442821">Linux下IPCS的10种用法</a><br/>
-4、<a href="http://www.linuxdiyf.com/viewarticle.php?id=6783">Linux IPC小结</a><br/>
-5、<a href="http://www.cnblogs.com/wangkangluo1/archive/2012/05/14/2498786.html">Linux IPC总结</a></p>
 </div>
   
+  
+    <footer>
+      <a rel="full-article" target="_blank" href="/blog/2015/03/19/kernel-net-rcv_wnd/">Read on &rarr;</a>
+    </footer>
   
 
 
@@ -358,7 +281,7 @@ Linux中，与IPC相关的命令包括：ipcs、ipcrm（释放IPC）、</p>
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2015/02/09/kernel-mm-shm2/">修改共享内存大小</a></h2>
+      <h2 class="entry-title"><a href="/blog/2015/03/19/kernel-net-sack-dsack/">TCP的核心系列 — SACK和DSACK的实现</a></h2>
     
     
       <p class="meta">
@@ -367,14 +290,50 @@ Linux中，与IPC相关的命令包括：ipcs、ipcrm（释放IPC）、</p>
 
 
 
-<time class='entry-date' datetime='2015-02-09T15:33:00+08:00'><span class='date'>2015-02-09</span> <span class='time'>15:33:00</span></time>
+<time class='entry-date' datetime='2015-03-19T16:27:00+08:00'><span class='date'>2015-03-19</span> <span class='time'>16:27:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><p><a href="http://blog.csdn.net/l_yangliu/article/details/11193187">http://blog.csdn.net/l_yangliu/article/details/11193187</a></p>
+  <div class="entry-content"><p><a href="http://blog.csdn.net/zhangskd/article/details/9613347">TCP的核心系列 — SACK和DSACK的实现（一）</a><br/>
+<a href="http://blog.csdn.net/zhangskd/article/details/8979718">TCP的核心系列 — SACK和DSACK的实现（二）</a><br/>
+<a href="http://blog.csdn.net/zhangskd/article/details/9706113">TCP的核心系列 — SACK和DSACK的实现（三）</a><br/>
+<a href="http://blog.csdn.net/zhangskd/article/details/9766895">TCP的核心系列 — SACK和DSACK的实现（四）</a><br/>
+<a href="http://blog.csdn.net/zhangskd/article/details/9768315">TCP的核心系列 — SACK和DSACK的实现（五）</a><br/>
+<a href="http://blog.csdn.net/zhangskd/article/details/9768519">TCP的核心系列 — SACK和DSACK的实现（六）</a><br/>
+<a href="http://blog.csdn.net/zhangskd/article/details/9698901">TCP的核心系列 — SACK和DSACK的实现（七）</a></p>
+
+<hr />
+
+<h3>TCP的核心系列 — SACK和DSACK的实现（一）</h3>
+
+<p>TCP的实现中，SACK和DSACK是比较重要的一部分。</p>
+
+<p>SACK和DSACK的处理部分由Ilpo Järvinen (<a href="&#x6d;&#x61;&#x69;&#108;&#116;&#x6f;&#x3a;&#x69;&#x6c;&#112;&#x6f;&#x2e;&#106;&#97;&#114;&#x76;&#x69;&#110;&#x65;&#110;&#64;&#104;&#x65;&#x6c;&#115;&#x69;&#110;&#x6b;&#105;&#x2e;&#102;&#x69;">&#105;&#x6c;&#x70;&#111;&#x2e;&#x6a;&#x61;&#114;&#x76;&#105;&#x6e;&#101;&#110;&#64;&#x68;&#x65;&#108;&#115;&#x69;&#110;&#x6b;&#x69;&#46;&#x66;&#105;</a>) 维护。</p>
+
+<p>tcp_ack()处理接收到的带有ACK标志的数据段时，如果此ACK处于慢速路径，且此ACK的记分牌不为空，则调用<br/>
+tcp_sacktag_write_queue()来根据SACK选项标记发送队列中skb的记分牌状态。</p>
+
+<p>笔者主要分析18和37这两个版本的实现。<br/>
+相对而言，18版本的逻辑清晰，但效率较低；37版本的逻辑复杂，但效率较高。</p>
+
+<p>本文主要内容：18版tcp_sacktag_write_queue()的实现，也即18版SACK和DSACK的实现。</p>
+
+<h4>18版数据结构</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* 这就是一个SACK块 */
+</span><span class='line'>struct tcp_sack_block {
+</span><span class='line'>&#9;u32 start_seq;  /* 起始序号 */
+</span><span class='line'>&#9;u32 end_seq;    /* 结束序号 */
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -386,85 +345,179 @@ Linux中，与IPC相关的命令包括：ipcs、ipcrm（释放IPC）、</p>
 <span class='line-number'>8</span>
 <span class='line-number'>9</span>
 <span class='line-number'>10</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>beijibing@bjb-desktop:/proc/sys/kernel$ cat shmmax 
-</span><span class='line'>33554432
-</span><span class='line'>beijibing@bjb-desktop:/proc/sys/kernel$ cat shmmni
-</span><span class='line'>4096
-</span><span class='line'>beijibing@bjb-desktop:/proc/sys/kernel$ cat msgmax
-</span><span class='line'>8192
-</span><span class='line'>beijibing@bjb-desktop:/proc/sys/kernel$ cat msgmni
-</span><span class='line'>622
-</span><span class='line'>beijibing@bjb-desktop:/proc/sys/kernel$ cat msgmnb
-</span><span class='line'>16384</span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct tcp_sock {
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;/* Options received (usually on last packet, some only on SYN packets). */
+</span><span class='line'>&#9;struct tcp_options_received rx_opt;
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;struct tcp_sack_block recv_sack_cache[4]; /* 保存收到的SACK块，用于提高效率*/
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;/* 快速路径中使用，上次第一个SACK块的结束处，现在直接从这里开始处理 */
+</span><span class='line'>&#9;struct sk_buff *fastpath_skb_hint;
+</span><span class='line'>&#9;int fastpath_cnt_hint;  /* 快速路径中使用，上次记录的fack_count，现在继续累加 */
+</span><span class='line'>&#9;...
+</span><span class='line'>
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
 
 
-<h4>System V IPC 参数</h4>
 
-<table border="1">
-<tr>
-    <th>名字</th> <th>描述</th> <th>合理取值</th>
-</tr>
-<tr>
-    <td>SHMMAX</td> <td>最大共享内存段尺寸（字节）</td> <td>最少若干兆（见文本）</td>
-</tr>
-<tr>
-    <td>SHMMIN</td> <td>最小共享内存段尺寸（字节）</td> <td>1</td>
-</tr>
-<tr>
-    <td>SHMALL</td> <td>可用共享内存的总数量（字节或者页面）</td> <td>如果是字节，就和 SHMMAX 一样；如果是页面，ceil(SHMMAX/PAGE_SIZE)</td>
-</tr>
-<tr>
-    <td>SHMSEG</td> <td>每进程最大共享内存段数量</td> <td>只需要 1 个段，不过缺省比这高得多。</td>
-</tr>
-<tr>
-    <td>SHMMNI</td> <td>系统范围最大共享内存段数量</td> <td>类似 SHMSEG 加上用于其他应用的空间</td>
-</tr>
-<tr>
-    <td>SEMMNI</td> <td>信号灯标识符的最小数量（也就是说，套）</td> <td>至少 ceil(max_connections / 16)</td>
-</tr>
-<tr>
-    <td>SEMMNS</td> <td>系统范围的最大信号灯数量</td> <td>ceil(max_connections / 16) * 17 加上用于其他应用的空间</td>
-</tr>
-<tr>
-    <td>SEMMSL</td> <td>每套信号灯最小信号灯数量</td> <td>至少 17</td>
-</tr>
-<tr>
-    <td>SEMMAP</td> <td>信号灯映射里的记录数量</td> <td>参阅文本</td>
-</tr>
-<tr>
-    <td>SEMVMX</td> <td>信号灯的最大值</td> <td>至少 1000 （缺省通常是32767，除非被迫，否则不要修改）</td>
-</tr>
-</table>
-
-
-<p>  最重要的共享内存参数是 SHMMAX ， 以字节记的共享内存段可拥有的最大尺寸。如果你收到来自shmget 的类似Invalid argument 这样的错误信息，那么很有可能是你超过限制了。</p>
-
-<p>  有些系统对系统里面共享内存的总数（SHMALL ）还有限制。 请注意这个数值必须足够大。（注意：SHMALL 在很多系统上是用页面数，而不是字节数来计算的。）</p>
-
-<p>  系统里的最大信号灯数目是由SEMMNS 设置的，因此这个值应该至少和 max_connections 设置一样大，并且每十六个联接还要另外加一个。  参数SEMMNI 决定系统里一次可以存在的信号灯集的数目。 因此这个参数至少应该为 ceil(max_connections % 16) 。降低允许的联接数目是一个临时的绕开失败的方法，这个启动失败通常被来自函数semget 的错误响应 No space left on device 搞得很让人迷惑。</p>
-
-<p>  有时候还可能有必要增大SEMMAP ，使之至少按照 SEMMNS 配置。这个参数定义信号灯资源映射的尺寸，可用的每个连续的信号灯块在这个映射中存放一条记录。每当一套信号灯被释放，那么它要么会加入到该映射中一条相连的已释放的块的入口中，要么注册成一条新的入口。如果映射填满了碎片，那么被释放的信号灯就丢失了（除非重起）。因此时间长信号灯空间的碎片了会导致可用的信号灯比应该有的信号灯少。</p>
-
-<p>SEMMSL 参数，决定一套信号灯里可以有多少信号灯，</p>
-
-<h4>更改方法</h4>
-
-<p>  缺省设置只适合小安装（缺省最大共享内存是 32 MB）。不过，其它的缺省值都相当大，通常不需要改变。最大的共享内存段设置可以用 sysctl 接口设置。 比如，要允许 128 MB，并且最大的总共享内存数为 2097152 页（缺省）：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>$ sysctl -w kernel.shmmax=134217728
-</span><span class='line'>$ sysctl -w kernel.shmall=2097152</span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct tcp_options_received {
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;u16 saw_tstamp : 1,    /* Saw TIMESTAMP on last packet */
+</span><span class='line'>&#9;&#9;tstamp_ok : 1,     /* TIMESTAMP seen on SYN packet */
+</span><span class='line'>&#9;&#9;dsack : 1,         /* D-SACK is scheduled, 下一个发送段是否存在D-SACK */
+</span><span class='line'>&#9;&#9;sack_ok : 4,       /* SACK seen on SYN packet, 接收方是否支持SACK */
+</span><span class='line'>&#9;&#9;...
+</span><span class='line'>&#9;u8 num_sacks;          /* Number of SACK blocks, 下一个发送段中SACK块数 */
+</span><span class='line'>&#9;...
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
 
 
-<p>  你可以把这些设置放到 /etc/sysctl.conf 里，在重启后保持有效。</p>
 
-<p>  老版本里可能没有 sysctl 程序，但是同样的改变可以通过操作 /proc 文件系统来做：</p>
+
+</div>
+  
+  
+    <footer>
+      <a rel="full-article" target="_blank" href="/blog/2015/03/19/kernel-net-sack-dsack/">Read on &rarr;</a>
+    </footer>
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2015/03/13/kernel-sched-rt/">linux进程调度之FIFO和RR调度策略</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-03-13T00:00:00+08:00'><span class='date'>2015-03-13</span> <span class='time'>00:00:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://blog.chinaunix.net/uid-24774106-id-3379478.html">http://blog.chinaunix.net/uid-24774106-id-3379478.html</a></p>
+
+<p>严格地说，对于优先级对于实时进程和普通进程的意义是不一样的。</p>
+
+<p>1、在一定程度上，实时进程优先级高，实时进程存在，就没有普通进程占用CPU的机会，（但是前一篇博文也讲过了，实时组调度出现在内核以后，允许普通进程占用少量的CPU时间,取决于配置)。</p>
+
+<p>2、对于实时进程而言，高优先级的进程存在，低优先级的进程是轮不上的，没机会跑在CPU上，所谓实时进程的调度策略,指的是相同优先级之间的调度策略。如果是FIFO实时进程在占用CPU，除非出现以下事情，否则FIFO一条道跑到黑。<br/>
+  a）FIFO进程良心发现，调用了系统调用sched_yield 自愿让出CPU<br/>
+  b) 更高优先级的进程横空出世，抢占FIFO进程的CPU。有些人觉得很奇怪，怎么FIFO占着CPU，为啥还能有更高优先级的进程出现呢。别忘记，我们是多核多CPU ,如果其他CPU上出现了一个比FIFO优先级高的进程，可能会push到FIFO进程所在的CPU上。<br/>
+  c) FIFO进程停止（TASK_STOPPED or TASK_TRACED状态）或者被杀死（EXIT_ZOMBIE or EXIT_DEAD状态）<br/>
+  d) FIFO进程执行了阻塞调用并进入睡眠（TASK_INTERRUPTIBLE OR TASK_UNINTERRUPTIBLE）。</p>
+
+<p>  如果是进程的调度策略是时间片轮转RR，那么，除了前面提到的abcd，RR实时进程耗尽自己的时间片后，自动退到对应优先级实时队列的队尾，重新调度。</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>$ echo 134217728 &gt; /proc/sys/kernel/shmmax
-</span><span class='line'>$ echo 2097152 &gt; /proc/sys/kernel/shmall</span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct sched_param {
+</span><span class='line'>&#9;/* ... */
+</span><span class='line'>&#9;int sched_priority;
+</span><span class='line'>&#9;/* ... */
+</span><span class='line'>};
+</span><span class='line'>int sched_setscheduler (pid_t pid,
+</span><span class='line'>&#9;&#9;&#9;&#9;int policy,
+</span><span class='line'>&#9;&#9;&#9;&#9;const struct sched_param *sp);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  sched_setscheduler函数的第二个参数调度方法 ：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define SCHED_OTHER 0
+</span><span class='line'>#define SCHED_FIFO 1
+</span><span class='line'>#define SCHED_RR 2
+</span><span class='line'>#ifdef __USE_GNU
+</span><span class='line'># define SCHED_BATCH 3
+</span><span class='line'>#endif</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  SCHED_OTHER表示普通进程，对于普通进程，第三个参数sp->sched_priority只能是0<br/>
+  SCHED_FIFO 和SCHED_RR表示实时进程的调度策略，第三个参数的取值范围为[1,99]。<br/>
+  如果sched_setscheduler 优先级设置的值和调度策略不符合的话，会返回失败的。</p>
+
+<p>应用层和内核层的优先级含义是不同的：<br/>
+  首先说实时进程：实时进程的优先级设置可以通过sched_setsheduler设置，也可以通过sched_setparam设置优先级的大小。
+int sched_setparam (pid_t pid, const struct sched_param *sp);</p>
+
+<p>  在用户层或者应用层，1表示优先级最低，99表示优先级最高。但是在内核中，[0,99]表示的实时进程的优先级，0最高，99最低。[100,139]是普通进程折腾的范围。应用层比较天真率直，就看大小，数字大，则优先级高。ps查看进程的优先级也是如此。有意思的是，应用层实时进程最高优先级的99，在ps看进程优先级的时候，输出的是139.</p>
+
+<p>  对于普通进程，是通过nice系统调用来调整优先级的。从内核角度讲[100,139]是普通进程的优先级的范围，100最高，139最低，默认是120。普通进程的优先级的作用和实时进程不同，普通进程优先级表示的是占的CPU时间。深入linux内核架构中提到，普通优先级越高（100最高，139最低），享受的CPU time越多，相邻的两个优先级，高一级的进程比低一级的进程多占用10%的CPU，比如内核优先级数值为120的进程要比数值是121的进程多占用10%的CPU。</p>
+
+<p>  内核中有一个数组：prio_to_weight[20]表示的是默认优先级120的权重，数值为1024，prio_to_weight[21]表示nice值为1，优先级为121的进程的权重，数值为820。这就到了CFS的原理了</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static const int prio_to_weight[40] = {
+</span><span class='line'> /* -20 */ 88761, 71755, 56483, 46273, 36291,
+</span><span class='line'> /* -15 */ 29154, 23254, 18705, 14949, 11916,
+</span><span class='line'> /* -10 */ 9548, 7620, 6100, 4904, 3906,
+</span><span class='line'> /* -5 */ 3121, 2501, 1991, 1586, 1277,
+</span><span class='line'> /* 0 */ 1024, 820, 655, 526, 423,
+</span><span class='line'> /* 5 */ 335, 272, 215, 172, 137,
+</span><span class='line'> /* 10 */ 110, 87, 70, 56, 45,
+</span><span class='line'> /* 15 */ 36, 29, 23, 18, 15,
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  假如有1台电脑，10个人玩，怎么才公平。<br/>
+  1 约定好时间片，每人玩1小时，玩完后记账，张XX 1小时，谁玩的时间短，谁去玩<br/>
+  2 引入优先级的概念，李四有紧急情况，需要提高他玩电脑的时间，怎么办，玩1个小时，记账半小时，那么同等情况下，李四会比其他人被选中玩电脑的频率要高，就体现了这个优先级的概念。<br/>
+  3  王五也有紧急情况，但是以考察，不如李四的紧急，好吧，玩1个小时，记账45分钟。<br/>
+  4  情况有变化，听说这里有电脑，突然又来了10个人，如果按照每人玩1小时的时间片，排在最后的那哥们早就开始骂人了，怎么办？时间片动态变化，根据人数来确定时间片。人越多，每个人玩的时间越少，防止哥们老捞不着玩，耐心耗尽，开始骂人。</p>
+
+<p>  这个记账就是我们prio_to_weight的作用。我就不多说了，prio_to_weight[20]就是基准，玩一小时，记账一小时，数组20以前的值是特权一级，玩1小时记账20分钟之类的享有特权的，数组20之后是倒霉蛋，玩1小时，记账1.5小时之类的倒霉蛋。 CFS这种调度好在大家都能捞着玩。</p>
+
+<p>对于FIFO而言，一旦sleep过后，高优先级运行，低优先级是没戏运行的，同等优先级的进程，先运行的不运行完，后运行的也没戏。<br/>
+对于RR而言，高优先级的先运行，同等优先级的进程过家家，你玩完，我玩，我玩完你再玩，每个进程耗费一个时间片的时间。对于Linux，RR时间片是100ms：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define DEF_TIMESLICE        (100 * HZ / 1000)</span></code></pre></td></tr></table></div></figure>
 
 
 
@@ -489,7 +542,7 @@ Linux中，与IPC相关的命令包括：ipcs、ipcrm（释放IPC）、</p>
   
     <section>
 <h1>Categories
-<span class='right_span'>(925)</span>
+<span class='right_span'>(943)</span>
 
 </h1>
 <head>
@@ -520,8 +573,8 @@ if (!document.getElementById('blog~octopress')) document.getElementById('aexp_bl
 if (!document.getElementById('blog')) document.getElementById('aexp_blog').style.visibility = 'hidden';
 if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ruby').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(151)</span></li>
-<div id='language' class='catsub'><li><a href='/blog/cats/language~c/?opendiv=language'>c</a><a href='##' onmousedown=showDiv('language~c') id='aexp_language~c'><span class='exp_style' id='exp_language~c'>[+]</span></a><span class='right_span'>32</span></li>
+<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(161)</span></li>
+<div id='language' class='catsub'><li><a href='/blog/cats/language~c/?opendiv=language'>c</a><a href='##' onmousedown=showDiv('language~c') id='aexp_language~c'><span class='exp_style' id='exp_language~c'>[+]</span></a><span class='right_span'>33</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~c')) document.getElementById('aexp_language~c').style.visibility = 'hidden';
 </script>
@@ -537,7 +590,7 @@ if (!document.getElementById('language~java')) document.getElementById('aexp_lan
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~jsp')) document.getElementById('aexp_language~jsp').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/language~php/?opendiv=language'>php</a><a href='##' onmousedown=showDiv('language~php') id='aexp_language~php'><span class='exp_style' id='exp_language~php'>[+]</span></a><span class='right_span'>50</span></li>
+<li><a href='/blog/cats/language~php/?opendiv=language'>php</a><a href='##' onmousedown=showDiv('language~php') id='aexp_language~php'><span class='exp_style' id='exp_language~php'>[+]</span></a><span class='right_span'>53</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~php')) document.getElementById('aexp_language~php').style.visibility = 'hidden';
 </script>
@@ -545,7 +598,7 @@ if (!document.getElementById('language~php')) document.getElementById('aexp_lang
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~python')) document.getElementById('aexp_language~python').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/language~web/?opendiv=language'>web</a><a href='##' onmousedown=showDiv('language~web') id='aexp_language~web'><span class='exp_style' id='exp_language~web'>[+]</span></a><span class='right_span'>48</span></li>
+<li><a href='/blog/cats/language~web/?opendiv=language'>web</a><a href='##' onmousedown=showDiv('language~web') id='aexp_language~web'><span class='exp_style' id='exp_language~web'>[+]</span></a><span class='right_span'>54</span></li>
 </div><script language='javascript' type='text/javascript'>
 if (!document.getElementById('language')) document.getElementById('aexp_language').style.visibility = 'hidden';
 if (!document.getElementById('language~web')) document.getElementById('aexp_language~web').style.visibility = 'hidden';
@@ -574,7 +627,7 @@ if (!document.getElementById('assembly~base')) document.getElementById('aexp_ass
 if (!document.getElementById('assembly')) document.getElementById('aexp_assembly').style.visibility = 'hidden';
 if (!document.getElementById('assembly~win')) document.getElementById('aexp_assembly~win').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(198)</span></li>
+<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(199)</span></li>
 <div id='tools' class='catsub'><li><a href='/blog/cats/tools~apache2/?opendiv=tools'>apache2</a><a href='##' onmousedown=showDiv('tools~apache2') id='aexp_tools~apache2'><span class='exp_style' id='exp_tools~apache2'>[+]</span></a><span class='right_span'>9</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~apache2')) document.getElementById('aexp_tools~apache2').style.visibility = 'hidden';
@@ -591,7 +644,7 @@ if (!document.getElementById('tools~ci')) document.getElementById('aexp_tools~ci
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~cloud')) document.getElementById('aexp_tools~cloud').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/tools~command/?opendiv=tools'>command</a><a href='##' onmousedown=showDiv('tools~command') id='aexp_tools~command'><span class='exp_style' id='exp_tools~command'>[+]</span></a><span class='right_span'>30</span></li>
+<li><a href='/blog/cats/tools~command/?opendiv=tools'>command</a><a href='##' onmousedown=showDiv('tools~command') id='aexp_tools~command'><span class='exp_style' id='exp_tools~command'>[+]</span></a><span class='right_span'>31</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~command')) document.getElementById('aexp_tools~command').style.visibility = 'hidden';
 </script>
@@ -684,8 +737,8 @@ if (!document.getElementById('tools~vim')) document.getElementById('aexp_tools~v
 if (!document.getElementById('tools')) document.getElementById('aexp_tools').style.visibility = 'hidden';
 if (!document.getElementById('tools~wxwork')) document.getElementById('aexp_tools~wxwork').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/system/'>system</a><a href='##' onmousedown=showDiv('system') id='aexp_system'><span class='exp_style' id='exp_system'>[+]</span></a><span class='right_span'>(114)</span></li>
-<div id='system' class='catsub'><li><a href='/blog/cats/system~base/?opendiv=system'>base</a><a href='##' onmousedown=showDiv('system~base') id='aexp_system~base'><span class='exp_style' id='exp_system~base'>[+]</span></a><span class='right_span'>25</span></li>
+<li class='catclass'><a href='/blog/cats/system/'>system</a><a href='##' onmousedown=showDiv('system') id='aexp_system'><span class='exp_style' id='exp_system'>[+]</span></a><span class='right_span'>(121)</span></li>
+<div id='system' class='catsub'><li><a href='/blog/cats/system~base/?opendiv=system'>base</a><a href='##' onmousedown=showDiv('system~base') id='aexp_system~base'><span class='exp_style' id='exp_system~base'>[+]</span></a><span class='right_span'>31</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('system~base')) document.getElementById('aexp_system~base').style.visibility = 'hidden';
 </script>
@@ -701,7 +754,7 @@ if (!document.getElementById('system~cgroup')) document.getElementById('aexp_sys
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('system~docker')) document.getElementById('aexp_system~docker').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/system~fs/?opendiv=system'>fs</a><a href='##' onmousedown=showDiv('system~fs') id='aexp_system~fs'><span class='exp_style' id='exp_system~fs'>[+]</span></a><span class='right_span'>11</span></li>
+<li><a href='/blog/cats/system~fs/?opendiv=system'>fs</a><a href='##' onmousedown=showDiv('system~fs') id='aexp_system~fs'><span class='exp_style' id='exp_system~fs'>[+]</span></a><span class='right_span'>12</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('system~fs')) document.getElementById('aexp_system~fs').style.visibility = 'hidden';
 </script>
@@ -923,7 +976,7 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 
 <section>
 <h1>Date Categories
-<span class='right_span'>(925)</span>
+<span class='right_span'>(943)</span>
 
 </h1>
 <head>
@@ -931,8 +984,9 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(45)</span></li>
-<div id='2024' class='catsub'><li><a href='/blog/cats/2024~07/?opendiv=2024'>2024-07</a><span class='right_span'>22</span></li>
+<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(63)</span></li>
+<div id='2024' class='catsub'><li><a href='/blog/cats/2024~08/?opendiv=2024'>2024-08</a><span class='right_span'>14</span></li>
+<li><a href='/blog/cats/2024~07/?opendiv=2024'>2024-07</a><span class='right_span'>26</span></li>
 <li><a href='/blog/cats/2024~06/?opendiv=2024'>2024-06</a><span class='right_span'>2</span></li>
 <li><a href='/blog/cats/2024~05/?opendiv=2024'>2024-05</a><span class='right_span'>5</span></li>
 <li><a href='/blog/cats/2024~04/?opendiv=2024'>2024-04</a><span class='right_span'>5</span></li>
@@ -1079,7 +1133,7 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 <h1>Tags</h1>
 <ul class="tag-cloud">
 <a style="font-size: 124%" href="/tags/10gb/">10gb(7)</a>
-<a style="font-size: 114%" href="/tags/lvm/">LVM(5)</a>
+<a style="font-size: 119%" href="/tags/lvm/">LVM(6)</a>
 <a style="font-size: 100%" href="/tags/chrome-debug/">chrome_debug(3)</a>
 <a style="font-size: 131%" href="/tags/gdb/">gdb(9)</a>
 <a style="font-size: 127%" href="/tags/git/">git(8)</a>
@@ -1101,43 +1155,43 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
   <ul id="recent_posts">
     
       <li class="post">
-        <a href="/blog/2024/07/31/lvm-attr/">LVM 输出更多信息</a>
+        <a href="/blog/2024/08/15/lang-web-js-copy/">禁止网页内容复制另存为</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/31/lvm-pvmove/">LVM 缩减 VG 大小 ( pvmove )</a>
+        <a href="/blog/2024/08/15/lang-web-iframe/">iframe网页嵌套</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/31/lang-web-override/">Chrome浏览器使用Overrides调试线上代码</a>
+        <a href="/blog/2024/08/15/lang-web-auto-textarea/">textarea自动调整高宽</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/31/lang-web-fetch/">fetch使用介绍, chrome如何重新提交请求并且更改参数</a>
+        <a href="/blog/2024/08/09/ntpd-log/">NTP log 记录每次发包</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/31/lang-web-95598/">95598停电公告信息抓取</a>
+        <a href="/blog/2024/08/09/ntpd/">NTP服务配置</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/30/lang-php-sm1234/">sm1、sm2、sm3、sm4简单介绍</a>
+        <a href="/blog/2024/08/09/lang-date/">unix时间戳, excel date, 儒略日julian date</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/30/lang-php-sm2/">php sm2</a>
+        <a href="/blog/2024/08/09/lang-web-times/">&amp;times被替换成x</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/30/lang-php-sm3/">php sm3</a>
+        <a href="/blog/2024/08/09/lang-c-localtime/">localtime函数</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/30/lang-php-bgcolor/">php spreadsheet 填充背景色</a>
+        <a href="/blog/2024/08/02/ups-webpower/">山特UPS NMC卡 USHA卡</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/30/lang-php-mb/">php统计文章字数</a>
+        <a href="/blog/2024/08/01/lang-web-holiday/">节假日 API</a>
       </li>
     
   </ul>

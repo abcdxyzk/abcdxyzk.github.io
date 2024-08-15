@@ -34,7 +34,7 @@
 </hgroup>
 
 </header>
-  <nav role="navigation" style='white-space: nowrap; min-width=1120px;'><form action="/search" method="get">
+  <nav role="navigation" style='white-space: nowrap; min-width=1120px; position: sticky; top: 0; z-index: 999;'><form action="/search" method="get">
     <input class="search" name="query" id="query" type="text" placeholder="search..." style="height:1.5em;">
     <input id="btnSubmit" value="search" type="submit">
 </form>
@@ -131,7 +131,7 @@ var ss360Config = {
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2015/05/15/kernel-net-tcp_urg/">TCP的URG标志和内核实现</a></h2>
+      <h2 class="entry-title"><a href="/blog/2015/06/02/kernel-base-rcu-apply/">Linux kernel 内存屏障在RCU上的应用</a></h2>
     
     
       <p class="meta">
@@ -140,67 +140,92 @@ var ss360Config = {
 
 
 
-<time class='entry-date' datetime='2015-05-15T13:51:00+08:00'><span class='date'>2015-05-15</span> <span class='time'>13:51:00</span></time>
+<time class='entry-date' datetime='2015-06-02T17:36:00+08:00'><span class='date'>2015-06-02</span> <span class='time'>17:36:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><p><a href="http://blog.csdn.net/phenix_lord/article/details/42012931">TCP的URG标志和内核实现之一：协议</a><br/>
-<a href="http://blog.csdn.net/phenix_lord/article/details/42046125">TCP的URG标志和内核实现之二：发送的实现</a><br/>
-<a href="http://blog.csdn.net/phenix_lord/article/details/42065897">TCP的URG标志和内核实现之三：接收的实现</a></p>
+  <div class="entry-content"><p><a href="http://blog.csdn.net/jianchaolv/article/details/7527647">http://blog.csdn.net/jianchaolv/article/details/7527647</a></p>
 
-<hr />
+<p>内存屏障主要解决的问题是编译器的优化和CPU的乱序执行。</p>
 
-<h3>TCP的URG标志和内核实现之一：协议</h3>
+<p>编译器在优化的时候，生成的汇编指令可能和c语言程序的执行顺序不一样，在需要程序严格按照c语言顺序执行时，需要显式的告诉编译不需要优化，这在linux下是通过barrier()宏完成的，它依靠volidate关键字和memory关键字，前者告诉编译barrier()周围的指令不要被优化，后者作用是告诉编译器汇编代码会使内存里面的值更改，编译器应使用内存里的新值而非寄存器里保存的老值。</p>
 
-<p>定义urgent数据的目的：<br/>
-urgent机制，是用于通知应用层需要接收urgent data，在urgent data接收完成后，通知应用层urgent data数据接收完毕。相关协议文本RFC793 RFC1122 RFC6093</p>
+<p>同样，CPU执行会通过乱序以提高性能。汇编里的指令不一定是按照我们看到的顺序执行的。linux中通过mb()系列宏来保证执行的顺序。简单的说，如果在程序某处插入了mb()/rmb()/wmb()宏，则宏之前的程序保证比宏之后的程序先执行，从而实现串行化。</p>
 
-<h4>哪些数据是urgent data？</h4>
+<p>即使是编译器生成的汇编码有序，处理器也不一定能保证有序。就算编译器生成了有序的汇编码，到了处理器那里也拿不准是不 是会按照代码顺序执行。所以就算编译器保证有序了，程序员也还是要往代码里面加内存屏障才能保证绝对访存有序，这倒不如编译器干脆不管算了，因为内存屏障 本身就是一个sequence point，加入后已经能够保证编译器也有序。</p>
 
-<h5>协议规定</h5>
+<p>处理器虽然乱序执行，但最终会得出正确的结果，所以逻辑上讲程序员本不需要关心处理器乱序的问题。但是在SMP并发执行的情况下，处理器无法知道并发程序之间的逻辑，比如，在不同core上的读者和写者之间的逻辑。简单讲，处理器只保证在单个core上按照code中的顺序给出最终结果。这就要求程序员通过mb()/rmb()/wmb()/read_barrier_depends来告知处理器，从而得到正确的并发结果。内存屏障、数据依赖屏障都是为了处理SMP环境下的数据同步问题，UP根本不存在这个问题。</p>
 
-<p>在TCP报头的URG位有效的时候，通过TCP报头中的urgent pointer来标识urgent data的位置，但是在urgent pointer的解析方式上各个协议文本的描述有差异：</p>
+<p>下面分析下内存屏障在RCU上的应用：</p>
 
-<p>解读一：RFC793  P17，描述是“The urgent pointer points to the sequence number of the octet following the urgent data.”，在P41有描述“This mechanism permits a point in the data stream to be designated as the end of urgent information. Whenever this point is in advance of the receive sequence number (RCV.NXT) at the receiving TCP, that TCP must tell the user to go into &ldquo;urgent mode&rdquo;; when the receive sequence number catches up to the urgent pointer, the TCP must tell user to go”，可以认为是：当前接收的报文中SEQ在SEG.SEQ+Urgent Pointer之前的都是,而urgent pointer是第一个非urgent data（ TCP已经接受，但是还没有提交给应用的数据是不是呢？）</p>
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define rcu_assign_pointer(p, v) ({ \
+</span><span class='line'>&#9;smp_wmb();                      \
+</span><span class='line'>&#9;(p)= (v);                       \
+</span><span class='line'>})
+</span><span class='line'>
+</span><span class='line'>#define rcu_dereference(p) ({     \
+</span><span class='line'>&#9;typeof(p)_________p1 = p;     \
+</span><span class='line'>&#9;smp_read_barrier_depends();   \
+</span><span class='line'>&#9;(_________p1);                \
+</span><span class='line'>}) </span></code></pre></td></tr></table></div></figure>
 
-<p>解读二：在P56的描述是“If the urgent flag is set, then SND.UP &lt;-SND.NXT-1 and set the urgent pointer in the outgoing segments”，也就是urgent pointer是最后一个urgent data字节。而在RFC1122中消除了这一歧义：在P84中说明“the urgent pointer points to the sequence number of the LAST octet (not LAST+1) in a sequence of urgent data”</p>
 
-<h5>linux实现</h5>
+<p>rcu_assign_pointer()通常用于写者的发布，rcu_dereference()通常用于读者的订阅。</p>
 
-<p>虽然在RFC1122中消除了这一歧义，linux仍然使用了解读一的解析方式，如果要使用解读二定义的方式，需要使用tcp_stdurg这个配置项。</p>
+<p>写者：</p>
 
-<h4>urgent data数据能有多长？</h4>
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>p-&gt;a = 1;
+</span><span class='line'>p-&gt;b = 2;
+</span><span class='line'>p-&gt;c = 3;
+</span><span class='line'>rcu_assign_pointer(gp, p);
+</span><span class='line'>
+</span><span class='line'>// 如果gp的原值马上会被改变/释放,则需要synchronize_rcu()/synchronize_net(),
+</span><span class='line'>// 如: 模块的卸载, 原gp指向函数被释放</span></code></pre></td></tr></table></div></figure>
 
-<h5>协议规定</h5>
 
-<p>按照RFC793 P41的描述，长度不受限，RFC1122 P84中，更是明确了“A TCP MUST support a sequence of urgent data of any length”</p>
+<p>读者：</p>
 
-<h5>linux实现</h5>
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>rcu_read_lock();
+</span><span class='line'>p = rcu_dereference(gp);
+</span><span class='line'>if (p != NULL) {
+</span><span class='line'>&#9;do_something_with(p-&gt;a, p-&gt;b, p-&gt;c);
+</span><span class='line'>}
+</span><span class='line'>rcu_read_unlock();</span></code></pre></td></tr></table></div></figure>
 
-<p>其实，linux只支持1BYTE的urgent data</p>
 
-<h4>urgent data与OOB数据</h4>
+<p>rcu_assign_pointer()是说，先把那块内存写好，再把指针指过去。这里使用的内存写屏障是为了保证并发的读者读到数据一致性。在这条语句之前的读者读到旧的指针和旧的内存，这条语句之后的读者读到新的指针和新的内存。如果没有这条语句，很有可能出现读者读到新的指针和旧的内存。也就是说，这里通过内存屏障刷新了p所指向的内存的值，至于gp本身的值有没有更新还不确定。实际上，gp本身值的真正更新要等到并发的读者来促发。</p>
 
-<p>OOB数据说的是带外数据，也就是这些数据不是放到TCP流供读取的，而是通过额外的接口来获取，linux默认把urgent data实现为OOB数据；而按照协议的规定，urgent data不是out of band data</p>
+<p>rcu_dereference() 原语用的是数据依赖屏障，smp_read_barrier_dependence,它要求后面的读操作如果依赖前面的读操作，则前面的读操作需要首先完成。根据数据之间的依赖，要读p->a, p->b, p->c, 就必须先读p，要先读p，就必须先读p1，要先读p1，就必须先读gp。也就是说读者所在的core在进行后续的操作之前，gp必须是同步过的当前时刻的最新值。如果没有这个数据依赖屏障，有可能读者所在的core很长一段时间内一直用的是旧的gp值。所以，这里使用数据依赖屏障是为了督促写者将gp值准备好，是为了呼应写者，这个呼应的诉求是通过数据之间的依赖关系来促发的，也就是说到了非呼应不可的地步了。</p>
 
-<p>由于OOB数据的协议和实现上存在很多不确定因素，因此现在已经不建议使用了</p>
+<p>下面看看kernel中常用的链表操作是如何使用这样的发布、订阅机制的：</p>
 
-<hr />
-
-<h3>TCP的URG标志和内核实现之二：发送的实现</h3>
-
-<p>Linxu内核在默认情况下，把urgent data实现为OOB数据</p>
-
-<h4>发送URG数据的接口</h4>
-
-<p>在内核态，使用kernel_sendmsg/kernel_sendpage完成发送，只不过需要加上MSG_OOB标志，表示要发送的URG数据。</p>
-
-<h4>URG数据发送接口的实现</h4>
-
-<p>分片主要在kernel_sendmsg中完成，在OOB数据的处理上，它和kernel_sendpage是一致</p>
+<p>写者：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -216,415 +241,49 @@ urgent机制，是用于通知应用层需要接收urgent data，在urgent data�
 <span class='line-number'>12</span>
 <span class='line-number'>13</span>
 <span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-<span class='line-number'>58</span>
-<span class='line-number'>59</span>
-<span class='line-number'>60</span>
-<span class='line-number'>61</span>
-<span class='line-number'>62</span>
-<span class='line-number'>63</span>
-<span class='line-number'>64</span>
-<span class='line-number'>65</span>
-<span class='line-number'>66</span>
-<span class='line-number'>67</span>
-<span class='line-number'>68</span>
-<span class='line-number'>69</span>
-<span class='line-number'>70</span>
-<span class='line-number'>71</span>
-<span class='line-number'>72</span>
-<span class='line-number'>73</span>
-<span class='line-number'>74</span>
-<span class='line-number'>75</span>
-<span class='line-number'>76</span>
-<span class='line-number'>77</span>
-<span class='line-number'>78</span>
-<span class='line-number'>79</span>
-<span class='line-number'>80</span>
-<span class='line-number'>81</span>
-<span class='line-number'>82</span>
-<span class='line-number'>83</span>
-<span class='line-number'>84</span>
-<span class='line-number'>85</span>
-<span class='line-number'>86</span>
-<span class='line-number'>87</span>
-<span class='line-number'>88</span>
-<span class='line-number'>89</span>
-<span class='line-number'>90</span>
-<span class='line-number'>91</span>
-<span class='line-number'>92</span>
-<span class='line-number'>93</span>
-<span class='line-number'>94</span>
-<span class='line-number'>95</span>
-<span class='line-number'>96</span>
-<span class='line-number'>97</span>
-<span class='line-number'>98</span>
-<span class='line-number'>99</span>
-<span class='line-number'>100</span>
-<span class='line-number'>101</span>
-<span class='line-number'>102</span>
-<span class='line-number'>103</span>
-<span class='line-number'>104</span>
-<span class='line-number'>105</span>
-<span class='line-number'>106</span>
-<span class='line-number'>107</span>
-<span class='line-number'>108</span>
-<span class='line-number'>109</span>
-<span class='line-number'>110</span>
-<span class='line-number'>111</span>
-<span class='line-number'>112</span>
-<span class='line-number'>113</span>
-<span class='line-number'>114</span>
-<span class='line-number'>115</span>
-<span class='line-number'>116</span>
-<span class='line-number'>117</span>
-<span class='line-number'>118</span>
-<span class='line-number'>119</span>
-<span class='line-number'>120</span>
-<span class='line-number'>121</span>
-<span class='line-number'>122</span>
-<span class='line-number'>123</span>
-<span class='line-number'>124</span>
-<span class='line-number'>125</span>
-<span class='line-number'>126</span>
-<span class='line-number'>127</span>
-<span class='line-number'>128</span>
-<span class='line-number'>129</span>
-<span class='line-number'>130</span>
-<span class='line-number'>131</span>
-<span class='line-number'>132</span>
-<span class='line-number'>133</span>
-<span class='line-number'>134</span>
-<span class='line-number'>135</span>
-<span class='line-number'>136</span>
-<span class='line-number'>137</span>
-<span class='line-number'>138</span>
-<span class='line-number'>139</span>
-<span class='line-number'>140</span>
-<span class='line-number'>141</span>
-<span class='line-number'>142</span>
-<span class='line-number'>143</span>
-<span class='line-number'>144</span>
-<span class='line-number'>145</span>
-<span class='line-number'>146</span>
-<span class='line-number'>147</span>
-<span class='line-number'>148</span>
-<span class='line-number'>149</span>
-<span class='line-number'>150</span>
-<span class='line-number'>151</span>
-<span class='line-number'>152</span>
-<span class='line-number'>153</span>
-<span class='line-number'>154</span>
-<span class='line-number'>155</span>
-<span class='line-number'>156</span>
-<span class='line-number'>157</span>
-<span class='line-number'>158</span>
-<span class='line-number'>159</span>
-<span class='line-number'>160</span>
-<span class='line-number'>161</span>
-<span class='line-number'>162</span>
-<span class='line-number'>163</span>
-<span class='line-number'>164</span>
-<span class='line-number'>165</span>
-<span class='line-number'>166</span>
-<span class='line-number'>167</span>
-<span class='line-number'>168</span>
-<span class='line-number'>169</span>
-<span class='line-number'>170</span>
-<span class='line-number'>171</span>
-<span class='line-number'>172</span>
-<span class='line-number'>173</span>
-<span class='line-number'>174</span>
-<span class='line-number'>175</span>
-<span class='line-number'>176</span>
-<span class='line-number'>177</span>
-<span class='line-number'>178</span>
-<span class='line-number'>179</span>
-<span class='line-number'>180</span>
-<span class='line-number'>181</span>
-<span class='line-number'>182</span>
-<span class='line-number'>183</span>
-<span class='line-number'>184</span>
-<span class='line-number'>185</span>
-<span class='line-number'>186</span>
-<span class='line-number'>187</span>
-<span class='line-number'>188</span>
-<span class='line-number'>189</span>
-<span class='line-number'>190</span>
-<span class='line-number'>191</span>
-<span class='line-number'>192</span>
-<span class='line-number'>193</span>
-<span class='line-number'>194</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>int tcp_sendmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,  
-</span><span class='line'>&#9;&#9;size_t size)  
-</span><span class='line'>{  
-</span><span class='line'>&#9;。。。。。。。。。。。。。。  
-</span><span class='line'>&#9;/*如果flags设置了MSG_OOB该接口其实返回的mss_now关闭了TSO功能*/  
-</span><span class='line'>&#9;mss_now = tcp_send_mss(sk, &size_goal, flags);  
-</span><span class='line'>&#9;。。。。。。。。。。。。。。  
-</span><span class='line'>&#9;while (--iovlen &gt;= 0) {  
-</span><span class='line'>&#9;&#9;size_t seglen = iov-&gt;iov_len;  
-</span><span class='line'>&#9;&#9;unsigned char __user *from = iov-&gt;iov_base;  
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;iov++;  
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;while (seglen &gt; 0) {  
-</span><span class='line'>&#9;&#9;&#9;int copy = 0;  
-</span><span class='line'>&#9;&#9;&#9;int max = size_goal;  
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;skb = tcp_write_queue_tail(sk);  
-</span><span class='line'>&#9;&#9;&#9;if (tcp_send_head(sk)) {  
-</span><span class='line'>&#9;&#9;&#9;&#9;if (skb-&gt;ip_summed == CHECKSUM_NONE)  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;max = mss_now;  
-</span><span class='line'>&#9;&#9;&#9;&#9;copy = max - skb-&gt;len;  
-</span><span class='line'>&#9;&#9;&#9;}  
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;if (copy &lt;= 0) {  
-</span><span class='line'>new_segment:  
-</span><span class='line'>&#9;&#9;&#9;&#9;/* Allocate new segment. If the interface is SG, 
-</span><span class='line'>&#9;&#9;&#9;&#9; * allocate skb fitting to single page. 
-</span><span class='line'>&#9;&#9;&#9;&#9; */  
-</span><span class='line'>&#9;&#9;&#9;&#9;if (!sk_stream_memory_free(sk))  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;goto wait_for_sndbuf;  
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;&#9;skb = sk_stream_alloc_skb(sk,  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9;  select_size(sk, sg),  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9;  sk-&gt;sk_allocation);  
-</span><span class='line'>&#9;&#9;&#9;&#9;if (!skb)  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;goto wait_for_memory;  
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;&#9;/* 
-</span><span class='line'>&#9;&#9;&#9;&#9; * Check whether we can use HW checksum. 
-</span><span class='line'>&#9;&#9;&#9;&#9; */  
-</span><span class='line'>&#9;&#9;&#9;&#9;if (sk-&gt;sk_route_caps & NETIF_F_ALL_CSUM)  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;skb-&gt;ip_summed = CHECKSUM_PARTIAL;  
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;&#9;skb_entail(sk, skb);  
-</span><span class='line'>&#9;&#9;&#9;&#9;copy = size_goal;  
-</span><span class='line'>&#9;&#9;&#9;&#9;max = size_goal;  
-</span><span class='line'>&#9;&#9;&#9;}  
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;/* Try to append data to the end of skb. */  
-</span><span class='line'>&#9;&#9;&#9;if (copy &gt; seglen)  
-</span><span class='line'>&#9;&#9;&#9;&#9;copy = seglen;  
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;/* Where to copy to? */  
-</span><span class='line'>&#9;&#9;&#9;if (skb_availroom(skb) &gt; 0) {  
-</span><span class='line'>&#9;&#9;&#9;&#9;/* We have some space in skb head. Superb! */  
-</span><span class='line'>&#9;&#9;&#9;&#9;copy = min_t(int, copy, skb_availroom(skb));  
-</span><span class='line'>&#9;&#9;&#9;&#9;err = skb_add_data_nocache(sk, skb, from, copy);  
-</span><span class='line'>&#9;&#9;&#9;&#9;if (err)  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;goto do_fault;  
-</span><span class='line'>&#9;&#9;&#9;} else {  
-</span><span class='line'>&#9;&#9;&#9;&#9;int merge = 0;  
-</span><span class='line'>&#9;&#9;&#9;&#9;int i = skb_shinfo(skb)-&gt;nr_frags;  
-</span><span class='line'>&#9;&#9;&#9;&#9;struct page *page = sk-&gt;sk_sndmsg_page;  
-</span><span class='line'>&#9;&#9;&#9;&#9;int off;  
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;&#9;if (page && page_count(page) == 1)  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;sk-&gt;sk_sndmsg_off = 0;  
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;&#9;off = sk-&gt;sk_sndmsg_off;  
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;&#9;if (skb_can_coalesce(skb, i, page, off) &&  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;off != PAGE_SIZE) {  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;/* We can extend the last page 
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9; * fragment. */  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;merge = 1;  
-</span><span class='line'>&#9;&#9;&#9;&#9;} else if (i == MAX_SKB_FRAGS || !sg) {  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;/* Need to add new fragment and cannot 
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9; * do this because interface is non-SG, 
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9; * or because all the page slots are 
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9; * busy. */  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;tcp_mark_push(tp, skb);  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;goto new_segment;  
-</span><span class='line'>&#9;&#9;&#9;&#9;} else if (page) {  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;if (off == PAGE_SIZE) {  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;put_page(page);  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;sk-&gt;sk_sndmsg_page = page = NULL;  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;off = 0;  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;}  
-</span><span class='line'>&#9;&#9;&#9;&#9;} else  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;off = 0;  
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;&#9;if (copy &gt; PAGE_SIZE - off)  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;copy = PAGE_SIZE - off;  
-</span><span class='line'>&#9;&#9;&#9;&#9;if (!sk_wmem_schedule(sk, copy))  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;goto wait_for_memory;  
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;&#9;if (!page) {  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;/* Allocate new cache page. */  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;if (!(page = sk_stream_alloc_page(sk)))  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;goto wait_for_memory;  
-</span><span class='line'>&#9;&#9;&#9;&#9;}  
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;&#9;/* Time to copy data. We are close to 
-</span><span class='line'>&#9;&#9;&#9;&#9; * the end! */  
-</span><span class='line'>&#9;&#9;&#9;&#9;err = skb_copy_to_page_nocache(sk, from, skb,  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9;&#9;   page, off, copy);  
-</span><span class='line'>&#9;&#9;&#9;&#9;if (err) {  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;/* If this page was new, give it to the 
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9; * socket so it does not get leaked. 
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9; */  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;if (!sk-&gt;sk_sndmsg_page) {  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;sk-&gt;sk_sndmsg_page = page;  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;sk-&gt;sk_sndmsg_off = 0;  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;}  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;goto do_error;  
-</span><span class='line'>&#9;&#9;&#9;&#9;}  
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;&#9;/* Update the skb. */  
-</span><span class='line'>&#9;&#9;&#9;&#9;if (merge) {  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;skb_frag_size_add(&skb_shinfo(skb)-&gt;frags[i - 1], copy);  
-</span><span class='line'>&#9;&#9;&#9;&#9;} else {  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;skb_fill_page_desc(skb, i, page, off, copy);  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;if (sk-&gt;sk_sndmsg_page) {  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;get_page(page);  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;} else if (off + copy &lt; PAGE_SIZE) {  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;get_page(page);  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;sk-&gt;sk_sndmsg_page = page;  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;}  
-</span><span class='line'>&#9;&#9;&#9;&#9;}  
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;&#9;sk-&gt;sk_sndmsg_off = off + copy;  
-</span><span class='line'>&#9;&#9;&#9;}  
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;if (!copied)  
-</span><span class='line'>&#9;&#9;&#9;&#9;TCP_SKB_CB(skb)-&gt;tcp_flags &= ~TCPHDR_PSH;  
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;tp-&gt;write_seq += copy;  
-</span><span class='line'>&#9;&#9;&#9;TCP_SKB_CB(skb)-&gt;end_seq += copy;  
-</span><span class='line'>&#9;&#9;&#9;skb_shinfo(skb)-&gt;gso_segs = 0;  
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;from += copy;  
-</span><span class='line'>&#9;&#9;&#9;copied += copy;  
-</span><span class='line'>&#9;&#9;&#9;if ((seglen -= copy) == 0 && iovlen == 0)  
-</span><span class='line'>&#9;&#9;&#9;&#9;goto out;  
-</span><span class='line'>&#9;&#9;&#9;/*对于OOB数据，即使一个分片用光，如果还有 
-</span><span class='line'>&#9;&#9;&#9;send_buff和OOB数据，就继续积累分片*/  
-</span><span class='line'>&#9;&#9;&#9;if (skb-&gt;len &lt; max || (flags & MSG_OOB))  
-</span><span class='line'>&#9;&#9;&#9;&#9;continue;  
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;if (forced_push(tp)) {  
-</span><span class='line'>&#9;&#9;&#9;&#9;tcp_mark_push(tp, skb);  
-</span><span class='line'>&#9;&#9;&#9;&#9;__tcp_push_pending_frames(sk, mss_now, TCP_NAGLE_PUSH);  
-</span><span class='line'>&#9;&#9;&#9;} else if (skb == tcp_send_head(sk))  
-</span><span class='line'>&#9;&#9;&#9;&#9;tcp_push_one(sk, mss_now);  
-</span><span class='line'>&#9;&#9;&#9;continue;  
-</span><span class='line'>
-</span><span class='line'>wait_for_sndbuf:  
-</span><span class='line'>&#9;&#9;&#9;set_bit(SOCK_NOSPACE, &sk-&gt;sk_socket-&gt;flags);  
-</span><span class='line'>wait_for_memory:  
-</span><span class='line'>&#9;&#9;&#9;if (copied)  
-</span><span class='line'>&#9;&#9;&#9;&#9;tcp_push(sk, flags & ~MSG_MORE, mss_now, TCP_NAGLE_PUSH);  
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;if ((err = sk_stream_wait_memory(sk, &timeo)) != 0)  
-</span><span class='line'>&#9;&#9;&#9;&#9;goto do_error;  
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;mss_now = tcp_send_mss(sk, &size_goal, flags);  
-</span><span class='line'>&#9;&#9;}  
-</span><span class='line'>&#9;}  
-</span><span class='line'>
-</span><span class='line'>out:  
-</span><span class='line'>&#9;if (copied)  
-</span><span class='line'>&#9;&#9;tcp_push(sk, flags, mss_now, tp-&gt;nonagle);  
-</span><span class='line'>&#9;release_sock(sk);  
-</span><span class='line'>&#9;return copied;  
-</span><span class='line'>
-</span><span class='line'>do_fault:  
-</span><span class='line'>&#9;if (!skb-&gt;len) {  
-</span><span class='line'>&#9;&#9;tcp_unlink_write_queue(skb, sk);  
-</span><span class='line'>&#9;&#9;/* It is the one place in all of TCP, except connection 
-</span><span class='line'>&#9;&#9; * reset, where we can be unlinking the send_head. 
-</span><span class='line'>&#9;&#9; */  
-</span><span class='line'>&#9;&#9;tcp_check_send_head(sk, skb);  
-</span><span class='line'>&#9;&#9;sk_wmem_free_skb(sk, skb);  
-</span><span class='line'>&#9;}  
-</span><span class='line'>
-</span><span class='line'>do_error:  
-</span><span class='line'>&#9;if (copied)  
-</span><span class='line'>&#9;&#9;goto out;  
-</span><span class='line'>out_err:  
-</span><span class='line'>&#9;err = sk_stream_error(sk, flags, err);  
-</span><span class='line'>&#9;release_sock(sk);  
-</span><span class='line'>&#9;return err;  
-</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
-
-
-<p>tcp_sendmsg中，涉及对OOB数据的处理主要有：</p>
-
-<h5>1、在调用tcp_send_mss确定分片大小的时候：</h5>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static int tcp_send_mss(struct sock *sk,int *size_goal, int flags)
+</pre></td><td class='code'><pre><code class=''><span class='line'>static inline void list_add_rcu(struct list_head *new, struct list_head *head)
 </span><span class='line'>{
-</span><span class='line'>&#9;intmss_now;
-</span><span class='line'>&#9;mss_now= tcp_current_mss(sk);
+</span><span class='line'>&#9;__list_add_rcu(new, head, head-&gt;next);
+</span><span class='line'>}
 </span><span class='line'>
-</span><span class='line'>&#9;/*如果是OOB数据，large_allowed=0，关闭TSO*/
-</span><span class='line'>&#9;*size_goal= tcp_xmit_size_goal(sk, mss_now, !(flags & MSG_OOB));
-</span><span class='line'>&#9;returnmss_now;
+</span><span class='line'>static inline void __list_add_rcu(struct list_head * new,
+</span><span class='line'>struct list_head * prev, struct list_head * next)
+</span><span class='line'>{
+</span><span class='line'>&#9;new-&gt;next = next;
+</span><span class='line'>&#9;new-&gt;prev = prev;
+</span><span class='line'>&#9;smp_wmb();
+</span><span class='line'>&#9;next-&gt;prev = new;
+</span><span class='line'>&#9;prev-&gt;next = new;
 </span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
-<p>如果是OOB数据，其实是关闭了TSO功能，这样做的原因是：天知道各个网卡芯片在执行分片的时候咋个处理TCP报头中的URG标志和urgent point</p>
+<p>读者：</p>
 
-<h5>2、在确定何时开始执行分片的发送的时候：</h5>
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define list_for_each_entry_rcu(pos, head, member)                \
+</span><span class='line'>&#9;for(pos = list_entry((head)-&gt;next, typeof(*pos), member);     \
+</span><span class='line'>&#9;&#9;&#9;prefetch(rcu_dereference(pos)-&gt;member.next),          \
+</span><span class='line'>&#9;&#9;&#9;&pos-&gt;member!= (head);                                \
+</span><span class='line'>&#9;&#9;pos= list_entry(pos-&gt;member.next, typeof(*pos), member))</span></code></pre></td></tr></table></div></figure>
 
-<p>如果是OOB数据，即使当前已经积累了一整个分片，也不会想普通的数据一样执行发送(tcp_push)，而是继续积累直到用户下发的数据全部分片或者snd_buf/内存用尽。</p>
 
-<h5>3、执行tcp_push的时候：</h5>
+<p>写者通过调用list_add_rcu来发布新的节点，其实是发布next->prev, prev->next这两个指针。读者通过list_for_each_entry_rcu来订阅这连个指针，我们将list_for_each_entry_rcu订阅部分简化如下：</p>
 
-<p>在用户下发的数据全部分片或者snd_buf/内存用尽后，进入tcp_push执行发送操作(所有的OOB数据，都会通过这个接口来执行发送)</p>
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>pos = prev-&gt;next;
+</span><span class='line'>prefetch(rcu_dereference(pos)-&gt;next);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>读者通过rcu_dereference订阅的是pos，而由于数据依赖关系，又间接订阅了prev->next指针，或者说是促发prev->next的更新。</p>
+
+<p>下面介绍下其他相关链表操作的函数：</p>
+
+<p>safe版本的iterate的函数？为什么就safe了？</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -633,555 +292,38 @@ urgent机制，是用于通知应用层需要接收urgent data，在urgent data�
 <span class='line-number'>5</span>
 <span class='line-number'>6</span>
 <span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static inline void tcp_push(struct sock*sk, int flags, int mss_now,
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9; int nonagle)
-</span><span class='line'>{
-</span><span class='line'>&#9;if(tcp_send_head(sk)) {
-</span><span class='line'>&#9;&#9;structtcp_sock *tp = tcp_sk(sk);
-</span><span class='line'>&#9;&#9;if(!(flags & MSG_MORE) || forced_push(tp))
-</span><span class='line'>&#9;&#9;&#9;tcp_mark_push(tp,tcp_write_queue_tail(sk));      
-</span><span class='line'>&#9;&#9;&#9;  /*tcp_mark_urg设置tp-&gt;snd_up，标识进入OOB数据发送模式，设置urgent point
-</span><span class='line'>&#9;&#9;&#9;  指向urgentdata接受后的第一个字符*/
-</span><span class='line'>&#9;&#9;tcp_mark_urg(tp,flags);
-</span><span class='line'>&#9;&#9;__tcp_push_pending_frames(sk,mss_now,
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;  (flags & MSG_MORE) ? TCP_NAGLE_CORK :nonagle);
-</span><span class='line'>&#9;}
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>发送处理</h4>
-
-<p>使用struct tcp_sock中的snd_up来标识当前的urgent point，同时也使用该数据来判断当前是否处于urgent data发送模式，在普通数据的发送模式中tcp_sock::snd_up总是和tcp_sock::snd_una相等，只有在有urgent data发送的时候，才在tcp_push&mdash;>tcp_mark_urg中设置为urgentpoint，进入到urgent data的处理模式</p>
-
-<p>在tcp_transmit_skb中的以下代码段负责urgent data相关的处理：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if (unlikely(tcp_urg_mode(tp) && before(tcb-&gt;seq, tp-&gt;snd_up))) {  
-</span><span class='line'>&#9;if (before(tp-&gt;snd_up, tcb-&gt;seq + 0x10000)) {  
-</span><span class='line'>&#9;&#9;th-&gt;urg_ptr = htons(tp-&gt;snd_up - tcb-&gt;seq);  
-</span><span class='line'>&#9;&#9;th-&gt;urg = 1;  
-</span><span class='line'>&#9;} else if (after(tcb-&gt;seq + 0xFFFF, tp-&gt;snd_nxt)) {  
-</span><span class='line'>&#9;&#9;th-&gt;urg_ptr = htons(0xFFFF);  
-</span><span class='line'>&#9;&#9;th-&gt;urg = 1;  
-</span><span class='line'>&#9;}  
-</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
-
-
-<p>只要当前待发送的skb的seq在tcp_sock记录的urgent point前面，就需要在报头中对URG标志置位，同时如果tcp_sock记录的urgent point。如果该报文的seq距离大于16为能表示的最大值，就置TCP报头中的urgent point为65535。</p>
-
-<h4>切换回普通模式：</h4>
-
-<p>在收到对方ACK的处理流程tcp_ack&mdash;>tcp_clean_rtx_queue中：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if (likely(between(tp-&gt;snd_up, prior_snd_una, tp-&gt;snd_una)))  
-</span><span class='line'>&#9;tp-&gt;snd_up = tp-&gt;snd_una;  </span></code></pre></td></tr></table></div></figure>
-
-
-<h4>报文体现</h4>
-
-<p>根据对发送代码的分析，可以看到：如果用户使用MSG_OOB数据发送一段比较长(若干个MSS)的数据，那么线路上的报文应该是分成了若干组，每组由若干个长度为MSS的报文构成，组内的每个报文有一样的urgent pointer，指向下一组报文的起始seq，每一组的长度最长为65535。</p>
-
-<hr />
-
-<h3>TCP的URG标志和内核实现之三：接收的实现</h3>
-
-<p>大致的处理过程</p>
-
-<p>TCP的接收流程：在tcp_v4_do_rcv中的相关处理(网卡收到报文触发)中，会首先通过tcp_check_urg设置tcp_sock的urg_data为TCP_URG_NOTYET(urgent point指向的可能不是本报文，而是后续报文或者前面收到的乱序报文)，并保存最新的urgent data的sequence和对于的1 BYTE urgent data到tcp_sock的urg_data (如果之前的urgent data没有读取，就会被覆盖)。</p>
-
-<p>用户接收流程：在tcp_recvmsg流程中，如果发现当前的skb的数据中有urgent data，首先拷贝urgent data之前的数据，然后tcp_recvmsg退出，提示用户来接收OOB数据；在用户下一次调用tcp_recvmsg来接收数据的时候，会跳过urgent data，并设置urgent data数据接收完成。
-相关的数据结构和定义</p>
-
-<p>tcp_sock结构：</p>
-
-<p>1、 urg_data成员，其高8bit为urgent data的接收状态；其低8位为保存的1BYTE urgent数据。urgent data的接收状态对应的宏的含义描述：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#defineTCP_URG_VALID 0x0100  /*urgent data已经读到了tcp_sock::urg_data*/
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define list_for_each_safe(pos,n, head)                    \
+</span><span class='line'>&#9;for(pos = (head)-&gt;next, n = pos-&gt;next; pos != (head);  \
+</span><span class='line'>&#9;&#9;&#9;pos= n, n = pos-&gt;next)
 </span><span class='line'>
-</span><span class='line'>#defineTCP_URG_NOTYET   0x0200  /*已经发现有urgent data，还没有读取到tcp_sock::urg_data*/
-</span><span class='line'>
-</span><span class='line'>#defineTCP_URG_READ       0x0400  /*urgent data已经被用户通过MSG_OOB读取了*/</span></code></pre></td></tr></table></div></figure>
+</span><span class='line'>#define list_for_each(pos, head)                                \
+</span><span class='line'>&#9;for(pos = (head)-&gt;next; prefetch(pos-&gt;next), pos != (head); \
+</span><span class='line'>&#9;&#9;&#9;pos= pos-&gt;next)</span></code></pre></td></tr></table></div></figure>
 
 
-<p>2、 urg_seq成员，为当前的urgent data的sequence</p>
+<p>当在iterate的过程中执行删除操作的时候，比如：</p>
 
-<p>流程详情</p>
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>list_for_each(pos,head)
+</span><span class='line'>&#9;list_del(pos)</span></code></pre></td></tr></table></div></figure>
 
-<h4>TCP的接收过程</h4>
 
-<p>在tcp_rcv_established的slow_path中</p>
+<p>这样会断链，为了避免这种断链，增加了safe版本的iterate函数。另外，由于preftech的缘故，有可能引用一个无效的指针LIST_POISON1。这里的safe是指，为避免有些cpu的preftech的影响，干脆在iterate的过程中去掉preftech。</p>
+
+<p>还有一个既有rcu+safe版本的iterative函数：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
 <span class='line-number'>3</span>
 <span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>slow_path:  
-</span><span class='line'>&#9;if (len &lt; (th-&gt;doff &lt;&lt; 2) || tcp_checksum_complete_user(sk, skb))  
-</span><span class='line'>&#9;&#9;goto csum_error;  
-</span><span class='line'>&#9;/* 
-</span><span class='line'>&#9; *  Standard slow path. 
-</span><span class='line'>&#9; */  
-</span><span class='line'>&#9;if (!tcp_validate_incoming(sk, skb, th, 1))  
-</span><span class='line'>&#9;&#9;return 0;  
-</span><span class='line'>step5:  
-</span><span class='line'>&#9;if (th-&gt;ack &&  
-</span><span class='line'>&#9;&#9;tcp_ack(sk, skb, FLAG_SLOWPATH | FLAG_UPDATE_TS_RECENT) &lt; 0)  
-</span><span class='line'>&#9;&#9;goto discard;  
-</span><span class='line'>&#9;tcp_rcv_rtt_measure_ts(sk, skb);  
-</span><span class='line'>&#9;/* 处理紧急数据. */  
-</span><span class='line'>&#9;tcp_urg(sk, skb, th);  </span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define list_for_each_safe_rcu(pos, n, head)              \
+</span><span class='line'>&#9;for(pos = (head)-&gt;next;                               \
+</span><span class='line'>&#9;&#9;&#9;n= rcu_dereference(pos)-&gt;next, pos != (head); \
+</span><span class='line'>&#9;&#9;&#9;pos= n)</span></code></pre></td></tr></table></div></figure>
 
 
-<p>也就是在报文的CRC验证和sequence验证完成后，就会通过tcp_urg来处理接收到的urgent data ：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static void tcp_urg(struct sock *sk, struct sk_buff *skb, const struct tcphdr *th)  
-</span><span class='line'>{  
-</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);  
-</span><span class='line'>  
-</span><span class='line'>&#9;/*收到了urgent data,则检查和设置urg_data和urg_seq成员*/  
-</span><span class='line'>&#9;if (th-&gt;urg)  
-</span><span class='line'>&#9;&#9;tcp_check_urg(sk, th);  
-</span><span class='line'>  
-</span><span class='line'>&#9;/* Do we wait for any urgent data? - normally not... 
-</span><span class='line'>&#9;发现了有urgent data，但是还没有保存到tp-&gt;urg_data*/  
-</span><span class='line'>&#9;if (tp-&gt;urg_data == TCP_URG_NOTYET) {  
-</span><span class='line'>&#9;&#9;u32 ptr = tp-&gt;urg_seq - ntohl(th-&gt;seq) + (th-&gt;doff * 4) -  
-</span><span class='line'>&#9;&#9;&#9;  th-&gt;syn;  
-</span><span class='line'>  
-</span><span class='line'>&#9;&#9;/* Is the urgent pointer pointing into this packet? */  
-</span><span class='line'>&#9;&#9;if (ptr &lt; skb-&gt;len) {  
-</span><span class='line'>&#9;&#9;&#9;u8 tmp;  
-</span><span class='line'>&#9;&#9;&#9;if (skb_copy_bits(skb, ptr, &tmp, 1))  
-</span><span class='line'>&#9;&#9;&#9;&#9;BUG();  
-</span><span class='line'>&#9;&#9;&#9;tp-&gt;urg_data = TCP_URG_VALID | tmp;  
-</span><span class='line'>&#9;&#9;&#9;if (!sock_flag(sk, SOCK_DEAD))  
-</span><span class='line'>&#9;&#9;&#9;&#9;sk-&gt;sk_data_ready(sk, 0);  
-</span><span class='line'>&#9;&#9;}  
-</span><span class='line'>&#9;}  
-</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
-
-
-<p>检查和设置urg_data和urg_seq成员的处理函数tcp_check_urg的具体流程</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-<span class='line-number'>58</span>
-<span class='line-number'>59</span>
-<span class='line-number'>60</span>
-<span class='line-number'>61</span>
-<span class='line-number'>62</span>
-<span class='line-number'>63</span>
-<span class='line-number'>64</span>
-<span class='line-number'>65</span>
-<span class='line-number'>66</span>
-<span class='line-number'>67</span>
-<span class='line-number'>68</span>
-<span class='line-number'>69</span>
-<span class='line-number'>70</span>
-<span class='line-number'>71</span>
-<span class='line-number'>72</span>
-<span class='line-number'>73</span>
-<span class='line-number'>74</span>
-<span class='line-number'>75</span>
-<span class='line-number'>76</span>
-<span class='line-number'>77</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static void tcp_check_urg(struct sock *sk, const struct tcphdr *th)  
-</span><span class='line'>{  
-</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);  
-</span><span class='line'>&#9;u32 ptr = ntohs(th-&gt;urg_ptr);  
-</span><span class='line'>&#9;/*两种urgent point的解析方式: 
-</span><span class='line'>&#9;一是指向urgent data之后的第一个字节 
-</span><span class='line'>&#9;二是执行urgent data的结束字节(RFC1122) 
-</span><span class='line'>&#9;sysctl_tcp_stdurg被设置表示当前采用的是第二种模式 
-</span><span class='line'>&#9;不需要把urgent point -1来指向urgent data的结束字节*/  
-</span><span class='line'>&#9;if (ptr && !sysctl_tcp_stdurg)  
-</span><span class='line'>&#9;&#9;ptr--;  
-</span><span class='line'>&#9;ptr += ntohl(th-&gt;seq);  
-</span><span class='line'>  
-</span><span class='line'>&#9;/* Ignore urgent data that we've already seen and read.  
-</span><span class='line'>&#9;如果copied_seq已经大于urgent point，那么对于从tcp_rcv_established 
-</span><span class='line'>&#9;来执行的，前面的tcp_validate_incoming已经拒绝了这种报文( 
-</span><span class='line'>&#9;接收窗口外)，这里要处理的是哪种情形?*/  
-</span><span class='line'>&#9;if (after(tp-&gt;copied_seq, ptr))  
-</span><span class='line'>&#9;&#9;return;  
-</span><span class='line'>  
-</span><span class='line'>&#9;/* Do not replay urg ptr. 
-</span><span class='line'>&#9; * 
-</span><span class='line'>&#9; * NOTE: interesting situation not covered by specs. 
-</span><span class='line'>&#9; * Misbehaving sender may send urg ptr, pointing to segment, 
-</span><span class='line'>&#9; * which we already have in ofo queue. We are not able to fetch 
-</span><span class='line'>&#9; * such data and will stay in TCP_URG_NOTYET until will be eaten 
-</span><span class='line'>&#9; * by recvmsg(). Seems, we are not obliged to handle such wicked 
-</span><span class='line'>&#9; * situations. But it is worth to think about possibility of some 
-</span><span class='line'>&#9; * DoSes using some hypothetical application level deadlock. 
-</span><span class='line'>&#9; */  
-</span><span class='line'>&#9;/*  这种情况什么时候发生?没搞明白*/  
-</span><span class='line'>&#9;if (before(ptr, tp-&gt;rcv_nxt))  
-</span><span class='line'>&#9;&#9;return;  
-</span><span class='line'>  
-</span><span class='line'>&#9;/* Do we already have a newer (or duplicate) urgent pointer?  
-</span><span class='line'>&#9;如果当前已经进入urg数据读取模式，且urgent point不大于当前 
-</span><span class='line'>&#9;保存的值，那么之前已经开始了读取tp-&gt;urg_seq对应的 
-</span><span class='line'>&#9;urgent 数据，无需重复处理了*/  
-</span><span class='line'>&#9;if (tp-&gt;urg_data && !after(ptr, tp-&gt;urg_seq))  
-</span><span class='line'>&#9;&#9;return;  
-</span><span class='line'>  
-</span><span class='line'>&#9;/* Tell the world about our new urgent pointer.*/  
-</span><span class='line'>&#9;sk_send_sigurg(sk);  
-</span><span class='line'>  
-</span><span class='line'>&#9;/* We may be adding urgent data when the last byte read was 
-</span><span class='line'>&#9; * urgent. To do this requires some care. We cannot just ignore 
-</span><span class='line'>&#9; * tp-&gt;copied_seq since we would read the last urgent byte again 
-</span><span class='line'>&#9; * as data, nor can we alter copied_seq until this data arrives 
-</span><span class='line'>&#9; * or we break the semantics of SIOCATMARK (and thus sockatmark()) 
-</span><span class='line'>&#9; * 
-</span><span class='line'>&#9; * NOTE. Double Dutch. Rendering to plain English: author of comment 
-</span><span class='line'>&#9; * above did something sort of  send("A", MSG_OOB); send("B", MSG_OOB); 
-</span><span class='line'>&#9; * and expect that both A and B disappear from stream. This is _wrong_. 
-</span><span class='line'>&#9; * Though this happens in BSD with high probability, this is occasional. 
-</span><span class='line'>&#9; * Any application relying on this is buggy. Note also, that fix "works" 
-</span><span class='line'>&#9; * only in this artificial test. Insert some normal data between A and B and we will 
-</span><span class='line'>&#9; * decline of BSD again. Verdict: it is better to remove to trap 
-</span><span class='line'>&#9; * buggy users. 
-</span><span class='line'>&#9; */  
-</span><span class='line'>&#9; /*用户下一次要读取的数据就是用户还没有读取的urgent数据 
-</span><span class='line'>&#9;且当前存在新的用户未读取数据*/  
-</span><span class='line'>&#9;if (tp-&gt;urg_seq == tp-&gt;copied_seq && tp-&gt;urg_data &&  
-</span><span class='line'>&#9;&#9;!sock_flag(sk, SOCK_URGINLINE) && tp-&gt;copied_seq != tp-&gt;rcv_nxt) {  
-</span><span class='line'>&#9;&#9;struct sk_buff *skb = skb_peek(&sk-&gt;sk_receive_queue);  
-</span><span class='line'>&#9;&#9;tp-&gt;copied_seq++;  
-</span><span class='line'>&#9;&#9;if (skb && !before(tp-&gt;copied_seq, TCP_SKB_CB(skb)-&gt;end_seq)) {  
-</span><span class='line'>&#9;&#9;&#9;__skb_unlink(skb, &sk-&gt;sk_receive_queue);  
-</span><span class='line'>&#9;&#9;&#9;__kfree_skb(skb);  
-</span><span class='line'>&#9;&#9;}  
-</span><span class='line'>&#9;}  
-</span><span class='line'>  
-</span><span class='line'>&#9;tp-&gt;urg_data = TCP_URG_NOTYET;  
-</span><span class='line'>&#9;tp-&gt;urg_seq = ptr;  
-</span><span class='line'>  
-</span><span class='line'>&#9;/* Disable header prediction. */  
-</span><span class='line'>&#9;tp-&gt;pred_flags = 0;  
-</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
-
-
-<h4>用户接收数据接口</h4>
-
-<h5>用户接收URG数据的接口</h5>
-
-<p>在用户接收数据的tcp_recvmsg函数中，如果用户通过MSG_OOB来接收数据，会进入tcp_recv_urg处理</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static int tcp_recv_urg(struct sock *sk, struct msghdr *msg, int len, int flags)  
-</span><span class='line'>{  
-</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);  
-</span><span class='line'>  
-</span><span class='line'>&#9;/* No URG data to read.  
-</span><span class='line'>&#9;用户已经读取过了*/  
-</span><span class='line'>&#9;if (sock_flag(sk, SOCK_URGINLINE) || !tp-&gt;urg_data ||  
-</span><span class='line'>&#9;&#9;tp-&gt;urg_data == TCP_URG_READ)  
-</span><span class='line'>&#9;&#9;return -EINVAL; /* Yes this is right ! */  
-</span><span class='line'>  
-</span><span class='line'>&#9;if (sk-&gt;sk_state == TCP_CLOSE && !sock_flag(sk, SOCK_DONE))  
-</span><span class='line'>&#9;&#9;return -ENOTCONN;  
-</span><span class='line'>&#9;/*当前的tp-&gt;urg_data为合法的数据，可以读取*/  
-</span><span class='line'>&#9;if (tp-&gt;urg_data & TCP_URG_VALID) {  
-</span><span class='line'>&#9;&#9;int err = 0;  
-</span><span class='line'>&#9;&#9;char c = tp-&gt;urg_data;  
-</span><span class='line'>&#9;&#9;/*标识urgent data已读*/  
-</span><span class='line'>&#9;&#9;if (!(flags & MSG_PEEK))  
-</span><span class='line'>&#9;&#9;&#9;tp-&gt;urg_data = TCP_URG_READ;  
-</span><span class='line'>  
-</span><span class='line'>&#9;&#9;/* Read urgent data. */  
-</span><span class='line'>&#9;&#9;msg-&gt;msg_flags |= MSG_OOB;  
-</span><span class='line'>  
-</span><span class='line'>&#9;&#9;if (len &gt; 0) {  
-</span><span class='line'>&#9;&#9;&#9;if (!(flags & MSG_TRUNC))  
-</span><span class='line'>&#9;&#9;&#9;&#9;err = memcpy_toiovec(msg-&gt;msg_iov, &c, 1);  
-</span><span class='line'>&#9;&#9;&#9;len = 1;  
-</span><span class='line'>&#9;&#9;} else  
-</span><span class='line'>&#9;&#9;&#9;msg-&gt;msg_flags |= MSG_TRUNC;  
-</span><span class='line'>  
-</span><span class='line'>&#9;&#9;return err ? -EFAULT : len;  
-</span><span class='line'>&#9;}  
-</span><span class='line'>  
-</span><span class='line'>&#9;if (sk-&gt;sk_state == TCP_CLOSE || (sk-&gt;sk_shutdown & RCV_SHUTDOWN))  
-</span><span class='line'>&#9;&#9;return 0;  
-</span><span class='line'>  
-</span><span class='line'>&#9;/* Fixed the recv(..., MSG_OOB) behaviour.  BSD docs and 
-</span><span class='line'>&#9; * the available implementations agree in this case: 
-</span><span class='line'>&#9; * this call should never block, independent of the 
-</span><span class='line'>&#9; * blocking state of the socket. 
-</span><span class='line'>&#9; * Mike &lt;pall@rz.uni-karlsruhe.de&gt; 
-</span><span class='line'>&#9; */  
-</span><span class='line'>&#9;return -EAGAIN;  
-</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
-
-
-<h5>用户接收普通数据的接口中的相关处理</h5>
-
-<p>在用户接收数据的tcp_recvmsg函数中，在查找到待拷贝的skb后，首先拷贝urgent data数据前的数据，然后退出接收过程，在用户下一次执行tcp_recvmsg的时候跳过urgent data，设置urgent data读取结束</p>
-
-<p>查找到准备拷贝的skb后的处理：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>found_ok_skb:  
-</span><span class='line'>/* Ok so how much can we use? */  
-</span><span class='line'>used = skb-&gt;len - offset;  
-</span><span class='line'>if (len &lt; used)  
-</span><span class='line'>&#9;used = len;  
-</span><span class='line'>  
-</span><span class='line'>/* 当前有urg_data数据*/  
-</span><span class='line'>if (tp-&gt;urg_data) {  
-</span><span class='line'>&#9;u32 urg_offset = tp-&gt;urg_seq - *seq;  
-</span><span class='line'>&#9;/*urgent data在当前待拷贝的数据范围内*/  
-</span><span class='line'>&#9;if (urg_offset &lt; used) {  
-</span><span class='line'>&#9;&#9;if (!urg_offset) {/*待拷贝的数据就是urgent data，跨过该urgent data， 
-</span><span class='line'>&#9;&#9;只给用户读取后面的数据*/  
-</span><span class='line'>&#9;&#9;&#9;if (!sock_flag(sk, SOCK_URGINLINE)) {  
-</span><span class='line'>&#9;&#9;&#9;&#9;++*seq;  
-</span><span class='line'>&#9;&#9;&#9;&#9;urg_hole++;  
-</span><span class='line'>&#9;&#9;&#9;&#9;offset++;  
-</span><span class='line'>&#9;&#9;&#9;&#9;used--;  
-</span><span class='line'>&#9;&#9;&#9;&#9;if (!used)  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;goto skip_copy;  
-</span><span class='line'>&#9;&#9;&#9;}  
-</span><span class='line'>&#9;&#9;}   
-</span><span class='line'>&#9;&#9;} else/*指定只拷贝urgent data数据之前的，完成后在下一次循环 
-</span><span class='line'>&#9;&#9;开始的位置，会退出循环，返回用户；下一次用户调用tcp_recvmsg 
-</span><span class='line'>&#9;&#9;就进入到上面的分支了*/  
-</span><span class='line'>&#9;&#9;&#9;used = urg_offset;  
-</span><span class='line'>&#9;}  
-</span><span class='line'>}   </span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>skip_copy:  
-</span><span class='line'>&#9;&#9;/*用户读取的数据跨过了urgent point，设置读取结束 
-</span><span class='line'>&#9;&#9;开启fast path*/  
-</span><span class='line'>&#9;&#9;if (tp-&gt;urg_data && after(tp-&gt;copied_seq, tp-&gt;urg_seq)) {  
-</span><span class='line'>&#9;&#9;&#9;tp-&gt;urg_data = 0;  
-</span><span class='line'>&#9;&#9;&#9;tcp_fast_path_check(sk);  
-</span><span class='line'>&#9;&#9;}  
-</span><span class='line'>&#9;&#9;if (used + offset &lt; skb-&gt;len)  
-</span><span class='line'>&#9;&#9;&#9;continue;  </span></code></pre></td></tr></table></div></figure>
-
-
-<p>在接收完urgent data数据前的所有数据之后， tcp_recvmsg的以下代码片段得到执行，这段代码退出当前接收过程，提示用户有urgent data数据到来，需要用MSG_OOB来接收</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if (tp-&gt;urg_data && tp-&gt;urg_seq == *seq) {  
-</span><span class='line'>&#9;if (copied)  
-</span><span class='line'>&#9;&#9;break;  
-</span><span class='line'>&#9;if (signal_pending(current)) {  
-</span><span class='line'>&#9;&#9;copied = timeo ? sock_intr_errno(timeo) : -EAGAIN;  
-</span><span class='line'>&#9;&#9;break;  
-</span><span class='line'>&#9;}  
-</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
-
-
-<h3>后记</h3>
-
-<p>TCP的urg数据，由于定义和实现上的混乱，当前已经不建议使用，但是为了兼容之前已经已经存在的实现，该机制会长期在内核中存在，如果不了解该机制及其内核行为，有可能就很难解释一些奇怪的问题：比如某段代码不小心地造成send接口事实上设置了MSG_OOB，就会造成接收端少了一个BYTE。</p>
+<p>只要用这个版本的iterate函数，就可以和多个_rcu版本的写操作(如：list_add_rcu())并发执行。</p>
 </div>
   
   
@@ -1194,7 +336,7 @@ urgent机制，是用于通知应用层需要接收urgent data，在urgent data�
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2015/05/15/debug-mark-tcp_collapse-bug/">tcp_collapse do not copy headers</a></h2>
+      <h2 class="entry-title"><a href="/blog/2015/06/02/kernel-mm-mm/">kmalloc、vmalloc、malloc的区别</a></h2>
     
     
       <p class="meta">
@@ -1203,155 +345,76 @@ urgent机制，是用于通知应用层需要接收urgent data，在urgent data�
 
 
 
-<time class='entry-date' datetime='2015-05-15T10:08:00+08:00'><span class='date'>2015-05-15</span> <span class='time'>10:08:00</span></time>
+<time class='entry-date' datetime='2015-06-02T16:48:00+08:00'><span class='date'>2015-06-02</span> <span class='time'>16:48:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>commit b3d6cb92fd190d720a01075c4d20cdca896663fc
-</span><span class='line'>Author: Eric Dumazet &lt;edumazet@google.com&gt;
-</span><span class='line'>Date:   Mon Sep 15 04:19:53 2014 -0700
-</span><span class='line'>
-</span><span class='line'>    tcp: do not copy headers in tcp_collapse()
-</span><span class='line'>
-</span><span class='line'>    tcp_collapse() wants to shrink skb so that the overhead is minimal.
-</span><span class='line'>
-</span><span class='line'>    Now we store tcp flags into TCP_SKB_CB(skb)-&gt;tcp_flags, we no longer
-</span><span class='line'>    need to keep around full headers.
-</span><span class='line'>    Whole available space is dedicated to the payload.
-</span><span class='line'>
-</span><span class='line'>    Signed-off-by: Eric Dumazet &lt;edumazet@google.com&gt;
-</span><span class='line'>    Acked-by: Neal Cardwell &lt;ncardwell@google.com&gt;
-</span><span class='line'>    Signed-off-by: David S. Miller &lt;davem@davemloft.net&gt;</span></code></pre></td></tr></table></div></figure>
+  <div class="entry-content"><p>blog.csdn.net/macrossdzh/article/details/5958368</p>
 
+<p>简单的说：<br/>
+  kmalloc和vmalloc是分配的是内核的内存,malloc分配的是用户的内存<br/>
+  kmalloc保证分配的内存在物理上是连续的,vmalloc保证的是在虚拟地址空间上的连续,malloc不保证任何东西(这点是自己猜测的,不一定正确)<br/>
+  kmalloc能分配的大小有限,vmalloc和malloc能分配的大小相对较大<br/>
+  内存只有在要被DMA访问的时候才需要物理上连续<br/>
+  vmalloc比kmalloc要慢</p>
 
+<p>详细的解释：<br/>
+  对于提供了MMU（存储管理器，辅助操作系统进行内存管理，提供虚实地址转换等硬件支持）的处理器而言，Linux提供了复杂的存储管理系统，使得进程所能访问的内存达到4GB。
+  进程的4GB内存空间被人为的分为两个部分&ndash;用户空间与内核空间。用户空间地址分布从0到3GB(PAGE_OFFSET，在0x86中它等于0xC0000000)，3GB到4GB为内核空间。<br/>
+  内核空间中，从3G到vmalloc_start这段地址是物理内存映射区域（该区域中包含了内核镜像、物理页框表mem_map等等），比如我们使用 的 VMware虚拟系统内存是160M，那么3G～3G+160M这片内存就应该映射物理内存。在物理内存映射区之后，就是vmalloc区域。对于 160M的系统而言，vmalloc_start位置应在3G+160M附近（在物理内存映射区与vmalloc_start期间还存在一个8M的gap 来防止跃界），vmalloc_end的位置接近4G(最后位置系统会保留一片128k大小的区域用于专用页面映射)</p>
 
+<p>  kmalloc和get_free_page申请的内存位于物理内存映射区域，而且在物理上也是连续的，它们与真实的物理地址只有一个固定的偏移，因此存在较简单的转换关系，virt_to_phys()可以实现内核虚拟地址转化为物理地址：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
 <span class='line-number'>3</span>
 <span class='line-number'>4</span>
 <span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>diff --git a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
-</span><span class='line'>index 228bf0c..ea92f23 100644
-</span><span class='line'>--- a/net/ipv4/tcp_input.c
-</span><span class='line'>+++ b/net/ipv4/tcp_input.c
-</span><span class='line'>@@ -4535,26 +4535,13 @@ restart:
-</span><span class='line'>      return;
-</span><span class='line'> 
-</span><span class='line'>  while (before(start, end)) {
-</span><span class='line'>+     int copy = min_t(int, SKB_MAX_ORDER(0, 0), end - start);
-</span><span class='line'>      struct sk_buff *nskb;
-</span><span class='line'>-     unsigned int header = skb_headroom(skb);
-</span><span class='line'>-     int copy = SKB_MAX_ORDER(header, 0);
-</span><span class='line'> 
-</span><span class='line'>-     /* Too big header? This can happen with IPv6. */
-</span><span class='line'>-     if (copy &lt; 0)
-</span><span class='line'>-         return;
-</span><span class='line'>-     if (end - start &lt; copy)
-</span><span class='line'>-         copy = end - start;
-</span><span class='line'>-     nskb = alloc_skb(copy + header, GFP_ATOMIC);
-</span><span class='line'>+     nskb = alloc_skb(copy, GFP_ATOMIC);
-</span><span class='line'>      if (!nskb)
-</span><span class='line'>          return;
-</span><span class='line'> 
-</span><span class='line'>-     skb_set_mac_header(nskb, skb_mac_header(skb) - skb-&gt;head);
-</span><span class='line'>-     skb_set_network_header(nskb, (skb_network_header(skb) -
-</span><span class='line'>-                       skb-&gt;head));
-</span><span class='line'>-     skb_set_transport_header(nskb, (skb_transport_header(skb) -
-</span><span class='line'>-                     skb-&gt;head));
-</span><span class='line'>-     skb_reserve(nskb, header);
-</span><span class='line'>-     memcpy(nskb-&gt;head, skb-&gt;head, header);
-</span><span class='line'>      memcpy(nskb-&gt;cb, skb-&gt;cb, sizeof(skb-&gt;cb));
-</span><span class='line'>      TCP_SKB_CB(nskb)-&gt;seq = TCP_SKB_CB(nskb)-&gt;end_seq = start;
-</span><span class='line'>      __skb_queue_before(list, skb, nskb);</span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define __pa(x) ((unsigned long)(x)-PAGE_OFFSET)
+</span><span class='line'>extern inline unsigned long virt_to_phys(volatile void * address)
+</span><span class='line'>{
+</span><span class='line'>&#9;return __pa(address);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
+
+<p>上面转换过程是将虚拟地址减去3G（PAGE_OFFSET=0XC000000）。</p>
+
+<p>与之对应的函数为phys_to_virt()，将内核物理地址转化为虚拟地址：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define __va(x) ((void *)((unsigned long)(x)+PAGE_OFFSET))
+</span><span class='line'>extern inline void * phys_to_virt(unsigned long address)
+</span><span class='line'>{
+</span><span class='line'>&#9;return __va(address);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>virt_to_phys()和phys_to_virt()都定义在include/asm-i386/io.h中。</p>
+
+<p>而vmalloc申请的内存则位于vmalloc_start～vmalloc_end之间，与物理地址没有简单的转换关系，虽然在逻辑上它们也是连续的，但是在物理上它们不要求连续。</p>
 
 <hr />
 
-<p>这个改进无形中修了一个BUG，但是这BUG正常情况下不会触发，除非我们对skb进行改动导致skb->data - skb->head = 4k时，如果此时内存紧张，且满足tcp_collapse合并条件才触发。</p>
+<p>blog.csdn.net/kris_fei/article/details/17243527</p>
 
-<p>BUG：
-tcp_collapse代码中有：</p>
+<p>平台： msm8x25<br/>
+系统： android 4.1<br/>
+内核： 3.4.0</p>
 
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>&#9;while (before(start, end)) {
-</span><span class='line'>&#9;&#9;struct sk_buff *nskb;
-</span><span class='line'>&#9;&#9;unsigned int header = skb_headroom(skb);
-</span><span class='line'>&#9;&#9;int copy = SKB_MAX_ORDER(header, 0);
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;/* Too big header? This can happen with IPv6. */
-</span><span class='line'>&#9;&#9;if (copy &lt; 0) 
-</span><span class='line'>&#9;&#9;&#9;return;
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;......
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;/* Copy data, releasing collapsed skbs. */
-</span><span class='line'>&#9;&#9;while (copy &gt; 0) { 
-</span><span class='line'>&#9;&#9;&#9;int offset = start - TCP_SKB_CB(skb)-&gt;seq;
-</span><span class='line'>&#9;&#9;&#9;int size = TCP_SKB_CB(skb)-&gt;end_seq - start;</span></code></pre></td></tr></table></div></figure>
+<h4>概念</h4>
 
+<p>由于系统的连续物理内存有限，这使得非连续物理内存的使用在linux内核中出现，这叫vmalloc机制。和前者一样，vmalloc机制中的虚拟地址也是连续的。</p>
 
-<p>也就是说如果header = 4k，那么copy = 0，那么会一直申请len=0的skb插入到receive队列，直到申请skb失败。这样就会造成tcp_recvmsg出错</p>
+<h5>Vmallocinfo</h5>
+
+<p>Vmalloc机制并不是狭义地指使用vmalloc函数分配，其他还有如ioremap, iotable_init等。可以从/proc/vmallocinfo获取到此信息：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -1373,37 +436,99 @@ tcp_collapse代码中有：</p>
 <span class='line-number'>18</span>
 <span class='line-number'>19</span>
 <span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>&#9;&#9;skb_queue_walk(&sk-&gt;sk_receive_queue, skb) {
-</span><span class='line'>&#9;&#9;&#9;/* Now that we have two receive queues this
-</span><span class='line'>&#9;&#9;&#9; * shouldn't happen.
-</span><span class='line'>&#9;&#9;&#9; */
-</span><span class='line'>&#9;&#9;&#9;if (WARN(before(*seq, TCP_SKB_CB(skb)-&gt;seq),
-</span><span class='line'>&#9;&#9;&#9;&#9; KERN_INFO "recvmsg bug: copied %X "
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;   "seq %X rcvnxt %X fl %X\n", *seq,
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;   TCP_SKB_CB(skb)-&gt;seq, tp-&gt;rcv_nxt,
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;   flags))
-</span><span class='line'>&#9;&#9;&#9;&#9;break;
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;offset = *seq - TCP_SKB_CB(skb)-&gt;seq;
-</span><span class='line'>&#9;&#9;&#9;if (tcp_hdr(skb)-&gt;syn)
-</span><span class='line'>&#9;&#9;&#9;&#9;offset--;
-</span><span class='line'>&#9;&#9;&#9;if (offset &lt; skb-&gt;len)
-</span><span class='line'>&#9;&#9;&#9;&#9;goto found_ok_skb;
-</span><span class='line'>&#9;&#9;&#9;if (tcp_hdr(skb)-&gt;fin)
-</span><span class='line'>&#9;&#9;&#9;&#9;goto found_fin_ok;
-</span><span class='line'>&#9;&#9;&#9;WARN(!(flags & MSG_PEEK), KERN_INFO "recvmsg bug 2: "
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;"copied %X seq %X rcvnxt %X fl %X\n",
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;*seq, TCP_SKB_CB(skb)-&gt;seq,
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;tp-&gt;rcv_nxt, flags);
-</span><span class='line'>&#9;&#9;}</span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#cat /proc/vmallocinfo
+</span><span class='line'>0xf3600000-0xf36ff0001044480 binder_mmap+0xb0/0x224 ioremap
+</span><span class='line'>………..
+</span><span class='line'>0xf6680000-0xf66c1000 266240 kgsl_page_alloc_map_kernel+0x98/0xe8 ioremap
+</span><span class='line'>0xf6700000-0xf67ff0001044480 binder_mmap+0xb0/0x224 ioremap
+</span><span class='line'>…………….
+</span><span class='line'>0xf6f00000-0xf6f41000 266240 kgsl_page_alloc_map_kernel+0x98/0xe8 ioremap
+</span><span class='line'>0xf7200000-0xf72ff0001044480 binder_mmap+0xb0/0x224 ioremap
+</span><span class='line'>0xfa000000-0xfa001000   4096 iotable_init+0x0/0xb0 phys=c0800000 ioremap
+</span><span class='line'>……………..
+</span><span class='line'>0xfa105000-0xfa106000   4096 iotable_init+0x0/0xb0 phys=a9800000 ioremap
+</span><span class='line'>0xfa200000-0xfa3000001048576 pmd_empty_section_gap+0x0/0x3c ioremap
+</span><span class='line'>0xfa300000-0xfa4000001048576 iotable_init+0x0/0xb0 phys=100000 ioremap
+</span><span class='line'>0xfa400000-0xfa5000001048576 iotable_init+0x0/0xb0 phys=aa500000 ioremap
+</span><span class='line'>0xfa500000-0xfa6000001048576 pmd_empty_section_gap+0x0/0x3c ioremap
+</span><span class='line'>0xfa701000-0xfa702000   4096 iotable_init+0x0/0xb0 phys=c0400000 ioremap
+</span><span class='line'>…………..
+</span><span class='line'>0xfa800000-0xfa9000001048576 pmd_empty_section_gap+0x0/0x3c ioremap
+</span><span class='line'>0xfa900000-0xfb60000013631488 iotable_init+0x0/0xb0 phys=ac000000 ioremap
+</span><span class='line'>0xfefdc000-0xff000000 147456 pcpu_get_vm_areas+0x0/0x56c vmalloc</span></code></pre></td></tr></table></div></figure>
 
 
-<p>因为offset = 0, len = 0, if (offset &lt; skb->len)就不符合，报WARN。而且如果申请的len=0的skb过多，会导致一直在这里循环，因为WARN有打印堆栈，执行很慢。</p>
+<p>上面的列数意思依次是：虚拟地址，分配大小，哪个函数分配的，物理地址，分配类型。</p>
 
-<p>错误如下：</p>
+<p>后面会提到vmalloc size的划分是按照此info来修改的。</p>
+
+<h4>分配标志</h4>
+
+<p>是否划分到vamlloc区域主要是以下重要的标志来决定的：</p>
+
+<p>File: kernel/include/linux/vmalloc.h</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* bits in flags ofvmalloc's vm_struct below */
+</span><span class='line'>#defineVM_IOREMAP    0x00000001     /* ioremap()and friends */
+</span><span class='line'>#define VM_ALLOC     0x00000002     /* vmalloc() */
+</span><span class='line'>#defineVM_MAP        0x00000004     /* vmap()ed pages */
+</span><span class='line'>#defineVM_USERMAP    0x00000008     /* suitable forremap_vmalloc_range */
+</span><span class='line'>#defineVM_VPAGES     0x00000010     /* buffer for pages was vmalloc'ed */
+</span><span class='line'>#defineVM_UNLIST     0x00000020     /* vm_struct is not listed in vmlist */
+</span><span class='line'>/* bits [20..32]reserved for arch specific ioremap internals */</span></code></pre></td></tr></table></div></figure>
+
+
+<p>Vmallocinfo中的函数，你可以对照源码看一下，在设置flag的时候就会有VM_IOREMAP, VM_ALLOC这些标志。</p>
+
+<h5>Vmalloc区域</h5>
+
+<p>Vmalloc的区域是由两个宏变量来表示： VMALLOC_START,VMALLOC_END.</p>
+
+<p>File: kernel/arch/arm/include/asm/pgtable.h</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#defineVMALLOC_OFFSET       (8*1024*1024)
+</span><span class='line'>#defineVMALLOC_START        (((unsigned long)high_memory + VMALLOC_OFFSET) & ~(VMALLOC_OFFSET-1))
+</span><span class='line'>#defineVMALLOC_END          0xff000000UL</span></code></pre></td></tr></table></div></figure>
+
+
+<p>VMALLOC_START：看上去会随着high_memory的值变化。</p>
+
+<p>VMALLOC_OFFSET：系统会在low memory和VMALLOC区域留8M，防止访问越界。因此假如理论上vmalloc size有300M，实际可用的也是只有292M。</p>
+
+<p>File: kernel/Documentation/arm/memory.txt有给出更好的解释：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>VMALLOC_START   VMALLOC_END-1    vmalloc() / ioremap() space. Memory returned byvmalloc/ioremap will be dynamically placed in this region. Machine specificstatic mappings are also located here through iotable_init(). VMALLOC_START isbased upon the value of the high_memoryvariable, and VMALLOC_END is equal to 0xff000000.</span></code></pre></td></tr></table></div></figure>
+
+
+<p>下图摘自网络，看下VMALLOC_START和VMALLOC_END的位置。0xc0000000到VMALLOC_START为low memory虚拟地址区域。</p>
+
+<h4>Vmallocsize 计算</h4>
+
+<p>有了以上知识后我们看下vmalloc size是如何分配的，目前有两种方法，kernel默认分配一个, 以及开机从cmdline分配。</p>
+
+<h5>1. 从cmdline分配</h5>
+
+<p>File: device/qcom/msm7627a/BoardConfig.mk</p>
+
+<p>BOARD_KERNEL_CMDLINE := androidboot.hardware=qcom loglevel=7vmalloc=200M</p>
+
+<p>上面的值在build的时候会被赋值给kernel 的cmdline。</p>
+
+<p>开机的时候early_vmalloc()会去读取vmalloc这个值。</p>
+
+<p>File: kernel/arch/arm/mm/mmu.c</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -1431,84 +556,53 @@ tcp_collapse代码中有：</p>
 <span class='line-number'>24</span>
 <span class='line-number'>25</span>
 <span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>WARNING: at net/ipv4/tcp.c:1457 tcp_recvmsg+0x96a/0xc20() (Tainted: G    W  ---------------   )
-</span><span class='line'>Hardware name: PowerEdge R620
-</span><span class='line'>Modules linked in: sha256_generic ws_st_tcp_cubic(U) ws_st(U) autofs4 i2c_dev i2c_core bonding 8021q garp stp llc be2iscsi iscsi_boot_sysfs ib]
-</span><span class='line'>Pid: 6964, comm: squid Tainted: G        W  ---------------    2.6.32-358.6.1.x86_64 #1
-</span><span class='line'>Call Trace:
-</span><span class='line'> [&lt;ffffffff8144f1ca&gt;] ? tcp_recvmsg+0x96a/0xc20
-</span><span class='line'> [&lt;ffffffff8144f1ca&gt;] ? tcp_recvmsg+0x96a/0xc20
-</span><span class='line'> [&lt;ffffffff81069aa8&gt;] ? warn_slowpath_common+0x98/0xc0
-</span><span class='line'> [&lt;ffffffff81069bce&gt;] ? warn_slowpath_fmt+0x6e/0x70
-</span><span class='line'> [&lt;ffffffff814ce08e&gt;] ? _spin_lock_bh+0x2e/0x40
-</span><span class='line'> [&lt;ffffffff813fea53&gt;] ? skb_release_data+0xb3/0x100
-</span><span class='line'> [&lt;ffffffff813feb56&gt;] ? __kfree_skb+0x46/0xa0
-</span><span class='line'> [&lt;ffffffff8144f1ca&gt;] ? tcp_recvmsg+0x96a/0xc20
-</span><span class='line'> [&lt;ffffffff813f93c7&gt;] ? sock_common_recvmsg+0x37/0x50
-</span><span class='line'> [&lt;ffffffff813f6b05&gt;] ? sock_aio_read+0x185/0x190
-</span><span class='line'> [&lt;ffffffff81171912&gt;] ? do_sync_read+0xf2/0x130
-</span><span class='line'> [&lt;ffffffff81090e60&gt;] ? autoremove_wake_function+0x0/0x40
-</span><span class='line'> [&lt;ffffffff811b4a2c&gt;] ? sys_epoll_wait+0x21c/0x3f0
-</span><span class='line'> [&lt;ffffffff8120b3b6&gt;] ? security_file_permission+0x16/0x20
-</span><span class='line'> [&lt;ffffffff81171bab&gt;] ? vfs_read+0x18b/0x1a0
-</span><span class='line'> [&lt;ffffffff81172df5&gt;] ? sys_read+0x55/0x90
-</span><span class='line'> [&lt;ffffffff8100af72&gt;] ? system_call_fastpath+0x16/0x1b
-</span><span class='line'>---[ end trace ef9663ba0fc61730 ]---
-</span><span class='line'>------------[ cut here ]------------
-</span><span class='line'>WARNING: at net/ipv4/tcp.c:1457 tcp_recvmsg+0x96a/0xc20() (Tainted: G        W  ---------------   )
-</span><span class='line'>Hardware name: PowerEdge R620
-</span><span class='line'>Modules linked in: sha256_generic ws_st_tcp_cubic(U) ws_st(U) autofs4 i2c_dev i2c_core bonding 8021q garp stp llc be2iscsi iscsi_boot_sysfs ib]
-</span><span class='line'>Pid: 6964, comm: squid Tainted: G        W  ---------------    2.6.32-358.6.1.x86_64 #1
-</span><span class='line'>Call Trace:
-</span><span class='line'> [&lt;ffffffff8144f1ca&gt;] ? tcp_recvmsg+0x96a/0xc20
-</span><span class='line'> [&lt;ffffffff8144f1ca&gt;] ? tcp_recvmsg+0x96a/0xc20
-</span><span class='line'> [&lt;ffffffff81069aa8&gt;] ? warn_slowpath_common+0x98/0xc0
-</span><span class='line'> [&lt;ffffffff81069bce&gt;] ? warn_slowpath_fmt+0x6e/0x70
-</span><span class='line'> [&lt;ffffffff814ce08e&gt;] ? _spin_lock_bh+0x2e/0x40
-</span><span class='line'> [&lt;ffffffff813fea53&gt;] ? skb_release_data+0xb3/0x100
-</span><span class='line'> [&lt;ffffffff813feb56&gt;] ? __kfree_skb+0x46/0xa0
-</span><span class='line'> [&lt;ffffffff8144f1ca&gt;] ? tcp_recvmsg+0x96a/0xc20
-</span><span class='line'> [&lt;ffffffff813f93c7&gt;] ? sock_common_recvmsg+0x37/0x50
-</span><span class='line'> [&lt;ffffffff813f6b05&gt;] ? sock_aio_read+0x185/0x190
-</span><span class='line'> [&lt;ffffffff81171912&gt;] ? do_sync_read+0xf2/0x130
-</span><span class='line'> [&lt;ffffffff81090e60&gt;] ? autoremove_wake_function+0x0/0x40
-</span><span class='line'> [&lt;ffffffff811b4a2c&gt;] ? sys_epoll_wait+0x21c/0x3f0
-</span><span class='line'> [&lt;ffffffff8120b3b6&gt;] ? security_file_permission+0x16/0x20
-</span><span class='line'> [&lt;ffffffff81171bab&gt;] ? vfs_read+0x18b/0x1a0
-</span><span class='line'> [&lt;ffffffff81172df5&gt;] ? sys_read+0x55/0x90
-</span><span class='line'> [&lt;ffffffff8100af72&gt;] ? system_call_fastpath+0x16/0x1b
-</span><span class='line'>---[ end trace ef9663ba0fc61731 ]---
-</span><span class='line'>------------[ cut here ]------------
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int__init early_vmalloc(char *arg)
+</span><span class='line'>{
+</span><span class='line'>&#9;/*cmdline中的vmalloc会被解析到vmlloc_reserve中。*/
+</span><span class='line'>&#9;unsigned long vmalloc_reserve = memparse(arg, NULL);
 </span><span class='line'>
-</span><span class='line'>.......
-</span></code></pre></td></tr></table></div></figure>
+</span><span class='line'>&#9;/*小于16M则用16M。*/
+</span><span class='line'>&#9;if (vmalloc_reserve &lt; SZ_16M) {
+</span><span class='line'>&#9;&#9;vmalloc_reserve = SZ_16M;
+</span><span class='line'>&#9;&#9;printk(KERN_WARNING
+</span><span class='line'>&#9;&#9;&#9;&#9;"vmalloc area too small, limiting to %luMB\n",
+</span><span class='line'>&#9;&#9;&#9;&#9;vmalloc_reserve &gt;&gt; 20);
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;/*大于可用虚拟地址内存则使用可用地址部分再减去32M。*/
+</span><span class='line'>&#9;if (vmalloc_reserve &gt; VMALLOC_END - (PAGE_OFFSET + SZ_32M)) {
+</span><span class='line'>&#9;&#9;vmalloc_reserve = VMALLOC_END - (PAGE_OFFSET + SZ_32M);
+</span><span class='line'>&#9;&#9;printk(KERN_WARNING
+</span><span class='line'>&#9;&#9;&#9;&#9;"vmalloc area is too big, limiting to %luMB\n",
+</span><span class='line'>&#9;&#9;&#9;&#9;vmalloc_reserve &gt;&gt; 20);
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;/*计算偏移起始地址。*/
+</span><span class='line'>&#9;vmalloc_min = (void *)(VMALLOC_END - vmalloc_reserve);
+</span><span class='line'>&#9;return 0;
+</span><span class='line'>}
+</span><span class='line'>early_param("vmalloc",early_vmalloc);</span></code></pre></td></tr></table></div></figure>
 
 
-<p>如果skb申请的不多，很快就能看到tcp_cleanup_rbuf的WARN，仔细观察会发现，这里打印的end_seq和上面的seq是一样的。</p>
+<p>vmalloc_min会影响arm_lowmem_limit,arm_lowmem_limit其实就是high_memory。因为此过程不是我们要分析的重点，如果有兴趣可分析kernel/arch/arm/mm/mmu.c中的sanity_check_meminfo()函数。</p>
+
+<p>所以，VMALLOC_START受到了hight_memory的影响而发生了变化，最终使得vmalloc size也变化了！</p>
+
+<h5>2. 开机默认分配：</h5>
+
+<p>File: kernel/arch/arm/mm/mmu.c</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void * __initdata vmalloc_min =
+</span><span class='line'>&#9;(void *)(VMALLOC_END - (240 &lt;&lt; 20) - VMALLOC_OFFSET);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>当cmdline无vmalloc参数传进来的时候，early_vmalloc()函数也不会调用到，vmalloc_min的值就会被默认传进来了，默认是240M。</p>
+
+<p>后面的步骤和方法1一样了！</p>
+
+<p>开机log有memory layout 信息：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -1521,73 +615,254 @@ tcp_collapse代码中有：</p>
 <span class='line-number'>9</span>
 <span class='line-number'>10</span>
 <span class='line-number'>11</span>
-<span class='line-number'>12</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>void tcp_cleanup_rbuf(struct sock *sk, int copied)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
-</span><span class='line'>&#9;int time_to_ack = 0;
-</span><span class='line'>
-</span><span class='line'>#if TCP_DEBUG
-</span><span class='line'>&#9;struct sk_buff *skb = skb_peek(&sk-&gt;sk_receive_queue);
-</span><span class='line'>
-</span><span class='line'>&#9;WARN(skb && !before(tp-&gt;copied_seq, TCP_SKB_CB(skb)-&gt;end_seq),
-</span><span class='line'>&#9;&#9; KERN_INFO "cleanup rbuf bug: copied %X seq %X rcvnxt %X\n",
-</span><span class='line'>&#9;&#9; tp-&gt;copied_seq, TCP_SKB_CB(skb)-&gt;end_seq, tp-&gt;rcv_nxt);
+</pre></td><td class='code'><pre><code class=''><span class='line'>[    0.000000] [cpuid: 0] Virtual kernelmemory layout:
+</span><span class='line'>[    0.000000] [cpuid:0]     vector  : 0xffff0000 - 0xffff1000  (   4 kB)
+</span><span class='line'>[    0.000000] [cpuid:0]     fixmap  : 0xfff00000 - 0xfffe0000   (896 kB)
+</span><span class='line'>[    0.000000] [cpuid:0]     vmalloc : 0xf3000000 - 0xff000000   ( 192MB)
+</span><span class='line'>[    0.000000] [cpuid:0]     lowmem  : 0xc0000000 - 0xf2800000   (808 MB)
+</span><span class='line'>[    0.000000] [cpuid:0]     pkmap   : 0xbfe00000 -0xc0000000   (   2 MB)
+</span><span class='line'>[    0.000000] [cpuid:0]     modules : 0xbf000000 - 0xbfe00000  (  14 MB)
+</span><span class='line'>[    0.000000] [cpuid:0]       .text : 0xc0008000 -0xc0893034   (8749 kB)
+</span><span class='line'>[    0.000000] [cpuid:0]       .init : 0xc0894000 -0xc08cdc00   ( 231 kB)
+</span><span class='line'>[    0.000000] [cpuid:0]       .data : 0xc08ce000 -0xc09f8eb8   (1196 kB)
+</span><span class='line'>[    0.000000] [cpuid:0]        .bss : 0xc0a78eec -0xc0f427a8   (4903 kB)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>其中看到vmalloc为192MB , cmdline中使用vmllaoc就是200M。</p>
+
+<p>Lowmem为地段内存部分，可见lowmem和vmalloc中间有8M空隙。</p>
+
+<h5>Vmalloc该分配多大?</h5>
+
+<p>Linux内核版本从3.2到3.3 默认的vmalloc size由128M 增大到了240M，3.4.0上的</p>
+
+<p>修改Commit信息如下：</p>
+
+<p>To accommodate all static mappings on machines withpossible highmem usage, the default vmalloc area size is changed to 240 MB sothat VMALLOC_START is no higher than 0xf0000000 by default.</p>
+
+<p>看其意思是因为开机的静态映射增加了，所以要扩大。</p>
+
+<p>另外3.2到3.3版本的一个重大变化是将android引入到主线内核中。我想增大vmalloc size到240M是基于此考虑吧。当然，各家厂商都也可以基于自己平台来动态修改size的。</p>
+
+<p>那么如何判断当前vmalloc size不足呢？</p>
+
+<p>/proc/meminfo中有vmalloc信息:<br/>
+VmallocTotal:     540672 kB<br/>
+VmallocUsed:      165268 kB<br/>
+VmallocChunk:     118788kB</p>
+
+<p>事实上这里的VmallocUsed只是表示已经被真正使用掉的vmalloc区域，但是区域之前的空隙也就是碎片没有被计算进去。</p>
+
+<p>所以，回到前面说的/proc/vmallocinfo，假设我们的vmalloc size就是200M。那么区域为0xf3000000- 0xff000000，从vmallocinfo中可以看到，前面大部分虚拟地址空间都用掉了，剩下0xfb600000到0xfefdc000这57M空间，假如申请了64M，那么就会失败了。</p>
+
+<p>开机分配使用掉vmalloc之后到底该剩余多少目前没有具体依据，一般来说1GB RAM可以设置为400~600M。</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2015/06/02/kernel-mm-alloc-numa/">Linux-2.6.32 NUMA架构之内存和调度</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-06-02T15:32:00+08:00'><span class='date'>2015-06-02</span> <span class='time'>15:32:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://blog.chinaunix.net/uid-7295895-id-3076420.html">http://blog.chinaunix.net/uid-7295895-id-3076420.html</a></p>
+
+<p>Linux-2.6.32 NUMA架构之内存和调度</p>
+
+<p>  本文将以XLP832通过ICI互连形成的NUMA架构进行分析，主要包括内存管理和调度两方面，参考内核版本2.6.32.9；NUMA架构常见配置选项有：CONFIG_SMP, CONFIG_NUMA, CONFIG_NEED_MULTIPLE_NODES, CONFIG_NODES_SHIFT, CONFIG_SPARSEMEM, CONFIG_CGROUPS, CONFIG_CPUSETS, CONFIG_MIGRATION等。</p>
+
+<p>本文试图从原理上介绍，尽量避免涉及代码的实现细节。</p>
+
+<h3>1 NUMA架构简介</h3>
+
+<p>NUMA(Non Uniform Memory Access)即非一致内存访问架构，市面上主要有X86_64(JASPER)和MIPS64(XLP)体系。</p>
+
+<h4>1.1 概念</h4>
+
+<p>NUMA具有多个节点(Node)，每个节点可以拥有多个CPU(每个CPU可以具有多个核或线程)，节点内使用共有的内存控制器，因此节点的所有内存对于本节点的所有CPU都是等同的，而对于其它节点中的所有CPU都是不同的。节点可分为本地节点(Local Node)、邻居节点(Neighbour Node)和远端节点(Remote Node)三种类型。</p>
+
+<p>本地节点：对于某个节点中的所有CPU，此节点称为本地节点；<br/>
+邻居节点：与本地节点相邻的节点称为邻居节点；<br/>
+远端节点：非本地节点或邻居节点的节点，称为远端节点。</p>
+
+<p>邻居节点和远端节点，称作非本地节点(Off Node)。</p>
+
+<p>CPU访问不同类型节点内存的速度是不相同的：本地节点>邻居节点>远端节点。访问本地节点的速度最快，访问远端节点的速度最慢，即访问速度与节点的距离有关，距离越远访问速度越慢，此距离称作Node Distance。</p>
+
+<p>常用的NUMA系统中：硬件设计已保证系统中所有的Cache是一致的(Cache Coherent, ccNUMA)；不同类型节点间的Cache同步时间不一样，会导致资源竞争不公平，对于某些特殊的应用，可以考虑使用FIFO Spinlock保证公平性。</p>
+
+<h4>1.2 关键信息</h4>
+
+<p>1) 物理内存区域与Node号之间的映射关系；<br/>
+2) 各Node之间的Node Distance；<br/>
+3) 逻辑CPU号与Node号之间的映射关系。</p>
+
+<h3>2 XLP832 NUMA初始化</h3>
+
+<p>首先需要完成1.2节中描述的3个关键信息的初始化。</p>
+
+<h4>2.1 CPU和Node的关系</h4>
+
+<p>start_kernel()->setup_arch()->prom_init():</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#ifdef CONFIG_NUMA
+</span><span class='line'>&#9;build_node_cpu_map();
 </span><span class='line'>#endif</span></code></pre></td></tr></table></div></figure>
 
-</div>
-  
-  
+
+<p>build_node_cpu_map()函数工作：</p>
+
+<p>a) 确定CPU与Node的相互关系，做法很简单：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define cpu_to_node(cpu)       (cpu &gt;&gt; 5)
+</span><span class='line'>#define cpumask_of_node    (NODE_CPU_MASK(node)) /* node0:0~31; node1: 32~63 */</span></code></pre></td></tr></table></div></figure>
 
 
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/05/11/kernel-net-tcp_queue/">tcp三个接收队列</a></h2>
-    
-    
-      <p class="meta">
-        
+<p>说明：XLP832每个节点有1个物理CPU，每个物理CPU有8个核，每个核有4个超线程，因此每个节点对应32个逻辑CPU，按节点依次展开。另外，实际物理存在的CPU数目是通过DTB传递给内核的；numa_node_id()可以获取当前CPU所处的Node号。</p>
+
+<p>b) 设置每个物理存在的节点的在线状态，具体是通过node_set_online()函数来设置全局变量</p>
+
+<p>nodemask_t node_states[];</p>
+
+<p>这样，类似于CPU号，Node号也就具有如下功能宏：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>for_each_node(node);
+</span><span class='line'>for_each_online_node(node);</span></code></pre></td></tr></table></div></figure>
 
 
+<p>详细可参考include/linux/nodemask.h</p>
+
+<h4>2.2 Node Distance确立</h4>
+
+<p>作用：建立buddy时用，可以依此来构建zonelist，以及zone relaim(zone_reclaim_mode)使用，详见后面的4.2.2节。</p>
+
+<h4>2.3 内存区域与Node的关系</h4>
+
+<p>start_kernel()->setup_arch()->arch_mem_init->bootmem_init()->nlm_numa_bootmem_init():</p>
+
+<p>nlm_get_dram_mapping();</p>
+
+<p>XLP832上电后的默认memory-mapped物理地址空间分布：</p>
+
+<p><img src="/images/kernel/2015-06-02-30.jpg" alt="" /></p>
+
+<p>  其中PCIE配置空间映射地址范围为[0x1800_0000, 0x1BFF_FFFF]，由寄存器ECFG_BASE和ECFG_LIMIT指定(注：但这2个寄存器本身是处于PCIE配置空间之中的)。</p>
+
+<p>PCIE配置空间：<br/>
+  PCIE配置空间与memory-mapped物理地址的映射方式：</p>
+
+<p><img src="/images/kernel/2015-06-02-31.jpg" alt="" /></p>
+
+<p>XLP832实现了所有设备都位于虚拟总线0上，每个节点有8个设备，按节点依次排开。</p>
+
+<p>DRAM映射寄存器组：<br/>
+  每个节点都独立实现有几组不同类型的DRAM(每组有8个相同类型的)寄存器可以配置DRAM空间映射到物理地址空间中的基址和大小，以及所属的节点信息(这些寄存器的值事先会由bootloader设好)；这组寄存器位于虚拟总线0的设备0/8/16/24(依次对应每个节点的第一个设备号)的Function0(每个设备最多可定义8个Function，每个Function有着独立的PCIE 4KB的配置空间)的PCIE配置空间中(这个配置空间实现的是DRAM/Bridge控制器)。</p>
+
+<p>本小节涉及到的3组不同类型的寄存器(注：按索引对应即DRAM_BAR<n>,DRAM_LIMIT<n>和 DRAM_NODE_TRANSLATION<n>描述一个内存区域属性)：</p>
+
+<p>第一组(DRAM空间映射物理空间基址)：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>DRAM_BAR0: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x54
+</span><span class='line'>DRAM_BAR1: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x55
+</span><span class='line'>DRAM_BAR2: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x56
+</span><span class='line'>DRAM_BAR3: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x57
+</span><span class='line'>DRAM_BAR4: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x58
+</span><span class='line'>DRAM_BAR5: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x59
+</span><span class='line'>DRAM_BAR6: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x5A
+</span><span class='line'>DRAM_BAR7: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x5B</span></code></pre></td></tr></table></div></figure>
 
 
-<time class='entry-date' datetime='2015-05-11T15:46:00+08:00'><span class='date'>2015-05-11</span> <span class='time'>15:46:00</span></time>
-        
-      </p>
-    
-  </header>
+<p>第二组(DRAM空间映射物理空间长度)：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>DRAM_LIMIT0: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x5C
+</span><span class='line'>DRAM_LIMIT1: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x5D
+</span><span class='line'>DRAM_LIMIT2: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x5E
+</span><span class='line'>DRAM_LIMIT3: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x5F
+</span><span class='line'>DRAM_LIMIT4: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x60
+</span><span class='line'>DRAM_LIMIT5: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x61
+</span><span class='line'>DRAM_LIMIT6: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x62
+</span><span class='line'>DRAM_LIMIT7: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x63</span></code></pre></td></tr></table></div></figure>
 
 
-  <div class="entry-content"><p><a href="http://www.cnblogs.com/alreadyskb/p/4386565.html">http://www.cnblogs.com/alreadyskb/p/4386565.html</a></p>
+<p>第三组(节点相关)：</p>
 
-<h4>三个接收队列</h4>
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>DRAM_NODE_TRANSLATION0: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x64
+</span><span class='line'>DRAM_NODE_TRANSLATION1: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x65
+</span><span class='line'>DRAM_NODE_TRANSLATION2: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x66
+</span><span class='line'>DRAM_NODE_TRANSLATION3: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x67
+</span><span class='line'>DRAM_NODE_TRANSLATION4: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x68
+</span><span class='line'>DRAM_NODE_TRANSLATION5: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x69
+</span><span class='line'>DRAM_NODE_TRANSLATION6: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x6A
+</span><span class='line'>DRAM_NODE_TRANSLATION7: PCIe Bus 0, Device 0/8/16/24, Function 0, Register 0x6B</span></code></pre></td></tr></table></div></figure>
 
-<ul>
-<li>tcp协议栈数据接收实现了三个接收缓存分别是prequeue、sk_write_queue、sk_backlog。</li>
-</ul>
 
+<p>根据上述的PCIE配置空间memory-mapped映射方式便可直接获取寄存器中的值，就可以建立各个节点中的所有内存区域(最多8个区域)信息。关于这些寄存器的使用可以参考“XLP® Processor Family Programming Reference Manual”的“Chapter 7 Memory and I/O Subsystem”。</p>
 
-<p>之所以需要三个接收缓存的原因如下：<br/>
-tcp协议栈接收到数据包时struct sock *sk 可能被进程下上文或者中断上下文占用：</p>
+<h3>3 Bootmem初始化</h3>
 
-<p>  1、如果处于进程上下文sk_lock.owned=1，软中断因为sk_lock.owned=1，所以数据只能暂存在后备队列中（backlog），当进程上下文逻辑处理完成后会回调tcp_v4_do_rcv处理backlog队列作为补偿，具体看tcp_sendmsg 函数 release_sock的实现。</p>
+<p>bootmem_init()->…->init_bootmem_node()->init_bootmem_core():</p>
 
-<p>  2、如果当前处于中断上下文，sk_lock.owned=0，那么数据可能被放置到receive_queue或者prequeue，数据优先放置到prequeue中，如果prequeue满了则会放置到receive_queue中，理论上这里有一个队列就行了，但是TCP协议栈为什么要设计两个呢？其实是为了快点结束软中断数据处理流程，软中断处理函数中禁止了进程抢占和其他软中断发生，效率应该是很低下的，如果数据被放置到prequeue中，那么软中断流程很快就结束了，如果放置到receive_queue那么会有很复杂的逻辑需要处理。receive_queue队列的处理在软中断中，prequeue队列的处理则是在进程上下文中。总的来说就是为了提高TCP协议栈的效率。</p>
+<p><img src="/images/kernel/2015-06-02-32.jpg" alt="" /></p>
 
-<h4>后备队列的处理逻辑</h4>
+<p>每个节点拥有各自的bootmem管理(code&amp;data之前可以为空闲页面)。</p>
 
-<h5>1、什么时候使用后备队列</h5>
+<h3>4 Buddy初始化</h3>
 
-<p>tcp协议栈对struct sock <em>sk有两把锁，第一把是sk_lock.slock，第二把则是sk_lock.owned。sk_lock.slock用于获取struct sock </em>sk对象的成员的修改权限；sk_lock.owned用于区分当前是进程上下文或是软中断上下文，为进程上下文时sk_lock.owned会被置1，中断上下文为0。</p>
+<p>初始化流程最后会设置全局struct node_active_region early_node_map[]用于初始化Buddy系统，for_each_online_node()遍历所有在线节点调用free_area_init_node()初始化，主要初始化每个zone的大小和所涉及页面的struct page结构(flags中初始化有所属zone和node信息，由set_page_links()函数设置)等。</p>
 
-<p>如果是要对sk修改，首先是必须拿锁sk_lock.slock，其后是判断当前是软中断或是进程上下文，如果是进程上下文，那么接收到的skb则只能先放置到后备队列中sk_backlog中。如果是软中断上下文则可以放置到prequeue和sk_write_queue中。</p>
+<h4>4.1 NUMA带来的变化</h4>
 
-<p>代码片段如下：</p>
+<p>1) pglist_data</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -1602,108 +877,25 @@ tcp协议栈接收到数据包时struct sock *sk 可能被进程下上文或者�
 <span class='line-number'>11</span>
 <span class='line-number'>12</span>
 <span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>&#9;bh_lock_sock_nested(sk);               // 获取第一把锁。
-</span><span class='line'>&#9;ret = 0;
-</span><span class='line'>&#9;if (!sock_owned_by_user(sk)) {         // 判断第二把锁，区分是处于进程上下文还是软中断上下文。
-</span><span class='line'>#ifdef CONFIG_NET_DMA
-</span><span class='line'>&#9;&#9;struct tcp_sock *tp = tcp_sk(sk);
-</span><span class='line'>&#9;&#9;if (!tp-&gt;ucopy.dma_chan && tp-&gt;ucopy.pinned_list)
-</span><span class='line'>&#9;&#9;&#9;tp-&gt;ucopy.dma_chan = dma_find_channel(DMA_MEMCPY);
-</span><span class='line'>&#9;&#9;if (tp-&gt;ucopy.dma_chan)
-</span><span class='line'>&#9;&#9;&#9;ret = tcp_v4_do_rcv(sk, skb);
-</span><span class='line'>&#9;&#9;else
-</span><span class='line'>#endif
-</span><span class='line'>&#9;&#9;{
-</span><span class='line'>&#9;&#9;&#9;if (!tcp_prequeue(sk, skb))    // 如果处于中断上下文，则优先放置到prequeue中，如果prequeue满则放置到sk_write_queue中。
-</span><span class='line'>&#9;&#9;&#9;&#9;ret = tcp_v4_do_rcv(sk, skb);
-</span><span class='line'>&#9;&#9;}
-</span><span class='line'>&#9;} else if (unlikely(sk_add_backlog(sk, skb,  // 如果是处于进程上下文则直接放置到后备队列中(sk_backlog中)。
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;sk-&gt;sk_rcvbuf + sk-&gt;sk_sndbuf))) {
-</span><span class='line'>&#9;&#9;bh_unlock_sock(sk);
-</span><span class='line'>&#9;&#9;NET_INC_STATS_BH(net, LINUX_MIB_TCPBACKLOGDROP);
-</span><span class='line'>&#9;&#9;goto discard_and_relse;
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;bh_unlock_sock(sk);</span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>typedef struct pglist_data {
+</span><span class='line'>&#9;struct zone node_zones[MAX_NR_ZONES];
+</span><span class='line'>&#9;struct zonelist node_zonelists[MAX_ZONELISTS];
+</span><span class='line'>&#9;int nr_zones;
+</span><span class='line'>&#9;struct bootmem_data *bdata;
+</span><span class='line'>&#9;unsigned long node_start_pfn;
+</span><span class='line'>&#9;unsigned long node_present_pages; /* total number of physical pages */
+</span><span class='line'>&#9;unsigned long node_spanned_pages; /* total size of physical pagerange, including holes */
+</span><span class='line'>&#9;int node_id;
+</span><span class='line'>&#9;wait_queue_head_t kswapd_wait;
+</span><span class='line'>&#9;struct task_struct *kswapd;
+</span><span class='line'>&#9;int kswapd_max_order;
+</span><span class='line'>} pg_data_t;</span></code></pre></td></tr></table></div></figure>
 
 
-<h5>2、skb怎么add到sk_backlog中</h5>
+<p>a)上节的bootmem结构的描述信息存放在NODE_DATA(node)-> bdata中；NODE_DATA(i)宏返回节点i的struct pglist_data结构，需要在架构相关的mmzone.h中实现；<br/>
+b) #define MAX_ZONELISTS 2，请参考后面的“zonelist初始化”。</p>
 
-<p>sk_add_backlog函数用于add sbk到sk_backlog中，所以下面我们分析次函数。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/* The per-socket spinlock must be held here. */
-</span><span class='line'>static inline __must_check int sk_add_backlog(struct sock *sk, struct sk_buff *skb,
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;   unsigned int limit)
-</span><span class='line'>{
-</span><span class='line'>&#9;if (sk_rcvqueues_full(sk, skb, limit))  // 判断接收缓存是否已经用完了，很明显sk_backlog的缓存大小也算在了总接收缓存中。
-</span><span class='line'>&#9;&#9;return -ENOBUFS;
-</span><span class='line'>
-</span><span class='line'>&#9;__sk_add_backlog(sk, skb);              // 将skb添加到sk_backlog队列中。
-</span><span class='line'>&#9;sk_extended(sk)-&gt;sk_backlog.len += skb-&gt;truesize;  // 更新sk_backlog中已经挂载的数据量。
-</span><span class='line'>&#9;return 0;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/* OOB backlog add */
-</span><span class='line'>static inline void __sk_add_backlog(struct sock *sk, struct sk_buff *skb)
-</span><span class='line'>{
-</span><span class='line'>&#9;if (!sk-&gt;sk_backlog.tail) {   // 如果当前sk_backlog为NULL，此时head和tail都指向skb。
-</span><span class='line'>&#9;&#9;sk-&gt;sk_backlog.head = sk-&gt;sk_backlog.tail = skb;
-</span><span class='line'>&#9;} else {                      // 分支表示sk_backlog中已经有数据了，那么skb直接挂在tail的尾部，之后tail指针后移到skb。
-</span><span class='line'>&#9;&#9;sk-&gt;sk_backlog.tail-&gt;next = skb;
-</span><span class='line'>&#9;&#9;sk-&gt;sk_backlog.tail = skb;
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;skb-&gt;next = NULL;             // 这种很重要，在sk_backlog处理时会用来判断skb是否处理完毕。
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>3、sk_backlog中skb的处理</h5>
-
-<p>很明显sk_backlog的处理必然中进程上下文进行，对于数据接收，进程上下文的接口是tcp_recvmmsg，所以sk_backlog肯定要在tcp_recvmmsg中处理。</p>
-
-<p>tcp_recvmmsg sk_backlog的代码处理片段如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>tcp_cleanup_rbuf(sk, copied);
-</span><span class='line'>TCP_CHECK_TIMER(sk);
-</span><span class='line'>release_sock(sk);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>release_sock(sk)涉及到sk_backlog处理。</p>
+<p>2) zone</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -1717,37 +909,124 @@ tcp协议栈接收到数据包时struct sock *sk 可能被进程下上文或者�
 <span class='line-number'>10</span>
 <span class='line-number'>11</span>
 <span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>void release_sock(struct sock *sk)
-</span><span class='line'>{
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct zone {
+</span><span class='line'>#ifdef CONFIG_NUMA
+</span><span class='line'>&#9;int node;
 </span><span class='line'>&#9;/*
-</span><span class='line'>&#9;* The sk_lock has mutex_unlock() semantics:
-</span><span class='line'>&#9;*/
-</span><span class='line'>&#9;mutex_release(&sk-&gt;sk_lock.dep_map, 1, _RET_IP_);
-</span><span class='line'>
-</span><span class='line'>&#9;spin_lock_bh(&sk-&gt;sk_lock.slock);   // 获取第一把锁。
-</span><span class='line'>&#9;if (sk-&gt;sk_backlog.tail)            // 如果后备队列不为NULL，则开始处理。
-</span><span class='line'>&#9;&#9;__release_sock(sk);
-</span><span class='line'>
-</span><span class='line'>&#9;if (proto_has_rhel_ext(sk-&gt;sk_prot, RHEL_PROTO_HAS_RELEASE_CB) &&
-</span><span class='line'>&#9;&#9;&#9;sk-&gt;sk_prot-&gt;release_cb)
-</span><span class='line'>&#9;&#9;sk-&gt;sk_prot-&gt;release_cb(sk);
-</span><span class='line'>
-</span><span class='line'>&#9;sk-&gt;sk_lock.owned = 0;              // 进成上下文skb处理完了，释放第二把锁。
-</span><span class='line'>&#9;if (waitqueue_active(&sk-&gt;sk_lock.wq))
-</span><span class='line'>&#9;&#9;wake_up(&sk-&gt;sk_lock.wq);
-</span><span class='line'>&#9;spin_unlock_bh(&sk-&gt;sk_lock.slock); // 释放第一把锁。
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+</span><span class='line'>&#9; * zone reclaim becomes active if more unmapped pages exist.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;unsigned long        min_unmapped_pages;
+</span><span class='line'>&#9;unsigned long        min_slab_pages;
+</span><span class='line'>&#9;struct per_cpu_pageset   *pageset[NR_CPUS];
+</span><span class='line'>#else
+</span><span class='line'>&#9;… …
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
 
 
-<p><code>__release_sock(sk)</code>是后备队列的真正处理函数。</p>
+<p>a)最终调用kmalloc_node()为pageset成员在每个CPU的对应的内存节点分配内存；<br/>
+b)min_unmapped_pages 对应/proc/sys/vm/min_unmapped_ratio，默认值为1；<br/>
+  min_slab_pages对应/proc/sys/vm/min_slab_ratio，默认值为5；<br/>
+  作用：当剩余可回收的非文件映射和SLAB页面超过这2个值时，才激活当前zone回收；</p>
+
+<p>c) 增加了zone对应的节点号。</p>
+
+<h4>4.2 zonelist初始化</h4>
+
+<p>  本节讲述zonelist的构建方式，实现位于start_kernel()->build_all_zonelists()中，zonelist的组织方式非常关键(这一点与以前的2.6.21内核版本不一样，2.6.32组织得更清晰)。</p>
+
+<h5>4.2.1 zonelist order</h5>
+
+<p>NUMA系统中存在多个节点，每个节点对应一个struct pglist_data结构，此结构中可以包含多个zone，如：ZONE_DMA, ZONE_NORMAL，这样就产生几种排列顺序，以2个节点2个zone为例(zone从高到低排列, ZONE_DMA0表示节点0的ZONE_DMA，其它类似)：</p>
+
+<p>a) Legacy方式<br/>
+<img src="/images/kernel/2015-06-02-33.jpg" alt="" /><br/>
+  每个节点只排列自己的zone；</p>
+
+<p>b)Node方式<br/>
+<img src="/images/kernel/2015-06-02-34.jpg" alt="" /><br/>
+  按节点顺序依次排列，先排列本地节点的所有zone，再排列其它节点的所有zone。</p>
+
+<p>c) Zone方式<br/>
+<img src="/images/kernel/2015-06-02-35.jpg" alt="" /><br/>
+  按zone类型从高到低依次排列各节点的同相类型zone。</p>
+
+<p>可通过启动参数“numa_zonelist_order”来配置zonelist order，内核定义了3种配置：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define ZONELIST_ORDER_DEFAULT  0 /* 智能选择Node或Zone方式 */
+</span><span class='line'>#define ZONELIST_ORDER_NODE     1 /* 对应Node方式 */
+</span><span class='line'>#define ZONELIST_ORDER_ZONE     2 /* 对应Zone方式 */</span></code></pre></td></tr></table></div></figure>
+
+
+<p>默认配置为ZONELIST_ORDER_DEFAULT，由内核通过一个算法来判断选择Node或Zone方式，算法思想：</p>
+
+<p>a) alloc_pages()分配内存是按照ZONE从高到低的顺序进行的，例如上节“Node方式”的图示中，从ZONE_NORMAL0中分配内存时，ZONE_NORMAL0中无内存时将落入较低的ZONE_DMA0中分配，这样当ZONE_DMA0比较小的时候，很容易将ZONE_DMA0中的内存耗光，这样是很不理智的，因为还有更好的分配方式即从ZONE_NORMAL1中分配；</p>
+
+<p>b) 内核会检测各ZONE的页面数来选择Zone组织方式，当ZONE_DMA很小时，选择ZONELIST_ORDER_DEFAULT时，内核将倾向于选择ZONELIST_ORDER_ZONE方式，否则选择ZONELIST_ORDER_NODE方式。</p>
+
+<p>另外，可以通过/proc/sys/vm/numa_zonelist_order动态改变zonelist order的分配方式。</p>
+
+<h5>4.2.2 Node Distance</h5>
+
+<p>上节中的例子是以2个节点为例，如果有>2个节点存在，就需要考虑不同节点间的距离来安排节点，例如以4个节点2个ZONE为例，各节点的布局(如4个XLP832物理CPU级联)值如下：</p>
+
+<p><img src="/images/kernel/2015-06-02-36.jpg" alt="" /></p>
+
+<p>上图中，Node0和Node2的Node Distance为25，Node1和Node3的Node Distance为25，其它的Node Distance为15。</p>
+
+<h6>4.2.2.1 优先进行Zone Reclaim</h6>
+
+<p>另外，当Node Distance超过20的时候，内核会在某个zone分配内存不足的时候，提前激活本zone的内存回收工作，由全局变量zone_reclaim_mode控制，build_zonelists()中：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/*
+</span><span class='line'> * If another node is sufficiently far away then it is better
+</span><span class='line'> * to reclaim pages in a zone before going off node.
+</span><span class='line'> */
+</span><span class='line'>if (distance &gt; RECLAIM_DISTANCE)
+</span><span class='line'>&#9;zone_reclaim_mode = 1;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>通过/proc/sys/vm/zone_reclaim_mode可以动态调整zone_reclaim_mode的值来控制回收模式，含义如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define RECLAIM_OFF    0
+</span><span class='line'>#define RECLAIM_ZONE  (1&lt;&lt;0)     /* Run shrink_inactive_list on the zone */
+</span><span class='line'>#define RECLAIM_WRITE (1&lt;&lt;1)     /* Writeout pages during reclaim */
+</span><span class='line'>#define RECLAIM_SWAP  (1&lt;&lt;2)     /* Swap pages out during reclaim */</span></code></pre></td></tr></table></div></figure>
+
+
+<h6>4.2.2.2 影响zonelist方式</h6>
+
+<p>采用Node方式组织的zonelist为：</p>
+
+<p><img src="/images/kernel/2015-06-02-37.jpg" alt="" /></p>
+
+<p>  即各节点按照与本节点的Node Distance距离大小来排序，以达到更优的内存分配。</p>
+
+<h5>4.2.3 zonelist[2]</h5>
+
+<p>配置NUMA后，每个节点将关联2个zonelist：<br/>
+  1) zonelist[0]中存放以Node方式或Zone方式组织的zonelist，包括所有节点的zone；<br/>
+  2) zonelist[1]中只存放本节点的zone即Legacy方式；</p>
+
+<p>zonelist[1]用来实现仅从节点自身zone中的内存分配(参考<code>__GFP_THISNODE</code>标志)。</p>
+
+<h3>5 SLAB初始化</h3>
+
+<p>配置NUMA后对SLAB(本文不涉及SLOB或SLUB)的初始化影响不大，只是在分配一些变量采用类似Buddy系统的per_cpu_pageset(单面页缓存)在CPU本地节点进行内存分配。</p>
+
+<h4>5.1 NUMA带来的变化</h4>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -1767,69 +1046,420 @@ tcp协议栈接收到数据包时struct sock *sk 可能被进程下上文或者�
 <span class='line-number'>16</span>
 <span class='line-number'>17</span>
 <span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static void __release_sock(struct sock *sk)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct sk_buff *skb = sk-&gt;sk_backlog.head;
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct kmem_cache {
+</span><span class='line'>&#9;struct array_cache *array[NR_CPUS];
+</span><span class='line'>&#9;… …
+</span><span class='line'>&#9;struct kmem_list3 *nodelists[MAX_NUMNODES];
+</span><span class='line'>};
 </span><span class='line'>
-</span><span class='line'>&#9;do {
-</span><span class='line'>&#9;&#9;sk-&gt;sk_backlog.head = sk-&gt;sk_backlog.tail = NULL;
-</span><span class='line'>&#9;&#9;bh_unlock_sock(sk);
+</span><span class='line'>struct kmem_list3 {
+</span><span class='line'>&#9;… …
+</span><span class='line'>&#9;struct array_cache *shared;    /* shared per node */
+</span><span class='line'>&#9;struct array_cache **alien;    /* on other nodes */
+</span><span class='line'>&#9;… …
+</span><span class='line'>};
 </span><span class='line'>
-</span><span class='line'>&#9;&#9;do {
-</span><span class='line'>&#9;&#9;&#9;struct sk_buff *next = skb-&gt;next;
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;skb-&gt;next = NULL;
-</span><span class='line'>&#9;&#9;&#9;sk_backlog_rcv(sk, skb);    // skb的处理函数，其实调用的是tcp_v4_do_rcv函数。
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;/*
-</span><span class='line'>&#9;&#9;&#9; * We are in process context here with softirqs
-</span><span class='line'>&#9;&#9;&#9; * disabled, use cond_resched_softirq() to preempt.
-</span><span class='line'>&#9;&#9;&#9; * This is safe to do because we've taken the backlog
-</span><span class='line'>&#9;&#9;&#9; * queue private:
-</span><span class='line'>&#9;&#9;&#9; */
-</span><span class='line'>&#9;&#9;&#9;cond_resched_softirq();
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;skb = next;
-</span><span class='line'>&#9;&#9;} while (skb != NULL);          // 如果skb=NULL，那么说明之前的sk_backlog已经处理完了。
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;bh_lock_sock(sk);
-</span><span class='line'>&#9;} while ((skb = sk-&gt;sk_backlog.head) != NULL); // 在处理上一个sk_backlog时，可能被软中断中断了，建立了新的sk_backlog，新建立的sk_backlog也将一并被处理。
-</span><span class='line'>
-</span><span class='line'>&#9;/*
-</span><span class='line'>&#9;* Doing the zeroing here guarantee we can not loop forever
-</span><span class='line'>&#9;* while a wild producer attempts to flood us.
-</span><span class='line'>&#9;*/
-</span><span class='line'>&#9;sk_extended(sk)-&gt;sk_backlog.len = 0;
+</span><span class='line'>struct slab {
+</span><span class='line'>&#9;… …
+</span><span class='line'>&#9;unsigned short nodeid;
+</span><span class='line'>&#9;… …
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>上面的4种类型的指针变量在SLAB初始化完毕后将改用kmalloc_node()分配的内存。具体实现请参考enable_cpucache()，此函数最终调用alloc_arraycache()和alloc_kmemlist()来分配这些变量代表的空间。</p>
+
+<p>  nodelists[MAX_NUMNODES]存放的是所有节点对应的相关数据，本文称作SLAB节点。每个节点拥有各自的数据；</p>
+
+<p>注：有些非NUMA系统比如非连续内存系统可能根据不同的内存区域定义多个节点(实际上Node Distance都是0即物理内存访问速度相同)，所以这些变量并没有采用CONFIG_NUMA宏来控制，本文暂称为NUMA带来的变化。</p>
+
+<h4>5.2 SLAB缓存</h4>
+
+<p>配置NUMA后，SLAB将有三种类型的缓存：本地缓存(当前CPU的缓存)，共享缓存(节点内的缓存)和外部缓存(节点间的缓存)。</p>
+
+<p>SLAB系统分配对象时，先从本地缓存中查找，如果本地缓存为空，则将共享缓存中的缓存搬运本地缓存中，重新从本地缓存中分配；如果共享缓存为空，则从SLAB中进行分配；如果SLAB中已经无空闲对象，则分配新的SLAB后重新分配本地缓存。</p>
+
+<p>SLAB系统释放对象时，先不归还给SLAB (简化分配流程，也可充分利用CPU Cache)，如果是同节点的SLAB对象先放入本地缓存中，如果本地缓存溢出(满)，则转移一部分(以batch为单位)至共享缓存中；如果是跨节点释放，则先放入外部缓存中，如果外部缓存溢出，则转移一部分至共享缓存中，以供后续分配时使用；如果共享缓存溢出，则调用free_block()函数释放溢出的缓存对象。</p>
+
+<p>关于这三种类型缓存的大小以及参数设置，不在本文的讨论范围。</p>
+
+<p>本地缓存<br/>
+  kmem_cache-> array[] 中缓存每个CPU的SLAB cached objects；</p>
+
+<p>共享缓存<br/>
+  kmem_list3[]->shared(如果存在shared缓存)中缓存与当前CPU同节点的所有CPU (如XLP832 NUMA系统中的Node0包含为CPU0~CPU31) 本地缓存溢出的缓存，详细实现请参考cache_flusharray()；另外，大对象SLAB不存在共享缓存。</p>
+
+<p>外部缓存<br/>
+  kmem_list3[]->alien中存放其它节点的SLAB cached objects，当在某个节点上分配的SLAB 的object在另外一个节点上被释放的时候(即slab->nodeid与numa_node_id()当前节点不相等时)，将加入到对象所在节点的alien缓存中(如果不存在此alien缓存，此对象不会被缓存，而是直接释放给此对象所属SLAB)，否则加入本地缓存或共享缓存(本地缓存溢出且存在shared缓存时)；当alien缓存满的时候，会调用cache_free_alien()搬迁至shared缓存中(如果不存在shared缓存，直接释放给SLAB)；</p>
+
+<p>slab->nodeid记录本SLAB内存块(若干个页面)所在的节点。</p>
+
+<p>示例</p>
+
+<p>例如2个节点，CPU0~31位于Node0，CPU32~CPU63位于Node1：</p>
+
+<p>64个(依次对应于CPU0~CPU63)本地缓存<br/>
+kmem_cache->array[0~31]:在Node0分配“array_cache结构+cached Objs指针”；<br/>
+kmem_cache->array[32~63]:在Node1分配“array_cache结构+cached Objs指针”；</p>
+
+<p>2个SLAB节点<br/>
+kmem_cache->nodelists[0]:在Node0分配“kmem_list3结构”；<br/>
+kmem_cache->nodelists[1]:在Node1分配“kmem_list3结构”；</p>
+
+<p>SLAB节点0(CPU0~CPU31)共享缓存和外部缓存alien[1]<br/>
+kmem_cache->nodelists[0]->shared:在Node0分配“array_cache结构+cached Objs指针”；<br/>
+kmem_cache->nodelists[0]->alien:在Node0分配“节点数<em>sizeof(void</em>)”；<br/>
+kmem_cache->nodelists[0]->alien[0]:置为NULL；<br/>
+kmem_cache->nodelists[0]->alien[1]:在Node0分配“array_cache结构+cached Objs指针”；</p>
+
+<p>SLAB节点1(CPU32~CPU63)共享缓存和外部缓存alien[0]<br/>
+kmem_cache->nodelists[1]->shared:在Node1分配“array_cache结构+cached Objs指针”；<br/>
+kmem_cache->nodelists[1]->alien:在Node1分配“节点数<em>sizeof(void</em>)”；<br/>
+kmem_cache->nodelists[1]->alien[0]:在Node1分配“array_cache结构+cached Objs指针”；<br/>
+kmem_cache->nodelists[1]->alien[1]:置为NULL；</p>
+
+<p>另外，可以用内核启动参数“use_alien_caches”来控制是否开启alien缓存：默认值为1，当系统中的节点数目为1时，use_alien_caches初始化为0；use_alien_caches目的是用于某些多节点非连续内存(访问速度相同)的非NUMA系统。</p>
+
+<p>由上可见，随着节点个数的增加，SLAB明显会开销越来越多的缓存，这也是SLUB涎生的一个重要原因。</p>
+
+<h4>5.3 __GFP_THISNODE</h4>
+
+<p>SLAB在某个节点创建新的SLAB时，都会置<code>__GFP_THISNODE</code>标记向Buddy系统提交页面申请，Buddy系统中看到此标记，选用申请节点的Legacy zonelist[1]，仅从申请节点的zone中分配内存，并且不会走内存不足流程，也不会重试或告警，这一点需要引起注意。</p>
+
+<p>SLAB在申请页面的时候会置GFP_THISNODE标记后调用cache_grow()来增长SLAB；</p>
+
+<p>GFP_THISNODE定义如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#ifdef CONFIG_NUMA
+</span><span class='line'>#define GFP_THISNODE     (__GFP_THISNODE | __GFP_NOWARN | __GFP_NORETRY)</span></code></pre></td></tr></table></div></figure>
+
+
+<h3>6 调度初始化</h3>
+
+<p>配置NUMA后负载均衡会多一层NUMA调度域，根据需要在topology.h中定义，示例：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define SD_NODE_INIT (struct sched_domain) {                 \
+</span><span class='line'>&#9;.parent             = NULL,                              \
+</span><span class='line'>&#9;.child              = NULL,                              \
+</span><span class='line'>&#9;.groups             = NULL,                              \
+</span><span class='line'>&#9;.min_interval       = 8,                                 \
+</span><span class='line'>&#9;.max_interval       = 32,                                \
+</span><span class='line'>&#9;.busy_factor        = 32,                                \
+</span><span class='line'>&#9;.imbalance_pct      = 125,                               \
+</span><span class='line'>&#9;.cache_nice_tries   = 1,                                 \
+</span><span class='line'>&#9;.flags              = SD_LOAD_BALANCE | SD_BALANCE_EXEC, \
+</span><span class='line'>&#9;.last_balance       = jiffies,                           \
+</span><span class='line'>&#9;.balance_interval   = 1,                                 \
+</span><span class='line'>&#9;.nr_balance_failed  = 0,                                 \
 </span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
-<p>  一开始重置sk->sk_backlog.head ，sk->sk_backlog.tail为NULL。sk_backlog是一个双链表，head指向了链表头部的skb，而tail则指向了链表尾部的skb。这里之所以置NULL head 和tail，是因为struct sk_buff *skb = sk->sk_backlog.head 提前取到了head指向的skb，之后就可以通过skb->next来获取下一个skb处理，结束的条件是skb->next=NULL，这个是在<code>__sk_add_backlog</code>函数中置位的，也就说对于sk_backlog的处理head和tail指针已经没有用了。</p>
+<p>  顺便提一下，2.6.32对于实时任务不走负载均衡流程，采用了全局优先级调度的思想，保证实时任务的及时运行；这样的做法同时也解决了低版本内核在处理同一个逻辑CPU上相同最高优先级实时任务的负载均衡的时延。</p>
 
-<p>  为什么要置NULLsk->sk_backlog.head ，sk->sk_backlog.tail呢？第一想法是它可能要被重新使用了。那么在什么情况下会被重新使用呢？试想一下当前是在进程上下文，并且sk->sk_lock.slock没有被锁住，那是不是可能被软中断打断呢？如果被软中断打断了是不是要接收数据呢，tcp协议栈为了效率考虑肯定是要接收数据的，前面分析道这种情况的数据必须放置到后备队列中(sk_backlog)，所以可以肯定置NULL sk->sk_backlog.head ，sk->sk_backlog.tail是为了在处理上一个sk_backlog时，能重用sk_backlog，建立一条新的sk_backlog，或许有人会问为什么不直接添加到原先的sk_backlog tail末尾呢？这个问题我也没有想太清楚，或许是同步不好做吧。</p>
+<h3>7 NUMA内存分配</h3>
 
-<h5>4、skb被处理到哪去了</h5>
+<p>Zonelist[2]组织方式在NUMA内存分配过程中起着至关重要的作用，它决定了整个页面在不同节点间的申请顺序和流程。</p>
 
-<p>  很明显接收的数据最终都将被传递到应用层，在传递到应用层前必须要保证三个接收队列中的数据有序，那么这三个队列是怎么保证数据字节流有序的被递交给应用层呢？三个队列都会调用tcp_v4_do_rcv函数，prequeue和sk_backlog是在tcp_recvmsg中调用tcp_v4_do_rcv函数，也就是进程上下文中调用tcp_v4_do_rcv函数，但会local_bh_disable禁止软中断。如果在tcp_rcv_established, tcp_data_queue中如果刚好数据可以直接copy到用户空间，又会短暂开始软中断local_bh_enable。</p>
+<h4>7.1显式分配</h4>
 
-<p>  但在tcp_checksum_complete_user、tcp_rcv_established、tcp_data_queue函数中开启软中断将来容易出问题，进入软中断:softirq()+=1; local_bh_enable:softirq()-=2; 所以现在只是软中断中softirq()统计不准，进程中还是准的。但如果以后在软中断中在local_bh_enable之前给softirq()+=1了，那么就会导致软中断被打断，导致软中断执行途中被切走而且永远切不回来。tcp_checksum_complete_user被切走导致收包不成功，tcp_rcv_established、tcp_data_queue函数中如果在tp->copied_seq+=chunk后被切走就会导致tp->copied_seq>tp->rcv_nxt，那么下次收包后就有可能出现tp->copied_seq > sk_write_queue.first.end_seq, 等异常。</p>
+<p>显式分配即指定节点的分配函数，此类基础分配函数主要有2个：Buddy系统的   alloc_pages_node()和SLAB系统的kmem_cache_alloc_node()，其它的函数都可以从这2个派生出来。</p>
 
-<p>  如果仔细分析tcp_v4_do_rcv函数能发现，这个函数能保证数据有序的排列在一起，所以无论是在处理sk_backlog还是prequeue，最终都会调用tcp_v4_do_rcv函数将数据有效地插入到sk_write_queue中，最后被应用层取走。</p>
+<p>例如，kmalloc_node()最终调用kmem_cache_alloc_node()进行分配。</p>
+
+<h5>7.1.1 Buddy显式分配</h5>
+
+<p>alloc_pages_node(node, gfp_flags, order)分配流程：<br/>
+  1) 如果node小于0，node取本地节点号(node = numa_node_id())；<br/>
+  2) NODE_DATA(node)得到node对应的struct pglist_data结构，从而得到zonelist[2]；<br/>
+  3) 如果gfp_flags含有<code>__GFP_THISNODE</code>标志，仅在此节点分配内存，使用node节点的Legacy zonelist[1]，否则使用其包含所有节点zone的zonelist[0] (见4.2.2.3节)；<br/>
+  4) 遍历确定出来的zonelist结构中包含的每一个符合要求的zone，gfp_flags指定了本次分配中的最高的zone，如<code>__GFP_HIGHMEM</code>表示最高的zone为ZONE_HIGH；<br/>
+  5) 分配结束。</p>
+
+<h5>7.1.2 SLAB显式分配</h5>
+
+<p>kmem_cache_alloc_node(cachep, gfp_flags, node)分配流程：<br/>
+  1) 如果node值为-1，node取本地节点号(node = numa_node_id())；<br/>
+  2) 如果node &lt; -1，则执行fall back行为，此行为与用户策略有关，有点类似隐式分配：<br/>
+   a) 根据用户策略(包括CPUSET和内存策略)依次选取节点，根据gfp_flags选取合适的zonelist进行分配；<br/>
+   b) 如果内存不足分配失败，则跳过内存策略直接进行隐式Buddy页面分配(仍受CPUSET的限定，关于CPUSET和内存策略后面会介绍)，最终构建成新的SLAB并完成本次分配；转5)；<br/>
+  3) 如果node是正常节点号，则先在node节点上根据gfp_flags选取合适的zonelist进行分配；<br/>
+  4) 如果3)中node节点内存不足分配失败，转2) a)执行fall back行为。<br/>
+  5) 分配结束。</p>
+
+<p>注：fall back行为指的是某个节点上内存不足时会落到此节点的zonelist[0]中定义的其它节点zone分配。</p>
+
+<h5>7.1.3 设备驱动</h5>
+
+<p>配置CONFIG_NUMA后，设备会关联一个NUMA节点信息，struct device结构中会多一个numa_node字段记录本设备所在的节点，这个结构嵌套在各种类型的驱动中，如struct net_device结构。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct device {
+</span><span class='line'>&#9;… …
+</span><span class='line'>&#9;#ifdef CONFIG_NUMA
+</span><span class='line'>&#9;&#9;int          numa_node;    /* NUMA node this device is close to */
+</span><span class='line'>&#9;#endif
+</span><span class='line'>&#9;… …
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>附<code>__netdev_alloc_skb()</code>的实现：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct sk_buff *__netdev_alloc_skb(struct net_device *dev,
+</span><span class='line'>&#9;&#9;unsigned int length, gfp_t gfp_mask)
+</span><span class='line'>{
+</span><span class='line'>&#9;int node = dev-&gt;dev.parent ? dev_to_node(dev-&gt;dev.parent) : -1;
+</span><span class='line'>&#9;struct sk_buff *skb;
+</span><span class='line'>
+</span><span class='line'>&#9;skb = __alloc_skb(length + NET_SKB_PAD, gfp_mask, 0, node);
+</span><span class='line'>&#9;if (likely(skb)) {
+</span><span class='line'>&#9;&#9;skb_reserve(skb, NET_SKB_PAD);
+</span><span class='line'>&#9;&#9;skb-&gt;dev = dev;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;return skb;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p><code>__alloc_skb()</code>最终调用kmem_cache_alloc_node()和kmalloc_node()在此node上分配内存。</p>
+
+<h4>7.2 隐式分配和内存策略</h4>
+
+<p>隐式分配即不指定节点的分配函数，此类基础分配函数主要有2个：Buddy系统的   alloc_pages()和SLAB系统的kmem_cache_alloc()，其它的函数都可以从这2个派生出来。</p>
+
+<p>隐式分配涉及到NUMA内存策略(Memory Policy)，内核定义了四种内存策略。</p>
+
+<p>注：隐式分配还涉及到CPUSET，本文后面会介绍。</p>
+
+<h5>7.2.1 内存策略</h5>
+
+<p>内核mm/mempolicy.c中实现了NUMA内存的四种内存分配策略：MPOL_DEFAULT, MPOL_PREFERRED, MPOL_INTERLEAVE和MPOL_BIND，内存策略会从父进程继承。</p>
+
+<p>MPOL_DEFAULT：使用本地节点的zonelist；<br/>
+MPOL_PREFERRED：使用指定节点的zonelist；<br/>
+MPOL_BIND： 设置一个节点集合，只能从这个集合中节点的zone申请内存：</p>
+
+<p>  1)无<code>__GFP_THISNODE</code>申请标记，使用本地节点的zonelist[0]；<br/>
+  2)置有<code>__GFP_THISNODE</code>申请标记，如果本地节点：<br/>
+   a)在集合中，使用本地节点的zonelist[1]；<br/>
+   b)不在集合中，使用集合中最小节点号的zonelist[1]；</p>
+
+<p>MPOL_INTERLEAVE：采用Round-Robin方式从设定的节点集合中选出某个节点，使用此节点的zonelist；</p>
+
+<p>内核实现的内存策略，用struct mempolicy结构来描述：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct mempolicy {
+</span><span class='line'>&#9;atomic_t refcnt;
+</span><span class='line'>&#9;unsigned short mode;              /* See MPOL_* above */
+</span><span class='line'>&#9;unsigned short flags;             /* See set_mempolicy() MPOL_F_* above */
+</span><span class='line'>&#9;union {
+</span><span class='line'>&#9;&#9;short         preferred_node; /* preferred */
+</span><span class='line'>&#9;&#9;nodemask_t    nodes;          /* interleave/bind */
+</span><span class='line'>&#9;&#9;/* undefined for default */
+</span><span class='line'>&#9;} v;
+</span><span class='line'>&#9;union {
+</span><span class='line'>&#9;&#9;nodemask_t cpuset_mems_allowed;     /* relative to these nodes */
+</span><span class='line'>&#9;&#9;nodemask_t user_nodemask;           /* nodemask passed by user */
+</span><span class='line'>&#9;} w;
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>成员mode表示使用四种分配策略中的哪一种，联合体v根据不同的分配策略记录相应的分配信息。</p>
+
+<p>另外，MPOL_PREFERRED策略有一种特殊的模式，当其flags置上MPOL_F_LOCAL标志后，将等同于MPOL_DEFAULT策略，内核默认使用此种策略，见全局变量default_policy。</p>
+
+<p>内存策略涉及的分配函数有2个：alloc_pages_current()和alloc_page_vma()，可以分别为不同任务以及任务的不同VMA设置内存策略。</p>
+
+<h5>7.2.2 Buddy隐式分配</h5>
+
+<p>以默认的NUMA内存策略为例讲解，alloc_pages(gfp_flags, order)分配流程：<br/>
+  1) 得到本地节点对应的struct pglist_data结构，从而得到zonelist[2]；<br/>
+  2) 如果gfp_flags含有<code>__GFP_THISNODE</code>标志，仅在此节点分配内存即使用本地节点的Legacy zonelist[1]，否则使用zonelist[0] (见4.2.2.3节)；<br/>
+  3) 遍历确定出来的zonelist结构中包含的每一个符合要求的zone，gfp_flags指定了本次分配中的最高的zone，如<code>__GFP_HIGHMEM</code>表示最高的zone为ZONE_HIGH；<br/>
+  4) 分配结束。</p>
+
+<h5>7.2.3 SLAB隐式分配</h5>
+
+<p>以默认的NUMA内存策略为例讲解，kmem_cache_alloc(cachep, gfp_flags)分配流程：<br/>
+  1) 调用<code>____cache_alloc()</code>函数在本地节点local_node分配，此函数无fall back行为；<br/>
+  2) 如果1)中本地节点内存不足分配失败，调用<code>____cache_alloc_node</code>(cachep, gfp_flags,local_node)再次尝试在本地节点分配，如果还失败此函数会进行fall back行为；<br/>
+  3) 分配结束。</p>
+
+<h4>7.3 小结</h4>
+
+<p>上文提到的所有的内存分配函数都允许fall back行为，但有2种情况例外：<br/>
+  1) <code>__GFP_THISNODE</code>分配标记限制了只能从某一个节点上分配内存；<br/>
+  2) MPOL_BIND策略，限制了只能从一个节点集合中的节点上分配内存；<br/>
+   (gfp_zone(gfp_flags) &lt; policy_zone的情况，MPOL_BIND不限制节点)。</p>
+
+<p>注：还有一种情况，CPUSET限制的内存策略，后面会介绍。</p>
+
+<h3>8 CPUSET</h3>
+
+<p>CPUSET基于CGROUP的框架构建的子系统，有如下特点：<br/>
+  1) 限定一组任务所允许使用的内存Node和CPU资源；<br/>
+  2) CPUSET在内核各子系统中添加的检测代码很少，对内核没有性能影响；<br/>
+  3) CPUSET的限定优先级高于内存策略(针对于Node)和绑定(针对于CPU)；<br/>
+  4) 没有额外实现系统调用接口，只能通过/proc文件系统和用户交互。</p>
+
+<p>本节只讲述CPUSET的使用方法和说明。</p>
+
+<h4>8.1 创建CPUSET</h4>
+
+<p>因为CPUSET只能使用/proc文件系统访问，所以第一步就要先mount cpuset文件系统，配置CONFIG_CGROUPS和CONFIG_CPUSETS后/proc/filesystems中将有这个文件系统。</p>
+
+<p>CPUSET是分层次的，可以在cpuset文件系统根目录是最顶层的CPUSET，可以在其下创建CPUSET子项，创建方式很简单即创建一个新的目录。</p>
+
+<p>mount命令：mount nodev –t cpuset /your_dir或mount nodev –t cgroup –o cpuset /your_dir</p>
+
+<p>Mount成功后，进入mount目录，这个就是最顶层的CPUSET了(top_cpuset)，下面附一个演示例子：</p>
+
+<p><img src="/images/kernel/2015-06-02-38.jpg" alt="" /></p>
+
+<h4>8.2 CPUSET文件</h4>
+
+<p>介绍几个重要的CPUSET文件：<br/>
+1) tasks，实际上是CGROUPS文件，为此CPUSET包含的线程pid集合；<br/>
+  echo 100 > tasks</p>
+
+<p>2) cgroup.procs是CGROUPS文件，为此CPUSET包含的线程组tgid集合；<br/>
+  echo 100 > cgroup.procs</p>
+
+<p>3) cpus是CPUSET文件，表示此CPUSET允许的CPU；<br/>
+  echo 0-8 > cpus</p>
+
+<p>4) mems是CPUSET文件，表示此CPUSET允许的内存节点；
+  echo 0-1 > mems  (对应于struct task_struct中的mems_allowed字段)</p>
+
+<p>5) sched_load_balance，为CPUSET文件，设置cpus集合的CPU是否参与负载均衡；
+  echo 0 > sched_load_balance (禁止负载均衡)；默认值为1表示开启负载均衡；</p>
+
+<p>6) sched_relax_domain_level，为CPUSET文件，数值代表某个调度域级别，大于此级别的调度域层次将禁用闲时均衡和唤醒均衡，而其余级别的调度域都开启；
+也可以通过启动参数“relax_domain_level”设置，其值含义：<br/>
+  -1 : 无效果，此为默认值<br/>
+   0 - 设置此值会禁用所有调度域的闲时均衡和唤醒均衡<br/>
+   1 - 超线程域<br/>
+   2 - 核域<br/>
+   3 - 物理域<br/>
+   4 - NUMA域<br/>
+   5 - ALLNODES模式的NUMA域</p>
+
+<p>7) mem_exclusive和mem_hardwall，为CPUSET文件，表示内存硬墙标记；默认为0，表示软墙；有关CPUSET的内存硬墙(HardWall)和内存软墙(SoftWall)，下文会介绍；</p>
+
+<p>8) memory_spread_page和memory_spread_slab，为CPUSET文件，设定CPUSET中的任务PageCache和SLAB(创建时置有SLAB_MEM_SPREAD)以Round-Robin方式使用内存节点(类似于MPOL_INTERLEAVE)；默认为0，表示未开启；struct task_struct结构中增加成员cpuset_mem_spread_rotor记录下次使用的节点号；</p>
+
+<p>9) memory_migrate，为CPUSET文件，表明开启此CPUSET的内存迁移，默认为0；</p>
+
+<p>  当一个任务从一个CPUSET1(mems值为0)迁移至另一个CPUSET2(mems值为1)的时候，此任务在节点0上分配的页面内容将迁移至节点1上分配新的页面(将数据同步到新页面)，这样就避免了此任务的非本地节点的内存访问。</p>
+
+<p><img src="/images/kernel/2015-06-02-39.jpg" alt="" /></p>
+
+<p>上图为单Node，8个CPU的系统。</p>
+
+<p>1) 顶层CPUSET包含了系统中的所有CPU以及Node，而且是只读的，不能更改；<br/>
+2) 顶层CPUSET包含了系统中的所有任务，可以更改；<br/>
+3) child为新创建的子CPUSET，子CPUSET的资源不能超过父CPUSET的资源；<br/>
+4) 新创建的CPUSET的mems和cpus都是空的，使用前必须先初始化；<br/>
+5) 添加任务：设置tasks和cgroup.procs文件；<br/>
+6) 删除任务：将任务重新添加至其它CPUSET(如顶层)就可以从本CPUSET删除任务。</p>
+
+<h4>8.3 利用CPUSET限定CPU和Node</h4>
+
+<p>设置步骤：<br/>
+1) 在某个父CPUSET中创建子CPUSET；<br/>
+2) 在子CPUSET目录下，输入指定的Node号至mems文件；<br/>
+3) 在子CPUSET目录下，输入指定的Node号至mems文件；<br/>
+4) 在子CPUSET目录下，设定任务至tasks或group.procs文件；<br/>
+5) 还可以设置memory_migrate为1，激活内存页面的迁移功能。</p>
+
+<p>这样限定后，此CPUSET中所有的任务都将使用限定的CPU和Node，但毕竟系统中的任务并不能完全孤立，比如还是可能会全局共享Page Cache，动态库等资源，因此内核在某些情况下还是可以允许打破这个限制，如果不允许内核打破这个限制，需要设定CPUSET的内存硬墙标志即mem_exclusive或mem_hardwall置1即可；CPUSET默认是软墙。</p>
+
+<p>硬软墙用于Buddy系统的页面分配，优先级高于内存策略，请参考内核函数：</p>
+
+<p>cpuset_zone_allowed_hardwall()和cpuset_zone_allowed_softwall()</p>
+
+<p>另外，当内核分不到内存将导致Oops的时候，CPUSET所有规则将被打破，毕竟一个系统的正常运行才是最重要的：<br/>
+  1) <code>__GFP_THISNODE</code>标记分配内存的时候(通常是SLAB系统)；<br/>
+  2) 中断中分配内存的时候；<br/>
+  3) 任务置有TIF_MEMDIE标记即被内核OOM杀死的任务。</p>
+
+<h4>8.4 利用CPUSET动态改变调度域结构</h4>
+
+<p>利用sched_load_balance文件可以禁用掉某些CPU的负载均衡，同时重新构建调度域，此功能类似启动参数“isolcpus”的功能。</p>
+
+<p>8个CPU的系统中，系统中存在一个物理域，现需要禁掉CPU4~CPU7的负载均衡，配置步骤为：<br/>
+  1) “mkdir child”在顶层CPUSET中创建子CPUSET，记为child；<br/>
+  2) “echo 0-3 > child/cpus ”(新建CPUSET的sched_load_balance默认是是打开的)；<br/>
+  3) “echo 0 > sched_load_balance”关闭顶层CPUSET的负载均衡。</p>
+
+<p>操作过程见下图：</p>
+
+<p><img src="/images/kernel/2015-06-02-40.jpg" alt="" /></p>
+
+<p>由图可见，CPU4~CPU7的调度域已经不存在了，具体效果是将CPU4~CPU7从负载均衡中隔离出来。</p>
+
+<h3>9 NUMA杂项</h3>
+
+<p>1) /sys/devices/system/node/中记录有系统中的所有内存节点信息；<br/>
+2)任务额外关联一个/proc/<tid>/numa_smaps文件信息；<br/>
+3) tmpfs可以指定在某个Node上创建；<br/>
+4) libnuma库和其numactl小工具可以方便操作NUMA内存；<br/>
+5) … …</p>
+
+<h3>10 参考资料</h3>
+
+<ol>
+<li>www.kernel.org</li>
+<li>ULK3</li>
+<li>XLP® Processor Family Programming Reference Manual</li>
+</ol>
+
 </div>
   
   
@@ -1851,7 +1481,7 @@ tcp协议栈接收到数据包时struct sock *sk 可能被进程下上文或者�
   
     <section>
 <h1>Categories
-<span class='right_span'>(925)</span>
+<span class='right_span'>(943)</span>
 
 </h1>
 <head>
@@ -1882,8 +1512,8 @@ if (!document.getElementById('blog~octopress')) document.getElementById('aexp_bl
 if (!document.getElementById('blog')) document.getElementById('aexp_blog').style.visibility = 'hidden';
 if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ruby').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(151)</span></li>
-<div id='language' class='catsub'><li><a href='/blog/cats/language~c/?opendiv=language'>c</a><a href='##' onmousedown=showDiv('language~c') id='aexp_language~c'><span class='exp_style' id='exp_language~c'>[+]</span></a><span class='right_span'>32</span></li>
+<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(161)</span></li>
+<div id='language' class='catsub'><li><a href='/blog/cats/language~c/?opendiv=language'>c</a><a href='##' onmousedown=showDiv('language~c') id='aexp_language~c'><span class='exp_style' id='exp_language~c'>[+]</span></a><span class='right_span'>33</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~c')) document.getElementById('aexp_language~c').style.visibility = 'hidden';
 </script>
@@ -1899,7 +1529,7 @@ if (!document.getElementById('language~java')) document.getElementById('aexp_lan
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~jsp')) document.getElementById('aexp_language~jsp').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/language~php/?opendiv=language'>php</a><a href='##' onmousedown=showDiv('language~php') id='aexp_language~php'><span class='exp_style' id='exp_language~php'>[+]</span></a><span class='right_span'>50</span></li>
+<li><a href='/blog/cats/language~php/?opendiv=language'>php</a><a href='##' onmousedown=showDiv('language~php') id='aexp_language~php'><span class='exp_style' id='exp_language~php'>[+]</span></a><span class='right_span'>53</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~php')) document.getElementById('aexp_language~php').style.visibility = 'hidden';
 </script>
@@ -1907,7 +1537,7 @@ if (!document.getElementById('language~php')) document.getElementById('aexp_lang
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~python')) document.getElementById('aexp_language~python').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/language~web/?opendiv=language'>web</a><a href='##' onmousedown=showDiv('language~web') id='aexp_language~web'><span class='exp_style' id='exp_language~web'>[+]</span></a><span class='right_span'>48</span></li>
+<li><a href='/blog/cats/language~web/?opendiv=language'>web</a><a href='##' onmousedown=showDiv('language~web') id='aexp_language~web'><span class='exp_style' id='exp_language~web'>[+]</span></a><span class='right_span'>54</span></li>
 </div><script language='javascript' type='text/javascript'>
 if (!document.getElementById('language')) document.getElementById('aexp_language').style.visibility = 'hidden';
 if (!document.getElementById('language~web')) document.getElementById('aexp_language~web').style.visibility = 'hidden';
@@ -1936,7 +1566,7 @@ if (!document.getElementById('assembly~base')) document.getElementById('aexp_ass
 if (!document.getElementById('assembly')) document.getElementById('aexp_assembly').style.visibility = 'hidden';
 if (!document.getElementById('assembly~win')) document.getElementById('aexp_assembly~win').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(198)</span></li>
+<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(199)</span></li>
 <div id='tools' class='catsub'><li><a href='/blog/cats/tools~apache2/?opendiv=tools'>apache2</a><a href='##' onmousedown=showDiv('tools~apache2') id='aexp_tools~apache2'><span class='exp_style' id='exp_tools~apache2'>[+]</span></a><span class='right_span'>9</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~apache2')) document.getElementById('aexp_tools~apache2').style.visibility = 'hidden';
@@ -1953,7 +1583,7 @@ if (!document.getElementById('tools~ci')) document.getElementById('aexp_tools~ci
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~cloud')) document.getElementById('aexp_tools~cloud').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/tools~command/?opendiv=tools'>command</a><a href='##' onmousedown=showDiv('tools~command') id='aexp_tools~command'><span class='exp_style' id='exp_tools~command'>[+]</span></a><span class='right_span'>30</span></li>
+<li><a href='/blog/cats/tools~command/?opendiv=tools'>command</a><a href='##' onmousedown=showDiv('tools~command') id='aexp_tools~command'><span class='exp_style' id='exp_tools~command'>[+]</span></a><span class='right_span'>31</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~command')) document.getElementById('aexp_tools~command').style.visibility = 'hidden';
 </script>
@@ -2046,8 +1676,8 @@ if (!document.getElementById('tools~vim')) document.getElementById('aexp_tools~v
 if (!document.getElementById('tools')) document.getElementById('aexp_tools').style.visibility = 'hidden';
 if (!document.getElementById('tools~wxwork')) document.getElementById('aexp_tools~wxwork').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/system/'>system</a><a href='##' onmousedown=showDiv('system') id='aexp_system'><span class='exp_style' id='exp_system'>[+]</span></a><span class='right_span'>(114)</span></li>
-<div id='system' class='catsub'><li><a href='/blog/cats/system~base/?opendiv=system'>base</a><a href='##' onmousedown=showDiv('system~base') id='aexp_system~base'><span class='exp_style' id='exp_system~base'>[+]</span></a><span class='right_span'>25</span></li>
+<li class='catclass'><a href='/blog/cats/system/'>system</a><a href='##' onmousedown=showDiv('system') id='aexp_system'><span class='exp_style' id='exp_system'>[+]</span></a><span class='right_span'>(121)</span></li>
+<div id='system' class='catsub'><li><a href='/blog/cats/system~base/?opendiv=system'>base</a><a href='##' onmousedown=showDiv('system~base') id='aexp_system~base'><span class='exp_style' id='exp_system~base'>[+]</span></a><span class='right_span'>31</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('system~base')) document.getElementById('aexp_system~base').style.visibility = 'hidden';
 </script>
@@ -2063,7 +1693,7 @@ if (!document.getElementById('system~cgroup')) document.getElementById('aexp_sys
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('system~docker')) document.getElementById('aexp_system~docker').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/system~fs/?opendiv=system'>fs</a><a href='##' onmousedown=showDiv('system~fs') id='aexp_system~fs'><span class='exp_style' id='exp_system~fs'>[+]</span></a><span class='right_span'>11</span></li>
+<li><a href='/blog/cats/system~fs/?opendiv=system'>fs</a><a href='##' onmousedown=showDiv('system~fs') id='aexp_system~fs'><span class='exp_style' id='exp_system~fs'>[+]</span></a><span class='right_span'>12</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('system~fs')) document.getElementById('aexp_system~fs').style.visibility = 'hidden';
 </script>
@@ -2285,7 +1915,7 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 
 <section>
 <h1>Date Categories
-<span class='right_span'>(925)</span>
+<span class='right_span'>(943)</span>
 
 </h1>
 <head>
@@ -2293,8 +1923,9 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(45)</span></li>
-<div id='2024' class='catsub'><li><a href='/blog/cats/2024~07/?opendiv=2024'>2024-07</a><span class='right_span'>22</span></li>
+<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(63)</span></li>
+<div id='2024' class='catsub'><li><a href='/blog/cats/2024~08/?opendiv=2024'>2024-08</a><span class='right_span'>14</span></li>
+<li><a href='/blog/cats/2024~07/?opendiv=2024'>2024-07</a><span class='right_span'>26</span></li>
 <li><a href='/blog/cats/2024~06/?opendiv=2024'>2024-06</a><span class='right_span'>2</span></li>
 <li><a href='/blog/cats/2024~05/?opendiv=2024'>2024-05</a><span class='right_span'>5</span></li>
 <li><a href='/blog/cats/2024~04/?opendiv=2024'>2024-04</a><span class='right_span'>5</span></li>
@@ -2441,7 +2072,7 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 <h1>Tags</h1>
 <ul class="tag-cloud">
 <a style="font-size: 124%" href="/tags/10gb/">10gb(7)</a>
-<a style="font-size: 114%" href="/tags/lvm/">LVM(5)</a>
+<a style="font-size: 119%" href="/tags/lvm/">LVM(6)</a>
 <a style="font-size: 100%" href="/tags/chrome-debug/">chrome_debug(3)</a>
 <a style="font-size: 131%" href="/tags/gdb/">gdb(9)</a>
 <a style="font-size: 127%" href="/tags/git/">git(8)</a>
@@ -2463,43 +2094,43 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
   <ul id="recent_posts">
     
       <li class="post">
-        <a href="/blog/2024/07/31/lvm-attr/">LVM 输出更多信息</a>
+        <a href="/blog/2024/08/15/lang-web-js-copy/">禁止网页内容复制另存为</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/31/lvm-pvmove/">LVM 缩减 VG 大小 ( pvmove )</a>
+        <a href="/blog/2024/08/15/lang-web-iframe/">iframe网页嵌套</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/31/lang-web-override/">Chrome浏览器使用Overrides调试线上代码</a>
+        <a href="/blog/2024/08/15/lang-web-auto-textarea/">textarea自动调整高宽</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/31/lang-web-fetch/">fetch使用介绍, chrome如何重新提交请求并且更改参数</a>
+        <a href="/blog/2024/08/09/ntpd-log/">NTP log 记录每次发包</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/31/lang-web-95598/">95598停电公告信息抓取</a>
+        <a href="/blog/2024/08/09/ntpd/">NTP服务配置</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/30/lang-php-sm1234/">sm1、sm2、sm3、sm4简单介绍</a>
+        <a href="/blog/2024/08/09/lang-date/">unix时间戳, excel date, 儒略日julian date</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/30/lang-php-sm2/">php sm2</a>
+        <a href="/blog/2024/08/09/lang-web-times/">&amp;times被替换成x</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/30/lang-php-sm3/">php sm3</a>
+        <a href="/blog/2024/08/09/lang-c-localtime/">localtime函数</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/30/lang-php-bgcolor/">php spreadsheet 填充背景色</a>
+        <a href="/blog/2024/08/02/ups-webpower/">山特UPS NMC卡 USHA卡</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/07/30/lang-php-mb/">php统计文章字数</a>
+        <a href="/blog/2024/08/01/lang-web-holiday/">节假日 API</a>
       </li>
     
   </ul>
