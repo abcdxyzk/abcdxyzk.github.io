@@ -131,7 +131,7 @@ var ss360Config = {
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2015/04/10/kernel-net-syncookie/">SYN cookies机制下连接的建立</a></h2>
+      <h2 class="entry-title"><a href="/blog/2015/04/29/kernel-net-socket-file/">文件socket</a></h2>
     
     
       <p class="meta">
@@ -140,42 +140,90 @@ var ss360Config = {
 
 
 
-<time class='entry-date' datetime='2015-04-10T14:34:00+08:00'><span class='date'>2015-04-10</span> <span class='time'>14:34:00</span></time>
+<time class='entry-date' datetime='2015-04-29T17:32:00+08:00'><span class='date'>2015-04-29</span> <span class='time'>17:32:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><p><a href="http://blog.csdn.net/justlinux2010/article/details/12619761">http://blog.csdn.net/justlinux2010/article/details/12619761</a></p>
+  <div class="entry-content"><p><a href="http://blog.csdn.net/y_23k_bug/article/details/9993555">http://blog.csdn.net/y_23k_bug/article/details/9993555</a></p>
 
-<p>  在正常情况下，服务器端接收到客户端发送的SYN包，会分配一个连接请求块（即request_sock结构），用于保存连接请求信息，并且发送SYN+ACK包给客户端，然后将连接请求块添加到半连接队列中。客户端接收到SYN+ACK包后，会发送ACK包对服务器端的包进行确认。服务器端收到客户端的确认后，根据保存的连接信息，构建一个新的连接，放到监听套接字的连接队列中，等待用户层accept连接。这是正常的情况，但是在并发过高或者遭受SYN flood攻击的情况下，半连接队列的槽位数量很快就会耗尽，会导致丢弃新的连接请求，SYN cookies技术可以使服务器在半连接队列已满的情况下仍能处理新的SYN请求。</p>
-
-<p>  如果开启了SYN cookies选项，在半连接队列满时，SYN cookies并不丢弃SYN请求，而是将源目的IP、源目的端口号、接收到的客户端初始序列号以及其他一些安全数值等信息进行hash运算，并加密后得到服务器端的初始序列号，称之为cookie。服务器端在发送初始序列号为cookie的SYN+ACK包后，会将分配的连接请求块释放。如果接收到客户端的ACK包，服务器端将客户端的ACK序列号减1得到的值，与上述要素hash运算得到的值比较，如果相等，直接完成三次握手，构建新的连接。SYN cookies机制的核心就是避免攻击造成的大量构造无用的连接请求块，导致内存耗尽，而无法处理正常的连接请求。</p>
-
-<p>  启用SYN cookies是通过在启动环境中设置以下命令完成：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>echo 1 &gt; /proc/sys/net/ipv4/tcp_syncookies</span></code></pre></td></tr></table></div></figure>
-
-
-<p>  注意，即使开启该机制并不意味着所有的连接都是用SYN cookies机制来完成连接的建立，只有在半连接队列已满的情况下才会触发SYN cookies机制。由于SYN cookies机制严重违背TCP协议，不允许使用TCP扩展，可能对某些服务造成严重的性能影响（如SMTP转发），对于防御SYN flood攻击的确有效。对于没有收到攻击的高负载服务器，不要开启此选项，可以通过修改tcp_max_syn_backlog、tcp_synack_retries和tcp_abort_on_overflow系统参数来调节。</p>
-
-<p>下面来看看内核中是怎么通过SYN cookie机制来完成连接的建立。</p>
-
-<p>  客户端的连接请求由</p>
+<h4>1. 建立socket</h4>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
 <span class='line-number'>3</span>
 <span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>tcp_v4_do_rcv()
-</span><span class='line'>&#9;tcp_rcv_state_process()
-</span><span class='line'>&#9;&#9;icsk-&gt;icsk_af_ops-&gt;conn_request()
-</span><span class='line'>&#9;&#9;&#9;tcp_v4_conn_request()</span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#include&lt;sys/socket.h&gt;
+</span><span class='line'>
+</span><span class='line'>int socket(
+</span><span class='line'>&#9;int domain,      //地址族的类型AF_UNIX (绑定在本地) AF_INET（绑定在网卡）
+</span><span class='line'>&#9;int type,      //支持的数据格式：流SOCK_STREAM/报文SOCK_DGRAM
+</span><span class='line'>&#9;int protocol); //支持的协议,建议为0
+</span><span class='line'>
+</span><span class='line'>返回值：
+</span><span class='line'>&#9;成功返回文件描述符号。
+</span><span class='line'>&#9;失败返回-1;</span></code></pre></td></tr></table></div></figure>
 
 
-<p>函数处理。tcp_v4_conn_request()中有一个局部变量want_cookie，用来标识是否使用SYN cookies机制。want_cookie的初始值为0，如果半连接队列已满，并且开启了tcp_syncookies系统参数，则将其值设置为1，如下所示：</p>
+<h4>2.绑定在地址上(文件目录地址)URL(Universe ResourceLocation)</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>协议://路径/文件名
+</span><span class='line'>file:///usr/bin/ls      普通文件
+</span><span class='line'>http://192.168.0.72/index.php
+</span><span class='line'>struct sockaddr;  地址结构体</span></code></pre></td></tr></table></div></figure>
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#include&lt;linux/un.h&gt;
+</span><span class='line'>
+</span><span class='line'>struct sockaddr_un;   un=unix（绑定unix本地）
+</span><span class='line'>
+</span><span class='line'>struct sockaddr_un {
+</span><span class='line'>&#9;sa_family_t   sun_family; /*AF_UNIX*/
+</span><span class='line'>&#9;char sun_path[UNIX_PATH_MAX];
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct sockaddr_in;   in=internet（绑定网卡）
+</span><span class='line'>int bind(int fd,           //socket描述符号
+</span><span class='line'>&#9;struct sockaddr *addr, //绑定地址
+</span><span class='line'>&#9;socklen_tsize);        //地址长度
+</span><span class='line'>
+</span><span class='line'>返回值：
+</span><span class='line'>&#9;0成功
+</span><span class='line'>&#9;-1失败</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>样例</h4>
+
+<h5>server.c</h5>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -205,286 +253,73 @@ var ss360Config = {
 <span class='line-number'>26</span>
 <span class='line-number'>27</span>
 <span class='line-number'>28</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>int tcp_v4_conn_request(struct sock *sk, struct sk_buff *skb)
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#include&lt;sys/socket.h&gt;
+</span><span class='line'>#include&lt;stdio.h&gt;
+</span><span class='line'>#include&lt;stdlib.h&gt;
+</span><span class='line'>#include&lt;string.h&gt;
+</span><span class='line'>#include&lt;unistd.h&gt;
+</span><span class='line'>#include&lt;linux/un.h&gt;
+</span><span class='line'> 
+</span><span class='line'>int main()
 </span><span class='line'>{
-</span><span class='line'>#ifdef CONFIG_SYN_COOKIES
-</span><span class='line'>&#9;int want_cookie = 0;
-</span><span class='line'>#else
-</span><span class='line'>#define want_cookie 0 /* Argh, why doesn't gcc optimize this :( */
-</span><span class='line'>#endif
-</span><span class='line'>
-</span><span class='line'>...... 
-</span><span class='line'>
-</span><span class='line'>&#9;/* TW buckets are converted to open requests without
-</span><span class='line'>&#9; * limitations, they conserve resources and peer is
-</span><span class='line'>&#9; * evidently real one.
-</span><span class='line'>&#9; */
-</span><span class='line'>&#9;if (inet_csk_reqsk_queue_is_full(sk) && !isn) {
-</span><span class='line'>#ifdef CONFIG_SYN_COOKIES
-</span><span class='line'>&#9;&#9;if (sysctl_tcp_syncookies) {
-</span><span class='line'>&#9;&#9;&#9;want_cookie = 1;
-</span><span class='line'>&#9;&#9;} else
-</span><span class='line'>#endif
-</span><span class='line'>&#9;   
-</span><span class='line'>&#9;&#9;goto drop;
-</span><span class='line'>&#9;}
-</span><span class='line'>......
-</span><span class='line'>
-</span><span class='line'>drop:
+</span><span class='line'>&#9;int fd; 
+</span><span class='line'>&#9;int r;
+</span><span class='line'>&#9;char buf[100];
+</span><span class='line'>&#9;//1.建立socket
+</span><span class='line'>&#9;fd = socket(AF_UNIX, SOCK_DGRAM, 0);  //AF_FILE 等同//AF_UNIX
+</span><span class='line'>&#9;if (fd == -1) {
+</span><span class='line'>&#9;&#9;printf("socket error:%m\n");
+</span><span class='line'>&#9;&#9;exit(-1);
+</span><span class='line'>&#9;}   
+</span><span class='line'> 
+</span><span class='line'>&#9;//2.构造本地文件地址
+</span><span class='line'>&#9;struct sockaddr_un addr = {0};
+</span><span class='line'>&#9;addr.sun_family = AF_UNIX; //必须跟socket的地址族一致
+</span><span class='line'>&#9;memcpy(addr.sun_path, "my.sock", strlen("my.sock"));
+</span><span class='line'>&#9;
+</span><span class='line'>&#9;//3.把socket绑定在地址上
+</span><span class='line'>&#9;r = bind(fd, (struct sockaddr *)&addr, sizeof(addr));
+</span><span class='line'>&#9;if (r == -1) {
+</span><span class='line'>&#9;&#9;printf("bind error:%m\n");
+</span><span class='line'>&#9;&#9;exit(-1);
+</span><span class='line'>&#9;}   
+</span><span class='line'> 
+</span><span class='line'>&#9;//4.接收数据
+</span><span class='line'>&#9;bzero(buf , sizeof(buf));
+</span><span class='line'>&#9;r = read(fd, buf, sizeof(buf));
+</span><span class='line'>&#9;buf[r] = 0;
+</span><span class='line'>&#9;printf("%s\n", buf);
+</span><span class='line'> 
+</span><span class='line'>&#9;//5.关闭
+</span><span class='line'>&#9;close(fd);
+</span><span class='line'> 
+</span><span class='line'>&#9;//6.删除socket文件
+</span><span class='line'>&#9;unlink("my.sock");
+</span><span class='line'> 
+</span><span class='line'>&#9;//socket文件不会自动删除，需要在程序结尾去删除该文件，否则，再次运行//A程序出错
 </span><span class='line'>&#9;return 0;
 </span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
-<p>  如果没有开启SYN cookies机制，在半连接队列满时，会跳转到drop处，返回0。在调用tcp_v4_conn_request()的tcp_rcv_state_process()中会直接释放SKB包。</p>
-
-<p>  我们前面提高过，造成半连接队列满有两种情况（不考虑半连接队列很小的情况），一种是负载过高，正常的连接数过多；另一种是SYN flood攻击。如果是第一种情况，此时是否继续构建连接，则要取决于连接队列的情况及半连接队列的重传情况，如下所示：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if (sk_acceptq_is_full(sk) && inet_csk_reqsk_queue_young(sk) &gt; 1)
-</span><span class='line'>&#9;goto drop;</span></code></pre></td></tr></table></div></figure>
-
-
-<p>  sk_acceptq_is_full()函数很好理解，根据字面意思就可以看出，该函数是检查连接队列是否已满。inet_csk_reqsk_queue_young()函数返回半连接队列中未重传过SYN+ACK段的连接请求块数量。如果连接队列已满并且半连接队列中的连接请求块中未重传的数量大于1，则会跳转到drop处，丢弃SYN包。如果半连接队列中未重传的请求块数量大于1，则表示未来可能有2个完成的连接，这些新完成的连接要放到连接队列中，但此时连接队列已满。如果在接收到三次握手中最后的ACK后连接队列中没有空闲的位置，会忽略接收到的ACK包，连接建立会推迟，所以此时最好丢掉部分新的连接请求，空出资源以完成正在进行的连接建立过程。还要注意，这个判断并没有考虑半连接队列是否已满的问题。从这里可以看出，即使开启了SYN cookies机制并不意味着一定可以完成连接的建立。</p>
-
-<p>  如果可以继续连接的建立，调用inet_reqsk_alloc()分配连接请求块，如下所示：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>req = inet_reqsk_alloc(&tcp_request_sock_ops);
-</span><span class='line'>if (!req)
-</span><span class='line'>&#9;goto drop;</span></code></pre></td></tr></table></div></figure>
-
-
-<p>  看到这里可能就有人疑惑，既然开启了SYN cookies机制，仍然分配连接请求块，那和正常的连接构建也没有什么区别了。这里之所以要分配连接请求块是用于发送SYN+ACK包给客户端，发送后会释放掉，并不会加入到半连接队列中。</p>
-
-<p>  接下来就是计算cookie的值，由cookie_v4_init_sequence()函数完成，如下所示：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if (want_cookie) {
-</span><span class='line'>#ifdef CONFIG_SYN_COOKIES
-</span><span class='line'>&#9;syn_flood_warning(skb);
-</span><span class='line'>&#9;req-&gt;cookie_ts = tmp_opt.tstamp_ok;
-</span><span class='line'>#endif
-</span><span class='line'>&#9;isn = cookie_v4_init_sequence(sk, skb, &req-&gt;mss);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>  计算得到的cookie值会保存在连接请求块tcp_request_sock结构的snt_isn成员中，接着会调用__tcp_v4_send_synack()函数发送SYN+ACK包，然后释放前面分配的连接请求块，如下所示：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if (__tcp_v4_send_synack(sk, req, dst) || want_cookie)
-</span><span class='line'>&#9;goto drop_and_free;</span></code></pre></td></tr></table></div></figure>
-
-
-<p>  在服务器端发送完SYN+ACK包后，我们看到在服务器端没有保存任何关于这个未完成连接的信息，所以在接收到客户端的ACK包后，只能根据前面发送的SYN+ACK包中的cookie值来决定是否继续构建连接。</p>
-
-<p>  我们接下来看接收到ACK包后的处理情况。ACK包在tcp_v4_do_rcv()函数中调用的tcp_v4_hnd_req()中处理，如下所示：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static struct sock *tcp_v4_hnd_req(struct sock *sk, struct sk_buff *skb)
-</span><span class='line'>{
-</span><span class='line'>&#9;......
-</span><span class='line'> 
-</span><span class='line'>#ifdef CONFIG_SYN_COOKIES
-</span><span class='line'>&#9;if (!th-&gt;rst && !th-&gt;syn && th-&gt;ack)
-</span><span class='line'>&#9;&#9;sk = cookie_v4_check(sk, skb, &(IPCB(skb)-&gt;opt));
-</span><span class='line'>#endif
-</span><span class='line'>&#9;return sk;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>  由于在服务器端没有保存未完成连接的信息，所以在半连接队列或ehash散列表中都不会找到对应的sock结构。如果开启了SYN cookies机制，则会检查接收到的数据包是否是ACK包，如果是，在cookie_v4_check()中会调用cookie_check()函数检查ACK包中的cookie值是否有效。如果有效，则会分配request_sock结构，并根据ACK包初始化相应的成员，开始构建描述连接的sock结构。创建过程和正常的连接创建过程一样。</p>
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/04/01/centos-base/">CentOS各种设置</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-04-01T23:39:00+08:00'><span class='date'>2015-04-01</span> <span class='time'>23:39:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><h4>centos个人目录文件夹路径中文转英文</h4>
-
-<p>方法1. 修改系统语言环境</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>export LANG=en_US
-</span><span class='line'>xdg-user-dirs-gtk-update
-</span><span class='line'>export LANG=zh_CN.UTF-8</span></code></pre></td></tr></table></div></figure>
-
-
-<p>方法2. 修改系统配置文件</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>vim ~/.config/user-dirs.dirs</span></code></pre></td></tr></table></div></figure>
-
-
-<hr />
-
-<h4>centos 8 重启网络命令</h4>
-
-<p><a href="https://blog.csdn.net/weixin_54626591/article/details/135974971">https://blog.csdn.net/weixin_54626591/article/details/135974971</a></p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>nmcli c reload ens33        (不会立即生效)  # 重新载入网卡配置文件
-</span><span class='line'>
-</span><span class='line'>nmcli c up ens33            (立即生效)      # 重启网卡ens33
-</span><span class='line'>
-</span><span class='line'>两条命令一起执行, 如果不行，可尝试以下命令
-</span><span class='line'>
-</span><span class='line'># 重载所有ifcfg或route到connection（不会立即生效）
-</span><span class='line'>nmcli c reload  ifcfg-xxx
-</span><span class='line'>
-</span><span class='line'># 重载指定ifcfg或route到connection（不会立即生效）
-</span><span class='line'>nmcli c load etc/sysconfig/network-scripts/ifcfg-ethX
-</span><span class='line'>nmcli c load etc/sysconfig/network-scripts/route-ethX
-</span><span class='line'>
-</span><span class='line'># 立即生效connection，有3种方法
-</span><span class='line'>nmcli c up ethX
-</span><span class='line'>nmcli d reapply ethX
-</span><span class='line'>nmcli d connect ethX
-</span></code></pre></td></tr></table></div></figure>
-
-
-<hr />
-
-<h4>Centos7系统rc.local不起作用</h4>
-
-<p>chmod +x /etc/rc.d/rc.local</p>
-
-<p>开头加 #!/bin/bash</p>
-
-<p>启动此项服务：</p>
-
-<p>systemctl list-units &ndash;type=service  #来查看一下所有的开启启动项目里面有没有这个rc-local这个服务。</p>
-
-<p>systemctl  status rc-local.service #来查看一下当前是怎么个状态</p>
-
-<p>systemctl enable rc-local.service</p>
-
-<p>systemctl start rc-local.service</p>
-
-<hr />
-
-<p>使用gcc时，总是按中文提示。回归英文的提示，方法是：
-首先使用env查看，发现LANGUAGE=zh_CN.UTF-8，接着执行export LANG=en_US.UTF-8就可以，以后的编译是就按英文来提示</p>
-
-<hr />
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>lsattr /etc/passwd /etc/group /etc/shadow /etc/gshadow
-</span><span class='line'>chattr -i /etc/passwd /etc/group /etc/shadow /etc/gshadow</span></code></pre></td></tr></table></div></figure>
-
-
-<hr />
-
-<p>英文：E437: terminal capability &ldquo;cm&rdquo; required<br/>
-中文：e437 终端需要能力 cm</p>
-
-<p>这个错误一般是环境变量TERM没有配置或者配置错误所致, 用 export TERM=linux 或者 export TERM=xterm</p>
-
-<hr />
-
-<p>上传是用rz -be，并且去掉弹出的对话框中“Upload files as ASCII”前的勾选。
- -a, –ascii
- -b, –binary 用binary的方式上传下载，不解释字符为ascii
- -e, –escape 强制escape 所有控制字符，比如Ctrl+x，DEL等</p>
-
-<hr />
-
-<p>nginx</p>
-
-<p><a href="http://nginx.org/packages/rhel/7/x86_64/RPMS/">http://nginx.org/packages/rhel/7/x86_64/RPMS/</a></p>
-
-<hr />
-
-<p>binkernel.spec</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>%pre
-</span><span class='line'>mkdir -p /usr/local/kernel/etc/
-</span><span class='line'>echo "version=%{version}-%{release}" &gt; /usr/local/kernel/etc/install.conf
-</span><span class='line'>
-</span><span class='line'>%post
-</span><span class='line'>/sbin/new-kernel-pkg --package kernel --mkinitrd --depmod --install 2.6.32-358.6.1.ws5.b.5.1.11t25
-</span><span class='line'>
-</span><span class='line'>%preun
-</span><span class='line'>rm -rf /usr/local/kernel/
-</span><span class='line'>
-</span><span class='line'>%postun
-</span><span class='line'>/sbin/new-kernel-pkg  --remove 2.6.32-358.6.1.ws5.b.5.1.11t25</span></code></pre></td></tr></table></div></figure>
-
-
-<hr />
-
-<p>更改 bash_history 默认历史记录</p>
+<h5>client.c</h5>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -512,128 +347,34 @@ var ss360Config = {
 <span class='line-number'>24</span>
 <span class='line-number'>25</span>
 <span class='line-number'>26</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>vim ~/.bashrc
-</span><span class='line'>
-</span><span class='line'># 忽略[连续]重复命令
-</span><span class='line'>HISTCONTROL=ignoredups
-</span><span class='line'>
-</span><span class='line'># 清除重复命令
-</span><span class='line'># HISTCONTROL=erasedups
-</span><span class='line'>
-</span><span class='line'># 忽略特定命令
-</span><span class='line'>HISTIGNORE="[   ]*:ls:ll:cd:vi:pwd:sync:exit:history*"
-</span><span class='line'>
-</span><span class='line'># 命令历史文件大小10M
-</span><span class='line'>HISTFILESIZE=1000000000
-</span><span class='line'>
-</span><span class='line'># 保存历史命令条数10W
-</span><span class='line'>HISTSIZE=1000000
-</span><span class='line'>
-</span><span class='line'>以上配置可以通过 set | grep HIST 查看可选项.
-</span><span class='line'>
-</span><span class='line'>
-</span><span class='line'>多终端追加
-</span><span class='line'>当打开多个终端，关闭其中一个终端时会覆盖其他终端的命令历史，这里我们采用追加的方式避免命令历史文件.bash_history 文件被覆盖。
-</span><span class='line'>
-</span><span class='line'>shopt -s histappend
-</span><span class='line'>
-</span><span class='line'>更多 shopt 可选项可以通过 echo $SHELLOPTS 命令查看。</span></code></pre></td></tr></table></div></figure>
-
-
-<hr />
-
-<p>关闭CentOS6启动进度条，显示详细自检信息。vim /boot/grub/grub.conf，将"rhgb"和 &ldquo;quiet"去掉，保存即可</p>
-
-<hr />
-
-<p>vmware虚拟机mkinitrd提示no module ehci-hcd 错误的话，加：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>--builtin=ehci-hcd --builtin=ohci-hcd --builtin=uhci-hcd</span></code></pre></td></tr></table></div></figure>
-
-
-<hr />
-
-<p>CentOS6.0 下默认开selinux时出现httpd 报“SELinux policy enabled; httpd running as context unconfined_u:system”的解决方案</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>yum install policycoreutils-python
-</span><span class='line'>
-</span><span class='line'># To allow httpd to use nfs dirs in CentOS-6
-</span><span class='line'>setsebool -P httpd_use_nfs 1
-</span><span class='line'>setsebool -P httpd_enable_homedirs 1</span></code></pre></td></tr></table></div></figure>
-
-
-<hr />
-
-<h4>CentOS 关闭防火墙</h4>
-
-<p>1） 永久性生效，重启后不会复原<br/>
-开启：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>chkconfig iptables on
-</span><span class='line'>chkconfig ip6tables on</span></code></pre></td></tr></table></div></figure>
-
-
-<p>关闭：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>chkconfig iptables off
-</span><span class='line'>chkconfig ip6tables off</span></code></pre></td></tr></table></div></figure>
-
-
-<p>2） 即时生效，重启后复原<br/>
-开启：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>service iptables start
-</span><span class='line'>service ip6tables start</span></code></pre></td></tr></table></div></figure>
-
-
-<p>关闭：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>service iptables stop
-</span><span class='line'>service ip6tables stop</span></code></pre></td></tr></table></div></figure>
-
-
-<hr />
-
-<h4>CentOS安装软件：/lib/ld-linux.so.2: bad ELF interpreter 解决</h4>
-
-<p>是因为64位系统中安装了32位程序, 解决方法：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>yum install glibc.i686</span></code></pre></td></tr></table></div></figure>
-
-
-<p>其他包</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>yum install libstdc++.i686</span></code></pre></td></tr></table></div></figure>
-
-
-<hr />
-
-<h4>gcc, c++</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>yum install glibc
-</span><span class='line'>yum install glibc-devel
-</span><span class='line'>yum install gcc-c++
-</span><span class='line'>yum install libstdc++</span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>27</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#include&lt;stdio.h&gt;
+</span><span class='line'>#include&lt;stdlib.h&gt;
+</span><span class='line'>#include&lt;sys/socket.h&gt;
+</span><span class='line'>#include&lt;linux/un.h&gt;
+</span><span class='line'>#include&lt;string.h&gt;
+</span><span class='line'>#include&lt;unistd.h&gt;
+</span><span class='line'> 
+</span><span class='line'>int main()
+</span><span class='line'>{
+</span><span class='line'>&#9;int fd; 
+</span><span class='line'>&#9;int r;
+</span><span class='line'>&#9;struct sockaddr_un addr = {0};
+</span><span class='line'>&#9;//1.建立socket
+</span><span class='line'>&#9;fd = socket(AF_UNIX, SOCK_DGRAM, 0); 
+</span><span class='line'> 
+</span><span class='line'>&#9;//2.连接到指定的地址
+</span><span class='line'>&#9;addr.sun_family = AF_UNIX;
+</span><span class='line'>&#9;memcpy(addr.sun_path, "my.sock", strlen("my.sock"));
+</span><span class='line'>&#9;r = connect(fd, (struct sockaddr*)&addr, sizeof(addr));
+</span><span class='line'> 
+</span><span class='line'>&#9;//3.发送数据
+</span><span class='line'>&#9;write(fd, "hello!", strlen("hello!"));
+</span><span class='line'> 
+</span><span class='line'>&#9;//4.关闭
+</span><span class='line'>&#9;close(fd);
+</span><span class='line'>&#9;return 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
 
@@ -649,7 +390,7 @@ var ss360Config = {
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2015/04/01/kernel-net-tc/">tc模拟丢包率时延</a></h2>
+      <h2 class="entry-title"><a href="/blog/2015/04/28/debug-ubuntu-stap/">ubuntu安装systemtap</a></h2>
     
     
       <p class="meta">
@@ -658,44 +399,407 @@ var ss360Config = {
 
 
 
-<time class='entry-date' datetime='2015-04-01T23:25:00+08:00'><span class='date'>2015-04-01</span> <span class='time'>23:25:00</span></time>
+<time class='entry-date' datetime='2015-04-28T14:42:00+08:00'><span class='date'>2015-04-28</span> <span class='time'>14:42:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><h4>tc 的最最基本的使用</h4>
+  <div class="entry-content"><p><a href="http://blog.csdn.net/ustc_dylan/article/details/7079876">http://blog.csdn.net/ustc_dylan/article/details/7079876</a></p>
+
+<h4>1. 从源安装systemtap</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>$ sudo apt-get install systemtap</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>2. 安装kernel-debug-info</h4>
+
+<p>由于ubuntu 桌面版默认没有安装kernel-debug-info，所以安装了systemtap后仍然不能够追踪内核信息，因此需要手动安装kernel-debug-info包。</p>
+
+<h5>（1）查看当前内核版本</h5>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>$ uname -a
+</span><span class='line'>Linux kk-desktop 2.6.32-73-generic #141-Ubuntu SMP Tue Mar 10 17:15:10 UTC 2015 x86_64 GNU/Linux</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>（2）下载对应内核版本的debug-info package</h5>
+
+<p><a href="http://ddebs.ubuntu.com/pool/main/l/linux/">http://ddebs.ubuntu.com/pool/main/l/linux/</a></p>
+
+<p><a href="http://ddebs.ubuntu.com/pool/main/l/linux/linux-image-2.6.32-73-generic-dbgsym_2.6.32-73.141_amd64.ddeb">http://ddebs.ubuntu.com/pool/main/l/linux/linux-image-2.6.32-73-generic-dbgsym_2.6.32-73.141_amd64.ddeb</a></p>
+
+<h4>3. 安装kernel-debug-info</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>$ sudo dpkg -i linux-image-2.6.32-73-generic-dbgsym_2.6.32-73.141_amd64.ddeb</span></code></pre></td></tr></table></div></figure>
+
+
+<p>经过以上安装配置后，就可以跟踪监控内核信息了，但是现在还不能跟踪linux内核模块的信息，因为，systemtap对linux内核模块的跟踪是通过libelf库来查找
+/usr/lib/debug目录下以.ko.dedug结尾的模块，但是linux发行版通常将linux模块的扩展名修改为.ko。</p>
+
+<h4>4. 安装elfutils并进行相应配置</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>$ sudo apt-get install elfutils</span></code></pre></td></tr></table></div></figure>
+
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
 <span class='line-number'>3</span>
 <span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>tc qdisc show    # 显示
-</span><span class='line'>tc qdisc add dev eth0 root ...... # 加入
-</span><span class='line'>tc qdisc change dev eth0 root ...... # 修改存在的 qdisc ，记的，加入同一条后只能用 change 来修改
-</span><span class='line'>tc qdisc del dev eth0 root  # 删除</span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'># 这些似乎不用
+</span><span class='line'>for file in `find /usr/lib/debug-name'*.ko' -print`
+</span><span class='line'>do
+</span><span class='line'>&#9;buildid=`eu-readelf-n $file| grep Build.ID:| awk '{print $3}'`
+</span><span class='line'>&#9;dir=`echo $buildid| cut-c1-2`
+</span><span class='line'>&#9;fn=`echo $buildid| cut-c3-`
+</span><span class='line'>&#9;rm -fr /usr/lib/debug/.build-id
+</span><span class='line'>&#9;mkdir -p/usr/lib/debug/.build-id/$dir
+</span><span class='line'>&#9;ln -s $file/usr/lib/debug/.build-id/$dir/$fn
+</span><span class='line'>&#9;ln -s $file/usr/lib/debug/.build-id/$dir/${fn}.debug
+</span><span class='line'>done</span></code></pre></td></tr></table></div></figure>
 
 
-<h4>Linux 中延时模拟</h4>
-
-<p>设置延时 3s :</p>
+<h4>5. 写个例子测试下</h4>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>tc qdisc add dev eth0 root netem delay 3000ms</span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>$ sudo stap -ve 'probe begin { log("hello world") exit() }'</span></code></pre></td></tr></table></div></figure>
 
 
-<p>可以在 3000ms 后面在加上一个延时，比如 3000ms 200ms 表示 3000ms ± 200ms ，延时范围 2800 – 3200 之间.</p>
+<p>如果能够打印出hello world，说明安装配置成功!</p>
+</div>
+  
+  
 
-<h4>Linux 中丢包模拟</h4>
 
-<p>设置丢包 50% ,iptables 也可以模拟这个，但一下不记的命令了，下次放上来:</p>
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2015/04/18/kernel-mm-reclaim2/">Linux物理内存回收机制</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-04-18T23:33:00+08:00'><span class='date'>2015-04-18</span> <span class='time'>23:33:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p>blog.tek-life.com/认识linux物理内存回收机制/</p>
+
+<h4>Introduction</h4>
+
+<p>本文所讲的物理页面回收是指动态的回收：即，空闲的内存不够用的时候，系统采取相应的方法将正在使用的内存释放，补充空闲内存，以满足内存的分配。</p>
+
+<h3>Text</h3>
+
+<h4>1.All channels for page freeing。首先先简单看一下系统中的内存释放的三种渠道。</h4>
+
+<p>  1-1>. 在用户进程退出的时候，释放内存。当用户进程退出的时候，会调用do_exit. do_exit最终会调用free_pagetables函数。该函数的作用是：遍历vma，根据vma中的虚拟地址找到实际的物理页，将其释放。在之前讲过，对于用户进程的虚拟地址区间，是以红黑树组织的。</p>
+
+<p>  1-2>. 手动的释放。在驱动中，分配内存使用alloc_pages()，释放内存用free_pages(这一点，类似于c语言中的malloc和free)。必须配对使用。否则会造成内存泄漏。</p>
+
+<p>  1-3>. 按需求调用内存回收例程来释放内存。这个区别于前两种的最大不同：它是动态的，按需的。当内存不够的时候，系统会自动按照一定的方式，将某些正在使用的内存释放掉，放进buddy system中再利用。</p>
+
+<h4>2. Overview for page frame reclaiming。</h4>
+
+<p>  2-1>. 先来看一下内存将会回收哪些页面<br/>
+  用户进程的页面都是通过page fault进行分配的。通过page fault进行分配的页面都是可以进行回收的。 这些页面总体可以划分为两种，分别是文件页(file cache)和匿名页(anonymous cache). 文件页，顾名思义，它是和外部存储设备上的某个文件相对应。匿名页，其内容不来自于外部存储设备，例如用户进程中的堆栈。这两种页面是内存回收的目标页面。</p>
+
+<p>  2-2>. 内存回收采用的主要算法是近似于LRU的算法。位于LRU链表前面的页是活跃的，位于LRU链表后面的页是不活跃的。为什么说是近似呢？<br/>
+   1. 页面在链表上排序并不是严格依据LRU不断移动的。他们挂上去后是不移动的。除非在进行页面回收的时候，有些页面从后面，可能会插入到前面；<br/>
+   2. Linux在LRU的基础上又引入了一个Referrenced标志。这种带Referenced标志的近似LRU的算法被有些人称之为Second-Chance Algorithm.</p>
+
+<p>简单看一下Second-Chance Algorithm. 当一个页从一个LRU链表上除去的时候，需要再看一下Referenced标志。如果该标志设置了，就将其置为0，不能将该页移出。</p>
+
+<p><img src="/images/kernel/2015-04-18-20.png" alt="" /><br/>
+图1</p>
+
+<p>以图一为例，当某个页面被访问后，Referenced标志被设置。当需要从该list上面回收某些页时，从后向前扫描该list上的页面。对于那些设置为1(Referenced标志被设置)，reset为0，不被移出链表。对于那些设置为0的页面，移出链表。</p>
+
+<p>  2-3>. Linux为了实现该算法，给每个zone都提供了5个LRU链表。这5个LRU链表分为3类，一类是活跃链表(active list)，活跃链表有两个：一个是链接file page cache的LRU list, 另一个是链接anonymous page cache的LRU list. 另一类是非活跃链表(inactive list)，非活跃链表也有两个：一个是链接file page cache 的LRU list, 另一个是链接anonymous page cache的LRU list. 内存回收例程从inactive list链表上获取页进行回收。第三类是unevictable链表，这个链表上挂载的是那些被mlock()或者locked的页面。Mlock(),是一个系统调用，用户程序通过该系统调用锁定某些页阻止系统将其换出。被Locked的页面通常是文件系统防止其他进程touch的页面。被锁定的页面都挂载unevictable链表上。</p>
+
+<p>  加入到active list链表上的页其page->flags上都要设置PG_active标志。凡是设置了PG_unevictable标志的都要挂载unevictable LRU list上。没有设置PG_active/PG_unevictable标志的都处于inactive状态。处于相关状态的页面通过page->lru 链接到对应的链表上。</p>
+
+<p>  当某个页被访问后，提高该页面的活跃度。提高活跃度的方法是:或者对page->flags设置PG_referenced标志，或者对page->flags设置PG_active(同时该物理页面从inactive_list链表上转移到active_list链表上). 有PG_referenced和PG_active标志，可以得到页面的状态，该活跃度由低到高依次为：00->01->10->11</p>
+
+<p>  2-4>. 对于一个可回收页面，按照LRU的算法，只有处于inactive状态的页并且没有设置PG_referenced标志位的页才能被回收。但实际上Linux在实现的时候并没有严格按照这中算法，PG_referenced位只是用来参考的。从下面的状态转换图中可以看出这一点。状态转换图一共有4种状态。</p>
+
+<p><img src="/images/kernel/2015-04-18-21.png" alt="" /><br/>
+图2</p>
+
+<p>当页面通过page fault被分配的时候，file page cache 被加入到非活动链表中(inactive list)， 匿名页(anonymous page cache)被加入到活动链表中(active list)。该状态迁移图所涉及的函数主要有以下几个：shrink_active_list，make_page_accessed，page_check_references。</p>
+
+<p>1)当inactive链表上的页数不够的时候，会调用shrink_active_list，该函数会将active链表上的页move到inactive链表上。对应于上图标号为1的转移；</p>
+
+<p>2). make_page_accessed().</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>tc qdisc change dev eth0 root netem loss 50%</span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>355 /*
+</span><span class='line'>356  * Mark a page as having seen activity.
+</span><span class='line'>357  *
+</span><span class='line'>358  * inactive,unreferenced        -&gt;      inactive,referenced
+</span><span class='line'>359  * inactive,referenced          -&gt;      active,unreferenced
+</span><span class='line'>360  * active,unreferenced         -&gt;      active,referenced
+</span><span class='line'>361  */
+</span><span class='line'>362 void mark_page_accessed(struct page *page)
+</span><span class='line'>363 {
+</span><span class='line'>364         if (!PageActive(page) && !PageUnevictable(page) &&
+</span><span class='line'>365                         PageReferenced(page) && PageLRU(page)) {
+</span><span class='line'>366                 activate_page(page);
+</span><span class='line'>367                 ClearPageReferenced(page);
+</span><span class='line'>368         } else if (!PageReferenced(page)) {
+</span><span class='line'>369                 SetPageReferenced(page);
+</span><span class='line'>370         }
+</span><span class='line'>371 }
+</span><span class='line'>372 EXPORT_SYMBOL(mark_page_accessed);</span></code></pre></td></tr></table></div></figure>
 
 
-<p>上面的设丢包，如果给后面的 50% 的丢包比率修改成 50% 80% 时，这时和上面的延时不一样，这是指丢包比率为 50-80% 之间。</p>
+<p>当通过read()系统调用或者读已经在cache中的页面时，会提高页面的活跃度。对应于上图标号为2的转移(00->01->10->11)；
+3) shrink_page_list->page_check_references()</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>704 static enum page_references page_check_references(struct page *page,
+</span><span class='line'>705                                                   struct mem_cgroup_zone *mz,
+</span><span class='line'>706                                                   struct scan_control *sc)
+</span><span class='line'>707 {
+</span><span class='line'>708         int referenced_ptes, referenced_page;
+</span><span class='line'>709         unsigned long vm_flags;
+</span><span class='line'>710
+</span><span class='line'>711         referenced_ptes = page_referenced(page, 1, mz-&gt;mem_cgroup, &vm_flags);
+</span><span class='line'>712         referenced_page = TestClearPageReferenced(page);
+</span><span class='line'>713
+</span><span class='line'>714         /* Lumpy reclaim – ignore references */
+</span><span class='line'>715         if (sc-&gt;reclaim_mode & RECLAIM_MODE_LUMPYRECLAIM)
+</span><span class='line'>716                 return PAGEREF_RECLAIM;
+</span><span class='line'>717
+</span><span class='line'>718         /*
+</span><span class='line'>719          * Mlock lost the isolation race with us.  Let try_to_unmap()
+</span><span class='line'>720          * move the page to the unevictable list.
+</span><span class='line'>721          */
+</span><span class='line'>722         if (vm_flags & VM_LOCKED)
+</span><span class='line'>723                 return PAGEREF_RECLAIM;
+</span><span class='line'>724
+</span><span class='line'>725         if (referenced_ptes) {
+</span><span class='line'>726                 if (PageAnon(page))
+</span><span class='line'>727                         return PAGEREF_ACTIVATE;
+</span><span class='line'>728                 /*
+</span><span class='line'>729                  * All mapped pages start out with page table
+</span><span class='line'>730                  * references from the instantiating fault, so we need
+</span><span class='line'>731                  * to look twice if a mapped file page is used more
+</span><span class='line'>732                  * than once.
+</span><span class='line'>733                  *
+</span><span class='line'>734                  * Mark it and spare it for another trip around the
+</span><span class='line'>735                  * inactive list.  Another page table reference will
+</span><span class='line'>736                  * lead to its activation.
+</span><span class='line'>737                  *
+</span><span class='line'>738                  * Note: the mark is set for activated pages as well
+</span><span class='line'>739                  * so that recently deactivated but used pages are
+</span><span class='line'>740                  * quickly recovered.
+</span><span class='line'>741                  */
+</span><span class='line'>742                 SetPageReferenced(page);
+</span><span class='line'>743
+</span><span class='line'>744                 if (referenced_page || referenced_ptes &gt; 1)
+</span><span class='line'>745                         return PAGEREF_ACTIVATE;
+</span><span class='line'>746
+</span><span class='line'>747                 /*
+</span><span class='line'>748                  * Activate file-backed executable pages after first usage.
+</span><span class='line'>749                  */
+</span><span class='line'>750                 if (vm_flags & VM_EXEC)
+</span><span class='line'>751                         return PAGEREF_ACTIVATE;
+</span><span class='line'>752
+</span><span class='line'>753                 return PAGEREF_KEEP;
+</span><span class='line'>754         }
+</span><span class='line'>755
+</span><span class='line'>756         /* Reclaim if clean, defer dirty pages to writeback */
+</span><span class='line'>757         if (referenced_page && !PageSwapBacked(page))
+</span><span class='line'>758                 return PAGEREF_RECLAIM_CLEAN;
+</span><span class='line'>759
+</span><span class='line'>760         return PAGEREF_RECLAIM;
+</span><span class='line'>761 }</span></code></pre></td></tr></table></div></figure>
+
+
+<p>该函数被真正的页面回收函数shrink_page_list调用。所处理的对象是处于inactive状态的页面。分以下几种情况：</p>
+
+<p>  3-a). 如果是匿名页，并且最近被访问过(PTE_young置位)，对应3-a的转移(Line 726)。即(inactive+PG_referenced)->active，inactive->active. (01->10或者00->10).</p>
+
+<p>  3-b). 如果是已经映射的文件页,最近被访问过(PTE_young置位)，如果PG_referenced置位或者被两个进程最近访问过(这一点不知道理解的对否)(Line 744~745)，对应于3-b的转移(01->11)。</p>
+
+<p>  3-c). 如果是已经映射的文件页,最近被访问过(PTE_young置位), 并且该page cache中的内容是可执行的(例如，用户进程的代码段)，则inactive->(active+PG_referenced).(00->11, 01->11)</p>
+
+<p>  3-d). 如果是已经映射的文件页,最近被访问过(PTE_young置位), 则，设置PG_referenced标志，仍旧保留inactive状态，不进行回收。(00->01,01-01)</p>
+
+<p>  3-e). 除了以上情况，均进行回收。即：最近没有被访问过(PTE_YOUNG没有设置)的匿名页和文件页。</p>
+
+<p>  对于page_check_references()中的返回值，简单介绍一下：<br/>
+   PAGEREF_RECLAIM：进行回收；<br/>
+   PAGEREF_RECLAIM_CLEAN：若该页是干净的(clean)，则进行回收；<br/>
+   PAGEREF_KEEP：仍然保持在inactive LRU list上，不进行回收。<br/>
+   PAGEREF_ACTIVATE：不进行回收，并将该页转移到active LRU list上。</p>
+
+<p>  2-5>. 由以上的状态转换图，简单了解一下一个可回收的物理页面可能的生命周期。</p>
+
+<p>Free->inactive->[active]&lt;–>inactive->reclaimable->free</p>
+
+<p>  对于一个文件页，其在buddy system中未被分配时，处于free状态。当被分配后，首先挂载在inactive LRU list上。若被进程访问，便会被active。当一段时间没有被访问后，就处于inactive状态，挂载在inactive 链表上等待回收。被回收例程回收后，就进入buddy system中，回归到free状态。</p>
+
+<p>Free->Active&lt;–>[inactive]->reclaimable->free</p>
+
+<p>  对于一个匿名页，通过page fault被分配后，挂载在active链表上，然后经过deactive变为inactive然后被回收进buddy system中。</p>
+
+<p>  对于匿名页和文件页，刚被分配后所设置的状态，可以得出：系统总是想尽快老化文件页面。在系统的眼中，文件页的换出成本要低于匿名页。</p>
+
+<h4>3. Synchronization Reclaiming</h4>
+
+<p>  当内存分配不足的时候，内存回收例程就会被调用了。相关的代码在<code>__alloc_pages</code>中。</p>
+
+<p><img src="/images/kernel/2015-04-18-22.png" alt="" /><br/>
+图3</p>
+
+<p>  若分配失败，就会进入到<code>__alloc_pages_slowpath</code>中。</p>
+
+<p><img src="/images/kernel/2015-04-18-23.png" alt="" /><br/>
+图4</p>
+
+<p>  该函数功能正如其名字所属，属于slow path。首先会唤醒各个node上的kswapd例程。kswapd是一个kernel thread,每一个node都有一个例程。该例程的函数体是kswapd().该例程会在第4节中降到。唤醒kwspad后，尝试重新调用get_page_from_freelist，分配内存。若失败，继续往下，如果需要分配内存的主儿在系统中的地位比较重要的话，会调用<code>__alloc_pages_high_priority()</code>. 该函数不会顾及系统设置的安全警告线(min water mark. 对于1GB左右的内存是min water mark是16MB)，分配内存。如果仍然失败；则会调用<code>__alloc_pages_direct_compat</code>来migrate内存来达到compat的目的。这个内存的compat类似于磁盘的压缩整理，把在物理内存中正在使用的分散内存，给迁移整合，以便腾出大的连续的物理内存，满足某些进程大页面的需求。需要注意的是，压缩内存需要在build kernel的时候enable CONFIG_COMPACTION。若仍然失败，就调用<code>__alloc_pages_direct_reclaim</code>来回收内存了。回收内存后，会继续调用get_page_from_freelist,尝试看是否能否分配成功。如果仍然失败，并且分配内存的时候要求不允许失败，那么就进入OOM中。OOM主要的功能是选择一个占用内存量比较大的用户进程，杀掉以释放内存。释放结束后，跳到<code>__alloc_pages_slowpath</code>函数的开头，重新执行一遍，以满足内存分配。如果，允许内存分配失败，则就不会OOM了。以分配失败返回给调用者。</p>
+
+<p>  <code>__alloc_pages_direct_reclaim</code>函数主要调用try_to_free_pages.</p>
+
+<p><img src="/images/kernel/2015-04-18-24.png" alt="" /><br/>
+图5</p>
+
+<p>  try_to_free_pages()做的事情是，按照自定义的优先级从12开始，递减循环（优先级越小代表级别越高，回收的程度越剧烈）从要分配内存的zone以及其fall-back zone list中回收可用内存释放到buddy system中。它通过调用shrink_zones来达到依次扫描zone以及fall-back zone list的目的。对各个zone进行回收结束后，对slab也进行回收（本文不对slab的回收做分析）。如果至此，已经回收了足够多的内存（32个页），那么就返回。如果没有回收到32个页，则是否需要唤醒pdflush进程，该进程的作用是唤醒块设备的读写进程将脏页写到块设备上。唤醒pdflush的条件是看是否扫描了超过48个页。之后，如果这是的扫描优先级已经小于10了，那么睡眠1/10HZ，即1S.然后递减优先级，进行下一遍的循环。</p>
+
+<p><img src="/images/kernel/2015-04-18-25.png" alt="" /><br/>
+图6</p>
+
+<p><img src="/images/kernel/2015-04-18-26.png" alt="" /><br/>
+图7</p>
+
+<p><img src="/images/kernel/2015-04-18-27.png" alt="" /><br/>
+图8</p>
+
+<p>关于swap cache的作用，请看下图（图9）。</p>
+
+<p><img src="/images/kernel/2015-04-18-28.png" alt="" /><br/>
+图9</p>
+
+<p>  有关对swap cache 作用的描述，最靠谱的分析是来自Understanding Linux Kernel. 摘录如下：<br/>
+Consider a page P that is shared among two processes, A and B. Initially, the Page Table entries of both processes contain a reference to the page frame, and the page has two owners; this case is illustrated in Figure 17-8(a). When the PFRA selects the page for reclaiming, shrink_list( ) inserts the page frame in the swap cache. As illustrated in Figure 17-8(b), now the page frame has three owners, while the page slot in the swap area is referenced only by the swap cache. Next, the PFRA invokes try_to_unmap( ) to remove the references to the page frame from the Page Table of the processes; once this function terminates, the page frame is referenced only by the swap cache, while the page slot is referenced by the two processes and the swap cache, as illustrated in Figure 17-8&copy;. Let’s suppose that, while the page’s contents are being written to disk, process B accesses the pagethat is, it tries to access a memory cell using a linear address inside the page. Then, the page fault handler finds the page frame in the swap cache and puts back its physical address in the Page Table entry of process B, as illustrated in Figure 17-8(d). Conversely, if the swap-out operation terminates without concurrent swap-in operations,the shrink_list( ) function removes the page frame from the swap cache and releases the page frame to the Buddy system, as illustrated in Figure 17-8(e).</p>
+
+<h5>Remark:</h5>
+
+<ol>
+<li>Figure 17-8 请对照图9.</li>
+<li>上图的函数都是来自于2.6.11内核。本文所参考的内核是3.4.因此引用中的函数可能和本文所述的函数不匹配。</li>
+</ol>
+
+
+<h4>4. Asynchronization reclaiming.</h4>
+
+<h3>References</h3>
+
+<ol>
+<li>Understanding Linux Kernel (3rd).</li>
+<li>Understanding virtual memory manager (2nd).</li>
+<li>Professional Linux Kernel Architecture.</li>
+</ol>
+
 </div>
   
   
@@ -717,7 +821,7 @@ var ss360Config = {
   
     <section>
 <h1>Categories
-<span class='right_span'>(943)</span>
+<span class='right_span'>(959)</span>
 
 </h1>
 <head>
@@ -725,6 +829,12 @@ var ss360Config = {
 <body>
 <div id="menu">
 <ul>
+<li class='catclass'><a href='/blog/cats/medicine/'>medicine</a><a href='##' onmousedown=showDiv('medicine') id='aexp_medicine'><span class='exp_style' id='exp_medicine'>[+]</span></a><span class='right_span'>(4)</span></li>
+<div id='medicine' class='catsub'><li><a href='/blog/cats/medicine~mimic/?opendiv=medicine'>mimic</a><a href='##' onmousedown=showDiv('medicine~mimic') id='aexp_medicine~mimic'><span class='exp_style' id='exp_medicine~mimic'>[+]</span></a><span class='right_span'>4</span></li>
+</div><script language='javascript' type='text/javascript'>
+if (!document.getElementById('medicine')) document.getElementById('aexp_medicine').style.visibility = 'hidden';
+if (!document.getElementById('medicine~mimic')) document.getElementById('aexp_medicine~mimic').style.visibility = 'hidden';
+</script>
 <li class='catclass'><a href='/blog/cats/blog/'>blog</a><a href='##' onmousedown=showDiv('blog') id='aexp_blog'><span class='exp_style' id='exp_blog'>[+]</span></a><span class='right_span'>(13)</span></li>
 <div id='blog' class='catsub'><li><a href='/blog/cats/blog~hello/?opendiv=blog'>hello</a><a href='##' onmousedown=showDiv('blog~hello') id='aexp_blog~hello'><span class='exp_style' id='exp_blog~hello'>[+]</span></a><span class='right_span'>1</span></li>
 <div id='blog~hello' class='catsub2'><li><a href='/blog/cats/blog~hello~hi/?opendiv=blog~hello'>hi</a><span class='right_span'>1</span></li>
@@ -748,7 +858,7 @@ if (!document.getElementById('blog~octopress')) document.getElementById('aexp_bl
 if (!document.getElementById('blog')) document.getElementById('aexp_blog').style.visibility = 'hidden';
 if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ruby').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(161)</span></li>
+<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(168)</span></li>
 <div id='language' class='catsub'><li><a href='/blog/cats/language~c/?opendiv=language'>c</a><a href='##' onmousedown=showDiv('language~c') id='aexp_language~c'><span class='exp_style' id='exp_language~c'>[+]</span></a><span class='right_span'>33</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~c')) document.getElementById('aexp_language~c').style.visibility = 'hidden';
@@ -773,7 +883,7 @@ if (!document.getElementById('language~php')) document.getElementById('aexp_lang
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~python')) document.getElementById('aexp_language~python').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/language~web/?opendiv=language'>web</a><a href='##' onmousedown=showDiv('language~web') id='aexp_language~web'><span class='exp_style' id='exp_language~web'>[+]</span></a><span class='right_span'>54</span></li>
+<li><a href='/blog/cats/language~web/?opendiv=language'>web</a><a href='##' onmousedown=showDiv('language~web') id='aexp_language~web'><span class='exp_style' id='exp_language~web'>[+]</span></a><span class='right_span'>61</span></li>
 </div><script language='javascript' type='text/javascript'>
 if (!document.getElementById('language')) document.getElementById('aexp_language').style.visibility = 'hidden';
 if (!document.getElementById('language~web')) document.getElementById('aexp_language~web').style.visibility = 'hidden';
@@ -912,8 +1022,8 @@ if (!document.getElementById('tools~vim')) document.getElementById('aexp_tools~v
 if (!document.getElementById('tools')) document.getElementById('aexp_tools').style.visibility = 'hidden';
 if (!document.getElementById('tools~wxwork')) document.getElementById('aexp_tools~wxwork').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/system/'>system</a><a href='##' onmousedown=showDiv('system') id='aexp_system'><span class='exp_style' id='exp_system'>[+]</span></a><span class='right_span'>(121)</span></li>
-<div id='system' class='catsub'><li><a href='/blog/cats/system~base/?opendiv=system'>base</a><a href='##' onmousedown=showDiv('system~base') id='aexp_system~base'><span class='exp_style' id='exp_system~base'>[+]</span></a><span class='right_span'>31</span></li>
+<li class='catclass'><a href='/blog/cats/system/'>system</a><a href='##' onmousedown=showDiv('system') id='aexp_system'><span class='exp_style' id='exp_system'>[+]</span></a><span class='right_span'>(126)</span></li>
+<div id='system' class='catsub'><li><a href='/blog/cats/system~base/?opendiv=system'>base</a><a href='##' onmousedown=showDiv('system~base') id='aexp_system~base'><span class='exp_style' id='exp_system~base'>[+]</span></a><span class='right_span'>36</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('system~base')) document.getElementById('aexp_system~base').style.visibility = 'hidden';
 </script>
@@ -1151,7 +1261,7 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 
 <section>
 <h1>Date Categories
-<span class='right_span'>(943)</span>
+<span class='right_span'>(959)</span>
 
 </h1>
 <head>
@@ -1159,8 +1269,9 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(63)</span></li>
-<div id='2024' class='catsub'><li><a href='/blog/cats/2024~08/?opendiv=2024'>2024-08</a><span class='right_span'>14</span></li>
+<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(79)</span></li>
+<div id='2024' class='catsub'><li><a href='/blog/cats/2024~09/?opendiv=2024'>2024-09</a><span class='right_span'>12</span></li>
+<li><a href='/blog/cats/2024~08/?opendiv=2024'>2024-08</a><span class='right_span'>18</span></li>
 <li><a href='/blog/cats/2024~07/?opendiv=2024'>2024-07</a><span class='right_span'>26</span></li>
 <li><a href='/blog/cats/2024~06/?opendiv=2024'>2024-06</a><span class='right_span'>2</span></li>
 <li><a href='/blog/cats/2024~05/?opendiv=2024'>2024-05</a><span class='right_span'>5</span></li>
@@ -1330,43 +1441,43 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
   <ul id="recent_posts">
     
       <li class="post">
-        <a href="/blog/2024/08/15/lang-web-js-copy/">禁止网页内容复制另存为</a>
+        <a href="/blog/2024/09/14/lang-web-ding/">钉钉开放平台API</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/08/15/lang-web-iframe/">iframe网页嵌套</a>
+        <a href="/blog/2024/09/14/lang-web-staticmap/">腾讯地图--静态地图API</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/08/15/lang-web-auto-textarea/">textarea自动调整高宽</a>
+        <a href="/blog/2024/09/14/lang-web-js-screen-on/">JS 保持屏幕常亮</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/08/09/ntpd-log/">NTP log 记录每次发包</a>
+        <a href="/blog/2024/09/14/lang-web-js-date/">JS 获取当前的日期和时间</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/08/09/ntpd/">NTP服务配置</a>
+        <a href="/blog/2024/09/14/lang-web-js-dist/">GPS 两点距离</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/08/09/lang-date/">unix时间戳, excel date, 儒略日julian date</a>
+        <a href="/blog/2024/09/14/lang-web-js-position/">JS获取当前地理位置</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/08/09/lang-web-times/">&amp;times被替换成x</a>
+        <a href="/blog/2024/09/14/lang-web-js-work/">前端缓存之：Service Worker</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/08/09/lang-c-localtime/">localtime函数</a>
+        <a href="/blog/2024/09/14/mimiciv3.0/">MIMIC IV 3.0数据库</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/08/02/ups-webpower/">山特UPS NMC卡 USHA卡</a>
+        <a href="/blog/2024/09/14/mimiciii1.4-show/">MIMIC III v1.4 数据简介</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/08/01/lang-web-holiday/">节假日 API</a>
+        <a href="/blog/2024/09/14/mimiciii1.4/">MIMIC III v1.4 数据入库</a>
       </li>
     
   </ul>

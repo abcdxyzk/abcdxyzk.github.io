@@ -131,7 +131,7 @@ var ss360Config = {
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2015/06/02/kernel-sched-switch/">进程切换过程分析</a></h2>
+      <h2 class="entry-title"><a href="/blog/2015/06/12/kernel-net-socket-wakeup/">Socket层实现系列 — 睡眠驱动的同步等待</a></h2>
     
     
       <p class="meta">
@@ -140,85 +140,1207 @@ var ss360Config = {
 
 
 
-<time class='entry-date' datetime='2015-06-02T14:10:00+08:00'><span class='date'>2015-06-02</span> <span class='time'>14:10:00</span></time>
+<time class='entry-date' datetime='2015-06-12T17:16:00+08:00'><span class='date'>2015-06-12</span> <span class='time'>17:16:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><p><a href="http://blog.csdn.net/nkguohao/article/details/9187381">http://blog.csdn.net/nkguohao/article/details/9187381</a></p>
+  <div class="entry-content"><p><a href="http://blog.csdn.net/zhangskd/article/details/45770323">http://blog.csdn.net/zhangskd/article/details/45770323</a></p>
 
-<p>参考《深入理解Linux内核（第三版）》</p>
+<p>主要内容：Socket的同步等待机制，connect和accept等待的实现。</p>
 
-<h4>进程切换</h4>
+<p>内核版本：3.15.2</p>
 
-<p>为了控制进程的执行，内核必须有能力挂起正在CPU上运行的进程，并恢复以前挂起的某个进程的执行。这种行为被称为进程切换，任务切换或上下文切换。下面几节描述在Linux中进行进程切换的主要内容。</p>
+<h4>概述</h4>
 
-<h4>硬件上下文</h4>
+<p>socket上定义了几个IO事件：状态改变事件、有数据可读事件、有发送缓存可写事件、有IO错误事件。对于这些事件，socket中分别定义了相应的事件处理函数，也称回调函数。</p>
 
-<p>尽管每个进程可以拥有属于自己的地址空间，但所有进程必须共享CPU寄存器。因此要恢复一个进程的执行之前，内核必须确保每个寄存器装入了挂起进程时的值。</p>
+<p>Socket I/O事件的处理过程中，要使用到sock上的两个队列：等待队列和异步通知队列，这两个队列中都保存着等待该Socket I/O事件的进程。</p>
 
-<p>进程恢复执行前必须装入寄存器的一组数据称为硬件上下文。硬件上下文是进程可执行上下文的一个子集，因为可执行上下文包含进程执行时需要的所有信息。在Linux中，进程硬件上下文的一部分存在TSS段，而剩余部分存放在内核态的堆栈中。</p>
+<p>Q：为什么要使用两个队列，等待队列和异步通知队列有什么区别呢？<br/>
+A：等待队列上的进程会睡眠，直到Socket I/O事件的发生，然后在事件处理函数中被唤醒。异步通知队列上的进程则不需要睡眠，Socket I/O事件发时，事件处理函数会给它们发送到信号，这些进程事先注册的信号处理函数就能够被执行。</p>
 
-<p>在下面的描述中，我们假定用prev局部变量表示切换出的进程的描述符，next表示切换进的进程的描述符。因此，我们把进程切换定义为这样的行为：保存prev硬件上下文，用next硬件上下文代替prev。因为进程切换经常发生，因此减少和装入硬件上下文所花费的时间是非常重要的。</p>
+<h4>等待队列</h4>
 
-<p>早期的Linux版本利用80x86体系结构所提供的硬件支持，并通过far jmp指令跳到进程TSS描述符的选择符来执行进程切换。当执行这条指令时，CPU通过自动保存原来的硬件上下文，装入新的硬件上下文来执行硬件上下文切换。但是基于以下原因，Linux2.6使用软件执行进程切换：</p>
+<p>Socket层使用等待队列来进行阻塞等待，在等待期间，阻塞在此socket上的进程会睡眠。</p>
 
-<p>  通过一组mov指令逐步执行切换，这样能较好地控制所装入数据的合法性，尤其是，这使检查ds和es段寄存器的值成为可能，这些值有可能被恶意用户伪造。当用单独的farjmp指令时，不可能进行这类检查。</p>
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct sock {
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;struct socket_wq __rcu *sk_wq; /* socket的等待队列和异步通知队列 */
+</span><span class='line'>&#9;...
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>struct socket_wq {
+</span><span class='line'>&#9;/* Note: wait MUST be first field of socket_wq */
+</span><span class='line'>&#9;wait_queue_head_t wait; /* 等待队列头 */
+</span><span class='line'>&#9;struct fasync_struct *fasync_list; /* 异步通知队列 */
+</span><span class='line'>&#9;struct rcu_head *rcu;
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
 
-<p>  旧方法和新方法所需时间大致相同。然而，尽管当前的切换代码还有改进的余地，却不能对硬件上下文切换进行优化。</p>
 
-<p>进程切换只发生在内核态。在执行进程切换之前，用户态进程所使用的所有寄存器内容已保存在内核态堆栈上，这也包括ss和esp这对寄存器的内容。</p>
+<h6>(1)  socket的等待队列头</h6>
 
-<h4>任务状态段</h4>
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct __wait_queue_head {
+</span><span class='line'>&#9;spinlock_t lock;
+</span><span class='line'>&#9;struct list_head task_list;
+</span><span class='line'>};
+</span><span class='line'>typedef struct __wait_queue_head wait_queue_head_t;</span></code></pre></td></tr></table></div></figure>
 
-<p>80x86体系结构包括一个特殊的段类型，叫任务状态段（Task State Segment, TSS）来存放硬件上下文。尽管Linux并不使用硬件上下文切换，但是强制它为系统中每个不同的CPU创建一个TSS。这样做的两个主要理由为：<br/>
-  当80x86的一个CPU从用户态切换到内核态时，它就从TSS中获取内核态堆栈的地址。<br/>
-  当用户态进程试图通过in或out指令访问一个I/O端口时，CPU需要访问存放在TSS中的I/O许可图以检查该进程是否有访问端口的权力。</p>
 
-<p>更确切地说，当进程在用户态下执行in或out指令时，控制单元执行下列操作：<br/>
-  它检查eflags寄存器中的2位IOPL字段。如果该字段值为3，控制单元就执行I/O指令。否则，执行下一个检查。<br/>
-  访问tr寄存器以确定当前的TSS和相应的I/O许可权位图。<br/>
-  检查I/O指令中指定的I/O端口在I/O许可权位图中对应的位。如果该位清0，这条I/O指令就执行，否则控制单元产生一个”Generalprotetion”异常。</p>
+<h5>(2) 进程的等待任务</h5>
 
-<p>tss_struct结构描述TSS的格式。正如第二章(《深入理解Linux内核（第三版）》)所提到的，init_tss数组为系统上每个不同的CPU存放一个TSS。在每次进程切换时，内核都更新TSS的某些字段以便相应的CPU控制单元可以安全地检索到它需要的信息。因此，TSS反映了CPU上的当前进程的特权级，但不必为没有在运行的进程保留TSS。</p>
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct __wait_queue {
+</span><span class='line'>&#9;unsigned int flags;
+</span><span class='line'>#define WQ_FLAG_EXCLUSIVE 0x01
+</span><span class='line'>&#9;void *private; /* 指向当前的进程控制块 */
+</span><span class='line'>&#9;wait_queue_func_t func; /* 唤醒函数 */
+</span><span class='line'>&#9;struct list_head task_list; /* 用于链接入等待队列 */
+</span><span class='line'>};
+</span><span class='line'>typedef struct __wait_queue wait_queue_t;
+</span><span class='line'>typedef int (*wait_queue_func_t) (wait_queue_t *wait, unsigned mode, int flags, void *key);
+</span><span class='line'>int default_wake_function(wait_queue_t *wait, unsigned mode, int flags, void *key);</span></code></pre></td></tr></table></div></figure>
 
-<p>每个TSS有它自己8字节的任务状态段描述符。这个描述符包括指向TSS起始地址的32位Base字段，20位Limit字段。TSSD的S标志被清0，以表示相应的TSS是系统段的事实。</p>
 
-<p>Type字段置为11或9以表示这个段实际上是TSS。在Intel的原始设计中，系统中的每个进程都应当指向自己的TSS；Type字段的第二个有效位叫做Busy位；如果进程正由CPU执行，则该位置为1，否则置为0。在Linux的设计中，每个CPU只有一个TSS，因此，Busy位总置为1。</p>
+<h5>(3) 初始化等待任务</h5>
 
-<p>由linux创建的TSSD存放在全局描述符表中。GDT的基地址存放在每个CPU的gdtr寄存器中。每个CPU的tr寄存器包含相应TSS的TSSD选择符，也包括了两个隐藏了非编程字段；TSSD的Base字段和Limit字段。这样，处理器就能直接对TSS寻址而不用从GDT中检索TSS的地址。</p>
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define DEFINE_WAIT(name) DEFINE_WAIT_FUNC(name, autoremove_wake_function)
+</span><span class='line'>
+</span><span class='line'>#define DEFINE_WAIT_FUNC(name, function)    \
+</span><span class='line'>&#9;wait_queue_t name = {    \
+</span><span class='line'>&#9;&#9;.private = current,    \
+</span><span class='line'>&#9;&#9;.func = function,    \
+</span><span class='line'>&#9;&#9;.task_list = LIST_HEAD_INIT((name).task_list),    \
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>int autoremove_wake_function(wait_queue_t *wait, unsigned mode, int sync, void *key)
+</span><span class='line'>{
+</span><span class='line'>&#9;int ret = default_wake_function(wait, mode, sync, key); /* 默认的唤醒函数 */
+</span><span class='line'>
+</span><span class='line'>&#9;if (ret)
+</span><span class='line'>&#9;&#9;list_del_init(&wait-&gt;task_list); /* 从等待队列中删除 */
+</span><span class='line'>
+</span><span class='line'>&#9;return ret;
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>int default_wake_function(wait_queue_t *curr, unsigned mode, int wake_flags, void *key)
+</span><span class='line'>{
+</span><span class='line'>&#9;return try_to_wake_up(curr-&gt;private, mode, wake_flags);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
-<h4>Thread字段</h4>
 
-<p>在每次进程切换时，被替换进程的硬件上下文必须保存在别处。不能像Intel原始设计那样把它保存在TSS中，因为Linux为每个处理器而不是为每个进程使用TSS。</p>
+<p>try_to_wake_up()通过把进程的状态设置为TASK_RUNNING，并把进程插入CPU运行队列，来唤醒睡眠的进程。</p>
 
-<p>因此，每个进程描述符包含一个类型为thread_struct的thread字段，只要进程被切换出去，内核就把其硬件上下文保存在这个结构中。随后我们会看到，这个数据结构包含的字段涉及大部分CPU寄存器，但不包括诸如exa、ebx等等这些通用寄存器，它们的值保留在内核堆栈中。</p>
+<h5>(4) 把等待任务插入到等待队列中</h5>
 
-<h4>执行进程切换</h4>
+<p>获取sock的等待队列。</p>
 
-<p>进程切换可能只发生在精心定义的点：schedule()函数（《深入理解Linux内核（第三版）》第七章有详细讨论）。这里，我们仅关注内核如何执行一个进程切换。</p>
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static inline wait_queue_head_t *sk_sleep(struct sock *sk)
+</span><span class='line'>{
+</span><span class='line'>&#9;BUILD_BUG_ON(offsetof(struct socket_wq, wait) != 0);
+</span><span class='line'>&#9;return &rcu_dereference_raw(sk-&gt;sk_wq)-&gt;wait;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
-<p>从本质上说，每个进程切换由两步组成：<br/>
-  切换页全局目录以安装一个新的地址空间；将在第九章（《深入理解Linux内核（第三版）》）描述这一步。<br/>
-  切换内核态堆栈和硬件上下文，因为硬件上下文提供了内核执行新进程所需要的所有信息，包含CPU寄存器。</p>
 
-<p>我们又一次假定prev指向被替换进程的描述符，而next指向被激活进程的描述符。prev和next是schedule()函数的局部变量。</p>
+<p>把等待任务加入到等待队列中，同时设置当前进程的状态，TASK_INTERRUPTIBLE或TASK_UNINTERRUPTIBLE。</p>
 
-<h4>switch_to宏</h4>
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void prepare_to_wait(wait_queue_head_t *q, wait_queue_t *wait, int state)
+</span><span class='line'>{
+</span><span class='line'>&#9;unsigned long flags;
+</span><span class='line'>&#9;wait-&gt;flags &= ~WQ_FLAG_EXCLUSIVE; /* 可以同时唤醒多个等待进程 */
+</span><span class='line'>
+</span><span class='line'>&#9;spin_lock_irqsave(&q-&gt;lock, flags);
+</span><span class='line'>
+</span><span class='line'>&#9;if (list_empty(&wait-&gt;task_list))
+</span><span class='line'>&#9;&#9;__add_wait_queue(q, wait); /* 把等待任务加入到等待队列的头部，会最先被唤醒 */
+</span><span class='line'>
+</span><span class='line'>&#9;set_current_state(state); /* 设置进程的状态 */
+</span><span class='line'>
+</span><span class='line'>&#9;spin_unlock_irqrestore(&q-&gt;lock, flags);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
-<p>进程切换的第二步由switch_to宏执行。它是内核中与硬件关系最密切的例程之一，要理解它到低做了些什么我们必须下些功夫。</p>
 
-<p>首先，该宏有三个参数，它们是prev,next和last。你可能很容易猜到prev和next的作用：它们仅是局部变量prev和next的占位符，即它们是输入参数，分别表示被替换进程和新进程描述符的地址在内存中的位置。</p>
+<p>prepare_to_wait()和prepare_to_wait_exclusive()都是用来把等待任务加入到等待队列中，不同之处在于使用prepare_to_wait_exclusive()时，会在等待任务中添加WQ_FLAG_EXCLUSIVE标志，表示一次只能唤醒一个等待任务，目的是为了避免惊群现象。</p>
 
-<p>那第三个参数last呢？在任何进程切换中，涉及到三个进程而不是两个。假设内核决定暂停进程A而激活里程B。在schedule()函数中，prev指向A的描述符而next指向B的描述符。switch_to宏一但使A暂停，A的执行流就冻结。</p>
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void prepare_to_wait_exclusive(wait_queue_head_t *q, wait_queue_t *wait, int state)
+</span><span class='line'>{
+</span><span class='line'>&#9;unsigned long flags;
+</span><span class='line'>
+</span><span class='line'>&#9;/* 这个标志表示一次只唤醒一个等待任务，避免惊群现象 */
+</span><span class='line'>&#9;wait-&gt;flags |= WQ_FLAG_EXCLUSIVE;
+</span><span class='line'>
+</span><span class='line'>&#9;spin_lock_irqsave(&q-&gt;lock, flags);
+</span><span class='line'>
+</span><span class='line'>&#9;if (list_empty(&wait-&gt;task_list))
+</span><span class='line'>&#9;&#9;__add_wait_queue_tail(q, wait); /* 把此等待任务加入到等待队列尾部 */
+</span><span class='line'>
+</span><span class='line'>&#9;set_current_state(state); /* 设置当前进程的状态 */
+</span><span class='line'>
+</span><span class='line'>&#9;spin_unlock_irqrestore(&q-&gt;lock, flags);
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>static inline void __add_wait_queue_tail(wait_queue_head_t *head, wait_queue_t *new)
+</span><span class='line'>{
+</span><span class='line'>&#9;list_add_tail(&new-&gt;task_list, &head-&gt;task_list);
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>#define set_current_state(state_value)    \
+</span><span class='line'>&#9;set_mb(current-&gt;state, (state_value))</span></code></pre></td></tr></table></div></figure>
 
-<p>随后，当内核想再次此激活A，就必须暂停另一个进程C，于是就要用prev指向C而next指向A来执行另一个swithch_to宏。当A恢复它的执行流时，就会找到它原来的内核栈，于是prev局部变量还是指向A的描述符而next指向B的描述符。此时，代表进程A执行的内核就失去了对C的任何引用。但是，事实表明这个引用对于完成进程切换是很有用的。</p>
 
-<p>switch_to宏的最后一个参数是输出参数，它表示宏把进程C的描述符地址写在内存的什么位置了。在进程切换之前，宏把第一个输入参数prev表示的变量的内容存入CPU的eax寄存器。在完成进程切换，A已经恢复执行时，宏把CPU的eax寄存器的内容写入由第三个输出参数&mdash;&mdash;-last所指示的A在内存中的位置。因为CPU寄存器不会在切换点发生变化，所以C的描述符地址也存在内存的这个位置。在schedule()执行过程中，参数last指向A的局部变量prev，所以prev被C的地址覆盖。</p>
+<h5>(5) 删除等待任务</h5>
 
-<p>图3-7显示了进程A，B，C内核堆栈的内容以及eax寄存器的内容。必须注意的是：图中显示的是在被eax寄存器的内容覆盖以前的prev局部变量的值。</p>
+<p>从等待队列中删除等待任务，同时把等待进程的状态置为可运行状态，即TASK_RUNNING。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/**
+</span><span class='line'> * finish_wait - clean up after waiting in a queue
+</span><span class='line'> * @q: waitqueue waited on，等待队列头
+</span><span class='line'> * @wait: wait descriptor，等待任务
+</span><span class='line'> *
+</span><span class='line'> * Sets current thread back to running state and removes the wait
+</span><span class='line'> * descriptor from the given waitqueue if still queued.
+</span><span class='line'> */
+</span><span class='line'>void finish_wait(wait_queue_head_t *q, wait_queue_t *wait)
+</span><span class='line'>{
+</span><span class='line'>&#9;unsigned long flags;
+</span><span class='line'>&#9;__set_current_state(TASK_RUNNING);
+</span><span class='line'>
+</span><span class='line'>&#9;if (! list_empty_careful(&wait-&gt;task_list)) {
+</span><span class='line'>&#9;&#9;spin_lock_irqsave(&q-&gt;lock, flags);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;list_del_init(&wait-&gt;task_list); /* 从等待队列中删除 */
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;spin_unlock_irqrestore(&q-&gt;lock, flags);
+</span><span class='line'>&#9;}
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>connect等待</h4>
+
+<h5>(1) 睡眠</h5>
+
+<p>connect()的超时时间为sk->sk_sndtimeo，在sock_init_data()中初始化为MAX_SCHEDULE_TIMEOUT，表示无限等待，可以通过SO_SNDTIMEO选项来修改。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static long inet_wait_for_connect(struct sock *sk, long timeo, int writebias)
+</span><span class='line'>{
+</span><span class='line'>&#9;DEFINE_WAIT(wait);  /* 初始化等待任务 */
+</span><span class='line'>
+</span><span class='line'>&#9;/* 把等待任务加入到socket的等待队列头部，把进程的状态设为TASK_INTERRUPTIBLE */
+</span><span class='line'>&#9;prepare_to_wait(sk_sleep(sk), &wait, TASK_INTERRUPTIBLE);
+</span><span class='line'>&#9;sk-&gt;sk_write_pending += writebias;
+</span><span class='line'>
+</span><span class='line'>&#9;/* Basic assumption: if someone sets sk-&gt;sk_err, he _must_ change state of the socket
+</span><span class='line'>&#9; * from TCP_SYN_*. Connect() does not allow to get error notifications without closing
+</span><span class='line'>&#9; * the socket.
+</span><span class='line'>&#9; */
+</span><span class='line'>
+</span><span class='line'>&#9;/* 完成三次握手后，状态就会变为TCP_ESTABLISHED，从而退出循环 */
+</span><span class='line'>&#9;while ((1 &lt;&lt; sk-&gt;sk_state) & (TCPF_SYN_SENT | TCPF_SYN_RECV)) {
+</span><span class='line'>&#9;&#9;release_sock(sk); /* 等下要睡觉了，先释放锁 */
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;/* 进入睡眠，直到超时或收到信号，或者被I/O事件处理函数唤醒。
+</span><span class='line'>&#9;&#9; * 1. 如果是收到信号退出的，timeo为剩余的jiffies。
+</span><span class='line'>&#9;&#9; * 2. 如果使用了SO_SNDTIMEO选项，超时退出后，timeo为0。
+</span><span class='line'>&#9;&#9; * 3. 如果没有使用SO_SNDTIMEO选项，timeo为无穷大，即MAX_SCHEDULE_TIMEOUT，
+</span><span class='line'>&#9;&#9; *      那么返回值也是这个，而超时时间不定。为了无限阻塞，需要上面的while循环。
+</span><span class='line'>&#9;&#9; */
+</span><span class='line'>&#9;&#9;timeo = schedule_timeout(timeo);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;lock_sock(sk); /* 被唤醒后重新上锁 */
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;/* 如果进程有待处理的信号，或者睡眠超时了，退出循环，之后会返回错误码 */
+</span><span class='line'>&#9;&#9;if (signal_pending(current) || !timeo)
+</span><span class='line'>&#9;&#9;&#9;break;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;/* 继续睡眠吧 */
+</span><span class='line'>&#9;&#9;prepare_to_wait(sk_sleep(sk), &wait, TASK_INTERRUPTIBLE);
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;/* 等待结束时，把等待进程从等待队列中删除，把当前进程的状态设为TASK_RUNNING */
+</span><span class='line'>&#9;finish_wait(sk_sleep(sk), &wait);
+</span><span class='line'>&#9;sk-&gt;sk_write_pending -= writebias;
+</span><span class='line'>&#9;return timeo;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>(2) 唤醒</h5>
+
+<p>三次握手中，当客户端收到SYNACK、发出ACK后，连接就成功建立了。此时连接的状态从TCP_SYN_SENT或TCP_SYN_RECV变为TCP_ESTABLISHED，sock的状态发生变化，会调用sock_def_wakeup()来处理连接状态变化事件，唤醒进程，connect()就能成功返回了。</p>
+
+<p>sock_def_wakeup()的函数调用路径如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>tcp_v4_rcv
+</span><span class='line'>&#9;tcp_v4_do_rcv
+</span><span class='line'>&#9;&#9;tcp_rcv_state_process
+</span><span class='line'>&#9;&#9;&#9;tcp_rcv_synsent_state_process
+</span><span class='line'>&#9;&#9;&#9;&#9;tcp_finish_connect
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;sock_def_wakeup
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;wake_up_interruptible_all
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9;__wake_up
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9;&#9;__wake_up_common</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void tcp_finish_connect(struct sock *sk, struct sk_buff *skb)
+</span><span class='line'>{
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;tcp_set_state(sk, TCP_ESTABLISHED); /* 在这里设置为连接已建立的状态 */
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;if (! sock_flag(sk, SOCK_DEAD)) {
+</span><span class='line'>&#9;&#9;sk-&gt;sk_state_change(sk); /* 指向sock_def_wakeup，会唤醒调用connect()的进程，完成连接的建立 */
+</span><span class='line'>&#9;&#9;sk_wake_async(sk, SOCK_WAKE_IO, POLL_OUT); /* 如果使用了异步通知，则发送SIGIO通知进程可写 */
+</span><span class='line'>&#9;}
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>accept等待</h4>
+
+<p>(1) 睡眠</p>
+
+<p>accept()超时时间为sk->sk_rcvtimeo，在sock_init_data()中初始化为MAX_SCHEDULE_TIMEOUT，表示无限等待。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* Wait for an incoming connection, avoid race conditions.
+</span><span class='line'> * This must be called with the socket locked.
+</span><span class='line'> */
+</span><span class='line'>static int inet_csk_wait_for_connect(struct sock *sk, long timeo)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct inet_connection_sock *icsk = inet_csk(sk);
+</span><span class='line'>&#9;DEFINE_WAIT(wait); /* 初始化等待任务 */
+</span><span class='line'>&#9;int err;
+</span><span class='line'>
+</span><span class='line'>&#9;for (; ;) {
+</span><span class='line'>&#9;&#9;/* 把等待任务加入到socket的等待队列中，把进程状态设置为TASK_INTERRUPTIBLE */
+</span><span class='line'>&#9;&#9;prepare_to_wait_exclusive(sk_sleep(sk), &wait, TASK_INTERRUPTIBLE);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;release_sock(sk); /* 等下可能要睡觉了，先释放 */
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (reqsk_queue_empty(&icsk-&gt;icsk_accept_queue)) /* 如果全连接队列为空 */
+</span><span class='line'>&#9;&#9;&#9;timeo = schedule_timeout(timeo); /* 进入睡眠直到超时或收到信号，或被IO事件处理函数唤醒 */
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;lock_sock(sk); /* 醒来后重新上锁 */
+</span><span class='line'>&#9;&#9;err = 0;
+</span><span class='line'>&#9;&#9;/* 全连接队列不为空时，说明有新的连接建立了，成功返回 */
+</span><span class='line'>&#9;&#9;if (! reqsk_queue_empty(&icsk-&gt;icsk_accept_queue))
+</span><span class='line'>&#9;&#9;&#9;break;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;err = -EINVAL;
+</span><span class='line'>&#9;&#9;if (sk-&gt;sk_state != TCP_LISTEN) /* 如果sock不处于监听状态了，退出，返回错误码 */
+</span><span class='line'>&#9;&#9;&#9;break;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;err = sock_intr_errno(timeo);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;/* 如果进程有待处理的信号，退出，返回错误码。
+</span><span class='line'>&#9;&#9; * 因为timeo默认为MAX_SCHEDULE_TIMEOUT，所以err默认为-ERESTARTSYS。
+</span><span class='line'>&#9;&#9; * 接下来会重新调用此函数，所以accept()依然阻塞。
+</span><span class='line'>&#9;&#9; */
+</span><span class='line'>&#9;&#9;if (signal_pending(current))
+</span><span class='line'>&#9;&#9;&#9;break;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;err = -EAGAIN;
+</span><span class='line'>&#9;&#9;if (! timeo) /* 如果等待超时，即超过用户设置的sk-&gt;sk_rcvtimeo，退出 */
+</span><span class='line'>&#9;&#9;&#9;break;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;/* 从等待队列中删除等待任务，把等待进程的状态设为TASK_RUNNING */
+</span><span class='line'>&#9;finish_wait(sk_sleep(sk), &wait);
+</span><span class='line'>&#9;return err;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>(2) 唤醒</h5>
+
+<p>三次握手中，当服务器端接收到ACK完成连接建立的时候，会把新的连接链入全连接队列中，然后唤醒监听socket上的等待进程，accept()就能成功返回了。</p>
+
+<p>三次握手时，当收到客户端的ACK后，经过如下调用：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>tcp_v4_rcv
+</span><span class='line'>&#9;tcp_v4_do_rcv
+</span><span class='line'>&#9;&#9;tcp_child_process
+</span><span class='line'>&#9;&#9;&#9;sock_def_readable
+</span><span class='line'>&#9;&#9;&#9;&#9;wake_up_interruptible_sync_poll
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;__wake_up_sync_key
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;__wake_up_common</span></code></pre></td></tr></table></div></figure>
+
+
+<p>最终调用我们给等待任务注册的唤醒函数。</p>
+
+<p>我们来看下accept()是如何避免惊群现象的。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void __wake_up_common(wait_queue_head_t *q, unsigned int mode, int nr_exclusive,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9; int wake_flags, void *key)
+</span><span class='line'>{
+</span><span class='line'>&#9;wait_queue_t *curr, *next;
+</span><span class='line'>
+</span><span class='line'>&#9;list_for_each_entry_safe(curr, next, &q-&gt;task_list, task_list) {
+</span><span class='line'>&#9;&#9;unsigned flags = curr-&gt;flags;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (curr-&gt;func(curr, mode, wake_flags, key) && (flags & WQ_FLAG_EXCLUSIVE)
+</span><span class='line'>&#9;&#9;&#9;!--nr_exclusive)
+</span><span class='line'>&#9;&#9;&#9;break;
+</span><span class='line'>&#9;}
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>初始化等待任务时，flags |= WQ_FLAG_EXCLUSIVE。传入的nr_exclusive为1，表示只允许唤醒一个等待任务。</p>
+
+<p>所以这里只会唤醒一个等待的进程，不会导致惊群现象。</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2015/06/12/kernel-net-socket-signal/">Socket层实现系列 — 信号驱动的异步等待</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-06-12T17:13:00+08:00'><span class='date'>2015-06-12</span> <span class='time'>17:13:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://blog.csdn.net/zhangskd/article/details/45932775">http://blog.csdn.net/zhangskd/article/details/45932775</a></p>
+
+<p>主要内容：Socket的异步通知机制。</p>
+
+<p>内核版本：3.15.2</p>
+
+<h4>概述</h4>
+
+<p>socket上定义了几个IO事件：状态改变事件、有数据可读事件、有发送缓存可写事件、有IO错误事件。对于这些事件，socket中分别定义了相应的事件处理函数，也称回调函数。</p>
+
+<p>Socket I/O事件的处理过程中，要使用到sock上的两个队列：等待队列和异步通知队列，这两个队列中都保存着等待该Socket I/O事件的进程。</p>
+
+<p>Q：为什么要使用两个队列，等待队列和异步通知队列有什么区别呢？<br/>
+A：等待队列上的进程会睡眠，直到Socket I/O事件的发生，然后在事件处理函数中被唤醒。异步通知队列上的进程则不需要睡眠，Socket I/O事件发时，事件处理函数会给它们发送到信号，这些进程事先注册的信号处理函数就能够被执行。</p>
+
+<h4>异步通知队列</h4>
+
+<p>Socket层使用异步通知队列来实现异步等待，此时等待Socket I/O事件的进程不用睡眠。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct sock {
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;struct socket_wq __rcu *sk_wq; /* socket的等待队列和异步通知队列 */
+</span><span class='line'>&#9;...
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>struct socket_wq {
+</span><span class='line'>&#9;/* Note: wait MUST be first field of socket_wq */
+</span><span class='line'>&#9;wait_queue_head_t wait; /* 等待队列头 */
+</span><span class='line'>&#9;struct fasync_struct *fasync_list; /* 异步通知队列 */
+</span><span class='line'>&#9;struct rcu_head *rcu;
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct fasync_struct {
+</span><span class='line'>&#9;spinlock_t fa_lock;
+</span><span class='line'>&#9;int magic;
+</span><span class='line'>&#9;int fa_fd; /* 文件描述符 */
+</span><span class='line'>&#9;struct fasync_struct *fa_next; /* 用于链入单向链表 */
+</span><span class='line'>&#9;struct file *fa_file; /* fa_file-&gt;f_owner记录接收信号的进程 */
+</span><span class='line'>&#9;struct rcu_head fa_rcu;
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>通过之前的blog《linux的异步通知机制》，我们知道为了能处理协议栈发出的SIGIO信号，</p>
+
+<p>用户程序需要做的事情有：<br/>
+1. 通过signal()指定SIGIO的处理函数。<br/>
+2. 设置sockfd的拥有者为本进程，如此一来本进程才能收到协议栈发出的SIGIO信号。<br/>
+3. 设置sockfd支持异步通知，即设置O_ASYNC标志。</p>
+
+<p>对应的用户程序函数调用大概如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>signal(SIGIO, my_handler); /* set new SIGIO handler */
+</span><span class='line'>fcntl(sockfd, F_SETOWN, getpid()); /* set sockfd's owner process */
+</span><span class='line'>oflags = fcntl(sockfd, F_GETFL); /* get old sockfd flags */
+</span><span class='line'>fcntl(sockfd, F_SETFL, oflags | O_ASYNC); /* set new sockfd flags */</span></code></pre></td></tr></table></div></figure>
+
+
+<p>下文关注的是内核层面的一些工作：<br/>
+1. 如何把进程加入Socket的异步通知队列，或者把进程从Socket的异步通知队列中删除。<br/>
+2. 协议栈何时发送信号给Socket异步通知队列上的进程。</p>
+
+<h4>插入和删除</h4>
+
+<p>首先来看下fcntl()的系统调用。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>SYSCALL_DEFINE3(fcntl, unsigned int, fd, unsigned int, cmd, unsigned long, arg)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct fd f = fdget_raw(fd);
+</span><span class='line'>&#9;long err = -EBADF; /* Bad file number */
+</span><span class='line'>
+</span><span class='line'>&#9;if (! f.file)
+</span><span class='line'>&#9;&#9;goto out;
+</span><span class='line'>
+</span><span class='line'>&#9;/* File is opened with O_PATH, almost nothing can be done with it */
+</span><span class='line'>&#9;if (unlikely(f.file-&gt;f_mode & FMODE_PATH)) {
+</span><span class='line'>&#9;&#9;if (! check_fcntl_cmd(cmd))
+</span><span class='line'>&#9;&#9;&#9;goto out1;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;err = security_file_fcntl(f.file, cmd, arg);
+</span><span class='line'>&#9;if (! err)
+</span><span class='line'>&#9;&#9;err = do_fcntl(fd, cmd, arg, f.file); /* 实际的处理函数 */
+</span><span class='line'>
+</span><span class='line'>out1:
+</span><span class='line'>&#9;fdput(f);
+</span><span class='line'>out:
+</span><span class='line'>&#9;return err;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static long do_fcntl(int fd, unsigned int cmd, unsigned long arg, struct fil *filp)
+</span><span class='line'>{
+</span><span class='line'>&#9;long err = -EINVAL;
+</span><span class='line'>
+</span><span class='line'>&#9;switch(cmd) {
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;case F_SETFL: /* 在这里设置O_ASYNC标志 */
+</span><span class='line'>&#9;&#9;err = setfl(fd, filp, arg);
+</span><span class='line'>&#9;&#9;break;
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;case F_SETOWN: /* 在这里设置所有者进程 */
+</span><span class='line'>&#9;&#9;err = f_setown(filp, arg, 1);
+</span><span class='line'>&#9;&#9;break;
+</span><span class='line'>&#9;....
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;return err;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int setfl(int fd, struct file *filp, unsigned long arg)
+</span><span class='line'>{
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;/* -&gt;fasync() is responsible for setting the FASYNC bit. */
+</span><span class='line'>&#9;if (((arg ^ filp-&gt;f_flags) & FASYNC) && filp-&gt;f_op-&gt;fasync) {
+</span><span class='line'>&#9;&#9;error = filp-&gt;f_op-&gt;fasync(fd, filp, (arg & FASYNC) != 0);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (error &lt; 0)
+</span><span class='line'>&#9;&#9;&#9;goto out;
+</span><span class='line'>&#9;&#9;if (error &gt; 0)
+</span><span class='line'>&#9;&#9;&#9;error = 0;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;...
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>Socket文件的操作函数集为socket_file_ops。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static const struct file_operations socket_file_ops = {
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;.fasync = sock_fasync,
+</span><span class='line'>&#9;...
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* Update the socket async list. */
+</span><span class='line'>static int sock_fasync(int fd, struct file *filp, int on)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct socket *sock = filp-&gt;private_data;
+</span><span class='line'>&#9;struct sock *sk = sock-&gt;sk;
+</span><span class='line'>&#9;struct socket_wq *wq; /* Socket的等待队列和异步通知队列 */
+</span><span class='line'>
+</span><span class='line'>&#9;if (sk == NULL)
+</span><span class='line'>&#9;&#9;return -EINVAL;
+</span><span class='line'>
+</span><span class='line'>&#9;lock_sock(sk);
+</span><span class='line'>&#9;wq = rcu_dereference_protected(sock-&gt;wq, sock_owned_by_user(sk));
+</span><span class='line'>
+</span><span class='line'>&#9;fasync_helper(fd, filp, on, &wq-&gt;fasync_list); /* 使用此函数来插入或删除 */
+</span><span class='line'>
+</span><span class='line'>&#9;/* 设置或取消SOCK_FASYNC标志 */
+</span><span class='line'>&#9;if (! wq-&gt;fasync_list)
+</span><span class='line'>&#9;&#9;sock_reset_flag(sk, SOCK_FASYNC);
+</span><span class='line'>&#9;else
+</span><span class='line'>&#9;&#9;sock_set_flag(sk, SOCK_FASYNC);
+</span><span class='line'>
+</span><span class='line'>&#9;release_sock(sk);
+</span><span class='line'>
+</span><span class='line'>&#9;return 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>和设备驱动一样，最终调用fasync_helper()来把进程插入异步通知队列，或者把进程从异步通知队列中删除。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/*
+</span><span class='line'> * fasync_helper() is used by almost all character device drivers to set up the fasync
+</span><span class='line'> * queue, and for regular files by the file lease code. It returns negative on error, 0 if
+</span><span class='line'> * it did no changes and positive if it added / deleted the entry.
+</span><span class='line'> */
+</span><span class='line'>
+</span><span class='line'>int fasync_helper(int fd, struct file *filp, int on, struct fasync_struct **fapp)
+</span><span class='line'>{
+</span><span class='line'>&#9;if (! on)
+</span><span class='line'>&#9;&#9;return fasync_remove_entry(filp, fapp); /* 插入 */
+</span><span class='line'>
+</span><span class='line'>&#9;return fasync_add_entry(fd, filp, fapp); /* 删除 */
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>发送信号</h4>
+
+<p>当Socket I/O事件触发时，协议栈会调用sk_wake_async()来进行异步通知。</p>
+
+<p>函数的处理方式：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>enum {
+</span><span class='line'>&#9;SOCK_WAKE_IO, /* 直接发送SIGIO信号 */
+</span><span class='line'>&#9;SOCK_WAKE_WAITD, /* 检测应用程序是否通过recv()类调用来等待接收数据，如果没有才发送SIGIO信号 */
+</span><span class='line'>&#9;SOCK_WAKE_SPACE, /* 检测sock的发送队列是否曾经到达上限，如果有的话发送SIGIO信号 */
+</span><span class='line'>&#9;SOCK_WAKE_URG, /* 直接发送SIGURG信号 */
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>通告的IO类型，常用的有：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define __SI_POLL 0
+</span><span class='line'>#define POLL_IN (__SI_POLL | 1) /* data input available, 有接收数据可读 */
+</span><span class='line'>#define POLL_OUT (__SI_POLL | 2) /* output buffers available, 有输出缓存可写 */
+</span><span class='line'>#define POLL_MSG (__SI_POLL | 3) /* input message available, 有输入消息可读 */
+</span><span class='line'>#define POLL_ERR (__SI_POLL | 4) /* i/0 error, I/O错误 */
+</span><span class='line'>#define POLL_PRI (__SI_POLL | 5) /* high priority input available, 有紧急数据可读 */
+</span><span class='line'>#define POLL_HUP (__SI_POLL | 6) /* device disconnected, 设备关闭或文件关闭，无法继续读写 */</span></code></pre></td></tr></table></div></figure>
+
+
+<p>how为函数的处理方式，band为通告的IO类型。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static inline void sk_wake_async(struct sock *sk, int how, int band)
+</span><span class='line'>{
+</span><span class='line'>&#9;if (sock_flag(sk, SOCK_FASYNC)) /* sock需要支持异步通知 */
+</span><span class='line'>&#9;&#9;sock_wake_async(sk-&gt;sk_socket, how, band);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int sock_wake_async(struct socket *sock, int how, int band)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct socket_wq *wq;
+</span><span class='line'>
+</span><span class='line'>&#9;if (! sock)
+</span><span class='line'>&#9;&#9;return -1;
+</span><span class='line'>
+</span><span class='line'>&#9;rcu_read_lock();
+</span><span class='line'>&#9;wq = rcu_dereference(sock-&gt;wq); /* socket的等待队列和异步通知队列 */
+</span><span class='line'>
+</span><span class='line'>&#9;if (! wq || !wq-&gt;fasync_list) { /* 如果有队列没有实例 */
+</span><span class='line'>&#9;&#9;rcu_read_unlock();
+</span><span class='line'>&#9;&#9;return -1;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;switch(how) {
+</span><span class='line'>&#9;/* 检测应用程序是否通过recv()类调用来等待接收数据，如果没有才发送SIGIO信号 */
+</span><span class='line'>&#9;case SOCK_WAKE_WAITD:
+</span><span class='line'>&#9;&#9;if (test_bit(SOCK_ASYNC_WAITDATA, &sock-&gt;flags))
+</span><span class='line'>&#9;&#9;&#9;break;
+</span><span class='line'>&#9;&#9;goto call_kill;
+</span><span class='line'>
+</span><span class='line'>&#9;/* 检测sock的发送队列是否曾经到达上限，如果有的话发送SIGIO信号 */
+</span><span class='line'>&#9;case SOCK_WAKE_SPACE:
+</span><span class='line'>&#9;&#9;if (! test_and_clear_bit(SOCK_ASYNC_NOSPACE, &sock-&gt;flags))
+</span><span class='line'>&#9;&#9;&#9;break;
+</span><span class='line'>&#9;/* fall_through */
+</span><span class='line'>
+</span><span class='line'>&#9;case SOCK_WAKE_IO: /* 直接发送SIGIO信号 */
+</span><span class='line'>call_kill:
+</span><span class='line'>&#9;&#9;&#9;/* 发送SIGIO信号给异步通知队列上的进程，告知IO消息 */
+</span><span class='line'>&#9;&#9;&#9;kill_fasync(&wq-&gt;fasync_list, SIGIO, band);
+</span><span class='line'>&#9;&#9;&#9;break;
+</span><span class='line'>
+</span><span class='line'>&#9;case SOCK_WAKE_URG:
+</span><span class='line'>&#9;&#9;&#9;/* 发送SIGURG信号给异步通知队列上的进程 */
+</span><span class='line'>&#9;&#9;&#9;kill_fasync(&wq-&gt;fasync_list, SIGURG, band);
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;rcu_read_unlock();
+</span><span class='line'>&#9;return 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>和设备驱动一样，最终调用kill_fasync()来发送信号给用户进程。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void kill_fasync(struct fasync_struct **fp, int sig, int band)
+</span><span class='line'>{
+</span><span class='line'>&#9;/* First a quick test without locking: usually the list is empty. */
+</span><span class='line'>&#9;if (*f) {
+</span><span class='line'>&#9;&#9;rcu_read_lock();
+</span><span class='line'>&#9;&#9;kill_fasync_rcu(rcu_dereference(*fp), sig, band);
+</span><span class='line'>&#9;&#9;rcu_read_unlock();
+</span><span class='line'>&#9;}
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void kill_fasync_rcu(struct fasync_struct *fa, int sig, int band)
+</span><span class='line'>{
+</span><span class='line'>&#9;while (fa) {
+</span><span class='line'>&#9;&#9;struct fown_struct *fown;
+</span><span class='line'>&#9;&#9;unsigned long flags;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (fa-&gt;magic != FASYNC_MAGIC) {
+</span><span class='line'>&#9;&#9;&#9;printk(KERN_ERR "kill_fasync: bad magic number in fasync_struct!\n");
+</span><span class='line'>&#9;&#9;&#9;return;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;spin_lock_irqsave(&fa-&gt;fa_lock, flags);
+</span><span class='line'>&#9;&#9;if (fa-&gt;fa_file) {
+</span><span class='line'>&#9;&#9;&#9;fown = &fa-&gt;file-&gt;f_owner; /* 持有文件的进程 */
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;/* Don't send SIGURG to processes which have not set a queued signum:
+</span><span class='line'>&#9;&#9;&#9; * SIGURG has its own default signalling mechanism. */
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;if (! (sig == SIGURG && fown-&gt;signum == 0))
+</span><span class='line'>&#9;&#9;&#9;&#9;send_sigio(fown, fa-&gt;fa_fd, band); /* 发送信号给持有文件的进程 */
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;spin_unlock_irqrestore(&fa-&gt;fa_lock, flags);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;fa = rcu_dereference(fa-&gt;fa_next); /* 指向下一个异步通知结构体 */
+</span><span class='line'>&#9;}
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2015/06/12/kernel-net-sock-socket/">socket和sock的一些分析</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-06-12T16:55:00+08:00'><span class='date'>2015-06-12</span> <span class='time'>16:55:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://blog.csdn.net/wolongzhumeng/article/details/8900414">http://blog.csdn.net/wolongzhumeng/article/details/8900414</a></p>
+
+<p>1、每一个打开的文件、socket等等都用一个file数据结构代表，这样文件和socket就通过inode->u(union)中的各个成员来区别：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct inode {
+</span><span class='line'>&#9;.....................
+</span><span class='line'>&#9;union {
+</span><span class='line'>&#9;&#9;struct ext2_inode_info ext2_i;
+</span><span class='line'>&#9;&#9;struct ext3_inode_info ext3_i;
+</span><span class='line'>&#9;&#9;struct socket socket_i;
+</span><span class='line'>&#9;&#9;.....................
+</span><span class='line'>&#9;} u;
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>2、每个socket数据结构都有一个sock数据结构成员，sock是对socket的扩充，两者一一对应，socket->sk指向对应的sock，sock->socket 指向对应的socket；</p>
+
+<p>3、socket和sock是同一事物的两个侧面，为什么不把两个数据结构合并成一个呢？这是因为socket是inode结构中的一部分，即把inode结
+构内部的一个union用作socket结构。由于插口操作的特殊性，这个数据结构中需要有大量的结构成分，如果把这些成分全部放到socket
+结构中，则inode结构中的这个union就会变得很大，从而inode结构也会变得很大，而对于其他文件系统这个union是不需要这么大的，
+所以会造成巨大浪费，系统中使用inode结构的数量要远远超过使用socket的数量，故解决的办法就是把插口分成两部分，把与文件系
+统关系密切的放在socket结构中，把与通信关系密切的放在另一个单独结构sock中；</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -268,1196 +1390,810 @@ var ss360Config = {
 <span class='line-number'>46</span>
 <span class='line-number'>47</span>
 <span class='line-number'>48</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#define switch_to(prev, next, last)                 \
-</span><span class='line'>32do {                                  \
-</span><span class='line'>33  /*                              \
-</span><span class='line'>34   * Context-switching clobbers all registers, so we clobber  \
-</span><span class='line'>35   * them explicitly, via unused output variables.        \
-</span><span class='line'>36   * (EAX and EBP is not listed because EBP is saved/restored \
-</span><span class='line'>37   * explicitly for wchan access and EAX is the return value of   \
-</span><span class='line'>38   * __switch_to())                       \
-</span><span class='line'>39   */                             \
-</span><span class='line'>40  unsigned long ebx, ecx, edx, esi, edi;              \
-</span><span class='line'>41                                  \
-</span><span class='line'>42  asm volatile("pushfl\n\t"       /* save    flags */ \
-</span><span class='line'>43           "pushl %%ebp\n\t"      /* save    EBP   */ \
-</span><span class='line'>44           "movl %%esp,%[prev_sp]\n\t"    /* save    ESP   */ \
-</span><span class='line'>45           "movl %[next_sp],%%esp\n\t"    /* restore ESP   */ \
-</span><span class='line'>46           "movl $1f,%[prev_ip]\n\t"  /* save    EIP   */ \
-</span><span class='line'>47           "pushl %[next_ip]\n\t" /* restore EIP   */ \
-</span><span class='line'>48           __switch_canary                    \
-</span><span class='line'>49           "jmp __switch_to\n"    /* regparm call  */ \
-</span><span class='line'>50           "1:\t"                     \
-</span><span class='line'>51           "popl %%ebp\n\t"       /* restore EBP   */ \
-</span><span class='line'>52           "popfl\n"          /* restore flags */ \
-</span><span class='line'>53                                  \
-</span><span class='line'>54           /* output parameters */                \
-</span><span class='line'>55           : [prev_sp] "=m" (prev-&gt;thread.sp),     \
-</span><span class='line'>56             [prev_ip] "=m" (prev-&gt;thread.ip),     \
-</span><span class='line'>57             "=a" (last),                 \
-</span><span class='line'>58                                  \
-</span><span class='line'>59             /* clobbered output registers: */        \
-</span><span class='line'>60             "=b" (ebx), "=c" (ecx), "=d" (edx),      \
-</span><span class='line'>61             "=S" (esi), "=D" (edi)               \
-</span><span class='line'>62                                      \
-</span><span class='line'>63             __switch_canary_oparam               \
-</span><span class='line'>64                                  \
-</span><span class='line'>65             /* input parameters: */              \
-</span><span class='line'>66           : [next_sp]  "m" (next-&gt;thread.sp),     \
-</span><span class='line'>67             [next_ip]  "m" (next-&gt;thread.ip),     \
-</span><span class='line'>68                                      \
-</span><span class='line'>69             /* regparm parameters for __switch_to(): */  \
-</span><span class='line'>70             [prev]     "a" (prev),               \
-</span><span class='line'>71             [next]     "d" (next)                \
-</span><span class='line'>72                                  \
-</span><span class='line'>73             __switch_canary_iparam               \
-</span><span class='line'>74                                  \
-</span><span class='line'>75           : /* reloaded segment registers */         \
-</span><span class='line'>76          "memory");                  \
-</span><span class='line'>77} while (0)
-</span><span class='line'>78</span></code></pre></td></tr></table></div></figure>
-
-
-<p>由于switch_to宏采用扩展的内联汇编语言编码，所以可读性比较差：实际上这段代码通过特殊位置记数法使用寄存器，而实际使用的通用寄存器由编译器自由选择。我们将采用标准汇编语言而不是麻烦的内联汇编语言来描述switch_to宏在80x86微处理器上所完成的典型工作。</p>
-
-<p>  在eax和edx寄存器中分别保存prev和next的值。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>movl prev ,%eax
-</span><span class='line'>movl next ,%edx</span></code></pre></td></tr></table></div></figure>
-
-
-<p>  把eflags和ebp寄存器的内容保存在prev内核栈中。必須保存它们的原因是编译器认为在switch_to结束之前它们的值应当保持不变。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>pushf1
-</span><span class='line'>push %ebp</span></code></pre></td></tr></table></div></figure>
-
-
-<p>  把esp的内容保存到prev->thread.esp中以使该字段指向prev内核栈的栈顶：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>movl %esp, 484(%eax)</span></code></pre></td></tr></table></div></figure>
-
-
-<p>  把next->thread.esp装入esp.此时，内核开始在next的内核栈上操作，因此这条指令实际上完成了从prev到next的切换。由于进程描述符的地址和内核栈的地址紧挨着，所以改变内核栈意味着改变进程。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>movl 484(%edx),%esp</span></code></pre></td></tr></table></div></figure>
-
-
-<p>  把标记为1的地址存入prev->thread.eip。当被替换的进程重新恢复执行时，进程执行被标记为1的那条指令：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>movl $lf, 480(%eax)</span></code></pre></td></tr></table></div></figure>
-
-
-<p>  宏把next->thread.eip的值压入next的内核栈。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>push1 480(%edx)</span></code></pre></td></tr></table></div></figure>
-
-
-<p>  跳到<code>__switch_to()</code> 函数</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>jmp __switch_to</span></code></pre></td></tr></table></div></figure>
-
-
-<p>  这里被进程B替换的进程A再次获得CPU；它执行一些保存eflags和ebp寄存器内容的指令，这两条指令的第一条指令被标记为1。</p>
-
-<p>  拷贝eax寄存器的内容到switch_to宏的第三个参数lash标识的内存区域中：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>movl  %eax, last</span></code></pre></td></tr></table></div></figure>
-
-
-<p>正如以前讨论的，eax寄存器指向刚被替换的进程描述符。</p>
-
-<h4><code>__switch_to()</code>函数</h4>
-
-<p><code>__switch_to()</code>函数执行大多数开始于switch_to()宏的进程切换。这个函数作用于prev_p和next_p参数，这两个参数表示前一个进程和新进程。这个函数的调用不同于一般函数的调用，因为<code>__switch_to()</code>从eax和edx取参数prev_p和next_p，而不像大多数函数一样从栈中取参数。为了强迫函数从寄存器取它的参数，内核利用<code>__attribute__</code>和regparm关键字，这两个关键字是C语言非标准的扩展名，由gcc编译程序实现。在include/asm-i386/system.h头文件中，<code>__switch_to()</code>函数的声明如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>__switch_to(structtask_struct *prev_p,struct tast_struct *next_p)__attribute_(regparm(2));</span></code></pre></td></tr></table></div></figure>
-
-
-<p>函数执行的步骤如下：<br/>
-  1、执行由<code>__unlazy_fpu()</code>宏产生的代码，以有选择地保存prev_p进程的FPU、MMX及XMM寄存器的内容。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>__unlazy_fpu(prev_p);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>  2、执行smp_processor_id()宏获得本地(local)CPU的下标，即执行代码的CPU。该宏从当前进程的thread_info结构的cpu字段获得下标将它保存到cpu局部变量。</p>
-
-<p>  3、把next_p->thread.esp0装入对应于本地CPU的TSS的esp0字段；将在通过sysenter指令发生系统调用一节看到，以后任何由sysenter汇编指令产生的从用户态到内核态的特权级转换将把这个地址拷贝到esp寄存器中：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>init_tss[cpu].esp0= next_p-&gt;thread.esp0;</span></code></pre></td></tr></table></div></figure>
-
-
-<p>  4、把next_p进程使用的线程局部存储段装入本地CPU的全局描述符表；三个段选择符保存在进程描述符内的tls_array数组中</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>cpu_gdt_table[cpu][6]= next_p-&gt;thread.tls_array[0];
-</span><span class='line'>cpu_gdt_table[cpu][7]= next_p-&gt;thread.tls_array[1];
-</span><span class='line'>cpu_gdt_table[cpu][8]= next_p-&gt;thread.tls_array[2];</span></code></pre></td></tr></table></div></figure>
-
-
-<p>  5、把fs和gs段寄存器的内容分别存放在prev_p->thread.fs和prev_p->thread.gs中，对应的汇编语言指令是：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>movl%fs,40(%esi)
-</span><span class='line'>movl%gs,44(%esi)</span></code></pre></td></tr></table></div></figure>
-
-
-<p>  6、如果fs或gs段寄存器已经被prev_p或next_p进程中的任意一个使用，则将next_p进程的thread_struct描述符中保存的值装入这些寄存器中。这一步在逻辑上补充了前一步中执行的操作。主要的汇编语言指令如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>movl40(%ebx),%fs
-</span><span class='line'>movl44(%edb),%gs</span></code></pre></td></tr></table></div></figure>
-
-
-<p>  7、ebx寄存器指向next_p->thread结构。代码实际上更复杂，因为当它检测到一个无效的段寄存器值时，CPU可能产生一个异常。</p>
-
-<p>  8、用next_p->thread.debugreg数组的内容装载dr0,&hellip;,dr7中的6个调试寄存器。只有在next_p被挂起时正在使用调试寄存器，这种操作才能进行。这些寄存器不需要被保存，因为只有当一个调试器想要监控prev时prev_p->thread.debugreg才会修改。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if(next_p-&gt;thread.debugreg[7]){
-</span><span class='line'>loaddebug(&next_p-&gt;thread,0);
-</span><span class='line'>loaddebug(&next_p-&gt;thread,1);
-</span><span class='line'>loaddebug(&next_p-&gt;thread,2);
-</span><span class='line'>loaddebug(&next_p-&gt;thread,3);
-</span><span class='line'>loaddebug(&next_p-&gt;thread,6);
-</span><span class='line'>loaddebug(&next_p-&gt;thread,7);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>  8、如果必要，更新TSS中的I/O位图。当next_p或prev_p有其自己的定制I/O权限位图时必须这么做：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if(prev_p-&gt;thread.io_bitmap_ptr|| next_p-&gt;thread.io_bitmap_ptr )
-</span><span class='line'>handle_io_bitmap(&next_p-&gt;thread,&init_tss[cpu]);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>因为进程很修改I/O权限位图，所以该位图在“懒”模式中被处理；当且仅当一个进程在当前时间片内实际访问I/O端口时，真实位图才被拷贝到本地CPU的TSS中。进程的定制I/O权限位图被保存在thread_info结构的io_bitmap_ptr字段指向的缓冲区中。handle_io_bitmap()函数为next_p进程设置本地CPU使用的TSS的in_bitmap字段如下：<br/>
-  (a)如果next_p进程不拥有自己的I/O权限位图，则TSS的io_bitmap字段被设为0x8000.<br/>
-  (b) 如果next_p进程拥有自己的I/O权限位图，则TSS的io_bitmap字段被设为0x9000。</p>
-
-<p>TSS的io_bitmap字段应当包含一个在TSS中的偏移量，其中存放实际位图。无论何时用户态进程试图访问一个I/O端口，0x8000和0x9000指向TSS界限之外并将因此引起”Generalprotection”异常。do_general_protection()异常处理程序将检查保存在io_bitmap字段的值：如果是0x8000，函数发送一个SIGSEGV信号给用户态进程；如果是0x9000，函数把进程位图拷贝拷贝到本地CPU的TSS中，把io_bitmap字段为实际位图的偏移(104)，并强制再一次执行有缺陷的汇编指令。</p>
-
-<p>  9、终止。
-<code>__switch_to()</code>函数通过使用下列声明结束：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>return prev_p;</span></code></pre></td></tr></table></div></figure>
-
-
-<p>  由编译器产生的相应汇编语言指令是：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>movl %edl,%eax
-</span><span class='line'>ret</span></code></pre></td></tr></table></div></figure>
-
-
-<p>  prev_p参数被拷贝到eax，因为缺省情况下任何C函数的返回值被传递给eax寄存器。注意eax的值因此在调用<code>__switch_to()</code>的过程中被保护起来；这非常重要，因为调用switch_to宏时会假定eax总是用来存放被替换的进程描述符的地址。</p>
-
-<p>  汇编语言指令ret把栈顶保存的返回地址装入eip程序计数器。不过，通过简单地跳转到<code>__switch_to()</code>函数来调用该函数。因此，ret汇编指令在栈中找到标号为1的指令的地址，其中标号为1的地址是由switch_to()宏推入栈中的。如果因为next_p第一次执行而以前从未被挂起，<code>__switch_to()</code>就找到ret_from_fork()函数的起始地址。</p>
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/06/01/debug-systemtap-with-c/">SystemTap---嵌入C代码</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-06-01T15:36:00+08:00'><span class='date'>2015-06-01</span> <span class='time'>15:36:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><ul>
-<li>访问参数的值是以STAP_ARG_+参数名的形式，返回值<code>STAP_RETVALUE=xxx</code>，这种方式是最新版本的SystemTap中的方式。1.7及更早的版本是通过THIS->+参数名的方式, 返回值<code>THIS-&gt;__returnval=xxx</code></li>
-</ul>
-
-
-<hr />
-
-<p><a href="http://www.4byte.cn/learning/53860.html">http://www.4byte.cn/learning/53860.html</a></p>
-
-<p>  SystemTap支持guru模式，通过-g选项来以这种模式执行SystemTap脚本。在guru模式下，嵌入的C代码在“%{&ldquo;和“%}"标记之间，这些代码会原封不动地放到生成的模块中。嵌入的C代码不仅可以作为函数体，还可以出现在SystemTap描述中（例如函数等），示例如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>%{
-</span><span class='line'>&#9;#include &lt;linux/in.h&gt;
-</span><span class='line'>&#9;#include &lt;linux/ip.h&gt;
-</span><span class='line'>%} /* &lt;-- top level */
-</span><span class='line'>
-</span><span class='line'>function read_iphdr:long(skb:long)
-</span><span class='line'>%{
-</span><span class='line'>&#9;struct iphdr *iph = ip_hdr((struct sk_buff *)STAP_ARG_skb);
-</span><span class='line'>&#9;STAP_RETVALUE = (long)iph;
-</span><span class='line'>%}
-</span><span class='line'>
-</span><span class='line'>/* Determines whether an IP packet is TCP, based on the iphdr: */
-</span><span class='line'>function is_tcp_packet:long(iphdr)
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+<span class='line-number'>82</span>
+<span class='line-number'>83</span>
+<span class='line-number'>84</span>
+<span class='line-number'>85</span>
+<span class='line-number'>86</span>
+<span class='line-number'>87</span>
+<span class='line-number'>88</span>
+<span class='line-number'>89</span>
+<span class='line-number'>90</span>
+<span class='line-number'>91</span>
+<span class='line-number'>92</span>
+<span class='line-number'>93</span>
+<span class='line-number'>94</span>
+<span class='line-number'>95</span>
+<span class='line-number'>96</span>
+<span class='line-number'>97</span>
+<span class='line-number'>98</span>
+<span class='line-number'>99</span>
+<span class='line-number'>100</span>
+<span class='line-number'>101</span>
+<span class='line-number'>102</span>
+<span class='line-number'>103</span>
+<span class='line-number'>104</span>
+<span class='line-number'>105</span>
+<span class='line-number'>106</span>
+<span class='line-number'>107</span>
+<span class='line-number'>108</span>
+<span class='line-number'>109</span>
+<span class='line-number'>110</span>
+<span class='line-number'>111</span>
+<span class='line-number'>112</span>
+<span class='line-number'>113</span>
+<span class='line-number'>114</span>
+<span class='line-number'>115</span>
+<span class='line-number'>116</span>
+<span class='line-number'>117</span>
+<span class='line-number'>118</span>
+<span class='line-number'>119</span>
+<span class='line-number'>120</span>
+<span class='line-number'>121</span>
+<span class='line-number'>122</span>
+<span class='line-number'>123</span>
+<span class='line-number'>124</span>
+<span class='line-number'>125</span>
+<span class='line-number'>126</span>
+<span class='line-number'>127</span>
+<span class='line-number'>128</span>
+<span class='line-number'>129</span>
+<span class='line-number'>130</span>
+<span class='line-number'>131</span>
+<span class='line-number'>132</span>
+<span class='line-number'>133</span>
+<span class='line-number'>134</span>
+<span class='line-number'>135</span>
+<span class='line-number'>136</span>
+<span class='line-number'>137</span>
+<span class='line-number'>138</span>
+<span class='line-number'>139</span>
+<span class='line-number'>140</span>
+<span class='line-number'>141</span>
+<span class='line-number'>142</span>
+<span class='line-number'>143</span>
+<span class='line-number'>144</span>
+<span class='line-number'>145</span>
+<span class='line-number'>146</span>
+<span class='line-number'>147</span>
+<span class='line-number'>148</span>
+<span class='line-number'>149</span>
+<span class='line-number'>150</span>
+<span class='line-number'>151</span>
+<span class='line-number'>152</span>
+<span class='line-number'>153</span>
+<span class='line-number'>154</span>
+<span class='line-number'>155</span>
+<span class='line-number'>156</span>
+<span class='line-number'>157</span>
+<span class='line-number'>158</span>
+<span class='line-number'>159</span>
+<span class='line-number'>160</span>
+<span class='line-number'>161</span>
+<span class='line-number'>162</span>
+<span class='line-number'>163</span>
+<span class='line-number'>164</span>
+<span class='line-number'>165</span>
+<span class='line-number'>166</span>
+<span class='line-number'>167</span>
+<span class='line-number'>168</span>
+<span class='line-number'>169</span>
+<span class='line-number'>170</span>
+<span class='line-number'>171</span>
+<span class='line-number'>172</span>
+<span class='line-number'>173</span>
+<span class='line-number'>174</span>
+<span class='line-number'>175</span>
+<span class='line-number'>176</span>
+<span class='line-number'>177</span>
+<span class='line-number'>178</span>
+<span class='line-number'>179</span>
+<span class='line-number'>180</span>
+<span class='line-number'>181</span>
+<span class='line-number'>182</span>
+<span class='line-number'>183</span>
+<span class='line-number'>184</span>
+<span class='line-number'>185</span>
+<span class='line-number'>186</span>
+<span class='line-number'>187</span>
+<span class='line-number'>188</span>
+<span class='line-number'>189</span>
+<span class='line-number'>190</span>
+<span class='line-number'>191</span>
+<span class='line-number'>192</span>
+<span class='line-number'>193</span>
+<span class='line-number'>194</span>
+<span class='line-number'>195</span>
+<span class='line-number'>196</span>
+<span class='line-number'>197</span>
+<span class='line-number'>198</span>
+<span class='line-number'>199</span>
+<span class='line-number'>200</span>
+<span class='line-number'>201</span>
+<span class='line-number'>202</span>
+<span class='line-number'>203</span>
+<span class='line-number'>204</span>
+<span class='line-number'>205</span>
+<span class='line-number'>206</span>
+<span class='line-number'>207</span>
+<span class='line-number'>208</span>
+<span class='line-number'>209</span>
+<span class='line-number'>210</span>
+<span class='line-number'>211</span>
+<span class='line-number'>212</span>
+<span class='line-number'>213</span>
+<span class='line-number'>214</span>
+<span class='line-number'>215</span>
+<span class='line-number'>216</span>
+<span class='line-number'>217</span>
+<span class='line-number'>218</span>
+<span class='line-number'>219</span>
+<span class='line-number'>220</span>
+<span class='line-number'>221</span>
+<span class='line-number'>222</span>
+<span class='line-number'>223</span>
+<span class='line-number'>224</span>
+<span class='line-number'>225</span>
+<span class='line-number'>226</span>
+<span class='line-number'>227</span>
+<span class='line-number'>228</span>
+<span class='line-number'>229</span>
+<span class='line-number'>230</span>
+<span class='line-number'>231</span>
+<span class='line-number'>232</span>
+<span class='line-number'>233</span>
+<span class='line-number'>234</span>
+<span class='line-number'>235</span>
+<span class='line-number'>236</span>
+<span class='line-number'>237</span>
+<span class='line-number'>238</span>
+<span class='line-number'>239</span>
+<span class='line-number'>240</span>
+<span class='line-number'>241</span>
+<span class='line-number'>242</span>
+<span class='line-number'>243</span>
+<span class='line-number'>244</span>
+<span class='line-number'>245</span>
+<span class='line-number'>246</span>
+<span class='line-number'>247</span>
+<span class='line-number'>248</span>
+<span class='line-number'>249</span>
+<span class='line-number'>250</span>
+<span class='line-number'>251</span>
+<span class='line-number'>252</span>
+<span class='line-number'>253</span>
+<span class='line-number'>254</span>
+<span class='line-number'>255</span>
+<span class='line-number'>256</span>
+<span class='line-number'>257</span>
+<span class='line-number'>258</span>
+<span class='line-number'>259</span>
+<span class='line-number'>260</span>
+<span class='line-number'>261</span>
+<span class='line-number'>262</span>
+<span class='line-number'>263</span>
+<span class='line-number'>264</span>
+<span class='line-number'>265</span>
+<span class='line-number'>266</span>
+<span class='line-number'>267</span>
+<span class='line-number'>268</span>
+<span class='line-number'>269</span>
+<span class='line-number'>270</span>
+<span class='line-number'>271</span>
+<span class='line-number'>272</span>
+<span class='line-number'>273</span>
+<span class='line-number'>274</span>
+<span class='line-number'>275</span>
+<span class='line-number'>276</span>
+<span class='line-number'>277</span>
+<span class='line-number'>278</span>
+<span class='line-number'>279</span>
+<span class='line-number'>280</span>
+<span class='line-number'>281</span>
+<span class='line-number'>282</span>
+<span class='line-number'>283</span>
+<span class='line-number'>284</span>
+<span class='line-number'>285</span>
+<span class='line-number'>286</span>
+<span class='line-number'>287</span>
+<span class='line-number'>288</span>
+<span class='line-number'>289</span>
+<span class='line-number'>290</span>
+<span class='line-number'>291</span>
+<span class='line-number'>292</span>
+<span class='line-number'>293</span>
+<span class='line-number'>294</span>
+<span class='line-number'>295</span>
+<span class='line-number'>296</span>
+<span class='line-number'>297</span>
+<span class='line-number'>298</span>
+<span class='line-number'>299</span>
+<span class='line-number'>300</span>
+<span class='line-number'>301</span>
+<span class='line-number'>302</span>
+<span class='line-number'>303</span>
+<span class='line-number'>304</span>
+<span class='line-number'>305</span>
+<span class='line-number'>306</span>
+<span class='line-number'>307</span>
+<span class='line-number'>308</span>
+<span class='line-number'>309</span>
+<span class='line-number'>310</span>
+<span class='line-number'>311</span>
+<span class='line-number'>312</span>
+<span class='line-number'>313</span>
+<span class='line-number'>314</span>
+<span class='line-number'>315</span>
+<span class='line-number'>316</span>
+<span class='line-number'>317</span>
+<span class='line-number'>318</span>
+<span class='line-number'>319</span>
+<span class='line-number'>320</span>
+<span class='line-number'>321</span>
+<span class='line-number'>322</span>
+<span class='line-number'>323</span>
+<span class='line-number'>324</span>
+<span class='line-number'>325</span>
+<span class='line-number'>326</span>
+<span class='line-number'>327</span>
+<span class='line-number'>328</span>
+<span class='line-number'>329</span>
+<span class='line-number'>330</span>
+<span class='line-number'>331</span>
+<span class='line-number'>332</span>
+<span class='line-number'>333</span>
+<span class='line-number'>334</span>
+<span class='line-number'>335</span>
+<span class='line-number'>336</span>
+<span class='line-number'>337</span>
+<span class='line-number'>338</span>
+<span class='line-number'>339</span>
+<span class='line-number'>340</span>
+<span class='line-number'>341</span>
+<span class='line-number'>342</span>
+<span class='line-number'>343</span>
+<span class='line-number'>344</span>
+<span class='line-number'>345</span>
+<span class='line-number'>346</span>
+<span class='line-number'>347</span>
+<span class='line-number'>348</span>
+<span class='line-number'>349</span>
+<span class='line-number'>350</span>
+<span class='line-number'>351</span>
+<span class='line-number'>352</span>
+<span class='line-number'>353</span>
+<span class='line-number'>354</span>
+<span class='line-number'>355</span>
+<span class='line-number'>356</span>
+<span class='line-number'>357</span>
+<span class='line-number'>358</span>
+<span class='line-number'>359</span>
+<span class='line-number'>360</span>
+<span class='line-number'>361</span>
+<span class='line-number'>362</span>
+<span class='line-number'>363</span>
+<span class='line-number'>364</span>
+<span class='line-number'>365</span>
+<span class='line-number'>366</span>
+<span class='line-number'>367</span>
+<span class='line-number'>368</span>
+<span class='line-number'>369</span>
+<span class='line-number'>370</span>
+<span class='line-number'>371</span>
+<span class='line-number'>372</span>
+<span class='line-number'>373</span>
+<span class='line-number'>374</span>
+<span class='line-number'>375</span>
+<span class='line-number'>376</span>
+<span class='line-number'>377</span>
+<span class='line-number'>378</span>
+<span class='line-number'>379</span>
+<span class='line-number'>380</span>
+<span class='line-number'>381</span>
+<span class='line-number'>382</span>
+<span class='line-number'>383</span>
+<span class='line-number'>384</span>
+<span class='line-number'>385</span>
+<span class='line-number'>386</span>
+<span class='line-number'>387</span>
+<span class='line-number'>388</span>
+<span class='line-number'>389</span>
+<span class='line-number'>390</span>
+<span class='line-number'>391</span>
+<span class='line-number'>392</span>
+<span class='line-number'>393</span>
+<span class='line-number'>394</span>
+<span class='line-number'>395</span>
+<span class='line-number'>396</span>
+<span class='line-number'>397</span>
+<span class='line-number'>398</span>
+<span class='line-number'>399</span>
+<span class='line-number'>400</span>
+<span class='line-number'>401</span>
+<span class='line-number'>402</span>
+<span class='line-number'>403</span>
+<span class='line-number'>404</span>
+<span class='line-number'>405</span>
+<span class='line-number'>406</span>
+<span class='line-number'>407</span>
+<span class='line-number'>408</span>
+<span class='line-number'>409</span>
+<span class='line-number'>410</span>
+<span class='line-number'>411</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct socket
 </span><span class='line'>{
-</span><span class='line'>&#9;protocol = @cast(iphdr, "iphdr")-&gt;protocol
-</span><span class='line'>&#9;return (protocol == %{ IPPROTO_TCP %}) /* &lt;-- expression */
-</span><span class='line'>}
+</span><span class='line'>&#9;socket_state state;      // 该state用来表明该socket的当前状态
+</span><span class='line'>&#9;typedef enum {
+</span><span class='line'>&#9;&#9;SS_FREE = 0,         /* not allocated */
+</span><span class='line'>&#9;&#9;SS_UNCONNECTED,      /* unconnected to any socket */
+</span><span class='line'>&#9;&#9;SS_CONNECTING,       /* in process of connecting */
+</span><span class='line'>&#9;&#9;SS_CONNECTED,        /* connected to socket */
+</span><span class='line'>&#9;&#9;SS_DISCONNECTING     /* in process of disconnecting */
+</span><span class='line'>&#9;} socket_state;
+</span><span class='line'>&#9;unsigned long flags;     //该成员可能的值如下，该标志用来设置socket是否正在忙碌
+</span><span class='line'>&#9;#define SOCK_ASYNC_NOSPACE 0
+</span><span class='line'>&#9;#define SOCK_ASYNC_WAITDATA 1
+</span><span class='line'>&#9;#define SOCK_NOSPACE 2
+</span><span class='line'>&#9;struct proto_ops *ops;   //依据协议邦定到该socket上的特定的协议族的操作函数指针，例如IPv4 TCP就是inet_stream_ops
+</span><span class='line'>&#9;struct inode *inode;     //表明该socket所属的inode
+</span><span class='line'>&#9;struct fasync_struct *fasync_list; //异步唤醒队列
+</span><span class='line'>&#9;struct file *file;       //file回指指针
+</span><span class='line'>&#9;struct sock *sk;         //sock指针
+</span><span class='line'>&#9;wait_queue_head_t wait;  //sock的等待队列，在TCP需要等待时就sleep在这个队列上
+</span><span class='line'>&#9;short type;              //表示该socket在特定协议族下的类型例如SOCK_STREAM,
+</span><span class='line'>&#9;unsigned char passcred;  //在TCP分析中无须考虑
+</span><span class='line'>};
 </span><span class='line'>
-</span><span class='line'>probe begin {
-</span><span class='line'>&#9;printf("SystemTap start!\n");
-</span><span class='line'>}
+</span><span class='line'>struct sock {
+</span><span class='line'>&#9;/* socket用来对进入的包进行匹配的5大因素 */
+</span><span class='line'>&#9;__u32 daddr;        // dip，Foreign IPv4 addr
+</span><span class='line'>&#9;__u32 rcv_saddr;    // 记录套接字所绑定的地址 Bound local IPv4 addr
+</span><span class='line'>&#9;__u16 dport;        // dport
+</span><span class='line'>&#9;unsigned short num; /* 套接字所在的端口号, 端口号小于1024的为特权端口, 只有特权用户才能绑定,当用户指定的端
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9; * 口号为零时, 系统将提供一个未分配的用户端口，如果对于raw socket的话，该num又可以用来
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9; * 保存socket(int family, int type, int protocol)中的protocol，而不是端口号了；在bind时候，会首先
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9; * 将邦定的源端口号赋予该成员，最终sport成员从该成员出获取源端口号__tcp_v4_hash主要就
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9; * 是利用了该成员来hash从而排出hash链
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9; */
+</span><span class='line'>&#9;int bound_dev_if;   // Bound device index if != 0
 </span><span class='line'>
-</span><span class='line'>probe kernel.function("ip_local_deliver") {
-</span><span class='line'>&#9;iph = read_iphdr(pointer_arg(1));
-</span><span class='line'>&#9;printf("tcp packet ? %s\n", is_tcp_packet(iph) ? "yes" : "no");
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>在这里read_iphdr函数就是使用嵌入的C代码作为函数体，is_tcp_packet中是作为systemtap辅助函数中的一部分。</p>
-
-<p>在使用嵌入C代码作为函数体的函数中，访问参数的值是以STAP_ARG_+参数名的形式，这种方式是最新版本的SystemTap中的方式。1.7及更早的版本是通过THIS->+参数名的方式。CentOS6.4中的SystemTap版本是1.8，所以你如果在SystemTap脚本中仍然使用老的访问方式会报错。同样，最新的设置返回值的方式是STAP_RETVALUE，1.7及更早的版本是THIS->__retvalue。</p>
-
-<p>由于在guru模式下，SystemTap对嵌入的C代码没有做任何的处理，所以如果在C代码中出现异常的访问或者其他错误，就会导致内核crash。不过SystemTap提供了kread宏来安全地访问指针，如下所示：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct net_device *dev;
-</span><span class='line'>char *name;
-</span><span class='line'>dev = kread(&(skb-&gt;dev));
-</span><span class='line'>name = kread(&(dev-&gt;name));</span></code></pre></td></tr></table></div></figure>
-
-
-<p>还有一点要特别注意，所有的SystemTap函数和probe都是在关闭中断下执行，所以在所有嵌入的C代码中都不能睡眠！</p>
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/06/01/debug-systemtap-beginner/">SystemTap Beginner</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-06-01T15:03:00+08:00'><span class='date'>2015-06-01</span> <span class='time'>15:03:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://blog.csdn.net/kafeiflynn/article/details/6429976">http://blog.csdn.net/kafeiflynn/article/details/6429976</a></p>
-
-<h3>SystemTap</h3>
-
-<p>应用：</p>
-
-<p>  对管理员，SystemTap可用于监控系统性能，找出系统瓶颈，而对于开发者，可以查看他们的程序运行时在linux系统内核内部的运行情况。主要用于查看内核空间事件信息，对用户空间事件的探测，目前正加紧改进。</p>
-
-<h4>安装</h4>
-
-<p>1、SystemTap的安装及使用需要针对正在使用的内核安装相应的kernel-devel、kernel-debuginfo和kernel-debuginfo-common包，以插入探针。<br/>
-2、安装SystemTap和SystemTap-runtime包<br/>
-3、使用如下命令测试一下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>stap -v -e 'probe vfs.read {printf("read performed/n"); exit()}'</span></code></pre></td></tr></table></div></figure>
-
-
-<p>为目标机产生SystemTap instrumentation:</p>
-
-<p>这样就可以在一台机器上为多种内核产生SystemTap instrumentation，而且目标机上只安装SystemTap-runtime即可。</p>
-
-<p>操作如下：<br/>
-1.在目标机上安装systemtap-runtime RPM包；<br/>
-2.使用uname –r查看目标机内核；<br/>
-3.在host system上安装SystemTap；<br/>
-4.在host system上安装目标机内核及相关RPMs<br/>
-5.在host name上运行命令：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>stap -r kernel_version script -m module_name</span></code></pre></td></tr></table></div></figure>
-
-
-<p>6.把新产生的模块拷贝到目标机，并运行如下命令：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>staprun module_name.ko</span></code></pre></td></tr></table></div></figure>
-
-
-<p>注意：host system和目标机架构及操作系统版本必须一致。</p>
-
-<h4>运行SystemTap脚本</h4>
-
-<p>运行stap和staprun需要被授以权限，一般用户需要运行SystemTap，则需要被加入到以下用户组的一个：<br/>
-1、stapdev：用stap编译SystemTap脚本成内核模块，并加载进内核；<br/>
-2、stapusr：仅能运行staprun加载/lib/modules/kernel_version/systemtap/目录下模块。</p>
-
-<h5>SystemTap Flight Recorder模式</h5>
-
-<p>该模式允许长时间运行SystemTap脚本，但仅focus on 最近的输出，有2个变种：in-memory和file模式，两种情况下SystemTap都作为后台进程运行。</p>
-
-<h5>In-memory模式：</h5>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>stap -F iotime.stp</span></code></pre></td></tr></table></div></figure>
-
-
-<p>一旦脚本启动后，你可以看到以下输出信息以辅助命令重新连到运行中的脚本：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>Disconnecting from systemtap module.
-</span><span class='line'>To reconnect, type "staprun -A stap_5dd0073edcb1f13f7565d8c343063e68_19556"</span></code></pre></td></tr></table></div></figure>
-
-
-<p>当感兴趣的事件发生时，可以重新连接到运行中的脚本，并在内存Buffer中输出最近的数据并持续输出：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>staprun -A stap_5dd0073edcb1f13f7565d8c343063e68_19556</span></code></pre></td></tr></table></div></figure>
-
-
-<p>内存Buffer默认1MB，可以使用-S选项，例如-S2指定为2MB</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>File Flight Recorder
-</span><span class='line'>stap -F -o /tmp/pfaults.log -S 1,2  pfaults.stp</span></code></pre></td></tr></table></div></figure>
-
-
-<p>命令结果输出到/tmp/pfaults.log.[0-9]，每个文件1MB，并且仅保存最近的两个文件，-S指定了第一个参数：每个输出文件大小1MB，第二个参数：仅保留最近的两个文件，systemtap在pfaults.log后面加.[0-9]后缀。</p>
-
-<p>该命令的输出是systemtap脚本进程ID，使用如下命令可以终止systemtap脚本</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>kill -s SIGTERM 7590</span></code></pre></td></tr></table></div></figure>
-
-
-<p>运行</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>ls –sh /tmp/pfaults.log.*
+</span><span class='line'>&#9;/* 主hash链，系统已分配的端口用tcp_hashinfo.__tcp_bhash来索引, 索引槽结构为tcp_bind_hashbucket, 端口绑定结构用tcp_bind_bucket描述,
+</span><span class='line'>&#9;它包含指向绑定到该端口套接字的指针(owners), 套接字的sk-&gt;prev指针指向该绑定结构 */
+</span><span class='line'>&#9;struct sock *next;
+</span><span class='line'>&#9;struct sock **pprev;
+</span><span class='line'>&#9;/* sk-&gt;bind_next和sk-&gt;bind_pprev用来描述绑定到同一端口的套接字，例如http服务器 */
+</span><span class='line'>&#9;struct sock *bind_next;
+</span><span class='line'>&#9;struct sock **bind_pprev;
+</span><span class='line'>&#9;struct sock *prev;
 </span><span class='line'>
-</span><span class='line'>1020K /tmp/pfaults.log.5    44K /tmp/pfaults.log.6</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>SystemTap如何工作</h4>
-
-<p>SystemTap的基本工作原理就是：event/handler，运行systemtap脚本产生的加载模块时刻监控事件的发生，一旦发生，内核就调用相关的handler处理。</p>
-
-<p>一运行一个SystemTap脚本就会产生一个SystemTap session：<br/>
-1.SystemTap检查脚本以及所使用的相关tapset库；<br/>
-2.SystemTap将脚本转换成C语言文件，并运行C语言编译器编译之创建一个内核模块；<br/>
-3.SystemTap加载该模块，从而使用所有探针(events和handlers)；<br/>
-4.事件发生时，执行相关handlers<br/>
-5.一旦SystemTap session停止，则探针被禁止，该内核模块被卸载。</p>
-
-<p>探针：event及其handler，一个SystemTap脚本可以包含多个探针。</p>
-
-<p>SystemTap脚本以.stp为扩展名，其基本格式如下所示：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>probe event {statements}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>允许一个探针内多个event，以,隔开，任一个event发生时，都会执行statements，各个语句之间不需要特殊的结束符号标记。而且可以在一个statements block中包含其他的statements block。</p>
-
-<p>函数编写：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>function function_name(arguments) {statements}
+</span><span class='line'>&#9;volatile unsigned char state, zapped; // Connection state，zapped在TCP分析中无须考虑
+</span><span class='line'>&#9;__u16 sport;                   // 源端口，见num
 </span><span class='line'>
-</span><span class='line'>probe event {function_name(arguments)}</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>SystemTap Event</h4>
-
-<p>可大致划分为synchronous和asynchronous。</p>
-
-<h5>同步事件：</h5>
-
-<p>执行到定位到内核代码中的特定位置时触发event</p>
-
-<p>1.syscall.system_call<br/>
-系统调用入口和exit处：syscall.system_call和syscall.system_call.return，比如对于close系统调用：syscall.close和syscall.close.return</p>
-
-<p>2.vfs.file_operation<br/>
-vfs.file_operation和vfs.file_operation.return</p>
-
-<p>3.kernel.function(&ldquo;function&rdquo;)<br/>
-如：kernel.function(“sys_open”)和kernel.function(“sys_open”).return</p>
-
-<p>可使用*来代表wildcards：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>probe kernel.function("*@net/socket.c") { }
-</span><span class='line'>probe kernel.function("*@net/socket.c").return { }</span></code></pre></td></tr></table></div></figure>
-
-
-<p>代表了net/socket.c中所有函数的入口和exit口。</p>
-
-<p>4.kernel.trace(&ldquo;tracepoint&rdquo;)<br/>
-2.6.30及newer为内核中的特定事件定义了instrumentation，入kernel.trace(“kfree_skb”)代表内核中每次网络buffer被释放掉时的event。</p>
-
-<p>5.module(&ldquo;module&rdquo;).function(&ldquo;function&rdquo;)</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>probe module("ext3").function("*") { }
-</span><span class='line'>probe module("ext3").function("*").return { }</span></code></pre></td></tr></table></div></figure>
-
-
-<p>系统内核模块多存放在/lib/modules/kernel_version</p>
-
-<h4>Asynchronous Events</h4>
-
-<p>不绑定到内核的特定指令或位置处。包括：<br/>
-1、begin：SystemTap session开始时触发，当SystemTap脚本开始运行时触发；<br/>
-2、end ：SystemTap session终止时触发；<br/>
-3、timer事件：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>probe timer.s(4)
+</span><span class='line'>&#9;unsigned short family;         // 协议族，例如PF_INET
+</span><span class='line'>&#9;unsigned char reuse;           // 地址是否可重用，只有RAW才使用
+</span><span class='line'>&#9;unsigned char shutdown;        // 判断该socket连接在某方向或者双向方向上都已经关闭
+</span><span class='line'>&#9;#define SHUTDOWN_MASK 3
+</span><span class='line'>&#9;#define RCV_SHUTDOWN 1
+</span><span class='line'>&#9;#define SEND_SHUTDOWN 2
+</span><span class='line'>&#9;atomic_t refcnt;               // 引用计数
+</span><span class='line'>&#9;socket_lock_t lock;            // 锁标志， 每个socket都有一个自旋锁，该锁在用户上下文和软中断处理时提供了同步机制
+</span><span class='line'>&#9;typedef struct {
+</span><span class='line'>&#9;&#9;spinlock_t slock;
+</span><span class='line'>&#9;&#9;unsigned int users;
+</span><span class='line'>&#9;&#9;wait_queue_head_t wq;
+</span><span class='line'>&#9;} socket_lock_t;
+</span><span class='line'>&#9;wait_queue_head_t *sleep;      // Sock所属线程的自身休眠等待队列
+</span><span class='line'>&#9;struct dst_entry *dst_cache;   // 目的地的路由缓存
+</span><span class='line'>&#9;rwlock_t dst_lock;             // 为该socket赋dst_entry值时的锁
+</span><span class='line'>
+</span><span class='line'>&#9;/* sock的收发都是要占用内存的，即发送缓冲区和接收缓冲区。 系统对这些内存的使用是有限制的。 通常，每个sock都会从配额里
+</span><span class='line'>&#9;&#9;预先分配一些，这就是forward_alloc， 具体分配时：
+</span><span class='line'>&#9;&#9;1）比如收到一个skb，则要计算到rmem_alloc中，并从forward_alloc中扣除。 接收处理完成后（如用户态读取），则释放skb，并利
+</span><span class='line'>&#9;&#9;&#9;用tcp_rfree()把该skb的内存反还给forward_alloc。
+</span><span class='line'>&#9;&#9;2）发送一个skb，也要暂时放到发送缓冲区，这也要计算到wmem_queued中，并从forward_alloc中扣除。真正发送完成后，也释放
+</span><span class='line'>&#9;&#9;&#9;skb，并反还forward_alloc。 当从forward_alloc中扣除的时候，有可能forward_alloc不够，此时就要调用tcp_mem_schedule()来增
+</span><span class='line'>&#9;&#9;&#9;加forward_alloc，当然，不是随便想加就可以加的，系统对整个TCP的内存使用有总的限制，即sysctl_tcp_mem[3]。也对每个sock
+</span><span class='line'>&#9;&#9;&#9;的内存使用分别有限制，即sysctl_tcp_rmem[3]和sysctl_tcp_wmem[3]。只有满足这些限制（有一定的灵活性），forward_alloc才
+</span><span class='line'>&#9;&#9;&#9;能增加。 当发现内存紧张的时候，还会调用tcp_mem_reclaim()来回收forward_alloc预先分配的配额。
+</span><span class='line'>&#9;*/
+</span><span class='line'>&#9;int rcvbuf;                    // 接受缓冲区的大小（按字节）
+</span><span class='line'>&#9;int sndbuf;                    // 发送缓冲区的大小（按字节）
+</span><span class='line'>&#9;atomic_t rmem_alloc;           // 接受队列中存放的数据的字节数
+</span><span class='line'>&#9;atomic_t wmem_alloc;           // 发送队列中存放的数据的字节数
+</span><span class='line'>&#9;int wmem_queued;               // 所有已经发送的数据的总字节数
+</span><span class='line'>&#9;int forward_alloc;             // 预分配剩余字节数
+</span><span class='line'>
+</span><span class='line'>&#9;struct sk_buff_head receive_queue; // 接受队列
+</span><span class='line'>&#9;struct sk_buff_head write_queue;   // 发送队列
+</span><span class='line'>&#9;atomic_t omem_alloc;               // 在TCP分析中无须考虑 * "o" is "option" or "other" */
+</span><span class='line'>
+</span><span class='line'>&#9;__u32 saddr; /* 指真正的发送地址，这里需要注意的是，rcv_saddr是记录套接字所绑定的地址，其可能是广播或者
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;多播，对于我们要发送的包来说，只能使用接口的IP地址，而不能使用广播或者多播地址 */
+</span><span class='line'>&#9;unsigned int allocation;       // 分配该sock之skb时选择的模式，GFP_ATOMIC还是GFP_KERNEL等等
+</span><span class='line'>
+</span><span class='line'>&#9;volatile char dead,            // tcp_close.tcp_listen_stop.inet_sock_release调用sock_orphan将该值置1，表示该socket已经和进程分开，变成孤儿
+</span><span class='line'>&#9;&#9;&#9;&#9;done,              // 用于判断该socket是否已经收到 fin，如果收到则将该成员置1
+</span><span class='line'>&#9;&#9;&#9;&#9;urginline,         // 如果该值被设置为1，表示将紧急数据放于普通数据流中一起处理，而不在另外处理
+</span><span class='line'>&#9;&#9;&#9;&#9;keepopen,          // 是否启动保活定时器
+</span><span class='line'>&#9;&#9;&#9;&#9;linger,            // lingertime一起，指明了close()后保留的时间
+</span><span class='line'>&#9;&#9;&#9;&#9;destroy,           // 在TCP分析中无须考虑
+</span><span class='line'>&#9;&#9;&#9;&#9;no_check,          // 是否对发出的skb做校验和，仅对UDP有效
+</span><span class='line'>&#9;&#9;&#9;&#9;broadcast,         // 是否允许广播，仅对UPD有效
+</span><span class='line'>&#9;&#9;&#9;&#9;bsdism;            // 在TCP分析中无须考虑
+</span><span class='line'>&#9;unsigned char debug;           // 在TCP分析中无须考虑
+</span><span class='line'>&#9;unsigned char rcvtstamp;       // 是否将收到skb的时间戳发送给app
+</span><span class='line'>&#9;unsigned char use_write_queue; // 在init中该值被初始化为1，该值一直没有变化
+</span><span class='line'>&#9;unsigned char userlocks;       // 包括如下几种值的组合，从而改变收包等操作的执行顺序
+</span><span class='line'>&#9;#define SOCK_SNDBUF_LOCK 1
+</span><span class='line'>&#9;#define SOCK_RCVBUF_LOCK 2
+</span><span class='line'>&#9;#define SOCK_BINDADDR_LOCK 4
+</span><span class='line'>&#9;#define SOCK_BINDPORT_LOCK 8
+</span><span class='line'>&#9;int route_caps;                // 指示本sock用到的路由的信息
+</span><span class='line'>&#9;int proc;                      // 保存用户线程的pid
+</span><span class='line'>&#9;unsigned long lingertime;      // lingertime一起，指明了close()后保留的时间
+</span><span class='line'>&#9;int hashent;                   // 存放4元的hash值
+</span><span class='line'>&#9;struct sock *pair;             // 在TCP分析中无须考虑
+</span><span class='line'>
+</span><span class='line'>&#9;/* 一个进程也许会锁住socket导致该socket不能被改变。特别是这点意味着其甚至不能被驱动中断所改变，例如，
+</span><span class='line'>&#9;&#9;到达的报会被堵塞，导致我们无法获取新的数据或者任何的状态改变。所以在这里，当socket被锁住的时候，中
+</span><span class='line'>&#9;&#9;断处理可以将包往下面的backlog中添加*/
+</span><span class='line'>&#9;struct {
+</span><span class='line'>&#9;&#9;struct sk_buff *head;
+</span><span class='line'>&#9;&#9;struct sk_buff *tail;
+</span><span class='line'>&#9;} backlog;
+</span><span class='line'>
+</span><span class='line'>&#9;rwlock_t callback_lock;          // sock相关函数内部操作的保护锁
+</span><span class='line'>&#9;struct sk_buff_head error_queue; // 错误报文的队列，很少使用
+</span><span class='line'>&#9;struct proto *prot;              // 例如指向tcp_prot
+</span><span class='line'>
+</span><span class='line'>&#9;union {       // 私有TCP相关数据保存
+</span><span class='line'>&#9;&#9;struct tcp_opt af_tcp;
+</span><span class='line'>&#9;&#9;.............
+</span><span class='line'>&#9;} tp_pinfo;
+</span><span class='line'>
+</span><span class='line'>&#9;int err,      // 保存各种错误，例如ECONNRESET Connection reset by peer，从而会影响到后续流程的处理
+</span><span class='line'>&#9;&#9;err_soft; // 保存各种软错误，例如EPROTO Protocol error，从而会影响到后续流程的处理
+</span><span class='line'>&#9;unsigned short ack_backlog;       // 当前已经accept的数目
+</span><span class='line'>&#9;unsigned short max_ack_backlog;   // 当前listen sock能保留多少个待处理TCP连接.
+</span><span class='line'>&#9;__u32 priority;                   /* Packet queueing priority，Used to set the TOS field. Packets with a higher priority may be processed first, depending on the device’s queueing discipline. See SO_PRIORITY */
+</span><span class='line'>&#9;unsigned short type;              // 例如SOCK_STREAM，SOCK_DGRAM或者SOCK_RAW等
+</span><span class='line'>&#9;unsigned char localroute;         // Route locally only if set – set by SO_DONTROUTE option.
+</span><span class='line'>&#9;unsigned char protocol;           // socket(int family, int type, int protocol)中的protocol
+</span><span class='line'>&#9;struct ucred peercred;            // 在TCP分析中无须考虑
+</span><span class='line'>&#9;int rcvlowat;                     /* 声明在开始发送 数据 (SO_SNDLOWAT) 或正在接收数据的用户 (SO_RCVLOWAT) 传递数据之
+</span><span class='line'>&#9;前缓冲区内的最小字节数. 在 Linux 中这两个值是不可改变的, 固定为 1 字节. */
+</span><span class='line'>&#9;long rcvtimeo;                    // 接收时的超时设定, 并在超时时报错
+</span><span class='line'>&#9;long sndtimeo;                    // 发送时的超时设定, 并在超时时报错
+</span><span class='line'>
+</span><span class='line'>&#9;union {       // 私有inet相关数据保存
+</span><span class='line'>&#9;&#9;struct inet_opt af_inet;
+</span><span class='line'>&#9;&#9;.................
+</span><span class='line'>&#9;} protinfo;
+</span><span class='line'>
+</span><span class='line'>&#9;/* the timer is used for SO_KEEPALIVE (i.e. sending occasional keepalive probes to a remote site – by default, set to 2 hours in
+</span><span class='line'>&#9;stamp is simply the time that the last packet was received. */
+</span><span class='line'>&#9;struct timer_list timer;
+</span><span class='line'>&#9;struct timeval stamp;
+</span><span class='line'>&#9;struct socket *socket; // 对应的socket
+</span><span class='line'>&#9;void *user_data;       // 私有数据，在TCP分析中无须考虑
+</span><span class='line'>
+</span><span class='line'>&#9;/* The state_change operation is called whenever the status of the socket is changed. Similarly, data_ready is called
+</span><span class='line'>&#9;&#9;when data have been received, write_space when free memory available for writing has increased and error_report
+</span><span class='line'>&#9;&#9;when an error occurs, backlog_rcv when socket locked, putting skb to backlog, destruct for release this sock*/
+</span><span class='line'>&#9;void (*state_change)(struct sock *sk);
+</span><span class='line'>&#9;void (*data_ready)(struct sock *sk,int bytes);
+</span><span class='line'>&#9;void (*write_space)(struct sock *sk);
+</span><span class='line'>&#9;void (*error_report)(struct sock *sk);
+</span><span class='line'>&#9;int (*backlog_rcv) (struct sock *sk, struct sk_buff *skb);
+</span><span class='line'>&#9;void (*destruct)(struct sock *sk);
+</span><span class='line'>};
+</span><span class='line'>
+</span><span class='line'>
+</span><span class='line'>struct inet_opt
 </span><span class='line'>{
-</span><span class='line'>&#9;printf("hello world/n")
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>• timer.ms(milliseconds)<br/>
-• timer.us(microseconds)<br/>
-• timer.ns(nanoseconds)<br/>
-• timer.hz(hertz)<br/>
-• timer.jiffies(jiffies)</p>
-
-<p>可查看man stapprobes来查看其它支持的events</p>
-
-<h4>SystemTap Handler/Body</h4>
-
-<p>支持的函数：<br/>
-1、  printf (&ldquo;format string/n&rdquo;, arguments)，%s：字符串，%d数字，以 , 隔开；<br/>
-2、  tid()：当前线程ID；<br/>
-3、  uid()：当前用户ID；<br/>
-4、  cpu()：当前CPU号；<br/>
-5、  gettimeofday_s()：自从Epoch开始的秒数；<br/>
-6、  ctime()将从Unix Epoch开始的秒数转换成date；<br/>
-7、  pp()：描述当前被处理的探针点的字符串；<br/>
-8、  thread_indent()：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>probe kernel.function("*@net/socket.c")
-</span><span class='line'>{
-</span><span class='line'>&#9;printf ("%s -&gt; %s/n", thread_indent(1), probefunc())
-</span><span class='line'>}
+</span><span class='line'>&#9;int ttl;                    // IP的TTL设置
+</span><span class='line'>&#9;int tos;                    // IP的TOS设置
+</span><span class='line'>&#9;unsigned cmsg_flags;        // 该标志用来决定是否向应用层打印相关信息，包括如下可能的值
+</span><span class='line'>&#9;#define IP_CMSG_PKTINFO 1
+</span><span class='line'>&#9;#define IP_CMSG_TTL 2
+</span><span class='line'>&#9;#define IP_CMSG_TOS 4
+</span><span class='line'>&#9;#define IP_CMSG_RECVOPTS 8
+</span><span class='line'>&#9;#define IP_CMSG_RETOPTS 16
+</span><span class='line'>&#9;struct ip_options *opt;     // IP选项，包括安全和处理限制、记录路径、时间戳、宽松的源站选路、严格的源站选路
+</span><span class='line'>&#9;unsigned char hdrincl;      // 用于RAW
+</span><span class='line'>&#9;__u8 mc_ttl;                // 多播TTL
+</span><span class='line'>&#9;__u8 mc_loop;               // 多播回环
+</span><span class='line'>&#9;unsigned recverr : 1,       // 是否允许传递扩展的可靠的错误信息.
+</span><span class='line'>&#9;freebind : 1;               // 是否允许socket被绑定
+</span><span class='line'>&#9;__u16 id;                   // 用于禁止分片的IP包的ID计数
+</span><span class='line'>&#9;__u8 pmtudisc;              // 路径MTU发现
+</span><span class='line'>&#9;int mc_index;               // 多播设备索引
+</span><span class='line'>&#9;__u32 mc_addr;              // 自己的多播地址
+</span><span class='line'>&#9;struct ip_mc_socklist *mc_list; // 多播组
+</span><span class='line'>};
 </span><span class='line'>
-</span><span class='line'>probe kernel.function("*@net/socket.c").return
-</span><span class='line'>{
-</span><span class='line'>&#9;printf ("%s &lt;- %s/n", thread_indent(-1), probefunc())
-</span><span class='line'>}
+</span><span class='line'>struct tcp_opt {
+</span><span class='line'>&#9;int tcp_header_len;         // tcp首部长度（包括选项）
+</span><span class='line'>&#9;__u32 pred_flags; /* 首部预测标志，在syn_rcv、syn_sent、更新窗口或其他恰当的时候，设置pred_flags（主要
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;是创建出不符合快速路径的条件，一般值为0x??10 &lt;&lt; 16 + snd_wnd）?所对应的值不确定，
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;在连接完毕之后，根据pred_flags以及其他因素来确定是否走快速路径。*/
 </span><span class='line'>
-</span><span class='line'>0 ftp(7223): -&gt; sys_socketcall
-</span><span class='line'>1159 ftp(7223):  -&gt; sys_socket
-</span><span class='line'>2173 ftp(7223):   -&gt; __sock_create
-</span><span class='line'>2286 ftp(7223):    -&gt; sock_alloc_inode
-</span><span class='line'>2737 ftp(7223):    &lt;- sock_alloc_inode
-</span><span class='line'>3349 ftp(7223):    -&gt; sock_alloc
-</span><span class='line'>3389 ftp(7223):    &lt;- sock_alloc
-</span><span class='line'>3417 ftp(7223):   &lt;- __sock_create
-</span><span class='line'>4117 ftp(7223):   -&gt; sock_create
-</span><span class='line'>4160 ftp(7223):   &lt;- sock_create
-</span><span class='line'>4301 ftp(7223):   -&gt; sock_map_fd
-</span><span class='line'>4644 ftp(7223):    -&gt; sock_map_file
-</span><span class='line'>4699 ftp(7223):    &lt;- sock_map_file
-</span><span class='line'>4715 ftp(7223):   &lt;- sock_map_fd
-</span><span class='line'>4732 ftp(7223):  &lt;- sys_socket
-</span><span class='line'>4775 ftp(7223): &lt;- sys_socketcall</span></code></pre></td></tr></table></div></figure>
-
-
-<p>  函数thread_indent()只有1个参数：代表对线程的”indentation counter”的增减数，即系统调用显示的步数，返回字符串(自从第一次调用thread_indent()以来的描述：进程名(进程ID))</p>
-
-<p>9、name<br/>
-标记系统调用的名字，仅用于syscall.system_call中。</p>
-
-<p>10、target()<br/>
-与stap script -x process ID or stap script -c command联合使用，如果想在脚本中获得进程ID或命令可以如此做</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>probe syscall.* {
-</span><span class='line'>&#9;if (pid() == target())
-</span><span class='line'>&#9;&#9;printf("%s/n", name)
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>SystemTap Handler构造</h4>
-
-<h5>变量</h5>
-
-<p>1、不必事先声明，直接使用即可，由SystemTap自动判断其属于string还是integer，整数则默认为0，默认在probe中声明的是local变量<br/>
-2、在各个probe之间共享的变量使用global声明</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>global count_jiffies, count_ms
-</span><span class='line'>probe timer.jiffies(100) { count_jiffies ++ }
-</span><span class='line'>probe timer.ms(100) { count_ms ++ }
-</span><span class='line'>probe timer.ms(12345)
-</span><span class='line'>{
-</span><span class='line'>&#9;hz=(1000*count_jiffies) / count_ms
-</span><span class='line'>&#9;printf ("jiffies:ms ratio %d:%d =&gt; CONFIG_HZ=%d/n",
-</span><span class='line'>&#9;&#9;count_jiffies, count_ms, hz)
-</span><span class='line'>&#9;exit()
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>Target变量</h5>
-
-<p>Probe event可以映射到代码的实际位置，如kernel.function(“function”)、kernel.statement(“statement”)，这允许使用target变量来记录代码中指定位置处可视变量的值。</p>
-
-<p>运行如下命令：可以显示指定vfs_read处可视target变量</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>stap -L 'kernel.function("vfs_read")'</span></code></pre></td></tr></table></div></figure>
-
-
-<p>显示</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>kernel.function("vfs_read@fs/read_write.c:277") $file:struct file* $buf:char* $count:size_t
+</span><span class='line'>&#9;__u32 rcv_nxt;              // 期望接受到的下一个tcp包的seq
+</span><span class='line'>&#9;__u32 snd_nxt;              // 要发送的下一个tcp包的seq
+</span><span class='line'>&#9;__u32 snd_una;              // 表示最近一个尚未确认的但是已经发送过的报文的seq
+</span><span class='line'>&#9;__u32 snd_sml;              // 最近发送的小包的最后一个字节数，主要用于Nagle算法
+</span><span class='line'>&#9;__u32 rcv_tstamp;           // 最近收到的ACK的时间，用于保活
+</span><span class='line'>&#9;__u32 lsndtime;             // 最近发送的数据包的时间，用于窗口restart
 </span><span class='line'>
-</span><span class='line'>$pos:loff_t*</span></code></pre></td></tr></table></div></figure>
-
-
-<p>每个target变量以$开头：变量类型。如果是结构体类型，则SystemTap可以使用->来查看其成员。对基本类型，integer或string，SystemTap有函数可以直接读取address处的值，如：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'># 好像有时对于小于8位的函数，会取出8为长度的值
-</span><span class='line'>kernel_char(address)
-</span><span class='line'>Obtain the character at address from kernel memory.
+</span><span class='line'>&#9;/* 经受时延的确认的控制 */
+</span><span class='line'>&#9;struct {
+</span><span class='line'>&#9;&#9;__u8 pending;           /* 正处于ACK延时状态，包括如下几种状态 ACK is pending */
+</span><span class='line'>&#9;&#9;enum tcp_ack_state_t
+</span><span class='line'>&#9;&#9;{
+</span><span class='line'>&#9;&#9;&#9;TCP_ACK_SCHED = 1,
+</span><span class='line'>&#9;&#9;&#9;TCP_ACK_TIMER = 2,
+</span><span class='line'>&#9;&#9;&#9;TCP_ACK_PUSHED= 4
+</span><span class='line'>&#9;&#9;};
+</span><span class='line'>&#9;&#9;__u8 quick;            /* 快速恢复算法时，用于决定是否需要重传的收到的重复ACK的最大数目 Scheduled number of quick acks */
+</span><span class='line'>&#9;&#9;__u8 pingpong;         /* 当前该TCP会话处于交互状态（非延时ACK状态）The session is interactive */
+</span><span class='line'>&#9;&#9;__u8 blocked;          /* 当前socket被锁住了，这时候延时的ACK不再等待，而是立即发送 Delayed ACK was blocked by socket lock*/]
+</span><span class='line'>&#9;&#9;/*Adaptive Time-Out (ATO) is the time that must elapse before an acknowledgment is considered lost. RFC 2637*/
+</span><span class='line'>&#9;&#9;__u32 ato;             /* 软件时钟的预测嘀嗒数目 Predicted tick of soft clock */
+</span><span class='line'>&#9;&#9;unsigned long timeout; /* 当前延时确认的定时器时间 Currently scheduled timeout */
+</span><span class='line'>&#9;&#9;__u32 lrcvtime;        /* 最后收到的数据报的时间戳 timestamp of last received data packet*/
+</span><span class='line'>&#9;&#9;__u16 last_seg_size;   /* 最后收到的数据报的大小 Size of last incoming segment */
 </span><span class='line'>
-</span><span class='line'>kernel_short(address)
-</span><span class='line'>Obtain the short at address from kernel memory.
+</span><span class='line'>&#9;&#9;/*
+</span><span class='line'>&#9;&#9;1. tp-&gt;advmss：The MSS advertised by the host. This is initialised in the function tcp_advertise_mss, from the routing table's destination cache(dst-&gt;advmss).
+</span><span class='line'>Given that the cached entry is calculated from the MTU (maximum transfer unit) of the next hop, this will have a value of 1460 over Ethernet.
 </span><span class='line'>
-</span><span class='line'>kernel_int(address)
-</span><span class='line'>Obtain the int at address from kernel memory.
+</span><span class='line'>&#9;&#9;2. tp-&gt;ack.rcv_mss：A lower-bound estimate of the peer's MSS. This is initiated in tcp_initialize_rcv mss, and updated whenever a segment is received by
+</span><span class='line'>tcp measure rcv mss.
 </span><span class='line'>
-</span><span class='line'>kernel_long(address)
-</span><span class='line'>Obtain the long at address from kernel memory
+</span><span class='line'>&#9;&#9;3. tp-&gt;mss_cache：The current effective sending MSS, which is calculated in the function tcp_sync_mss. When the socket is created, it is initialised to 536 by
+</span><span class='line'>tcp_v4_init_sock. Note that these are the only functions that alter the value of tp-&gt;mss cache.
 </span><span class='line'>
-</span><span class='line'>kernel_string(address)
-</span><span class='line'>Obtain the string at address from kernel memory.
+</span><span class='line'>&#9;&#9;4. tp-&gt;mss clamp：An upper-bound value of the MSS of the connection. This is negotiated at connect(), such that it is the minimum of the MSS values advertised
+</span><span class='line'>by the two hosts.We will never see a segment larger than this.
+</span><span class='line'>*/
+</span><span class='line'>&#9;&#9;__u16 rcv_mss;    /* 属于点到点的mss，用于延时确认 MSS used for delayed ACK decisions */
+</span><span class='line'>&#9;} ack;
 </span><span class='line'>
-</span><span class='line'>kernel_string_n(address, n)
-</span><span class='line'>Obtain the string at address from the kernel memory and limits the string to n bytes.</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>打印target变量</h5>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>$$vars：类似sprintf("parm1=%x ... parmN=%x var1=%x ... varN=%x", parm1, ..., parmN, var1, ..., varN)，目的是打印probe点处的每个变量；
+</span><span class='line'>&#9;__u16 mss_cache;      // 当前提供的有效mss， /* Cached effective mss, not including SACKS */
+</span><span class='line'>&#9;__u16 mss_clamp;      // 最大mss，连接建立时协商的mss或者用户通过ioctl指定的mss的两者之中最大值
+</span><span class='line'>&#9;/* Maximal mss, negotiated at connection setup */
+</span><span class='line'>&#9;__u16 advmss;         /* MTU包括路径MTU，这里的advmss是本机告知周围网关的我自身的mss */
 </span><span class='line'>
-</span><span class='line'>$$locals：$$vars子集，仅打印local变量；
+</span><span class='line'>&#9;/* 用于直接拷贝给应用层的数据，当用户正在读取该套接字时, TCP包将被排入套接字的预备队列(tcp_prequeue ())，将其
+</span><span class='line'>&#9;传递到该用户线程上下文中进行处理. */
+</span><span class='line'>&#9;struct {
+</span><span class='line'>&#9;&#9;struct sk_buff_head prequeue; // 当前预备队列
+</span><span class='line'>&#9;&#9;struct task_struct *task;     // 当前线程
+</span><span class='line'>&#9;&#9;struct iovec *iov;            // 用户空间接受数据的地址
+</span><span class='line'>&#9;&#9;int memory;                   // 当前预备队列中的包总字节数目
+</span><span class='line'>&#9;&#9;int len;                      // 用户进程从预备队列中读取的数据字节数
+</span><span class='line'>&#9;} ucopy;
 </span><span class='line'>
-</span><span class='line'>$$parms：$$vars子集，仅包含函数参数；
+</span><span class='line'>&#9;__u32 snd_wl1;        // 收到对方返回的skb，记下该包的seq号，用于判断窗口是否需要更新 /* Sequence for window update */
+</span><span class='line'>&#9;__u32 snd_wnd;        // 记录对方提供的窗口大小 /* The window we expect to receive */
+</span><span class='line'>&#9;__u32 max_window;     // 对方曾经提供的最大窗口 /* Maximal window ever seen from peer */
+</span><span class='line'>&#9;__u32 pmtu_cookie;    // 将发送mss和当前的pmtu/exthdr设置同步 /* Last pmtu seen by socket */
+</span><span class='line'>&#9;__u16 ext_header_len; // 网络层协议选项长度 /* Network protocol overhead (IP/IPv6 options) */
+</span><span class='line'>&#9;__u8 ca_state;        // 快速重传状态机 /* State of fast-retransmit machine */
+</span><span class='line'>&#9;enum tcp_ca_state
+</span><span class='line'>&#9;{
+</span><span class='line'>&#9;&#9;TCP_CA_Open = 0,
+</span><span class='line'>&#9;&#9;TCP_CA_Disorder = 1,
+</span><span class='line'>&#9;&#9;TCP_CA_CWR = 2,
+</span><span class='line'>&#9;&#9;TCP_CA_Recovery = 3,
+</span><span class='line'>&#9;&#9;TCP_CA_Loss = 4
+</span><span class='line'>&#9;};
+</span><span class='line'>&#9;/* RFC 1122指出，TCP实现必须包括Karn和Jacobson实现计算重传超时（retransmission timeout：RTO）的算法 */
+</span><span class='line'>&#9;__u8 retransmits; // 某个还没有被确认的发送TCP包重传的次数 /* Number of unrecovered RTO timeouts. */
 </span><span class='line'>
-</span><span class='line'>$$return：仅在return probes存在，类似sprintf("return=%x", $return)，如果没有返回值，则是空串</span></code></pre></td></tr></table></div></figure>
-
-
-<p>例子如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>stap -e 'probe kernel.function("vfs_read") {printf("%s/n", $$parms); exit(); }'</span></code></pre></td></tr></table></div></figure>
-
-
-<p>函数vfs_read有4个参数：file、buf、count和pos，输出如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>file=0xffff8800b40d4c80 buf=0x7fff634403e0 count=0x2004 pos=0xffff8800af96df48</span></code></pre></td></tr></table></div></figure>
-
-
-<p>如果你想知道数据结构里面的成员信息，可以在”$$params”后面加一个”$”，如下所示：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>stap -e 'probe kernel.function("vfs_read") {printf("%s/n", $$parms$); exit(); }'</span></code></pre></td></tr></table></div></figure>
-
-
-<p>输出如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>file={.f_u={...}, .f_path={...}, .f_op=0xffffffffa06e1d80, .f_lock={...}, .f_count={...}, .f_flags=34818, buf="" count=8196 pos=-131938753921208</span></code></pre></td></tr></table></div></figure>
-
-
-<p>仅一个”$”表示，不展开数据结构域成员，如想展开，则需使用”$$”</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>stap -e 'probe kernel.function("vfs_read") {printf("%s/n", parms); exit(); }'</span></code></pre></td></tr></table></div></figure>
-
-
-<p>输出受限于最大字符串大小：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>file={.f_u={.fu_list={.next=0xffff8801336ca0e8, .prev=0xffff88012ded0840}, .fu_rcuhead={.next=0xffff8801336ca0e8</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>强制类型转换</h5>
-
-<p>大多数情况下，SystemTap都可以从debuginfo中获得变量类型，但对于代码中void指针则debuginfo中类型信息不可用，同样probe handler里面的类型信息在function里面也不可用，怎么办呢？</p>
-
-<p>SystemTap函数参数使用long来代替typed pointer，SystemTap的@cast操作可以指出对象正确类型：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>function task_state:long (task:long)
-</span><span class='line'>{
-</span><span class='line'>&#9;return @cast(task, "task_struct", "kernel&lt;linux/sched.h&gt;")-&gt;state
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>第一个参数是指向对象的指针， 第二个参数是将该对象(参数1)要强制类型转换成的类型，第三个参数指出类型定义的出处，是可选的。</p>
-
-<h5>检查Target变量可用性</h5>
-
-<p>随着代码运行，变量可能失效，因此需要用@defined来判断该变量是否可用：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>probe vm.pagefault = kernel.function("__handle_mm_fault@mm/memory.c") ?,
+</span><span class='line'>&#9;/* 当收到下面数量的重复ack时，快速重传开始，而无需等待重传定时器超时 */
+</span><span class='line'>&#9;__u8 reordering; /* Packet reordering metric. */
 </span><span class='line'>
-</span><span class='line'>kernel.function("handle_mm_fault@mm/memory.c") ?
-</span><span class='line'>{
-</span><span class='line'>&#9;name = "pagefault"
-</span><span class='line'>&#9;write_access = (@defined($flags) ? $flags & FAULT_FLAG_WRITE : $write_access)
-</span><span class='line'>&#9;address = $address
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>条件语句</h5>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if (condition)
-</span><span class='line'>&#9;statement1
-</span><span class='line'>else
-</span><span class='line'>&#9;statement2</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>global countread, countnonread
-</span><span class='line'>probe kernel.function("vfs_read"),kernel.function("vfs_write")
-</span><span class='line'>{
-</span><span class='line'>&#9;if (probefunc()=="vfs_read")
-</span><span class='line'>&#9;&#9;countread ++
-</span><span class='line'>&#9;else
-</span><span class='line'>&#9;&#9;countnonread ++
-</span><span class='line'>}
+</span><span class='line'>&#9;/* 当我们发出一个tcp包之后，并不立刻释放掉该包，而是等待其对应的ack到来，如果这时候ack来了，那么我们将从
+</span><span class='line'>&#9;write_queue队列中释放掉该包，同时将该事件的标志记录在tp-&gt;queue_shrunk中，如果原来进程由于write_queue中没
+</span><span class='line'>&#9;有足够的空间继续发送数据而休眠的话，那么此时将会唤醒其对应的sock，从而进程可以继续发送数据 */
+</span><span class='line'>&#9;__u8 queue_shrunk; /* Write queue has been shrunk recently.*/
+</span><span class='line'>&#9;__u8 defer_accept; // 请参考附录1 /* User waits for some data after accept() */
 </span><span class='line'>
-</span><span class='line'>probe timer.s(5) { exit() }
+</span><span class='line'>&#9;/* 往返时间测量 RTT，有关RTT的侧量这里不再详细讨论measurement ：Round-Trip Time (RTT) is the estimated round-trip time for an Acknowledgment to be received for a
+</span><span class='line'>given transmitted packet. When the network link is a local network, this delay will be minimal (if not zero). When the network link is
+</span><span class='line'>the Internet, this delay could be substantial and vary widely. RTT is adaptive. */
+</span><span class='line'>&#9;__u8 backoff;         /* backoff */
+</span><span class='line'>&#9;__u32 srtt;           /* smothed round trip time &lt;&lt; 3 */
+</span><span class='line'>&#9;__u32 mdev;           /* medium deviation */
+</span><span class='line'>&#9;__u32 mdev_max;       /* maximal mdev for the last rtt period */
+</span><span class='line'>&#9;__u32 rttvar;         /* smoothed mdev_max */
+</span><span class='line'>&#9;__u32 rtt_seq;        /* sequence number to update rttvar */
+</span><span class='line'>&#9;__u32 rto;            /* 重传超时时间 retransmit timeout */
 </span><span class='line'>
-</span><span class='line'>probe end
-</span><span class='line'>{
-</span><span class='line'>&#9;printf("VFS reads total %d/n VFS writes total %d/n", countread, countnonread)
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>循环语句</h5>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>while (condition)
-</span><span class='line'>&#9;statement
+</span><span class='line'>&#9;__u32 packets_out;    /* 已经发出去的数目 Packets which are "in flight" */
+</span><span class='line'>&#9;__u32 left_out;       /* 发出去已经被确认的数目 Packets which leaved network */
+</span><span class='line'>&#9;__u32 retrans_out;    /* 重传的发出去的包数目 Retransmitted packets out */
 </span><span class='line'>
-</span><span class='line'>for (initialization; conditional; increment) statement</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>比较：</h5>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>==、&gt;=、&lt;=、!=</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>命令行参数：</h5>
-
-<p>使用$标志着希望输入的是integer类型命令行参数，@：string</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>probe kernel.function(@1) { }
-</span><span class='line'>probe kernel.function(@1).return { }</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>关联数组</h4>
-
-<p>关联数组一般在multiple probes里面处理，所以必须声明为global，不管是在一个还是多个probes里面用，要读取数组成员值，可以：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>array_name[index_expression]</span></code></pre></td></tr></table></div></figure>
-
-
-<p>如下所示：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>foo["tom"] = 23
-</span><span class='line'>foo["dick"] = 24
-</span><span class='line'>foo["harry"] = 25</span></code></pre></td></tr></table></div></figure>
-
-
-<p>一个索引可以包含最多9个索引表达式，用 , 隔开：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>device[pid(),execname(),uid(),ppid(),"W"] = devname</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>SystemTap的数组操作</h5>
-
-<h6>赋值：</h6>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>array_name[index_expression] = value</span></code></pre></td></tr></table></div></figure>
-
-
-<p>例子：索引和值可以使用handler function：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>foo[tid()] = gettimeofday_s()</span></code></pre></td></tr></table></div></figure>
-
-
-<p>每次触发这个语句，多次后就会构成一个关联数组，如果tid()返回值在foo索引中已有一个，则用新值代替旧值。</p>
-
-<h6>读取数组值：</h6>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>delta = gettimeofday_s() - foo[tid()]</span></code></pre></td></tr></table></div></figure>
-
-
-<p>如果无法找到指定”索引”对应的值，则数组读返回0(int)或null/empty值(string)</p>
-
-<h6>增加关联数组值</h6>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>array_name[index_expression] ++</span></code></pre></td></tr></table></div></figure>
-
-
-<p>处理数组的多个成员：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>global reads
-</span><span class='line'>probe vfs.read
-</span><span class='line'>{
-</span><span class='line'>&#9;reads[execname()] ++
-</span><span class='line'>}
+</span><span class='line'>&#9;// 慢启动和拥塞控制 Slow start and congestion control (see also Nagle, and Karn & Partridge)
+</span><span class='line'>&#9;__u32 snd_ssthresh;   // 拥塞控制时的慢启动门限 /* Slow start size threshold */
+</span><span class='line'>&#9;__u32 snd_cwnd;       // 当前采用的拥塞窗口 /* Sending congestion window */
+</span><span class='line'>&#9;__u16 snd_cwnd_cnt;   // 线形增加的拥塞窗口计数器 /* Linear increase counter */
+</span><span class='line'>&#9;__u16 snd_cwnd_clamp; // 拥塞窗口的最大值（一般为对方通告的窗口大小） /* Do not allow snd_cwnd to grow above this */
+</span><span class='line'>&#9;__u32 snd_cwnd_used;  // 慢启动，每发出去一个包，snd_cwnd_used++
+</span><span class='line'>&#9;__u32 snd_cwnd_stamp; // 该参数可以保证在重传模式下不会改变拥塞窗口的大小 */
 </span><span class='line'>
-</span><span class='line'>probe timer.s(3)
-</span><span class='line'>{
-</span><span class='line'>&#9;foreach (count in reads)
-</span><span class='line'>&#9;printf("%s : %d /n", count, reads[count])
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>这个foreach无序打印所有reads数组值，如果想升序/降序，则需要使用升序(+)、降序(-)，也可以限制处理的数组数目：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>probe timer.s(3)
-</span><span class='line'>{
-</span><span class='line'>&#9;foreach (count in reads- limit 10)
-</span><span class='line'>&#9;printf("%s : %d /n", count, reads[count])
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>Clearing/Deleting数组和数组成员</h5>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>global reads
-</span><span class='line'>probe vfs.read
-</span><span class='line'>{
-</span><span class='line'>&#9;reads[execname()] ++
-</span><span class='line'>}
+</span><span class='line'>&#9;/* 重传定时器和延时确认定时器 Two commonly used timers in both sender and receiver paths. */
+</span><span class='line'>&#9;unsigned long timeout;// 用于重传
+</span><span class='line'>&#9;struct timer_list retransmit_timer;     /* Resend (no ack) */
+</span><span class='line'>&#9;struct timer_list delack_timer;         /* Ack delay */
+</span><span class='line'>&#9;struct sk_buff_head out_of_order_queue; // 乱序的TCP报都存放在该队列中 /* Out of order segments go here */
 </span><span class='line'>
-</span><span class='line'>probe timer.s(3)
-</span><span class='line'>{
-</span><span class='line'>&#9;foreach (count in reads)
-</span><span class='line'>&#9;printf("%s : %d /n", count, reads[count])
+</span><span class='line'>&#9;struct tcp_func *af_specific;           // ipv4/ipv6 相关特定处理函数 /* Operations which are AF_INET{4,6} specific */
+</span><span class='line'>&#9;struct tcp_func ipv4_specific = {
+</span><span class='line'>&#9;&#9;ip_queue_xmit,
+</span><span class='line'>&#9;&#9;tcp_v4_send_check,
+</span><span class='line'>&#9;&#9;tcp_v4_rebuild_header,
+</span><span class='line'>&#9;&#9;tcp_v4_conn_request,
+</span><span class='line'>&#9;&#9;tcp_v4_syn_recv_sock,
+</span><span class='line'>&#9;&#9;tcp_v4_remember_stamp,
+</span><span class='line'>&#9;&#9;sizeof(struct iphdr),
 </span><span class='line'>
-</span><span class='line'>&#9;delete reads
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>使用delete操作来删除数组成员或整个数组。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>global reads, totalreads
-</span><span class='line'>probe vfs.read
-</span><span class='line'>{
-</span><span class='line'>&#9;reads[execname()] ++
-</span><span class='line'>&#9;totalreads[execname()] ++
-</span><span class='line'>}
+</span><span class='line'>&#9;&#9;ip_setsockopt,
+</span><span class='line'>&#9;&#9;ip_getsockopt,
+</span><span class='line'>&#9;&#9;v4_addr2sockaddr,
+</span><span class='line'>&#9;&#9;sizeof(struct sockaddr_in)
+</span><span class='line'>&#9;};
+</span><span class='line'>&#9;struct sk_buff *send_head;  // 最先要发送的TCP报文 /* Front of stuff to transmit */
+</span><span class='line'>&#9;struct page *sndmsg_page;   // sendmsg所使用的缓冲内存页面 /* Cached page for sendmsg */
+</span><span class='line'>&#9;u32 sndmsg_off;             // sendmsg所使用的缓冲偏移 /* Cached offset for sendmsg */
 </span><span class='line'>
-</span><span class='line'>probe timer.s(3)
-</span><span class='line'>{
-</span><span class='line'>&#9;printf("=======/n")
-</span><span class='line'>&#9;foreach (count in reads-)
-</span><span class='line'>&#9;&#9;printf("%s : %d /n", count, reads[count])
-</span><span class='line'>&#9;delete reads
-</span><span class='line'>}
+</span><span class='line'>&#9;__u32 rcv_wnd;              // 当前接受窗口 /* Current receiver window */
+</span><span class='line'>&#9;__u32 rcv_wup;              // 对方窗口最后一次更新时的rcv_nxt /* rcv_nxt on last window update sent */
+</span><span class='line'>&#9;__u32 write_seq;            // tcp发送总数据字节量+1 /* Tail(+1) of data held in tcp send buffer */
+</span><span class='line'>&#9;__u32 pushed_seq;           // 上次发送带PSH标志的TCP包的seq /* Last pushed seq, required to talk to windows */
+</span><span class='line'>&#9;__u32 copied_seq;           // 尚未读取的数据第一个字节位置 /* Head of yet unread data */
 </span><span class='line'>
-</span><span class='line'>probe end
-</span><span class='line'>{
-</span><span class='line'>&#9;printf("TOTALS/n")
-</span><span class='line'>&#9;foreach (total in totalreads-)
-</span><span class='line'>&#9;printf("%s : %d /n", total, totalreads[total])
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>在if语句中使用数组：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>global reads
-</span><span class='line'>probe vfs.read
-</span><span class='line'>{
-</span><span class='line'>&#9;reads[execname()] ++
-</span><span class='line'>}
+</span><span class='line'>&#9;// Options received (usually on last packet, some only on SYN packets).
+</span><span class='line'>&#9;char tstamp_ok,        /* syn包上的时间戳 TIMESTAMP seen on SYN packet */
+</span><span class='line'>&#9;wscale_ok,             /* SACK选项处理Kind=5不再详细叙说 Wscale seen on SYN packet */
+</span><span class='line'>&#9;sack_ok;               /* SACK选项处理Kind=5不再详细叙说 SACK seen on SYN packet */
+</span><span class='line'>&#9;char saw_tstamp;       /* 最后一个TCP包的时间戳 Saw TIMESTAMP on last packet */
+</span><span class='line'>&#9;__u8 snd_wscale;       /* 接受窗口扩大因子 Window scaling received from sender */
+</span><span class='line'>&#9;__u8 rcv_wscale;       /* 发送窗口扩大因子 Window scaling to send to receiver */
+</span><span class='line'>&#9;__u8 nonagle;          /* 是否允许Nagle算法 Disable Nagle algorithm? */
+</span><span class='line'>&#9;__u8 keepalive_probes; /* 保活探测的数量 num of allowed keep alive probes */
 </span><span class='line'>
-</span><span class='line'>probe timer.s(3)
-</span><span class='line'>{
-</span><span class='line'>&#9;printf("=======/n")
-</span><span class='line'>&#9;foreach (count in reads-)
-</span><span class='line'>&#9;if (reads[count] &gt;= 1024)
-</span><span class='line'>&#9;&#9;printf("%s : %dkB /n", count, reads[count]/1024)
-</span><span class='line'>&#9;else
-</span><span class='line'>&#9;&#9;printf("%s : %dB /n", count, reads[count])
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>检查成员</h5>
-
-<p>可以检查是否一个指定健是数组键值：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if([index_expression] in array_name) statement</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>global reads
-</span><span class='line'>probe vfs.read
-</span><span class='line'>{
-</span><span class='line'>&#9;reads[execname()] ++
-</span><span class='line'>}
+</span><span class='line'>&#9;/* PAWS：防止回绕的序号，不再详细叙说 PAWS/RTTM data */
+</span><span class='line'>&#9;__u32 rcv_tsval;       /* Time stamp value */
+</span><span class='line'>&#9;__u32 rcv_tsecr;       /* Time stamp echo reply */
+</span><span class='line'>&#9;__u32 ts_recent;       /* Time stamp to echo next */
+</span><span class='line'>&#9;long ts_recent_stamp;  /* Time we stored ts_recent (for aging) */
 </span><span class='line'>
-</span><span class='line'>probe timer.s(3)
-</span><span class='line'>{
-</span><span class='line'>&#9;printf("=======/n")
-</span><span class='line'>&#9;foreach (count in reads+)
-</span><span class='line'>&#9;&#9;printf("%s : %d /n", count, reads[count])
-</span><span class='line'>&#9;if(["stapio"] in reads) {
-</span><span class='line'>&#9;&#9;printf("stapio read detected, exiting/n")
-</span><span class='line'>&#9;&#9;exit()
-</span><span class='line'>&#9;}
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>计算统计集合</h5>
-
-<p>统计集合用于收集数值的统计信息，用于计算新值</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>global reads
-</span><span class='line'>probe vfs.read
-</span><span class='line'>{
-</span><span class='line'>&#9;reads[execname()] &lt;&lt;&lt; count
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>操作符&lt;&lt;&lt;用于将count返回的值存放在read数组中execname()相关的值中，即一个键值关联多个相关值。</p>
-
-<p>为计算统计信息，使用@extractor(variable/array index expression)，extractor可以是如下integer extractor：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>count：@count(writes[execname()])返回存放在writes数组中某单一键值对应的值数目；
-</span><span class='line'>sum：@sum(writes[execname()])返回在writes数组中某单一键值对应的值的和
-</span><span class='line'>min：最小值
-</span><span class='line'>max：最大值
-</span><span class='line'>avg：variable/array作为索引的统计集合中数据的平均值</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>global reads
-</span><span class='line'>probe vfs.read
-</span><span class='line'>{
-</span><span class='line'>&#9;reads[execname(),pid()] &lt;&lt;&lt; 1
-</span><span class='line'>}
+</span><span class='line'>&#9;/* SACK选项处理Kind=5不再详细叙说 SACKs data1 */
+</span><span class='line'>&#9;__u16 user_mss;        /* 用户通过ioctl指定的mssmss requested by user in ioctl */
+</span><span class='line'>&#9;__u8 dsack;            /* D-SACK is scheduled */
+</span><span class='line'>&#9;__u8 eff_sacks;        /* Size of SACK array to send with next packet */
+</span><span class='line'>&#9;struct tcp_sack_block duplicate_sack[1]; /* D-SACK block */
+</span><span class='line'>&#9;struct tcp_sack_block selective_acks[4]; /* The SACKS themselves*/
 </span><span class='line'>
-</span><span class='line'>probe timer.s(3)
-</span><span class='line'>{
-</span><span class='line'>&#9;foreach([var1,var2] in reads)
-</span><span class='line'>&#9;printf("%s (%d) : %d /n", var1, var2, @count(reads[var1,var2]))
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+</span><span class='line'>&#9;/* 通告窗口(advertised window，tp-&gt;tcv_wnd)，window_clamp是最大的通告窗口，说白了就是
+</span><span class='line'>&#9;应用程序的缓冲区真实大小。rcv_ssthresh是更为严格的window_clamp，主要用于慢启动期间
+</span><span class='line'>&#9;预测连接的行为 */
+</span><span class='line'>&#9;__u32 window_clamp;   /* Maximal window to advertise */
+</span><span class='line'>&#9;__u32 rcv_ssthresh;   /* Current window clamp */
+</span><span class='line'>
+</span><span class='line'>&#9;__u8 probes_out;      /* 用于零窗口探测 unanswered 0 window probes */
+</span><span class='line'>&#9;__u8 num_sacks;       /* Number of SACK blocks */
+</span><span class='line'>
+</span><span class='line'>&#9;__u8 syn_retries;     /* syn重试次数 num of allowed syn retries */
+</span><span class='line'>&#9;__u8 ecn_flags;       /* 显式拥塞通知状态位，不再详叙 ECN status bits. */
+</span><span class='line'>&#9;__u16 prior_ssthresh; /* 在经过重传后恢复时的ssthresh保存值 ssthresh saved at recovery start */
+</span><span class='line'>
+</span><span class='line'>&#9;/* SACK选项处理Kind=5不再详细叙说 SACKs data2 */
+</span><span class='line'>&#9;__u32 lost_out;       /* Lost packets */
+</span><span class='line'>&#9;__u32 sacked_out;     /* SACK'd packets */
+</span><span class='line'>&#9;__u32 fackets_out;    /* FACK'd packets */
+</span><span class='line'>&#9;__u32 high_seq;       /* snd_nxt at onset of congestion */
+</span><span class='line'>
+</span><span class='line'>&#9;__u32 retrans_stamp;  // 上次重传的时间，其也会记住第一个syn的时间戳
+</span><span class='line'>&#9;__u32 undo_marker;    /* 开始跟踪重传的标示符 tracking retrans started here. */
+</span><span class='line'>&#9;int undo_retrans;     /* 用于Undo冗余的重传 number of undoable retransmissions. */
+</span><span class='line'>&#9;__u32 urg_seq;        /* 紧急指针的seq Seq of received urgent pointer */
+</span><span class='line'>&#9;__u16 urg_data;       /* 紧急指针的相关控制标志保存 Saved octet of OOB data and control flags */
+</span><span class='line'>&#9;__u8 pending;         /* 确定定时器的事件 Scheduled timer event，包括如下四种情况 */
+</span><span class='line'>&#9;#define TCP_TIME_RETRANS 1  /* Retransmit timer */
+</span><span class='line'>&#9;#define TCP_TIME_DACK 2     /* Delayed ack timer */
+</span><span class='line'>&#9;#define TCP_TIME_PROBE0 3   /* Zero window probe timer */
+</span><span class='line'>&#9;#define TCP_TIME_KEEPOPEN 4 /* Keepalive timer */
+</span><span class='line'>
+</span><span class='line'>&#9;__u8 urg_mode;        /* 是否处于紧急模式 In urgent mode */
+</span><span class='line'>&#9;__u32 snd_up;         /* 紧急指针位置 Urgent pointer */
+</span><span class='line'>
+</span><span class='line'>&#9;/* The syn_wait_lock is necessary only to avoid tcp_get_info having to grab the main lock sock while browsing the listening hash
+</span><span class='line'>&#9; * (otherwise it's deadlock prone). This lock is acquired in read mode only from tcp_get_info() and it's acquired in write mode _only_ from
+</span><span class='line'>&#9; * code that is actively changing the syn_wait_queue. All readers that are holding the master sock lock don't need to grab this lock in read
+</span><span class='line'>&#9; * mode too as the syn_wait_queue writes are always protected from the main sock lock.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;rwlock_t syn_wait_lock;
+</span><span class='line'>&#9;struct tcp_listen_opt *listen_opt;
+</span><span class='line'>
+</span><span class='line'>&#9;/* 服务器段listening socket的已经建立的子socket FIFO队列 FIFO of established children */
+</span><span class='line'>&#9;struct open_request *accept_queue;
+</span><span class='line'>&#9;struct open_request *accept_queue_tail;
+</span><span class='line'>
+</span><span class='line'>&#9;int write_pending;             /* 是否有对socket的写请求 A write to socket waits to start. */
+</span><span class='line'>&#9;unsigned int keepalive_time;   /* 保活定时器启动的时间阀值 time before keep alive takes place */
+</span><span class='line'>&#9;unsigned int keepalive_intvl;  /* 保活探测时间间隔 time interval between keep alive probes */
+</span><span class='line'>&#9;int linger2;                   // lingertime一起，指明了close()后保留的时间
+</span><span class='line'>&#9;int frto_counter;              /* 开始重传后的新的ack数目 Number of new acks after RTO */
+</span><span class='line'>&#9;__u32 frto_highmark;           /* 重传发生时的要发送的下一个tcp包的seq snd_nxt when RTO occurred */
+</span><span class='line'>
+</span><span class='line'>&#9;unsigned long last_synq_overflow; // 用于syn_cookie处理
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
 
 
-<h4>Tapsets</h4>
+<p>/*
+附录1：
+The first option we&rsquo;ll consider is TCP_DEFER_ACCEPT. (This is what it&rsquo;s called in Linux; other OSs offer the same option but use different names.)
+To understand the idea of the TCP_DEFER_ACCEPT option, it is necessary to picture a typical process of the HTTP client-server interaction. Consider
+how the TCP establishes a connection with the goal of transferring data. On a network, information travels in discrete units called IP packets (or IP
+datagrams). A packet always has a header that carries service information, used for internal protocol handling, and it may also carry payload data. A
+typical example of service information is a set of so-called flags, which mark the packets as having special meaning to a TCP/IP stack, such as
+acknowledgement of successful packet receiving. Often, it&rsquo;s possible to carry payload in the “marked” packet, but sometimes, internal logic forces a
+TCP/IP stack to send out packets with just a header. These packets often introduce unwanted delays and increased overhead and result in overall
+performance degradation.</p>
 
-<p>Tapsets是脚本库，里面预写好了probes和functions可以被SystemTap脚本调用，tapsets也使用.stp作为后缀，默认位于：/usr/share/systemtap/tapset，但无法直接运行。</p>
+<p>The server has now created a socket and is waiting for a connection. The connection procedure in TCP/IP is a so-called “three-way handshake.” First,
+a client sends a TCP packet with a SYN flag set and no payload (a SYN packet). The server replies by sending a packet with SYN/ACK flags set (a
+SYN/ACK packet) to acknowledge receipt of the initial packet. The client then sends an ACK packet to acknowledge receipt of the second packet and to
+finalize the connection procedure. After receiving the SYN/ACK, the packet server wakes up a receiver process while waiting for data. When the three-way
+handshake is completed, the client starts to send “useful” data to be transferred to the server. Usually, an HTTP request is quite small and fits into a single
+packet. But in this case, at least four packets will be sent in both directions, adding considerable delay times. Note also that the receiver has already been
+waiting for the information—since before the data was ever sent.</p>
+
+<p>To alleviate these problems, Linux (along with some other OSs) includes a TCP_DEFER_ACCEPT option in its TCP implementation. Set on a server-side
+listening socket, it instructs the kernel not to wait for the final ACK packet and not to initiate the process until the first packet of real data has arrived. After
+sending the SYN/ACK, the server will then wait for a data packet from a client. Now, only three packets will be sent over the network, and the connection
+establishment delay will be significantly reduced, which is typical for HTTP.</p>
+
+<p>This feature, called an “accept filter” , is used in different ways, although in all cases, the effect is the same as TCP_DEFER_ACCEPT—the server
+will not wait for the final ACK packet, waiting only for a packet carrying a payload. More information about this option and its significance for a high-performance
+Web server is available in the Apache documentation.
+*/</p>
 </div>
   
   
@@ -1479,7 +2215,7 @@ vfs.file_operation和vfs.file_operation.return</p>
   
     <section>
 <h1>Categories
-<span class='right_span'>(943)</span>
+<span class='right_span'>(959)</span>
 
 </h1>
 <head>
@@ -1487,6 +2223,12 @@ vfs.file_operation和vfs.file_operation.return</p>
 <body>
 <div id="menu">
 <ul>
+<li class='catclass'><a href='/blog/cats/medicine/'>medicine</a><a href='##' onmousedown=showDiv('medicine') id='aexp_medicine'><span class='exp_style' id='exp_medicine'>[+]</span></a><span class='right_span'>(4)</span></li>
+<div id='medicine' class='catsub'><li><a href='/blog/cats/medicine~mimic/?opendiv=medicine'>mimic</a><a href='##' onmousedown=showDiv('medicine~mimic') id='aexp_medicine~mimic'><span class='exp_style' id='exp_medicine~mimic'>[+]</span></a><span class='right_span'>4</span></li>
+</div><script language='javascript' type='text/javascript'>
+if (!document.getElementById('medicine')) document.getElementById('aexp_medicine').style.visibility = 'hidden';
+if (!document.getElementById('medicine~mimic')) document.getElementById('aexp_medicine~mimic').style.visibility = 'hidden';
+</script>
 <li class='catclass'><a href='/blog/cats/blog/'>blog</a><a href='##' onmousedown=showDiv('blog') id='aexp_blog'><span class='exp_style' id='exp_blog'>[+]</span></a><span class='right_span'>(13)</span></li>
 <div id='blog' class='catsub'><li><a href='/blog/cats/blog~hello/?opendiv=blog'>hello</a><a href='##' onmousedown=showDiv('blog~hello') id='aexp_blog~hello'><span class='exp_style' id='exp_blog~hello'>[+]</span></a><span class='right_span'>1</span></li>
 <div id='blog~hello' class='catsub2'><li><a href='/blog/cats/blog~hello~hi/?opendiv=blog~hello'>hi</a><span class='right_span'>1</span></li>
@@ -1510,7 +2252,7 @@ if (!document.getElementById('blog~octopress')) document.getElementById('aexp_bl
 if (!document.getElementById('blog')) document.getElementById('aexp_blog').style.visibility = 'hidden';
 if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ruby').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(161)</span></li>
+<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(168)</span></li>
 <div id='language' class='catsub'><li><a href='/blog/cats/language~c/?opendiv=language'>c</a><a href='##' onmousedown=showDiv('language~c') id='aexp_language~c'><span class='exp_style' id='exp_language~c'>[+]</span></a><span class='right_span'>33</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~c')) document.getElementById('aexp_language~c').style.visibility = 'hidden';
@@ -1535,7 +2277,7 @@ if (!document.getElementById('language~php')) document.getElementById('aexp_lang
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~python')) document.getElementById('aexp_language~python').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/language~web/?opendiv=language'>web</a><a href='##' onmousedown=showDiv('language~web') id='aexp_language~web'><span class='exp_style' id='exp_language~web'>[+]</span></a><span class='right_span'>54</span></li>
+<li><a href='/blog/cats/language~web/?opendiv=language'>web</a><a href='##' onmousedown=showDiv('language~web') id='aexp_language~web'><span class='exp_style' id='exp_language~web'>[+]</span></a><span class='right_span'>61</span></li>
 </div><script language='javascript' type='text/javascript'>
 if (!document.getElementById('language')) document.getElementById('aexp_language').style.visibility = 'hidden';
 if (!document.getElementById('language~web')) document.getElementById('aexp_language~web').style.visibility = 'hidden';
@@ -1674,8 +2416,8 @@ if (!document.getElementById('tools~vim')) document.getElementById('aexp_tools~v
 if (!document.getElementById('tools')) document.getElementById('aexp_tools').style.visibility = 'hidden';
 if (!document.getElementById('tools~wxwork')) document.getElementById('aexp_tools~wxwork').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/system/'>system</a><a href='##' onmousedown=showDiv('system') id='aexp_system'><span class='exp_style' id='exp_system'>[+]</span></a><span class='right_span'>(121)</span></li>
-<div id='system' class='catsub'><li><a href='/blog/cats/system~base/?opendiv=system'>base</a><a href='##' onmousedown=showDiv('system~base') id='aexp_system~base'><span class='exp_style' id='exp_system~base'>[+]</span></a><span class='right_span'>31</span></li>
+<li class='catclass'><a href='/blog/cats/system/'>system</a><a href='##' onmousedown=showDiv('system') id='aexp_system'><span class='exp_style' id='exp_system'>[+]</span></a><span class='right_span'>(126)</span></li>
+<div id='system' class='catsub'><li><a href='/blog/cats/system~base/?opendiv=system'>base</a><a href='##' onmousedown=showDiv('system~base') id='aexp_system~base'><span class='exp_style' id='exp_system~base'>[+]</span></a><span class='right_span'>36</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('system~base')) document.getElementById('aexp_system~base').style.visibility = 'hidden';
 </script>
@@ -1913,7 +2655,7 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 
 <section>
 <h1>Date Categories
-<span class='right_span'>(943)</span>
+<span class='right_span'>(959)</span>
 
 </h1>
 <head>
@@ -1921,8 +2663,9 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(63)</span></li>
-<div id='2024' class='catsub'><li><a href='/blog/cats/2024~08/?opendiv=2024'>2024-08</a><span class='right_span'>14</span></li>
+<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(79)</span></li>
+<div id='2024' class='catsub'><li><a href='/blog/cats/2024~09/?opendiv=2024'>2024-09</a><span class='right_span'>12</span></li>
+<li><a href='/blog/cats/2024~08/?opendiv=2024'>2024-08</a><span class='right_span'>18</span></li>
 <li><a href='/blog/cats/2024~07/?opendiv=2024'>2024-07</a><span class='right_span'>26</span></li>
 <li><a href='/blog/cats/2024~06/?opendiv=2024'>2024-06</a><span class='right_span'>2</span></li>
 <li><a href='/blog/cats/2024~05/?opendiv=2024'>2024-05</a><span class='right_span'>5</span></li>
@@ -2092,43 +2835,43 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
   <ul id="recent_posts">
     
       <li class="post">
-        <a href="/blog/2024/08/15/lang-web-js-copy/">禁止网页内容复制另存为</a>
+        <a href="/blog/2024/09/14/lang-web-ding/">钉钉开放平台API</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/08/15/lang-web-iframe/">iframe网页嵌套</a>
+        <a href="/blog/2024/09/14/lang-web-staticmap/">腾讯地图--静态地图API</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/08/15/lang-web-auto-textarea/">textarea自动调整高宽</a>
+        <a href="/blog/2024/09/14/lang-web-js-screen-on/">JS 保持屏幕常亮</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/08/09/ntpd-log/">NTP log 记录每次发包</a>
+        <a href="/blog/2024/09/14/lang-web-js-date/">JS 获取当前的日期和时间</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/08/09/ntpd/">NTP服务配置</a>
+        <a href="/blog/2024/09/14/lang-web-js-dist/">GPS 两点距离</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/08/09/lang-date/">unix时间戳, excel date, 儒略日julian date</a>
+        <a href="/blog/2024/09/14/lang-web-js-position/">JS获取当前地理位置</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/08/09/lang-web-times/">&amp;times被替换成x</a>
+        <a href="/blog/2024/09/14/lang-web-js-work/">前端缓存之：Service Worker</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/08/09/lang-c-localtime/">localtime函数</a>
+        <a href="/blog/2024/09/14/mimiciv3.0/">MIMIC IV 3.0数据库</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/08/02/ups-webpower/">山特UPS NMC卡 USHA卡</a>
+        <a href="/blog/2024/09/14/mimiciii1.4-show/">MIMIC III v1.4 数据简介</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/08/01/lang-web-holiday/">节假日 API</a>
+        <a href="/blog/2024/09/14/mimiciii1.4/">MIMIC III v1.4 数据入库</a>
       </li>
     
   </ul>

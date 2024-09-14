@@ -7,13 +7,13 @@ function showDiv(divname)
 
 	var text = document.getElementById("exp_"+divname).innerHTML;
 	if (text == "[+]")
-		document.getElementById("exp_"+divname).innerHTML = "[-]";
-	else if (text == "[-]")
+		document.getElementById("exp_"+divname).innerHTML = "[=]";
+	else if (text == "[=]")
 		document.getElementById("exp_"+divname).innerHTML = "[+]";
 	else if (text.charAt(0) == '+') {
-		document.getElementById("exp_"+divname).innerHTML = text.replace('+', '-');
-	} else if (text.charAt(0) == '-') {
-		document.getElementById("exp_"+divname).innerHTML = text.replace('-', '+');
+		document.getElementById("exp_"+divname).innerHTML = text.replace('+', '=');
+	} else if (text.charAt(0) == '=') {
+		document.getElementById("exp_"+divname).innerHTML = text.replace('=', '+');
 	}
 }
 function GetRequest(name) {

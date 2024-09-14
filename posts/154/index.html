@@ -131,7 +131,7 @@ var ss360Config = {
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2017/07/23/kernel-clock-5/">Linux时间子系统之五：低分辨率定时器的原理和实现</a></h2>
+      <h2 class="entry-title"><a href="/blog/2018/02/04/mem-mb/">内存屏障</a></h2>
     
     
       <p class="meta">
@@ -140,20 +140,80 @@ var ss360Config = {
 
 
 
-<time class='entry-date' datetime='2017-07-23T16:38:00+08:00'><span class='date'>2017-07-23</span> <span class='time'>16:38:00</span></time>
+<time class='entry-date' datetime='2018-02-04T00:10:00+08:00'><span class='date'>2018-02-04</span> <span class='time'>00:10:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><p><a href="http://blog.csdn.net/DroidPhone/article/details/8051405">http://blog.csdn.net/DroidPhone/article/details/8051405</a></p>
+  <div class="entry-content"><p><a href="https://www.cnblogs.com/icanth/archive/2012/06/10/2544300.html">https://www.cnblogs.com/icanth/archive/2012/06/10/2544300.html</a></p>
 
-<p>利用定时器，我们可以设定在未来的某一时刻，触发一个特定的事件。所谓低分辨率定时器，是指这种定时器的计时单位基于jiffies值的计数，也就是说，它的精度只有1/HZ，假如你的内核配置的HZ是1000，那意味着系统中的低分辨率定时器的精度就是1ms。早期的内核版本中，内核并不支持高精度定时器，理所当然只能使用这种低分辨率定时器，我们有时候把这种基于HZ的定时器机制成为时间轮：time wheel。虽然后来出现了高分辨率定时器，但它只是内核的一个可选配置项，所以直到目前最新的内核版本，这种低分辨率定时器依然被大量地使用着。</p>
+<h3>内存屏障(Memory Barriers)</h3>
 
-<h4>1. 定时器的使用方法</h4>
+<p>一方面，CPU由于采用指令流水线和超流水线技术，可能导致CPU虽然顺序取指令、但有可能会出现“乱序”执行的情况，当然，对于” a++；b = f(a)；c = f”等存在依赖关系的指令，CPU则会在“b= f(a)”执行阶段之前被阻塞；另一方面，编译器也有可能将依赖关系很近“人为地”拉开距离以防止阻塞情况的发生，从而导致编译器乱序，如“a++ ；c = f；b = f(a)”。</p>
 
-<p>在讨论定时器的实现原理之前，我们先看看如何使用定时器。要在内核编程中使用定时器，首先我们要定义一个time_list结构，该结构在include/Linux/timer.h中定义：</p>
+<p>一个CPU对指令顺序提供如下保证：</p>
+
+<p>(1) On any given CPU, dependent memory accesses will be issued in order, with respect to itself.如Q = P; D = *Q;将保证其顺序执行</p>
+
+<p>(2) Overlapping loads and stores within a particular CPU will appear to be ordered within that CPU.重叠的Load和Store操作将保证顺序执行（目标地址相同的Load、Store），如：a = <em>X; </em>X = b;</p>
+
+<p>(3) It <em>must_not</em> be assumed that independent loads and stores will be issued in the order given.</p>
+
+<p>(4) It <em>must</em> be assumed that overlapping memory accesses may be merged or discarded.如<em>A = X; Y = </em>A; => STORE <em>A = X; Y = LOAD </em>A; / or STORE *A = Y = X;</p>
+
+<p>由此可见，无关的内存操作会被按随机顺序有效的得到执行,但是在CPU与CPU交互时或CPU与IO设备交互时, 这可能会成为问题. 我们需要一些手段来干预编译器和CPU, 使其限制指令顺序。内存屏障就是这样的干预手段. 他们能保证处于内存屏障两边的内存操作满足部分有序.(译注: 这里"部分有序"的意思是, 内存屏障之前的操作都会先于屏障之后的操作, 但是如果几个操作出现在屏障的同一边, 则不保证它们的顺序.)</p>
+
+<p>(1) 写(STORE)内存屏障。在写屏障之前的STORE操作将先于所有在写屏障之后的STORE操作。</p>
+
+<p>(2) 数据依赖屏障。两条Load指令，第二条Load指令依赖于第一条Load指令的结果，则数据依赖屏障保障第二条指令的目标地址将被更新。</p>
+
+<p>(3) 读(LOAD)内存屏障。读屏障包含数据依赖屏障的功能, 并且保证所有出现在屏障之前的LOAD操作都将先于所有出现在屏障之后的LOAD操作被系统中的其他组件所感知.</p>
+
+<p>(4) 通用内存屏障. 通用内存屏障保证所有出现在屏障之前的LOAD和STORE操作都将先于所有出现在屏障之后的LOAD和STORE操作被系统中的其他组件所感知.</p>
+
+<p>(5) LOCK操作.它的作用相当于一个单向渗透屏障.它保证所有出现在LOCK之后的内存操作都将在LOCK操作被系统中的其他组件所感知之后才能发生. 出现在LOCK之前的内存操作可能在LOCK完成之后才发生.LOCK操作总是跟UNLOCK操作配对出现.</p>
+
+<p>(6) UNLOCK操作。它保证所有出现在UNLOCK之前的内存操作都将在UNLOCK操作被系统中的其他组件所感知之前发生.</p>
+
+<p>LINUX对于x86而言，在为UP体系统架构下，调用barrier()进行通用内存屏障。在SMP体系架构下，若为64位CPU或支持mfence、lfence、sfence指令的32位CPU，则smp_mb()、smp_rmb()、smp_smb()对应通用内存屏障、写屏障和读屏障；而不支持mfence、lfence、sfence指令的32位CPU则smp_mb()、smp_rmb()、smp_smb()对应LOCK操作。源码请参见《内存屏障源码分析》一节。</p>
+
+<h4>内存屏障源码分析</h4>
+
+<p>/include/asm-generic/system.h：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>053 #ifdef CONFIG_SMP
+</span><span class='line'>054 #define smp_mb()        mb()
+</span><span class='line'>055 #define smp_rmb()       rmb()
+</span><span class='line'>056 #define smp_wmb()       wmb()
+</span><span class='line'>057 #else
+</span><span class='line'>058 #define smp_mb()        barrier()
+</span><span class='line'>059 #define smp_rmb()       barrier()
+</span><span class='line'>060 #define smp_wmb()       barrier()
+</span><span class='line'>061 #endif</span></code></pre></td></tr></table></div></figure>
+
+
+<p>在x86 UP体系架构中，smp_mb、smp_rmb、smp_wmb被翻译成barrier：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>012 #define barrier() __asm__ __volatile__("": : :"memory")</span></code></pre></td></tr></table></div></figure>
+
+
+<p><code>__volatile</code>告诉编译器此条语句不进行任何优化，"&ldquo;: : :"memory&rdquo; 内存单元已被修改、需要重新读入。</p>
+
+<p>在x86 SMP体系架构中，smp_mb、smp_rmb、smp_wmb如下定义：</p>
+
+<p>/arch/x86/include/asm/system.h：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -173,113 +233,86 @@ var ss360Config = {
 <span class='line-number'>16</span>
 <span class='line-number'>17</span>
 <span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct timer_list {
-</span><span class='line'>&#9;/* 
-</span><span class='line'>&#9; * All fields that change during normal runtime grouped to the 
-</span><span class='line'>&#9; * same cacheline 
-</span><span class='line'>&#9; */
-</span><span class='line'>&#9;struct list_head entry;
-</span><span class='line'>&#9;unsigned long expires;
-</span><span class='line'>&#9;struct tvec_base *base;
-</span><span class='line'>
-</span><span class='line'>&#9;void (*function)(unsigned long);
-</span><span class='line'>&#9;unsigned long data;
-</span><span class='line'>
-</span><span class='line'>&#9;int slack;
-</span><span class='line'>&#9;&#9;......
-</span><span class='line'>};
-</span><span class='line'>
-</span><span class='line'>entry  字段用于把一组定时器组成一个链表，至于内核如何对定时器进行分组，我们会在后面进行解释。
-</span><span class='line'>
-</span><span class='line'>expires  字段指出了该定时器的到期时刻，也就是期望定时器到期时刻的jiffies计数值。
-</span><span class='line'>
-</span><span class='line'>base  每个cpu拥有一个自己的用于管理定时器的tvec_base结构，该字段指向该定时器所属的cpu所对应tvec_base结构。
-</span><span class='line'>
-</span><span class='line'>function  字段是一个函数指针，定时器到期时，系统将会调用该回调函数，用于响应该定时器的到期事件。
-</span><span class='line'>
-</span><span class='line'>data  该字段用于上述回调函数的参数。
-</span><span class='line'>
-</span><span class='line'>slack  对有些对到期时间精度不太敏感的定时器，到期时刻允许适当地延迟一小段时间，该字段用于计算每次延迟的HZ数。</span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>352 /*
+</span><span class='line'>353  * Force strict CPU ordering.
+</span><span class='line'>354  * And yes, this is required on UP too when we're talking
+</span><span class='line'>355  * to devices.
+</span><span class='line'>356  */
+</span><span class='line'>357 #ifdef CONFIG_X86_32
+</span><span class='line'>358 /*
+</span><span class='line'>359  * Some non-Intel clones support out of order store. wmb() ceases to be a
+</span><span class='line'>360  * nop for these.
+</span><span class='line'>361  */
+</span><span class='line'>362 #define mb() alternative("lock; addl $0,0(%%esp)", "mfence", X86_FEATURE_XMM2)
+</span><span class='line'>363 #define rmb() alternative("lock; addl $0,0(%%esp)", "lfence", X86_FEATURE_XMM2)
+</span><span class='line'>364 #define wmb() alternative("lock; addl $0,0(%%esp)", "sfence", X86_FEATURE_XMM)
+</span><span class='line'>365 #else
+</span><span class='line'>366 #define mb()    asm volatile("mfence":::"memory")
+</span><span class='line'>367 #define rmb()   asm volatile("lfence":::"memory")
+</span><span class='line'>368 #define wmb()   asm volatile("sfence" ::: "memory")
+</span><span class='line'>369 #endif</span></code></pre></td></tr></table></div></figure>
 
 
-<p>要定义一个timer_list，我们可以使用静态和动态两种办法，静态方法使用DEFINE_TIMER宏：</p>
+<p>362~364行针对x86的32位CPU，366~368行针对x86的64位CPU。</p>
+
+<p>在x86的64位CPU中，mb()宏实际为：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#define DEFINE_TIMER(_name, _function, _expires, _data)</span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>asm volatile("sfence" ::: "memory")。</span></code></pre></td></tr></table></div></figure>
 
 
-<p>该宏将得到一个名字为<em>name，并分别用</em>function,<em>expires,</em>data参数填充timer_list的相关字段。</p>
+<p>volatile告诉编译器严禁在此处汇编语句与其它语句重组优化，memory强制编译器假设RAM所有内存单元均被汇编指令修改，"sfence" ::: 表示在此插入一条串行化汇编指令sfence。</p>
 
-<p>如果要使用动态的方法，则可以自己声明一个timer_list结构，然后手动初始化它的各个字段：</p>
+<p>mfence：串行化发生在mfence指令之前的读写操作</p>
 
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct timer_list timer;
-</span><span class='line'>......
-</span><span class='line'>init_timer(&timer);
-</span><span class='line'>timer.function = _function;
-</span><span class='line'>timer.expires = _expires;
-</span><span class='line'>timer.data = _data;</span></code></pre></td></tr></table></div></figure>
+<p>lfence：串行化发生在mfence指令之前的读操作、但不影响写操作</p>
 
+<p>sfence：串行化发生在mfence指令之前的写操作、但不影响读操作</p>
 
-<p>要激活一个定时器，我们只要调用add_timer即可：</p>
+<h4>在x86的32位CPU中，mb()宏实际为：</h4>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>add_timer(&timer);</span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>mb() alternative("lock; addl $0,0(%%esp)", "mfence", X86_FEATURE_XMM2)</span></code></pre></td></tr></table></div></figure>
 
 
-<p>要修改定时器的到期时间，我们只要调用mod_timer即可：</p>
+<p>由于x86的32位CPU有可能不提供mfence、lfence、sfence三条汇编指令的支持，故在不支持mfence的指令中使用："lock; addl $0,0(%%esp)&ldquo;, "mfence"。lock表示将“addl $0,0(%%esp)”语句作为内存屏障。</p>
 
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>mod_timer(&timer, jiffies+50);</span></code></pre></td></tr></table></div></figure>
+<p>关于lock的实现：cpu上有一根pin #HLOCK连到北桥,lock前缀会在执行这条指令前先去拉这根pin，持续到这个指令结束时放开#HLOCK pin，在这期间，北桥会屏蔽掉一切外设以及AGP的内存操作。也就保证了这条指令的atomic。</p>
 
+<h4>参考资料</h4>
 
-<p>要移除一个定时器，我们只要调用del_timer即可：</p>
+<p>《memroy-barries.txt》，/Documentation/memory-barriers.txt</p>
 
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>del_timer(&timer);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>定时器系统还提供了以下这些API供我们使用：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>void add_timer_on(struct timer_list *timer, int cpu);  // 在指定的cpu上添加定时器
-</span><span class='line'>int mod_timer_pending(struct timer_list *timer, unsigned long expires);  //  只有当timer已经处在激活状态时，才修改timer的到期时刻
-</span><span class='line'>int mod_timer_pinned(struct timer_list *timer, unsigned long expires);  //  当
-</span><span class='line'>void set_timer_slack(struct timer_list *time, int slack_hz);  //  设定timer允许的到期时刻的最大延迟，用于对精度不敏感的定时器
-</span><span class='line'>int del_timer_sync(struct timer_list *timer);  //  如果该timer正在被处理中，则等待timer处理完成才移除该timer</span></code></pre></td></tr></table></div></figure>
+<p>《LINUX内核内存屏障》，<a href="http://blog.csdn.net/ljl1603/article/details/6793982">http://blog.csdn.net/ljl1603/article/details/6793982</a></p>
+</div>
+  
+  
 
 
-<h4>2. 定时器的软件架构</h4>
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2018/02/03/kernel-net-synack/">SYN-ACK 重传</a></h2>
+    
+    
+      <p class="meta">
+        
 
-<p>低分辨率定时器是基于HZ来实现的，也就是说，每个tick周期，都有可能有定时器到期，关于tick如何产生，请参考：Linux时间子系统之四：定时器的引擎：clock_event_device。系统中有可能有成百上千个定时器，难道在每个tick中断中遍历一下所有的定时器，检查它们是否到期？内核当然不会使用这么笨的办法，它使用了一个更聪明的办法：按定时器的到期时间对定时器进行分组。因为目前的多核处理器使用越来越广泛，连智能手机的处理器动不动就是4核心，内核对多核处理器有较好的支持，低分辨率定时器在实现时也充分地考虑了多核处理器的支持和优化。为了较好地利用cache line，也为了避免cpu之间的互锁，内核为多核处理器中的每个cpu单独分配了管理定时器的相关数据结构和资源，每个cpu独立地管理属于自己的定时器。</p>
-
-<h5>2.1  定时器的分组</h5>
-
-<p>首先，内核为每个cpu定义了一个tvec_base结构指针：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static DEFINE_PER_CPU(struct tvec_base *, tvec_bases) = &boot_tvec_bases;</span></code></pre></td></tr></table></div></figure>
 
 
-<p>tvec_base结构的定义如下：</p>
+
+<time class='entry-date' datetime='2018-02-03T23:01:00+08:00'><span class='date'>2018-02-03</span> <span class='time'>23:01:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><h3>fastopen synack 重传</h3>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -289,161 +322,66 @@ var ss360Config = {
 <span class='line-number'>6</span>
 <span class='line-number'>7</span>
 <span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct tvec_base {
-</span><span class='line'>&#9;spinlock_t lock;
-</span><span class='line'>&#9;struct timer_list *running_timer;
-</span><span class='line'>&#9;unsigned long timer_jiffies;
-</span><span class='line'>&#9;unsigned long next_timer;
-</span><span class='line'>&#9;struct tvec_root tv1;
-</span><span class='line'>&#9;struct tvec tv2;
-</span><span class='line'>&#9;struct tvec tv3;
-</span><span class='line'>&#9;struct tvec tv4;
-</span><span class='line'>&#9;struct tvec tv5;
-</span><span class='line'>} ____cacheline_aligned;
-</span><span class='line'>
-</span><span class='line'>running_timer  该字段指向当前cpu正在处理的定时器所对应的timer_list结构。
-</span><span class='line'>
-</span><span class='line'>timer_jiffies  该字段表示当前cpu定时器所经历过的jiffies数，大多数情况下，该值和jiffies计数值相等，当cpu的idle状态连续持续了多个jiffies时间时，当退出idle状态时，jiffies计数值就会大于该字段，在接下来的tick中断后，定时器系统会让该字段的值追赶上jiffies值。
-</span><span class='line'>
-</span><span class='line'>next_timer  该字段指向该cpu下一个即将到期的定时器。
-</span><span class='line'>
-</span><span class='line'>tv1--tv5  这5个字段用于对定时器进行分组，实际上，tv1--tv5都是一个链表数组，其中tv1的数组大小为TVR_SIZE， tv2 tv3 tv4 tv5的数组大小为TVN_SIZE，根据CONFIG_BASE_SMALL配置项的不同，它们有不同的大小：</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#define TVN_BITS (CONFIG_BASE_SMALL ? 4 : 6)
-</span><span class='line'>#define TVR_BITS (CONFIG_BASE_SMALL ? 6 : 8)
-</span><span class='line'>#define TVN_SIZE (1 &lt;&lt; TVN_BITS)
-</span><span class='line'>#define TVR_SIZE (1 &lt;&lt; TVR_BITS)
-</span><span class='line'>#define TVN_MASK (TVN_SIZE - 1)
-</span><span class='line'>#define TVR_MASK (TVR_SIZE - 1)
-</span><span class='line'>
-</span><span class='line'>struct tvec {
-</span><span class='line'>&#9;struct list_head vec[TVN_SIZE];
-</span><span class='line'>};
-</span><span class='line'>
-</span><span class='line'>struct tvec_root {
-</span><span class='line'>&#9;struct list_head vec[TVR_SIZE];
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
-
-
-<p>默认情况下，没有使能CONFIG_BASE_SMALL，TVR_SIZE的大小是256，TVN_SIZE的大小则是64，当需要节省内存空间时，也可以使能CONFIG_BASE_SMALL，这时TVR_SIZE的大小是64，TVN_SIZE的大小则是16，以下的讨论我都是基于没有使能CONFIG_BASE_SMALL的情况。当有一个新的定时器要加入时，系统根据定时器到期的jiffies值和timer_jiffies字段的差值来决定该定时器被放入tv1至tv5中的哪一个数组中，最终，系统中所有的定时器的组织结构如下图所示：</p>
-
-<p><img src="/images/kernel/2017-07-23-4.png" alt="" /></p>
-
-<p>图 2.1.1  定时器在系统中的组织结构</p>
-
-<h5>2.2  定时器的添加</h5>
-
-<p>要加入一个新的定时器，我们可以通过api函数add_timer或mod_timer来完成，最终的工作会交由internal_add_timer函数来处理。该函数按以下步骤进行处理：</p>
-
-<p>计算定时器到期时间和所属cpu的tvec_base结构中的timer_jiffies字段的差值，记为idx；</p>
-
-<p>根据idx的值，选择该定时器应该被放到tv1&ndash;tv5中的哪一个链表数组中，可以认为tv1-tv5分别占据一个32位数的不同比特位，tv1占据最低的8位，tv2占据紧接着的6位，然后tv3再占位，以此类推，最高的6位分配给tv5。最终的选择规则如下表所示：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>链表数组     idx范围
-</span><span class='line'>tv1   0-255(2^8)
-</span><span class='line'>tv2   256--16383(2^14)
-</span><span class='line'>tv3   16384--1048575(2^20)
-</span><span class='line'>tv4   1048576--67108863(2^26)
-</span><span class='line'>tv5   67108864--4294967295(2^32)</span></code></pre></td></tr></table></div></figure>
-
-
-<p>确定链表数组后，接着要确定把该定时器放入数组中的哪一个链表中，如果时间差idx小于256，按规则要放入tv1中，因为tv1包含了256个链表，所以可以简单地使用timer_list.expires的低8位作为数组的索引下标，把定时器链接到tv1中相应的链表中即可。如果时间差idx的值在256&ndash;18383之间，则需要把定时器放入tv2中，同样的，使用timer_list.expires的8&ndash;14位作为数组的索引下标，把定时器链接到tv2中相应的链表中,。定时器要加入tv3 tv4 tv5使用同样的原理。经过这样分组后的定时器，在后续的tick事件中，系统可以很方便地定位并取出相应的到期定时器进行处理。以上的讨论都体现在internal_add_timer的代码中：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static void internal_add_timer(struct tvec_base *base, struct timer_list *timer)
+</pre></td><td class='code'><pre><code class=''><span class='line'>int tcp_conn_request(struct request_sock_ops *rsk_ops,
+</span><span class='line'>&#9;&#9;&#9;const struct tcp_request_sock_ops *af_ops,
+</span><span class='line'>&#9;&#9;&#9;struct sock *sk, struct sk_buff *skb)
 </span><span class='line'>{
-</span><span class='line'>&#9;unsigned long expires = timer-&gt;expires;
-</span><span class='line'>&#9;unsigned long idx = expires - base-&gt;timer_jiffies;
-</span><span class='line'>&#9;struct list_head *vec;
-</span><span class='line'>
-</span><span class='line'>&#9;if (idx &lt; TVR_SIZE) {
-</span><span class='line'>&#9;&#9;int i = expires & TVR_MASK;
-</span><span class='line'>&#9;&#9;vec = base-&gt;tv1.vec + i;
-</span><span class='line'>&#9;} else if (idx &lt; 1 &lt;&lt; (TVR_BITS + TVN_BITS)) {
-</span><span class='line'>&#9;&#9;int i = (expires &gt;&gt; TVR_BITS) & TVN_MASK;
-</span><span class='line'>&#9;&#9;vec = base-&gt;tv2.vec + i;
-</span><span class='line'>&#9;} else if (idx &lt; 1 &lt;&lt; (TVR_BITS + 2 * TVN_BITS)) {
-</span><span class='line'>&#9;&#9;int i = (expires &gt;&gt; (TVR_BITS + TVN_BITS)) & TVN_MASK;
-</span><span class='line'>&#9;&#9;vec = base-&gt;tv3.vec + i;
-</span><span class='line'>&#9;} else if (idx &lt; 1 &lt;&lt; (TVR_BITS + 3 * TVN_BITS)) {
-</span><span class='line'>&#9;&#9;int i = (expires &gt;&gt; (TVR_BITS + 2 * TVN_BITS)) & TVN_MASK;
-</span><span class='line'>&#9;&#9;vec = base-&gt;tv4.vec + i;
-</span><span class='line'>&#9;} else if ((signed long) idx &lt; 0) {
-</span><span class='line'>&#9;&#9;&#9;&#9;......
-</span><span class='line'>&#9;} else {
-</span><span class='line'>&#9;&#9;&#9;&#9;......
-</span><span class='line'>&#9;&#9;i = (expires &gt;&gt; (TVR_BITS + 3 * TVN_BITS)) & TVN_MASK;
-</span><span class='line'>&#9;&#9;vec = base-&gt;tv5.vec + i;
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;list_add_tail(&timer-&gt;entry, vec);
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;fastopen = !want_cookie &&
+</span><span class='line'>&#9;&#9;&#9;tcp_try_fastopen(sk, skb, req, &foc, dst);
+</span><span class='line'>&#9;...</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>bool tcp_try_fastopen(struct sock *sk, struct sk_buff *skb,
+</span><span class='line'>&#9;&#9;&#9;struct request_sock *req,
+</span><span class='line'>&#9;&#9;&#9;struct tcp_fastopen_cookie *foc,
+</span><span class='line'>&#9;&#9;&#9;struct dst_entry *dst)
+</span><span class='line'>{
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;if (tcp_fastopen_create_child(sk, skb, dst, req)) {
+</span><span class='line'>&#9;...
+</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static bool tcp_fastopen_create_child(struct sock *sk,
+</span><span class='line'>&#9;&#9;&#9;&#9;struct sk_buff *skb,
+</span><span class='line'>&#9;&#9;&#9;&#9;struct dst_entry *dst,
+</span><span class='line'>&#9;&#9;&#9;&#9;struct request_sock *req)
+</span><span class='line'>{
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;child = inet_csk(sk)-&gt;icsk_af_ops-&gt;syn_recv_sock(sk, skb, req, NULL);
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;inet_csk_reset_xmit_timer(child, ICSK_TIME_RETRANS,
+</span><span class='line'>&#9;&#9;&#9;&#9;TCP_TIMEOUT_INIT, TCP_RTO_MAX);
+</span><span class='line'>&#9;...
 </span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
-<h5>2.2  定时器的到期处理</h5>
 
-<p>经过2.1节的处理后，系统中的定时器按到期时间有规律地放置在tv1&ndash;tv5各个链表数组中，其中tv1中放置着在接下来的256个jiffies即将到期的定时器列表，需要注意的是，并不是tv1.vec[0]中放置着马上到期的定时器列表，tv1.vec[1]中放置着将在jiffies+1到期的定时器列表。因为base.timer_jiffies的值一直在随着系统的运行而动态地增加，原则上是每个tick事件会加1，base.timer_jiffies代表者该cpu定时器系统当前时刻，定时器也是动态地加入头256个链表tv1中，按2.1节的讨论，定时器加入tv1中使用的下标索引是定时器到期时间expires的低8位，所以假设当前的base.timer_jiffies值是0x34567826，则马上到期的定时器是在tv1.vec[0x26]中，如果这时候系统加入一个在jiffies值0x34567828到期的定时器，他将会加入到tv1.vec[0x28]中，运行两个tick后，base.timer_jiffies的值会变为0x34567828，很显然，在每次tick事件中，定时器系统只要以base.timer_jiffies的低8位作为索引，取出tv1中相应的链表，里面正好包含了所有在该jiffies值到期的定时器列表。</p>
-
-<p>那什么时候处理tv2&ndash;tv5中的定时器？每当base.timer_jiffies的低8位为0值时，这表明base.timer_jiffies的第8-13位有进位发生，这6位正好代表着tv2，这时只要按base.timer_jiffies的第8-13位的值作为下标，移出tv2中对应的定时器链表，然后用internal_add_timer把它们从新加入到定时器系统中来，因为这些定时器一定会在接下来的256个tick期间到期，所以它们肯定会被加入到tv1数组中，这样就完成了tv2往tv1迁移的过程。同样地，当base.timer_jiffies的第8-13位为0时，这表明base.timer_jiffies的第14-19位有进位发生，这6位正好代表着tv3，按base.timer_jiffies的第14-19位的值作为下标，移出tv3中对应的定时器链表，然后用internal_add_timer把它们从新加入到定时器系统中来，显然它们会被加入到tv2中，从而完成tv3到tv2的迁移，tv4，tv5的处理可以以此作类推。具体迁移的代码如下，参数index为事先计算好的高一级tv的需要迁移的数组索引：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -460,34 +398,24 @@ var ss360Config = {
 <span class='line-number'>13</span>
 <span class='line-number'>14</span>
 <span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static int cascade(struct tvec_base *base, struct tvec *tv, int index)
+</pre></td><td class='code'><pre><code class=''><span class='line'>void tcp_retransmit_timer(struct sock *sk)
 </span><span class='line'>{
-</span><span class='line'>&#9;/* cascade all the timers from tv up one level */
-</span><span class='line'>&#9;struct timer_list *timer, *tmp;
-</span><span class='line'>&#9;struct list_head tv_list;
+</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>&#9;struct inet_connection_sock *icsk = inet_csk(sk);
 </span><span class='line'>
-</span><span class='line'>&#9;list_replace_init(tv-&gt;vec + index, &tv_list);  //  移除需要迁移的链表
-</span><span class='line'>
-</span><span class='line'>&#9;/* 
-</span><span class='line'>&#9; * We are removing _all_ timers from the list, so we 
-</span><span class='line'>&#9; * don't have to detach them individually. 
-</span><span class='line'>&#9; */
-</span><span class='line'>&#9;list_for_each_entry_safe(timer, tmp, &tv_list, entry) {
-</span><span class='line'>&#9;&#9;BUG_ON(tbase_get_base(timer-&gt;base) != base);
-</span><span class='line'>&#9;&#9;&#9;&#9;//  重新加入到定时器系统中，实际上将会迁移到下一级的tv数组中
-</span><span class='line'>&#9;&#9;internal_add_timer(base, timer);  
+</span><span class='line'>&#9;if (tp-&gt;fastopen_rsk) {
+</span><span class='line'>&#9;&#9;WARN_ON_ONCE(sk-&gt;sk_state != TCP_SYN_RECV &&
+</span><span class='line'>&#9;&#9;&#9;sk-&gt;sk_state != TCP_FIN_WAIT1);
+</span><span class='line'>&#9;&#9;tcp_fastopen_synack_timer(sk);
+</span><span class='line'>&#9;&#9;/* Before we receive ACK to our SYN-ACK don't retransmit
+</span><span class='line'>&#9;&#9; * anything else (e.g., data or FIN segments).
+</span><span class='line'>&#9;&#9; */
+</span><span class='line'>&#9;&#9;return;
 </span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;return index;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+</span><span class='line'>&#9;...</span></code></pre></td></tr></table></div></figure>
 
 
-<p>每个tick事件到来时，内核会在tick定时中断处理期间激活定时器软中断：TIMER_SOFTIRQ，关于软件中断，请参考另一篇博文：Linux中断（interrupt）子系统之五：软件中断（softIRQ。TIMER_SOFTIRQ的执行函数是<code>__run_timers</code>，它实现了本节讨论的逻辑，取出tv1中到期的定时器，执行定时器的回调函数，由此可见，低分辨率定时器的回调函数是执行在软件中断上下文中的，这点在写定时器的回调函数时需要注意。<code>__run_timers</code>的代码如下：</p>
+
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -517,77 +445,47 @@ var ss360Config = {
 <span class='line-number'>26</span>
 <span class='line-number'>27</span>
 <span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static inline void __run_timers(struct tvec_base *base)
+</pre></td><td class='code'><pre><code class=''><span class='line'>/*
+</span><span class='line'> *      Timer for Fast Open socket to retransmit SYNACK. Note that the
+</span><span class='line'> *      sk here is the child socket, not the parent (listener) socket.
+</span><span class='line'> */
+</span><span class='line'>static void tcp_fastopen_synack_timer(struct sock *sk)
 </span><span class='line'>{
-</span><span class='line'>&#9;struct timer_list *timer;
+</span><span class='line'>&#9;struct inet_connection_sock *icsk = inet_csk(sk);
+</span><span class='line'>&#9;int max_retries = icsk-&gt;icsk_syn_retries ? :
+</span><span class='line'>&#9;&#9;sysctl_tcp_synack_retries + 1; /* add one more retry for fastopen */
+</span><span class='line'>&#9;struct request_sock *req;
 </span><span class='line'>
-</span><span class='line'>&#9;spin_lock_irq(&base-&gt;lock);
-</span><span class='line'>&#9;&#9;/* 同步jiffies，在NO_HZ情况下，base-&gt;timer_jiffies可能落后不止一个tick  */
-</span><span class='line'>&#9;while (time_after_eq(jiffies, base-&gt;timer_jiffies)) {  
-</span><span class='line'>&#9;&#9;struct list_head work_list;
-</span><span class='line'>&#9;&#9;struct list_head *head = &work_list;
-</span><span class='line'>&#9;&#9;&#9;&#9;/*  计算到期定时器链表在tv1中的索引  */
-</span><span class='line'>&#9;&#9;int index = base-&gt;timer_jiffies & TVR_MASK;  
+</span><span class='line'>&#9;req = tcp_sk(sk)-&gt;fastopen_rsk;
+</span><span class='line'>&#9;req-&gt;rsk_ops-&gt;syn_ack_timeout(sk, req);
 </span><span class='line'>
-</span><span class='line'>&#9;&#9;/* 
-</span><span class='line'>&#9;&#9; * /*  tv2--tv5定时器列表迁移处理  */
-</span><span class='line'>&#9;&#9; */
-</span><span class='line'>&#9;&#9;if (!index &&
-</span><span class='line'>&#9;&#9;&#9;(!cascade(base, &base-&gt;tv2, INDEX(0))) &&              
-</span><span class='line'>&#9;&#9;&#9;&#9;(!cascade(base, &base-&gt;tv3, INDEX(1))) &&      
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;!cascade(base, &base-&gt;tv4, INDEX(2)))  
-</span><span class='line'>&#9;&#9;&#9;cascade(base, &base-&gt;tv5, INDEX(3));  
-</span><span class='line'>&#9;&#9;&#9;&#9;/*  该cpu定时器系统运行时间递增一个tick  */                 
-</span><span class='line'>&#9;&#9;++base-&gt;timer_jiffies;  
-</span><span class='line'>&#9;&#9;&#9;&#9;/*  取出到期的定时器链表  */                                       
-</span><span class='line'>&#9;&#9;list_replace_init(base-&gt;tv1.vec + index, &work_list);
-</span><span class='line'>&#9;&#9;&#9;&#9;/*  遍历所有的到期定时器  */          
-</span><span class='line'>&#9;&#9;while (!list_empty(head)) {                                    
-</span><span class='line'>&#9;&#9;&#9;void (*fn)(unsigned long);
-</span><span class='line'>&#9;&#9;&#9;unsigned long data;
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;timer = list_first_entry(head, struct timer_list,entry);
-</span><span class='line'>&#9;&#9;&#9;fn = timer-&gt;function;
-</span><span class='line'>&#9;&#9;&#9;data = timer-&gt;data;
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;timer_stats_account_timer(timer);
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;base-&gt;running_timer = timer;    /*  标记正在处理的定时器  */
-</span><span class='line'>&#9;&#9;&#9;detach_timer(timer, 1);
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;spin_unlock_irq(&base-&gt;lock);
-</span><span class='line'>&#9;&#9;&#9;call_timer_fn(timer, fn, data);  /*  调用定时器的回调函数  */
-</span><span class='line'>&#9;&#9;&#9;spin_lock_irq(&base-&gt;lock);
-</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;if (req-&gt;num_timeout &gt;= max_retries) {
+</span><span class='line'>&#9;&#9;tcp_write_err(sk);
+</span><span class='line'>&#9;&#9;return;
 </span><span class='line'>&#9;}
-</span><span class='line'>&#9;base-&gt;running_timer = NULL;
-</span><span class='line'>&#9;spin_unlock_irq(&base-&gt;lock);
+</span><span class='line'>&#9;/* XXX (TFO) - Unlike regular SYN-ACK retransmit, we ignore error
+</span><span class='line'>&#9; * returned from rtx_syn_ack() to make it more persistent like
+</span><span class='line'>&#9; * regular retransmit because if the child socket has been accepted
+</span><span class='line'>&#9; * it's not good to give up too easily.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;inet_rtx_syn_ack(sk, req);
+</span><span class='line'>&#9;req-&gt;num_timeout++;
+</span><span class='line'>&#9;inet_csk_reset_xmit_timer(sk, ICSK_TIME_RETRANS,
+</span><span class='line'>&#9;&#9;TCP_TIMEOUT_INIT &lt;&lt; req-&gt;num_timeout, TCP_RTO_MAX);
 </span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
-<p>通过上面的讨论，我们可以发现，内核的低分辨率定时器的实现非常精妙，既实现了大量定时器的管理，又实现了快速的O(1)查找到期定时器的能力，利用巧妙的数组结构，使得只需在间隔256个tick时间才处理一次迁移操作，5个数组就好比是5个齿轮，它们随着base->timer_jifffies的增长而不停地转动，每次只需处理第一个齿轮的某一个齿节，低一级的齿轮转动一圈，高一级的齿轮转动一个齿，同时自动把即将到期的定时器迁移到上一个齿轮中，所以低分辨率定时器通常又被叫做时间轮：time wheel。事实上，它的实现是一个很好的空间换时间软件算法。</p>
+<hr />
 
-<h4>3. 定时器软件中断</h4>
+<p><a href="http://blog.csdn.net/u011130578/article/details/44954891">http://blog.csdn.net/u011130578/article/details/44954891</a></p>
 
-<p>系统初始化时，start_kernel会调用定时器系统的初始化函数init_timers：</p>
+<h4>1 Why</h4>
+
+<p>TCP服务器在收到SYN请求后发送SYN|ACK响应，然后等待对端的ACK到来以完成三次握手。如果没有收到ACK，TCP应该重传SYN|ACK，这个功能由SYN-ACK定时器完成。由于SYN|ACK发送后并没有放入发送队列中，故重传时必须重新构建SYN|ACK报文。</p>
+
+<h4>2 When</h4>
+
+<p>TCP在发送SYN|ACK响应后设置SYN-ACK定时器：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -600,34 +498,38 @@ var ss360Config = {
 <span class='line-number'>9</span>
 <span class='line-number'>10</span>
 <span class='line-number'>11</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>void __init init_timers(void)
-</span><span class='line'>{      
-</span><span class='line'>&#9;int err = timer_cpu_notify(&timers_nb, (unsigned long)CPU_UP_PREPARE, 
-</span><span class='line'>&#9;&#9;&#9;&#9;(void *)(long)smp_processor_id());
-</span><span class='line'>
-</span><span class='line'>&#9;init_timer_stats();
-</span><span class='line'>
-</span><span class='line'>&#9;BUG_ON(err != NOTIFY_OK);
-</span><span class='line'>&#9;register_cpu_notifier(&timers_nb);  /* 注册cpu notify，以便在hotplug时在cpu之间进行定时器的迁移 */
-</span><span class='line'>&#9;open_softirq(TIMER_SOFTIRQ, run_timer_softirq);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>1465 int tcp_v4_conn_request(struct sock *sk, struct sk_buff *skb)
+</span><span class='line'>1466 {
+</span><span class='line'>...
+</span><span class='line'>1598     skb_synack = tcp_make_synack(sk, dst, req,
+</span><span class='line'>1599         fastopen_cookie_present(&valid_foc) ? &valid_foc : NULL);　//构建SYN|ACK
+</span><span class='line'>1600
+</span><span class='line'>1601     if (skb_synack) {
+</span><span class='line'>1602         __tcp_v4_send_check(skb_synack, ireq-&gt;loc_addr, ireq-&gt;rmt_addr);
+</span><span class='line'>1603         skb_set_queue_mapping(skb_synack, skb_get_queue_mapping(skb));
+</span><span class='line'>1604     } else
+</span><span class='line'>1605         goto drop_and_free;
+</span><span class='line'>1606
+</span><span class='line'>1607     if (likely(!do_fastopen)) {
+</span><span class='line'>1608         int err;
+</span><span class='line'>1609         err = ip_build_and_send_pkt(skb_synack, sk, ireq-&gt;loc_addr,
+</span><span class='line'>1610              ireq-&gt;rmt_addr, ireq-&gt;opt);　//发送SYN|ACK
+</span><span class='line'>...
+</span><span class='line'>1617         /* Add the request_sock to the SYN table */
+</span><span class='line'>1618         inet_csk_reqsk_queue_hash_add(sk, req, TCP_TIMEOUT_INIT);　//将requese sock加入到SYN表中，并设置SYN-ACK定时器
+</span><span class='line'>...</span></code></pre></td></tr></table></div></figure>
 
 
-<p>可见，open_softirq把run_timer_softirq注册为TIMER_SOFTIRQ的处理函数，另外，当cpu的每个tick事件到来时，在事件处理中断中，update_process_times会被调用，该函数会进一步调用run_local_timers，run_local_timers会触发TIMER_SOFTIRQ软中断：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>void run_local_timers(void)
-</span><span class='line'>{
-</span><span class='line'>&#9;hrtimer_run_queues();
-</span><span class='line'>&#9;raise_softirq(TIMER_SOFTIRQ);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>TIMER_SOFTIRQ的处理函数是run_timer_softirq：</p>
+<p>inet_csk_reqsk_queue_hash_add函数：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -638,67 +540,148 @@ var ss360Config = {
 <span class='line-number'>7</span>
 <span class='line-number'>8</span>
 <span class='line-number'>9</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static void run_timer_softirq(struct softirq_action *h)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct tvec_base *base = __this_cpu_read(tvec_bases);
-</span><span class='line'>
-</span><span class='line'>&#9;hrtimer_run_pending();
-</span><span class='line'>
-</span><span class='line'>&#9;if (time_after_eq(jiffies, base-&gt;timer_jiffies))
-</span><span class='line'>&#9;&#9;__run_timers(base);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>521 void inet_csk_reqsk_queue_hash_add(struct sock *sk, struct request_sock *req,
+</span><span class='line'>522                    unsigned long timeout)
+</span><span class='line'>523 {
+</span><span class='line'>524     struct inet_connection_sock *icsk = inet_csk(sk);
+</span><span class='line'>525     struct listen_sock *lopt = icsk-&gt;icsk_accept_queue.listen_opt;
+</span><span class='line'>526     const u32 h = inet_synq_hash(inet_rsk(req)-&gt;rmt_addr, inet_rsk(req)-&gt;rmt_port,
+</span><span class='line'>527                      lopt-&gt;hash_rnd, lopt-&gt;nr_table_entries);
+</span><span class='line'>528
+</span><span class='line'>529     reqsk_queue_hash_req(&icsk-&gt;icsk_accept_queue, h, req, timeout);　//将request_sock放入syn_table中并记录超时时间
+</span><span class='line'>530     inet_csk_reqsk_queue_added(sk, timeout);　//设置SYN-ACK定时器
+</span><span class='line'>531 }</span></code></pre></td></tr></table></div></figure>
 
 
-<p>好啦，终于看到<code>__run_timers</code>函数了，2.2节已经介绍过，正是这个函数完成了对到期定时器的处理工作，也完成了时间轮的不停转动。</p>
-</div>
-  
-  
+<p>reqsk_queue_hash_req函数会记录request_sock的超时时间：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>262 static inline void reqsk_queue_hash_req(struct request_sock_queue *queue,
+</span><span class='line'>263                     u32 hash, struct request_sock *req,
+</span><span class='line'>264                     unsigned long timeout)
+</span><span class='line'>265 {
+</span><span class='line'>266     struct listen_sock *lopt = queue-&gt;listen_opt;
+</span><span class='line'>267
+</span><span class='line'>268     req-&gt;expires = jiffies + timeout;　//超时时间
+</span><span class='line'>269     req-&gt;num_retrans = 0;
+</span><span class='line'>270     req-&gt;num_timeout = 0;
+</span><span class='line'>271     req-&gt;sk = NULL;
+</span><span class='line'>272     req-&gt;dl_next = lopt-&gt;syn_table[hash];
+</span><span class='line'>273
+</span><span class='line'>274     write_lock(&queue-&gt;syn_wait_lock);
+</span><span class='line'>275     lopt-&gt;syn_table[hash] = req;
+</span><span class='line'>276     write_unlock(&queue-&gt;syn_wait_lock);
+</span><span class='line'>277 }</span></code></pre></td></tr></table></div></figure>
 
 
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2017/07/23/kernel-clock-4/">Linux时间子系统之四：定时器的引擎：clock_event_device</a></h2>
-    
-    
-      <p class="meta">
-        
+<p>inet_csk_reqsk_queue_added函数为整个syn_table设置一个SYN-ACK定时器：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>280 static inline void inet_csk_reqsk_queue_added(struct sock *sk,
+</span><span class='line'>281                           const unsigned long timeout)
+</span><span class='line'>282 {
+</span><span class='line'>283     if (reqsk_queue_added(&inet_csk(sk)-&gt;icsk_accept_queue) == 0) //如果添加request sock之前syn_table为空
+</span><span class='line'>284         inet_csk_reset_keepalive_timer(sk, timeout);//设置SYN-ACK定时器
+</span><span class='line'>285 }</span></code></pre></td></tr></table></div></figure>
 
 
+<p>inet_csk_reset_keepalive_timer函数真正设置定时器：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>404 void inet_csk_reset_keepalive_timer(struct sock *sk, unsigned long len)
+</span><span class='line'>405 {
+</span><span class='line'>406     sk_reset_timer(sk, &sk-&gt;sk_timer, jiffies + len);
+</span><span class='line'>407 }</span></code></pre></td></tr></table></div></figure>
 
 
-<time class='entry-date' datetime='2017-07-23T14:04:00+08:00'><span class='date'>2017-07-23</span> <span class='time'>14:04:00</span></time>
-        
-      </p>
-    
-  </header>
+<p>SYN-ACK定时器的超时时间为TCP_TIMEOUT_INIT（1秒）。</p>
+
+<h4>3 What</h4>
+
+<p>SYN-ACK定时器的结构为sk->sk_timer，其超时函数为tcp_keepalive_timer：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>558 static void tcp_keepalive_timer (unsigned long data)
+</span><span class='line'>559 {
+</span><span class='line'>560     struct sock *sk = (struct sock *) data;
+</span><span class='line'>561     struct inet_connection_sock *icsk = inet_csk(sk);
+</span><span class='line'>562     struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>563     u32 elapsed;
+</span><span class='line'>564
+</span><span class='line'>565     /* Only process if socket is not in use. */
+</span><span class='line'>566     bh_lock_sock(sk);
+</span><span class='line'>567     if (sock_owned_by_user(sk)) {
+</span><span class='line'>568         /* Try again later. */
+</span><span class='line'>569         inet_csk_reset_keepalive_timer (sk, HZ/20);
+</span><span class='line'>570         goto out;
+</span><span class='line'>571     }
+</span><span class='line'>572
+</span><span class='line'>573     if (sk-&gt;sk_state == TCP_LISTEN) {　//如果是SYN-ACK定时器超时则判断为真
+</span><span class='line'>574         tcp_synack_timer(sk);　//SYN-ACK定时器超时函数
+</span><span class='line'>575         goto out;
+</span><span class='line'>576     }
+</span><span class='line'>...</span></code></pre></td></tr></table></div></figure>
 
 
-  <div class="entry-content"><p><a href="http://blog.csdn.net/DroidPhone/article/details/8017604">http://blog.csdn.net/DroidPhone/article/details/8017604</a></p>
+<p>tcp_synack_timer函数：</p>
 
-<p>早期的内核版本中，进程的调度基于一个称之为tick的时钟滴答，通常使用时钟中断来定时地产生tick信号，每次tick定时中断都会进行进程的统计和调度，并对tick进行计数，记录在一个jiffies变量中，定时器的设计也是基于jiffies。这时候的内核代码中，几乎所有关于时钟的操作都是在machine级的代码中实现，很多公共的代码要在每个平台上重复实现。随后，随着通用时钟框架的引入，内核需要支持高精度的定时器，为此，通用时间框架为定时器硬件定义了一个标准的接口：clock_event_device，machine级的代码只要按这个标准接口实现相应的硬件控制功能，剩下的与平台无关的特性则统一由通用时间框架层来实现。</p>
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>534 static void tcp_synack_timer(struct sock *sk)
+</span><span class='line'>535 {
+</span><span class='line'>536     inet_csk_reqsk_queue_prune(sk, TCP_SYNQ_INTERVAL,
+</span><span class='line'>537                    TCP_TIMEOUT_INIT, TCP_RTO_MAX);
+</span><span class='line'>538 }</span></code></pre></td></tr></table></div></figure>
 
-<h4>1. 时钟事件软件架构</h4>
 
-<p>本系列文章的第一节中，我们曾经讨论了时钟源设备：clocksource，现在又来一个时钟事件设备：clock_event_device，它们有何区别？看名字，好像都是给系统提供时钟的设备，实际上，clocksource不能被编程，没有产生事件的能力，它主要被用于timekeeper来实现对真实时间进行精确的统计，而clock_event_device则是可编程的，它可以工作在周期触发或单次触发模式，系统可以对它进行编程，以确定下一次事件触发的时间，clock_event_device主要用于实现普通定时器和高精度定时器，同时也用于产生tick事件，供给进程调度子系统使用。时钟事件设备与通用时间框架中的其他模块的关系如下图所示：</p>
-
-<p><img src="/images/kernel/2017-07-23-2.png" alt="" /></p>
-
-<p>与clocksource一样，系统中可以存在多个clock_event_device，系统会根据它们的精度和能力，选择合适的clock_event_device对系统提供时钟事件服务。在smp系统中，为了减少处理器间的通信开销，基本上每个cpu都会具备一个属于自己的本地clock_event_device，独立地为该cpu提供时钟事件服务，smp中的每个cpu基于本地的clock_event_device，建立自己的tick_device，普通定时器和高精度定时器。</p>
-
-<p>在软件架构上看，clock_event_device被分为了两层，与硬件相关的被放在了machine层，而与硬件无关的通用代码则被集中到了通用时间框架层，这符合内核对软件的设计需求，平台的开发者只需实现平台相关的接口即可，无需关注复杂的上层时间框架。</p>
-
-<p>tick_device是基于clock_event_device的进一步封装，用于代替原有的时钟滴答中断，给内核提供tick事件，以完成进程的调度和进程信息统计，负载平衡和时间更新等操作。</p>
-
-<h4>2. 时钟事件设备相关数据结构</h4>
-
-<h5>2.1  struct clock_event_device</h5>
-
-<p>时钟事件设备的核心数据结构是clock_event_device结构，它代表着一个时钟硬件设备，该设备就好像是一个具有事件触发能力（通常就是指中断）的clocksource，它不停地计数，当计数值达到预先编程设定的数值那一刻，会引发一个时钟事件中断，继而触发该设备的事件处理回调函数，以完成对时钟事件的处理。clock_event_device结构的定义如下：</p>
+<p>inet_csk_reqsk_queue_prune函数：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -749,254 +732,125 @@ var ss360Config = {
 <span class='line-number'>47</span>
 <span class='line-number'>48</span>
 <span class='line-number'>49</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct clock_event_device {
-</span><span class='line'>&#9;void            (*event_handler)(struct clock_event_device *);
-</span><span class='line'>&#9;int         (*set_next_event)(unsigned long evt,
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;  struct clock_event_device *);
-</span><span class='line'>&#9;int         (*set_next_ktime)(ktime_t expires,
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;  struct clock_event_device *);
-</span><span class='line'>&#9;ktime_t         next_event;
-</span><span class='line'>&#9;u64         max_delta_ns;
-</span><span class='line'>&#9;u64         min_delta_ns;
-</span><span class='line'>&#9;u32         mult;
-</span><span class='line'>&#9;u32         shift;
-</span><span class='line'>&#9;enum clock_event_mode   mode;
-</span><span class='line'>&#9;unsigned int        features;
-</span><span class='line'>&#9;unsigned long       retries;
-</span><span class='line'>
-</span><span class='line'>&#9;void            (*broadcast)(const struct cpumask *mask);
-</span><span class='line'>&#9;void            (*set_mode)(enum clock_event_mode mode,
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;struct clock_event_device *);
-</span><span class='line'>&#9;unsigned long       min_delta_ticks;
-</span><span class='line'>&#9;unsigned long       max_delta_ticks;
-</span><span class='line'>
-</span><span class='line'>&#9;const char      *name;
-</span><span class='line'>&#9;int         rating;
-</span><span class='line'>&#9;int         irq;
-</span><span class='line'>&#9;const struct cpumask    *cpumask;
-</span><span class='line'>&#9;struct list_head    list;
-</span><span class='line'>} ____cacheline_aligned;
-</span><span class='line'>
-</span><span class='line'>event_handler  该字段是一个回调函数指针，通常由通用框架层设置，在时间中断到来时，machine底层的的中断服务程序会调用该回调，框架层利用该回调实现对时钟事件的处理。
-</span><span class='line'>
-</span><span class='line'>set_next_event  设置下一次时间触发的时间，使用类似于clocksource的cycle计数值（离现在的cycle差值）作为参数。
-</span><span class='line'>
-</span><span class='line'>set_next_ktime  设置下一次时间触发的时间，直接使用ktime时间作为参数。
-</span><span class='line'>
-</span><span class='line'>max_delta_ns  可设置的最大时间差，单位是纳秒。
-</span><span class='line'>
-</span><span class='line'>min_delta_ns  可设置的最小时间差，单位是纳秒。
-</span><span class='line'>
-</span><span class='line'>mult shift  与clocksource中的类似，只不过是用于把纳秒转换为cycle。
-</span><span class='line'>
-</span><span class='line'>mode  该时钟事件设备的工作模式，两种主要的工作模式分别是：
-</span><span class='line'>&#9;CLOCK_EVT_MODE_PERIODIC  周期触发模式，设置后按给定的周期不停地触发事件；
-</span><span class='line'>&#9;CLOCK_EVT_MODE_ONESHOT  单次触发模式，只在设置好的触发时刻触发一次；
-</span><span class='line'>
-</span><span class='line'>set_mode  函数指针，用于设置时钟事件设备的工作模式。
-</span><span class='line'>
-</span><span class='line'>rating  表示该设备的精度等级。
-</span><span class='line'>
-</span><span class='line'>list  系统中注册的时钟事件设备用该字段挂在全局链表变量clockevent_devices上。</span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>570 void inet_csk_reqsk_queue_prune(struct sock *parent,
+</span><span class='line'>571                 const unsigned long interval,
+</span><span class='line'>572                 const unsigned long timeout,
+</span><span class='line'>573                 const unsigned long max_rto)
+</span><span class='line'>574 {
+</span><span class='line'>575     struct inet_connection_sock *icsk = inet_csk(parent);
+</span><span class='line'>576     struct request_sock_queue *queue = &icsk-&gt;icsk_accept_queue;
+</span><span class='line'>577     struct listen_sock *lopt = queue-&gt;listen_opt;
+</span><span class='line'>578     int max_retries = icsk-&gt;icsk_syn_retries ? : sysctl_tcp_synack_retries;
+</span><span class='line'>579     int thresh = max_retries;
+</span><span class='line'>580     unsigned long now = jiffies;
+</span><span class='line'>581     struct request_sock **reqp, *req;
+</span><span class='line'>582     int i, budget;
+</span><span class='line'>583
+</span><span class='line'>584     if (lopt == NULL || lopt-&gt;qlen == 0)
+</span><span class='line'>585         return;
+</span><span class='line'>...
+</span><span class='line'>604     if (lopt-&gt;qlen&gt;&gt;(lopt-&gt;max_qlen_log-1)) {
+</span><span class='line'>605         int young = (lopt-&gt;qlen_young&lt;&lt;1);
+</span><span class='line'>606
+</span><span class='line'>607         while (thresh &gt; 2) {
+</span><span class='line'>608             if (lopt-&gt;qlen &lt; young)
+</span><span class='line'>609                 break;
+</span><span class='line'>610             thresh--;
+</span><span class='line'>611             young &lt;&lt;= 1;
+</span><span class='line'>612         }
+</span><span class='line'>613     }
+</span><span class='line'>614
+</span><span class='line'>615     if (queue-&gt;rskq_defer_accept)    //需要等待数据到来再唤醒应用进程
+</span><span class='line'>616         max_retries = queue-&gt;rskq_defer_accept;
+</span><span class='line'>617
+</span><span class='line'>618     budget = 2 * (lopt-&gt;nr_table_entries / (timeout / interval));
+</span><span class='line'>619     i = lopt-&gt;clock_hand;
+</span><span class='line'>620
+</span><span class='line'>621     do {　　//遍历SYN table
+</span><span class='line'>622         reqp=&lopt-&gt;syn_table[i];
+</span><span class='line'>623         while ((req = *reqp) != NULL) {
+</span><span class='line'>624             if (time_after_eq(now, req-&gt;expires)) {　//超时
+</span><span class='line'>625                 int expire = 0, resend = 0;
+</span><span class='line'>626
+</span><span class='line'>627                 syn_ack_recalc(req, thresh, max_retries,
+</span><span class='line'>628                            queue-&gt;rskq_defer_accept,
+</span><span class='line'>629                            &expire, &resend);     //计算request sock是否过期以及是否需要重发SYN|ACK
+</span><span class='line'>630                 req-&gt;rsk_ops-&gt;syn_ack_timeout(parent, req);　//调用tcp_syn_ack_timeout更新信息数据库
+</span><span class='line'>631                 if (!expire &&  //request socket没有超时
+</span><span class='line'>632                     (!resend ||
+</span><span class='line'>633                      !inet_rtx_syn_ack(parent, req) || 　//重传SYN-ACK
+</span><span class='line'>634                      inet_rsk(req)-&gt;acked)) {
+</span><span class='line'>635                     unsigned long timeo;
+</span><span class='line'>636
+</span><span class='line'>637                     if (req-&gt;num_timeout++ == 0)
+</span><span class='line'>638                         lopt-&gt;qlen_young--;
+</span><span class='line'>639                     timeo = min(timeout &lt;&lt; req-&gt;num_timeout,
+</span><span class='line'>640                             max_rto);
+</span><span class='line'>641                     req-&gt;expires = now + timeo;  //更新request_sock超时时间
+</span><span class='line'>642                     reqp = &req-&gt;dl_next;
+</span><span class='line'>643                     continue;
+</span><span class='line'>644                 }
+</span><span class='line'>645
+</span><span class='line'>646                 /* Drop this request */
+</span><span class='line'>647                 inet_csk_reqsk_queue_unlink(parent, req, reqp);　
+</span><span class='line'>648                 reqsk_queue_removed(queue, req);
+</span><span class='line'>649                 reqsk_free(req);
+</span><span class='line'>650                 continue;
+</span><span class='line'>651             }
+</span><span class='line'>652             reqp = &req-&gt;dl_next;
+</span><span class='line'>653         }
+</span><span class='line'>654
+</span><span class='line'>655         i = (i + 1) & (lopt-&gt;nr_table_entries - 1);
+</span><span class='line'>656
+</span><span class='line'>657     } while (--budget &gt; 0);
+</span><span class='line'>658
+</span><span class='line'>659     lopt-&gt;clock_hand = i;
+</span><span class='line'>660
+</span><span class='line'>661     if (lopt-&gt;qlen)　//syn_table中还有成员
+</span><span class='line'>662         inet_csk_reset_keepalive_timer(parent, interval);　//继续设置定时器，超时
+</span><span class='line'>663 }</span></code></pre></td></tr></table></div></figure>
 
 
-<h5>2.2 全局变量clockevent_devices</h5>
+<p>604-611：当syn_table中剩余空间比较小时，需要减小最大重试次数，以便使旧的request_sock能够更快消亡，从而新的request_sock能够更多的被接受</p>
 
-<p>系统中所有注册的clock_event_device都会挂在该链表下面，它在kernel/time/clockevents.c中定义：</p>
+<p>647-649：将超时的request_sock移出syn_table并释放，即丢弃其对应的连接</p>
 
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static LIST_HEAD(clockevent_devices);</span></code></pre></td></tr></table></div></figure>
+<p>631-642：全部满足下列条件就不删除request_sock而只是更新超时时间：<br/>
+（1）request_sock没有超时<br/>
+（2）下列3个条件之一成立<br/>
+     1）不需要重传SYN|ACK<br/>
+     2）重传SYN|ACK成功<br/>
+     3）应用进程使用TCP_DEFER_ACCEPT socket选项意图使数据到来时listen socket再唤醒进程，当ACK到来但没有数据时</p>
 
-
-<h5>2.3 全局变量clockevents_chain</h5>
-
-<p>通用时间框架初始化时会注册一个通知链（NOTIFIER），当系统中的时钟时间设备的状态发生变化时，利用该通知链通知系统的其它模块。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/* Notification for clock events */
-</span><span class='line'>static RAW_NOTIFIER_HEAD(clockevents_chain);</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>3. clock_event_device的初始化和注册</h4>
-
-<p>每一个machine，都要定义一个自己的machine_desc结构，该结构定义了该machine的一些最基本的特性，其中需要设定一个sys_timer结构指针，machine级的代码负责定义sys_timer结构，sys_timer的声明很简单：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct sys_timer {
-</span><span class='line'>&#9;void            (*init)(void);
-</span><span class='line'>&#9;void            (*suspend)(void);
-</span><span class='line'>&#9;void            (*resume)(void);
-</span><span class='line'>#ifdef CONFIG_ARCH_USES_GETTIMEOFFSET
-</span><span class='line'>&#9;unsigned long       (*offset)(void);
-</span><span class='line'>#endif
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
-
-
-<p>通常，我们至少要定义它的init字段，系统初始化阶段，该init回调会被调用，该init回调函数的主要作用就是完成系统中的clocksource和clock_event_device的硬件初始化工作，以samsung的exynos4为例，在V3.4内核的代码树中，machine_desc的定义如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>MACHINE_START(SMDK4412, "SMDK4412")
-</span><span class='line'>&#9;/* Maintainer: Kukjin Kim &lt;kgene.kim@samsung.com&gt; */
-</span><span class='line'>&#9;/* Maintainer: Changhwan Youn &lt;chaos.youn@samsung.com&gt; */
-</span><span class='line'>&#9;.atag_offset    = 0x100,
-</span><span class='line'>&#9;.init_irq   = exynos4_init_irq,
-</span><span class='line'>&#9;.map_io     = smdk4x12_map_io,
-</span><span class='line'>&#9;.handle_irq = gic_handle_irq,
-</span><span class='line'>&#9;.init_machine   = smdk4x12_machine_init,
-</span><span class='line'>&#9;.timer      = &exynos4_timer,
-</span><span class='line'>&#9;.restart    = exynos4_restart,
-</span><span class='line'>MACHINE_END</span></code></pre></td></tr></table></div></figure>
-
-
-<p>定义的sys_timer是exynos4_timer，它的定义和init回调定义如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static void __init exynos4_timer_init(void)
-</span><span class='line'>{
-</span><span class='line'>&#9;if (soc_is_exynos4210())
-</span><span class='line'>&#9;&#9;mct_int_type = MCT_INT_SPI;
-</span><span class='line'>&#9;else
-</span><span class='line'>&#9;&#9;mct_int_type = MCT_INT_PPI;
-</span><span class='line'>
-</span><span class='line'>&#9;exynos4_timer_resources();
-</span><span class='line'>&#9;exynos4_clocksource_init();
-</span><span class='line'>&#9;exynos4_clockevent_init();
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>struct sys_timer exynos4_timer = {
-</span><span class='line'>&#9;.init       = exynos4_timer_init,
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
-
-
-<p>exynos4_clockevent_init函数显然是初始化和注册clock_event_device的合适时机，在这里，它注册了一个rating为250的clock_event_device，并把它指定给cpu0：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static struct clock_event_device mct_comp_device = {
-</span><span class='line'>&#9;.name       = "mct-comp",
-</span><span class='line'>&#9;.features       = CLOCK_EVT_FEAT_PERIODIC | CLOCK_EVT_FEAT_ONESHOT,
-</span><span class='line'>&#9;.rating     = 250,
-</span><span class='line'>&#9;.set_next_event = exynos4_comp_set_next_event,
-</span><span class='line'>&#9;.set_mode   = exynos4_comp_set_mode,
-</span><span class='line'>};
-</span><span class='line'>......
-</span><span class='line'>static void exynos4_clockevent_init(void)
-</span><span class='line'>{
-</span><span class='line'>&#9;clockevents_calc_mult_shift(&mct_comp_device, clk_rate, 5);
-</span><span class='line'>&#9;&#9;......
-</span><span class='line'>&#9;mct_comp_device.cpumask = cpumask_of(0);
-</span><span class='line'>&#9;clockevents_register_device(&mct_comp_device);
-</span><span class='line'>
-</span><span class='line'>&#9;setup_irq(EXYNOS4_IRQ_MCT_G0, &mct_comp_event_irq);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>因为这个阶段其它cpu核尚未开始工作，所以该clock_event_device也只是在启动阶段给系统提供服务，实际上，因为exynos4是一个smp系统，具备2-4个cpu核心，前面说过，smp系统中，通常会使用各个cpu的本地定时器来为每个cpu单独提供时钟事件服务，继续翻阅代码，在系统初始化的后段，kernel_init会被调用，它会调用smp_prepare_cpus，其中会调用percpu_timer_setup函数，在arch/arm/kernel/smp.c中，为每个cpu定义了一个clock_event_device：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/* 
-</span><span class='line'> * Timer (local or broadcast) support 
-</span><span class='line'> */
-</span><span class='line'>static DEFINE_PER_CPU(struct clock_event_device, percpu_clockevent);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>percpu_timer_setup最终会调用exynos4_local_timer_setup函数完成对本地clock_event_device的初始化工作：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static int __cpuinit exynos4_local_timer_setup(struct clock_event_device *evt)
-</span><span class='line'>{
-</span><span class='line'>&#9;......
-</span><span class='line'>&#9;evt-&gt;name = mevt-&gt;name;
-</span><span class='line'>&#9;evt-&gt;cpumask = cpumask_of(cpu);
-</span><span class='line'>&#9;evt-&gt;set_next_event = exynos4_tick_set_next_event;
-</span><span class='line'>&#9;evt-&gt;set_mode = exynos4_tick_set_mode;
-</span><span class='line'>&#9;evt-&gt;features = CLOCK_EVT_FEAT_PERIODIC | CLOCK_EVT_FEAT_ONESHOT;
-</span><span class='line'>&#9;evt-&gt;rating = 450;
-</span><span class='line'>
-</span><span class='line'>&#9;clockevents_calc_mult_shift(evt, clk_rate / (TICK_BASE_CNT + 1), 5);
-</span><span class='line'>&#9;......
-</span><span class='line'>&#9;clockevents_register_device(evt);
-</span><span class='line'>&#9;......
-</span><span class='line'>&#9;enable_percpu_irq(EXYNOS_IRQ_MCT_LOCALTIMER, 0);
-</span><span class='line'>&#9;......
-</span><span class='line'>&#9;return 0;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>由此可见，每个cpu的本地clock_event_device的rating是450，比启动阶段的250要高，显然，之前注册给cpu0的精度要高，系统会用本地clock_event_device替换掉原来分配给cpu0的clock_event_device，至于怎么替换？我们先停一停，到这里我们一直在讨论machine级别的初始化和注册，让我们回过头来，看看框架层的初始化。在继续之前，让我们看看整个clock_event_device的初始化的调用序列图：</p>
-
-<p><img src="/images/kernel/2017-07-23-3.png" alt="" /></p>
-
-<p>图3.1  clock_event_device的系统初始化</p>
-
-<p>由上面的图示可以看出，框架层的初始化步骤很简单，又start_kernel开始，调用tick_init，它位于kernel/time/tick-common.c中，也只是简单地调用clockevents_register_notifier，同时把类型为notifier_block的tick_notifier作为参数传入，回看2.3节，clockevents_register_notifier注册了一个通知链，这样，当系统中的clock_event_device状态发生变化时（新增，删除，挂起，唤醒等等），tick_notifier中的notifier_call字段中设定的回调函数tick_notify就会被调用。接下来start_kernel调用了time_init函数，该函数通常定义在体系相关的代码中，正如前面所讨论的一样，它主要完成machine级别对时钟系统的初始化工作，最终通过clockevents_register_device注册系统中的时钟事件设备，把每个时钟时间设备挂在clockevent_device全局链表上，最后通过clockevent_do_notify触发框架层事先注册好的通知链，其实就是调用了tick_notify函数，我们主要关注CLOCK_EVT_NOTIFY_ADD通知，其它通知请自行参考代码，下面是tick_notify的简化版本：</p>
+<p>syn_ack_recalc函数来确定request_sock是否超时以及是否需要重传SYN|ACK：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -1018,71 +872,36 @@ var ss360Config = {
 <span class='line-number'>18</span>
 <span class='line-number'>19</span>
 <span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static int tick_notify(struct notifier_block *nb, unsigned long reason,
-</span><span class='line'>&#9;&#9;&#9;&#9;   void *dev)
-</span><span class='line'>{
-</span><span class='line'>&#9;switch (reason) {
-</span><span class='line'>
-</span><span class='line'>&#9;case CLOCK_EVT_NOTIFY_ADD:
-</span><span class='line'>&#9;&#9;return tick_check_new_device(dev);
-</span><span class='line'>
-</span><span class='line'>&#9;case CLOCK_EVT_NOTIFY_BROADCAST_ON:
-</span><span class='line'>&#9;case CLOCK_EVT_NOTIFY_BROADCAST_OFF:
-</span><span class='line'>&#9;case CLOCK_EVT_NOTIFY_BROADCAST_FORCE:
-</span><span class='line'>&#9;&#9;&#9;......
-</span><span class='line'>&#9;case CLOCK_EVT_NOTIFY_BROADCAST_ENTER:
-</span><span class='line'>&#9;case CLOCK_EVT_NOTIFY_BROADCAST_EXIT:
-</span><span class='line'>&#9;&#9;&#9;......
-</span><span class='line'>&#9;case CLOCK_EVT_NOTIFY_CPU_DYING:
-</span><span class='line'>&#9;&#9;&#9;......
-</span><span class='line'>&#9;case CLOCK_EVT_NOTIFY_CPU_DEAD:
-</span><span class='line'>&#9;&#9;&#9;......
-</span><span class='line'>&#9;case CLOCK_EVT_NOTIFY_SUSPEND:
-</span><span class='line'>&#9;&#9;&#9;......
-</span><span class='line'>&#9;case CLOCK_EVT_NOTIFY_RESUME:
-</span><span class='line'>&#9;&#9;&#9;......
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;return NOTIFY_OK;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>539 static inline void syn_ack_recalc(struct request_sock *req, const int thresh,
+</span><span class='line'>540                   const int max_retries,
+</span><span class='line'>541                   const u8 rskq_defer_accept,
+</span><span class='line'>542                   int *expire, int *resend)
+</span><span class='line'>543 {
+</span><span class='line'>544     if (!rskq_defer_accept) {    //不需要等待数据到来再调用accept系统调用
+</span><span class='line'>545         *expire = req-&gt;num_timeout &gt;= thresh;    //超时次数达到限制则超时
+</span><span class='line'>546         *resend = 1;    //重传SYN|ACK
+</span><span class='line'>547         return;
+</span><span class='line'>548     }
+</span><span class='line'>549     *expire = req-&gt;num_timeout &gt;= thresh &&    //超时次数达到限制
+</span><span class='line'>550           (!inet_rsk(req)-&gt;acked || req-&gt;num_timeout &gt;= max_retries);    //ACK没有到来或超时次数达到最高上限
+</span><span class='line'>551     /*
+</span><span class='line'>552      * Do not resend while waiting for data after ACK,
+</span><span class='line'>553      * start to resend on end of deferring period to give
+</span><span class='line'>554      * last chance for data or ACK to create established socket.
+</span><span class='line'>555      */
+</span><span class='line'>556     *resend = !inet_rsk(req)-&gt;acked || //ACK没有到来
+</span><span class='line'>557           req-&gt;num_timeout &gt;= rskq_defer_accept - 1;    //超时次数超过或即将达到应用进程的限制，赶快重传SYN|ACK以便给对端最后一个机会建立连接
+</span><span class='line'>558 }</span></code></pre></td></tr></table></div></figure>
 
 
-<p>可见，对于新注册的clock_event_device，会发出CLOCK_EVT_NOTIFY_ADD通知，最终会进入函数：tick_check_new_device，这个函数比对当前cpu所使用的与新注册的clock_event_device之间的特性，如果认为新的clock_event_device更好，则会进行切换工作。下一节将会详细的讨论该函数。到这里，每个cpu已经有了自己的clock_event_device，在这以后，框架层的代码会根据内核的配置项（CONFIG_NO_HZ、CONFIG_HIGH_RES_TIMERS），对注册的clock_event_device进行不同的设置，从而为系统的tick和高精度定时器提供服务，这些内容我们留在本系列的后续文章进行讨论。</p>
+<p>综上，SYN|ACK定时器超时时重传SYN|ACK的条件是下列条件全部成立：<br/>
+（1）request_sock超时<br/>
+（2）request_sock的超时次数达到限制<br/>
+（3）下列条件之一成立：<br/>
+    1）应用进程没有使用TCP_DEFER_ACCEPT socket选项来延迟accept request_sock的时间<br/>
+    2）应用进程使用TCP_DEFER_ACCEPT socket选项设置了超时次数限制，但ACK没有到来或，超时次数达到最高限制且超时次数超过或即将达到应用进程的限制</p>
 
-<h4>4. tick_device</h4>
-
-<p>当内核没有配置成支持高精度定时器时，系统的tick由tick_device产生，tick_device其实是clock_event_device的简单封装，它内嵌了一个clock_event_device指针和它的工作模式：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct tick_device {
-</span><span class='line'>&#9;struct clock_event_device *evtdev;
-</span><span class='line'>&#9;enum tick_device_mode mode;
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
-
-
-<p>在kernel/time/tick-common.c中，定义了一个per-cpu的tick_device全局变量，tick_cpu_device：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/* 
-</span><span class='line'> * Tick devices 
-</span><span class='line'> */
-</span><span class='line'>DEFINE_PER_CPU(struct tick_device, tick_cpu_device);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>前面曾经说过，当machine的代码为每个cpu注册clock_event_device时，通知回调函数tick_notify会被调用，进而进入tick_check_new_device函数，下面让我们看看该函数如何工作，首先，该函数先判断注册的clock_event_device是否可用于本cpu，然后从per-cpu变量中取出本cpu的tick_device：</p>
+<p>SYN|ACK的重传是由inet_rtx_syn_ack函数完成的：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -1092,103 +911,17 @@ var ss360Config = {
 <span class='line-number'>6</span>
 <span class='line-number'>7</span>
 <span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static int tick_check_new_device(struct clock_event_device *newdev)
-</span><span class='line'>{
-</span><span class='line'>&#9;&#9;......
-</span><span class='line'>&#9;cpu = smp_processor_id();
-</span><span class='line'>&#9;if (!cpumask_test_cpu(cpu, newdev-&gt;cpumask))
-</span><span class='line'>&#9;&#9;goto out_bc;
-</span><span class='line'>
-</span><span class='line'>&#9;td = &per_cpu(tick_cpu_device, cpu);
-</span><span class='line'>&#9;curdev = td-&gt;evtdev;
-</span><span class='line'>
-</span><span class='line'>如果不是本地clock_event_device，会做进一步的判断：如果不能把irq绑定到本cpu，则放弃处理，如果本cpu已经有了一个本地clock_event_device，也放弃处理：
-</span><span class='line'>
-</span><span class='line'>&#9;if (!cpumask_equal(newdev-&gt;cpumask, cpumask_of(cpu))) {
-</span><span class='line'>&#9;&#9;&#9;   ......
-</span><span class='line'>&#9;&#9;if (!irq_can_set_affinity(newdev-&gt;irq))
-</span><span class='line'>&#9;&#9;&#9;goto out_bc;
-</span><span class='line'>&#9;&#9;&#9;   ......
-</span><span class='line'>&#9;&#9;if (curdev && cpumask_equal(curdev-&gt;cpumask, cpumask_of(cpu)))
-</span><span class='line'>&#9;&#9;&#9;goto out_bc;
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>反之，如果本cpu已经有了一个clock_event_device，则根据是否支持单触发模式和它的rating值，决定是否替换原来旧的clock_event_device：
-</span><span class='line'>
-</span><span class='line'>&#9;if (curdev) {
-</span><span class='line'>&#9;&#9;if ((curdev-&gt;features & CLOCK_EVT_FEAT_ONESHOT) &&
-</span><span class='line'>&#9;&#9;&#9;!(newdev-&gt;features & CLOCK_EVT_FEAT_ONESHOT))
-</span><span class='line'>&#9;&#9;&#9;goto out_bc;  // 新的不支持单触发，但旧的支持，所以不能替换
-</span><span class='line'>&#9;&#9;if (curdev-&gt;rating &gt;= newdev-&gt;rating)
-</span><span class='line'>&#9;&#9;&#9;goto out_bc;  // 旧的比新的精度高，不能替换
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>在这些判断都通过之后，说明或者来cpu还没有绑定tick_device，或者是新的更好，需要替换：
-</span><span class='line'>
-</span><span class='line'>&#9;if (tick_is_broadcast_device(curdev)) {
-</span><span class='line'>&#9;&#9;clockevents_shutdown(curdev);
-</span><span class='line'>&#9;&#9;curdev = NULL;
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;clockevents_exchange_device(curdev, newdev);
-</span><span class='line'>&#9;tick_setup_device(td, newdev, cpu, cpumask_of(cpu));</span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>560 int inet_rtx_syn_ack(struct sock *parent, struct request_sock *req)
+</span><span class='line'>561 {
+</span><span class='line'>562     int err = req-&gt;rsk_ops-&gt;rtx_syn_ack(parent, req);    //指向tcp_v4_rtx_synack或tcp_v6_rtx_synack
+</span><span class='line'>563
+</span><span class='line'>564     if (!err)
+</span><span class='line'>565         req-&gt;num_retrans++;
+</span><span class='line'>566     return err;
+</span><span class='line'>567 }</span></code></pre></td></tr></table></div></figure>
 
 
-<p>上面的tick_setup_device函数负责重新绑定当前cpu的tick_device和新注册的clock_event_device，如果发现是当前cpu第一次注册tick_device，就把它设置为TICKDEV_MODE_PERIODIC模式，如果是替换旧的tick_device，则根据新的tick_device的特性，设置为TICKDEV_MODE_PERIODIC或TICKDEV_MODE_ONESHOT模式。可见，在系统的启动阶段，tick_device是工作在周期触发模式的，直到框架层在合适的时机，才会开启单触发模式，以便支持NO_HZ和HRTIMER。</p>
-
-<h4>5. tick事件的处理&ndash;最简单的情况</h4>
-
-<p>clock_event_device最基本的应用就是实现tick_device，然后给系统定期地产生tick事件，通用时间框架对clock_event_device和tick_device的处理相当复杂，因为涉及配置项：CONFIG_NO_HZ和CONFIG_HIGH_RES_TIMERS的组合，两个配置项就有4种组合，这四种组合的处理都有所不同，所以这里我先只讨论最简单的情况：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>CONFIG_NO_HZ == 0;
-</span><span class='line'>CONFIG_HIGH_RES_TIMERS == 0;</span></code></pre></td></tr></table></div></figure>
-
-
-<p>在这种配置模式下，我们回到上一节的tick_setup_device函数的最后：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if (td-&gt;mode == TICKDEV_MODE_PERIODIC)
-</span><span class='line'>&#9;tick_setup_periodic(newdev, 0);
-</span><span class='line'>else
-</span><span class='line'>&#9;tick_setup_oneshot(newdev, handler, next_event);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>因为启动期间，第一个注册的tick_device必然工作在TICKDEV_MODE_PERIODIC模式，所以tick_setup_periodic会设置clock_event_device的事件回调字段event_handler为tick_handle_periodic，工作一段时间后，就算有新的支持TICKDEV_MODE_ONESHOT模式的clock_event_device需要替换，再次进入tick_setup_device函数，tick_setup_oneshot的handler参数也是之前设置的tick_handle_periodic函数，所以我们考察tick_handle_periodic即可：</p>
+<p>tcp_v4_rtx_synack函数：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -1198,86 +931,17 @@ var ss360Config = {
 <span class='line-number'>6</span>
 <span class='line-number'>7</span>
 <span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>void tick_handle_periodic(struct clock_event_device *dev)
-</span><span class='line'>{
-</span><span class='line'>&#9;int cpu = smp_processor_id();
-</span><span class='line'>&#9;ktime_t next;
-</span><span class='line'>
-</span><span class='line'>&#9;tick_periodic(cpu);
-</span><span class='line'>
-</span><span class='line'>&#9;if (dev-&gt;mode != CLOCK_EVT_MODE_ONESHOT)
-</span><span class='line'>&#9;&#9;return;
-</span><span class='line'>
-</span><span class='line'>&#9;next = ktime_add(dev-&gt;next_event, tick_period);
-</span><span class='line'>&#9;for (;;) {
-</span><span class='line'>&#9;&#9;if (!clockevents_program_event(dev, next, false))
-</span><span class='line'>&#9;&#9;&#9;return;
-</span><span class='line'>&#9;&#9;if (timekeeping_valid_for_hres())
-</span><span class='line'>&#9;&#9;&#9;tick_periodic(cpu);
-</span><span class='line'>&#9;&#9;next = ktime_add(next, tick_period);
-</span><span class='line'>&#9;}
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>870 static int tcp_v4_rtx_synack(struct sock *sk, struct request_sock *req)
+</span><span class='line'>871 {
+</span><span class='line'>872     int res = tcp_v4_send_synack(sk, NULL, req, 0, false); //构建并发送SYN-ACK
+</span><span class='line'>873
+</span><span class='line'>874     if (!res)
+</span><span class='line'>875         TCP_INC_STATS_BH(sock_net(sk), TCP_MIB_RETRANSSEGS);
+</span><span class='line'>876     return res;
+</span><span class='line'>877 }</span></code></pre></td></tr></table></div></figure>
 
 
-<p>该函数首先调用tick_periodic函数，完成tick事件的所有处理，如果是周期触发模式，处理结束，如果工作在单触发模式，则计算并设置下一次的触发时刻，这里用了一个循环，是为了防止当该函数被调用时，clock_event_device中的计时实际上已经经过了不止一个tick周期，这时候，tick_periodic可能被多次调用，使得jiffies和时间可以被正确地更新。tick_periodic的代码如下：</p>
 
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static void tick_periodic(int cpu)
-</span><span class='line'>{
-</span><span class='line'>&#9;if (tick_do_timer_cpu == cpu) {
-</span><span class='line'>&#9;&#9;write_seqlock(&xtime_lock);
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;/* Keep track of the next tick event */
-</span><span class='line'>&#9;&#9;tick_next_period = ktime_add(tick_next_period, tick_period);
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;do_timer(1);
-</span><span class='line'>&#9;&#9;write_sequnlock(&xtime_lock);
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;update_process_times(user_mode(get_irq_regs()));
-</span><span class='line'>&#9;profile_tick(CPU_PROFILING);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>如果当前cpu负责更新时间，则通过do_timer进行以下操作：</p>
-
-<pre><code>更新jiffies_64变量；
-更新墙上时钟；
-每10个tick，更新一次cpu的负载信息；
-</code></pre>
-
-<p>调用update_peocess_times，完成以下事情：</p>
-
-<pre><code>更新进程的时间统计信息；
-触发TIMER_SOFTIRQ软件中断，以便系统处理传统的低分辨率定时器；
-检查rcu的callback；
-通过scheduler_tick触发调度系统进行进程统计和调度工作；
-</code></pre>
 </div>
   
   
@@ -1290,7 +954,7 @@ var ss360Config = {
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2017/07/23/kernel-clock-3/">Linux时间子系统之三：时间的维护者：timekeeper</a></h2>
+      <h2 class="entry-title"><a href="/blog/2018/01/25/kernel-net-fastopen/">TCP Fast Open(TFO), tcp_fastopen</a></h2>
     
     
       <p class="meta">
@@ -1299,60 +963,18 @@ var ss360Config = {
 
 
 
-<time class='entry-date' datetime='2017-07-23T13:46:00+08:00'><span class='date'>2017-07-23</span> <span class='time'>13:46:00</span></time>
+<time class='entry-date' datetime='2018-01-25T03:25:00+08:00'><span class='date'>2018-01-25</span> <span class='time'>03:25:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><p><a href="http://blog.csdn.net/droidphone/article/details/7989566">http://blog.csdn.net/droidphone/article/details/7989566</a></p>
+  <div class="entry-content"><p><a href="https://www.2cto.com/kf/201701/586043.html">https://www.2cto.com/kf/201701/586043.html</a></p>
 
-<p>本系列文章的前两节讨论了用于计时的时钟源：clocksource，以及内核内部时间的一些表示方法，但是对于真实的用户来说，我们感知的是真实世界的真实时间，也就是所谓的墙上时间，clocksource只能提供一个按给定频率不停递增的周期计数，如何把它和真实的墙上时间相关联？本节的内容正是要讨论这一点。</p>
+<p><a href="http://blog.csdn.net/u011130578/article/details/44515165">http://blog.csdn.net/u011130578/article/details/44515165</a></p>
 
-<h4>1. 时间的种类</h4>
-
-<p>内核管理着多种时间，它们分别是：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>RTC时间
-</span><span class='line'>wall time：墙上时间
-</span><span class='line'>monotonic time
-</span><span class='line'>raw monotonic time
-</span><span class='line'>boot time：总启动时间</span></code></pre></td></tr></table></div></figure>
-
-
-<p>RTC时间  在PC中，RTC时间又叫CMOS时间，它通常由一个专门的计时硬件来实现，软件可以读取该硬件来获得年月日、时分秒等时间信息，而在嵌入式系统中，有使用专门的RTC芯片，也有直接把RTC集成到Soc芯片中，读取Soc中的某个寄存器即可获取当前时间信息。一般来说，RTC是一种可持续计时的，也就是说，不管系统是否上电，RTC中的时间信息都不会丢失，计时会一直持续进行，硬件上通常使用一个后备电池对RTC硬件进行单独的供电。因为RTC硬件的多样性，开发者需要为每种RTC时钟硬件提供相应的驱动程序，内核和用户空间通过驱动程序访问RTC硬件来获取或设置时间信息。</p>
-
-<p>xtime  xtime和RTC时间一样，都是人们日常所使用的墙上时间，只是RTC时间的精度通常比较低，大多数情况下只能达到毫秒级别的精度，如果是使用外部的RTC芯片，访问速度也比较慢，为此，内核维护了另外一个wall time时间：xtime，取决于用于对xtime计时的clocksource，它的精度甚至可以达到纳秒级别，因为xtime实际上是一个内存中的变量，它的访问速度非常快，内核大部分时间都是使用xtime来获得当前时间信息。xtime记录的是自1970年1月1日24时到当前时刻所经历的纳秒数。</p>
-
-<p>monotonic time  该时间自系统开机后就一直单调地增加，它不像xtime可以因用户的调整时间而产生跳变，不过该时间不计算系统休眠的时间，也就是说，系统休眠时，monotoic时间不会递增。</p>
-
-<p>raw monotonic time  该时间与monotonic时间类似，也是单调递增的时间，唯一的不同是：raw monotonic time“更纯净”，他不会受到NTP时间调整的影响，它代表着系统独立时钟硬件对时间的统计。</p>
-
-<p>boot time  与monotonic时间相同，不过会累加上系统休眠的时间，它代表着系统上电后的总时间。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>时间种 类     精度（统计单位）     访问速度     累计休眠时间     受NTP调整的影响
-</span><span class='line'>RTC           低                   慢           Yes              Yes
-</span><span class='line'>xtime         高                   快           Yes              Yes
-</span><span class='line'>monotonic     高                   快           No               Yes
-</span><span class='line'>raw monotonic 高                   快           No               No
-</span><span class='line'>boot time     高                   快           Yes              Yes</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>2. struct timekeeper</h4>
-
-<p>内核用timekeeper结构来组织与时间相关的数据，它的定义如下：</p>
+<p><a href="http://blog.sina.com.cn/s/blog_583f42f101011veh.html">http://blog.sina.com.cn/s/blog_583f42f101011veh.html</a></p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -1372,99 +994,41 @@ var ss360Config = {
 <span class='line-number'>16</span>
 <span class='line-number'>17</span>
 <span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct timekeeper {  
-</span><span class='line'>&#9;struct clocksource *clock;    /* Current clocksource used for timekeeping. */  
-</span><span class='line'>&#9;u32 mult;    /* NTP adjusted clock multiplier */  
-</span><span class='line'>&#9;int shift;  /* The shift value of the current clocksource. */  
-</span><span class='line'>&#9;cycle_t cycle_interval; /* Number of clock cycles in one NTP interval. */  
-</span><span class='line'>&#9;u64 xtime_interval; /* Number of clock shifted nano seconds in one NTP interval. */  
-</span><span class='line'>&#9;s64 xtime_remainder;    /* shifted nano seconds left over when rounding cycle_interval */  
-</span><span class='line'>&#9;u32 raw_interval;   /* Raw nano seconds accumulated per NTP interval. */  
-</span><span class='line'>  
-</span><span class='line'>&#9;u64 xtime_nsec; /* Clock shifted nano seconds remainder not stored in xtime.tv_nsec. */  
-</span><span class='line'>&#9;/* Difference between accumulated time and NTP time in ntp 
-</span><span class='line'>&#9; * shifted nano seconds. */  
-</span><span class='line'>&#9;s64 ntp_error;  
-</span><span class='line'>&#9;/* Shift conversion between clock shifted nano seconds and 
-</span><span class='line'>&#9; * ntp shifted nano seconds. */  
-</span><span class='line'>&#9;int ntp_error_shift;  
-</span><span class='line'>  
-</span><span class='line'>&#9;struct timespec xtime;  /* The current time */  
-</span><span class='line'>  
-</span><span class='line'>&#9;struct timespec wall_to_monotonic;  
-</span><span class='line'>&#9;struct timespec total_sleep_time;   /* time spent in suspend */  
-</span><span class='line'>&#9;struct timespec raw_time;   /* The raw monotonic time for the CLOCK_MONOTONIC_RAW posix clock. */  
-</span><span class='line'>  
-</span><span class='line'>&#9;ktime_t offs_real;  /* Offset clock monotonic -&gt; clock realtime */  
-</span><span class='line'>  
-</span><span class='line'>&#9;ktime_t offs_boot;  /* Offset clock monotonic -&gt; clock boottime */  
-</span><span class='line'>  
-</span><span class='line'>&#9;seqlock_t lock; /* Seqlock for all timekeeper values */  
-</span><span class='line'>};  </span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define TFO_CLIENT_ENABLE       1
+</span><span class='line'>#define TFO_SERVER_ENABLE       2
+</span><span class='line'>#define TFO_CLIENT_NO_COOKIE    4       /* Data in SYN w/o cookie option */
+</span><span class='line'>
+</span><span class='line'>/* Process SYN data but skip cookie validation */
+</span><span class='line'>#define TFO_SERVER_COOKIE_NOT_CHKED     0x100 // 收到cookie也不检查
+</span><span class='line'>/* Accept SYN data w/o any cookie option */
+</span><span class='line'>#define TFO_SERVER_COOKIE_NOT_REQD      0x200 // 不需要cookie需要data就能创建fastopen child，默认情况下syn的data会被忽略
+</span><span class='line'>
+</span><span class='line'>/* Force enable TFO on all listeners, i.e., not requiring the
+</span><span class='line'> * TCP_FASTOPEN socket option. SOCKOPT1/2 determine how to set max_qlen.
+</span><span class='line'> */
+</span><span class='line'>#define TFO_SERVER_WO_SOCKOPT1  0x400     // 调listen后不需要再调setsockopt就开启fastopen
+</span><span class='line'>#define TFO_SERVER_WO_SOCKOPT2  0x800     // 调listen后不需要再调setsockopt就开启fastopen，backlog=TFO_SERVER_WO_SOCKOPT2&gt;&gt;16
+</span><span class='line'>/* Always create TFO child sockets on a TFO listener even when
+</span><span class='line'> * cookie/data not present. (For testing purpose!)
+</span><span class='line'> */
+</span><span class='line'>#define TFO_SERVER_ALWAYS       0x1000        // 不需要cookie也不需要data就创建fastopen child, 容易被攻击，不开启</span></code></pre></td></tr></table></div></figure>
 
 
-<p>其中的xtime字段就是上面所说的墙上时间，它是一个timespec结构的变量，它记录了自1970年1月1日以来所经过的时间，因为是timespec结构，所以它的精度可以达到纳秒级，当然那要取决于系统的硬件是否支持这一精度。</p>
+<h3>测试</h3>
 
-<p>内核除了用xtime表示墙上的真实时间外，还维护了另外一个时间：monotonic time，可以把它理解为自系统启动以来所经过的时间，该时间只能单调递增，可以理解为xtime虽然正常情况下也是递增的，但是毕竟用户可以主动向前或向后调整墙上时间，从而修改xtime值。但是monotonic时间不可以往后退，系统启动后只能不断递增。奇怪的是，内核并没有直接定义一个这样的变量来记录monotonic时间，而是定义了一个变量wall_to_monotonic，记录了墙上时间和monotonic时间之间的偏移量，当需要获得monotonic时间时，把xtime和wall_to_monotonic相加即可，因为默认启动时monotonic时间为0，所以实际上wall_to_monotonic的值是一个负数，它和xtime同一时间被初始化，请参考timekeeping_init函数。</p>
-
-<p>计算monotonic时间要去除系统休眠期间花费的时间，内核用total_sleep_time记录休眠的时间，每次休眠醒来后重新累加该时间，并调整wall_to_monotonic的值，使其在系统休眠醒来后，monotonic时间不会发生跳变。因为wall_to_monotonic值被调整。所以如果想获取boot time，需要加入该变量的值：</p>
+<h4>开启</h4>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
 <span class='line-number'>3</span>
 <span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>void get_monotonic_boottime(struct timespec *ts)  
-</span><span class='line'>{  
-</span><span class='line'>&#9;&#9;......  
-</span><span class='line'>&#9;do {  
-</span><span class='line'>&#9;&#9;seq = read_seqbegin(&timekeeper.lock);  
-</span><span class='line'>&#9;&#9;*ts = timekeeper.xtime;  
-</span><span class='line'>&#9;&#9;tomono = timekeeper.wall_to_monotonic;  
-</span><span class='line'>&#9;&#9;&lt;span style="color:#ff0000;"&gt;sleep = timekeeper.total_sleep_time;&lt;/span&gt;  
-</span><span class='line'>&#9;&#9;nsecs = timekeeping_get_ns();  
-</span><span class='line'>  
-</span><span class='line'>&#9;} while (read_seqretry(&timekeeper.lock, seq));  
-</span><span class='line'>  
-</span><span class='line'>&#9;set_normalized_timespec(ts, ts-&gt;tv_sec + tomono.tv_sec + sleep.tv_sec,  
-</span><span class='line'>&#9;&#9;&#9;ts-&gt;tv_nsec + tomono.tv_nsec + sleep.tv_nsec + nsecs);  
-</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>echo 3 &gt; /proc/sys/net/ipv4/tcp_fastopen   # 1 开启客户端，2 开启服务端，3 都开启
+</span><span class='line'>
+</span><span class='line'>tc qdisc add dev lo root netem delay 300ms # 设置延迟才能看出效果
+</span><span class='line'>ifconfig lo mtu 1500</span></code></pre></td></tr></table></div></figure>
 
 
-<p>raw_time字段用来表示真正的硬件时间，也就是上面所说的raw monotonic time，它不受时间调整的影响，monotonic时间虽然也不受settimeofday的影响，但会受到ntp调整的影响，但是raw_time不受ntp的影响，他真的就是开完机后就单调地递增。xtime、monotonic-time和raw_time可以通过用户空间的clock_gettime函数获得，对应的ID参数分别是 CLOCK_REALTIME、CLOCK_MONOTONIC、CLOCK_MONOTONIC_RAW。</p>
-
-<p>clock字段则指向了目前timekeeper所使用的时钟源，xtime，monotonic time和raw time都是基于该时钟源进行计时操作，当有新的精度更高的时钟源被注册时，通过timekeeping_notify函数，change_clocksource函数将会被调用，timekeeper.clock字段将会被更新，指向新的clocksource。</p>
-
-<p>早期的内核版本中，xtime、wall_to_monotonic、raw_time其实是定义为全局静态变量，到我目前的版本（V3.4.10），这几个变量被移入到了timekeeper结构中，现在只需维护一个timekeeper全局静态变量即可：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static struct timekeeper timekeeper;  </span></code></pre></td></tr></table></div></figure>
-
-
-<h4>3. timekeeper的初始化</h4>
-
-<p>timekeeper的初始化由timekeeping_init完成，该函数在start_kernel的初始化序列中被调用，timekeeping_init首先从RTC中获取当前时间：</p>
+<h4>client</h4>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -1513,84 +1077,82 @@ var ss360Config = {
 <span class='line-number'>45</span>
 <span class='line-number'>46</span>
 <span class='line-number'>47</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>void __init timekeeping_init(void)  
-</span><span class='line'>{  
-</span><span class='line'>&#9;struct clocksource *clock;  
-</span><span class='line'>&#9;unsigned long flags;  
-</span><span class='line'>&#9;struct timespec now, boot;  
-</span><span class='line'>  
-</span><span class='line'>&#9;read_persistent_clock(&now);  
-</span><span class='line'>&#9;read_boot_clock(&boot);  
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;stdio.h&gt;
+</span><span class='line'>#include &lt;unistd.h&gt;
+</span><span class='line'>#include &lt;string.h&gt;
+</span><span class='line'>#include &lt;errno.h&gt;
+</span><span class='line'>#include &lt;sys/types.h&gt;
+</span><span class='line'>#include &lt;sys/socket.h&gt;
+</span><span class='line'>#include &lt;netinet/in.h&gt;
 </span><span class='line'>
-</span><span class='line'>然后对锁和ntp进行必要的初始化：
+</span><span class='line'>#include &lt;netinet/tcp.h&gt;
 </span><span class='line'>
-</span><span class='line'>&#9;seqlock_init(&timekeeper.lock);  
-</span><span class='line'>  
-</span><span class='line'>&#9;ntp_init();  
+</span><span class='line'>#ifndef MSG_FASTOPEN
+</span><span class='line'>#define MSG_FASTOPEN   0x20000000
+</span><span class='line'>#endif
 </span><span class='line'>
-</span><span class='line'>接着获取默认的clocksource，如果平台没有重新实现clocksource_default_clock函数，
-</span><span class='line'>默认的clocksource就是基于jiffies的clocksource_jiffies，
-</span><span class='line'>然后通过timekeeper_setup_inernals内部函数把timekeeper和clocksource进行关联：
+</span><span class='line'>int main(int argc, char *argv[])
+</span><span class='line'>{
+</span><span class='line'>&#9;int sockfd, n;
+</span><span class='line'>&#9;struct sockaddr_in servaddr;
+</span><span class='line'>&#9;char buf[50000] = "aaabbbccc";
+</span><span class='line'>&#9;int ret = 0, tot;
 </span><span class='line'>
-</span><span class='line'>&#9;write_seqlock_irqsave(&timekeeper.lock, flags);  
-</span><span class='line'>&#9;clock = clocksource_default_clock();  
-</span><span class='line'>&#9;if (clock-&gt;enable)  
-</span><span class='line'>&#9;&#9;clock-&gt;enable(clock);  
-</span><span class='line'>&#9;timekeeper_setup_internals(clock);  
+</span><span class='line'>&#9;if ((sockfd = socket(AF_INET, SOCK_STREAM, 0)) &lt; 0) {
+</span><span class='line'>&#9;&#9;printf ("create socket error: %s(errno: %d)\n", strerror (errno), errno);
+</span><span class='line'>&#9;&#9;return -1;
+</span><span class='line'>&#9;}
 </span><span class='line'>
-</span><span class='line'>利用RTC的当前时间，初始化xtime，raw_time，wall_to_monotonic等字段：
+</span><span class='line'>&#9;memset (&servaddr, 0, sizeof (servaddr));
+</span><span class='line'>&#9;servaddr.sin_family = AF_INET;
+</span><span class='line'>&#9;servaddr.sin_port = htons (1935);
+</span><span class='line'>&#9;servaddr.sin_addr.s_addr = inet_addr("127.0.0.1");
 </span><span class='line'>
-</span><span class='line'>&#9;timekeeper.xtime.tv_sec = now.tv_sec;  
-</span><span class='line'>&#9;timekeeper.xtime.tv_nsec = now.tv_nsec;  
-</span><span class='line'>&#9;timekeeper.raw_time.tv_sec = 0;  
-</span><span class='line'>&#9;timekeeper.raw_time.tv_nsec = 0;  
-</span><span class='line'>&#9;if (boot.tv_sec == 0 && boot.tv_nsec == 0) {  
-</span><span class='line'>&#9;&#9;boot.tv_sec = timekeeper.xtime.tv_sec;  
-</span><span class='line'>&#9;&#9;boot.tv_nsec = timekeeper.xtime.tv_nsec;  
-</span><span class='line'>&#9;}  
-</span><span class='line'>&#9;set_normalized_timespec(&timekeeper.wall_to_monotonic,  
-</span><span class='line'>&#9;&#9;&#9;-boot.tv_sec, -boot.tv_nsec);  
+</span><span class='line'>#define FASTOPEN_TEST
+</span><span class='line'>#ifndef FASTOPEN_TEST
+</span><span class='line'>&#9;if (connect(sockfd, (struct sockaddr *)&servaddr, sizeof(servaddr))) {
+</span><span class='line'>&#9;&#9;printf("connect error\n");
+</span><span class='line'>&#9;&#9;return -2;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;ret = send(sockfd, buf, 1005, 0);
+</span><span class='line'>#else
+</span><span class='line'>&#9;ret = sendto(sockfd, buf, 1005, MSG_FASTOPEN, (struct sockaddr *)&servaddr, sizeof(servaddr));
+</span><span class='line'>#endif
+</span><span class='line'>&#9;if (ret &lt; 0) {
+</span><span class='line'>&#9;&#9;printf ("send msg error: %s(errno: %d)\n", strerror (errno), errno);
+</span><span class='line'>&#9;&#9;// 如果是连接失败会打印：Connection refused(errno: 111)
+</span><span class='line'>&#9;&#9;return -2;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;printf("client fastopen sendto len=%d\n", ret);
+</span><span class='line'>&#9;if ((ret = send(sockfd, buf, 20000, 0)) &lt; 0) {
+</span><span class='line'>&#9;&#9;printf("send error ret = %d\n", ret);
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;printf("client send len = %d\n", ret);
+</span><span class='line'>&#9;shutdown(sockfd, 1);
 </span><span class='line'>
-</span><span class='line'>最后，初始化代表实时时间和monotonic时间之间偏移量的offs_real字段，total_sleep_time字段初始化为0：
-</span><span class='line'>
-</span><span class='line'>
-</span><span class='line'>&#9;update_rt_offset();  
-</span><span class='line'>&#9;timekeeper.total_sleep_time.tv_sec = 0;  
-</span><span class='line'>&#9;timekeeper.total_sleep_time.tv_nsec = 0;  
-</span><span class='line'>&#9;write_sequnlock_irqrestore(&timekeeper.lock, flags);  
-</span><span class='line'>
+</span><span class='line'>&#9;tot = 0;
+</span><span class='line'>&#9;while ((n = recv(sockfd, buf, 1024, 0)) &gt; 0)
+</span><span class='line'>&#9;&#9;tot += n;
+</span><span class='line'>&#9;printf("client recv len = %d\n", tot);
+</span><span class='line'>&#9;close (sockfd);
+</span><span class='line'>&#9;return 0;
 </span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
-<p>xtime字段因为是保存在内存中，系统掉电后无法保存时间信息，所以每次启动时都要通过timekeeping_init从RTC中同步正确的时间信息。其中，read_persistent_clock和read_boot_clock是平台级的函数，分别用于获取RTC硬件时间和启动时的时间，不过值得注意到是，到目前为止（我的代码树基于3.4版本），ARM体系中，只有tegra和omap平台实现了read_persistent_clock函数。如果平台没有实现该函数，内核提供了一个默认的实现：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>void __attribute__((weak)) read_persistent_clock(struct timespec *ts)  
-</span><span class='line'>{  
-</span><span class='line'>&#9;ts-&gt;tv_sec = 0;  
-</span><span class='line'>&#9;ts-&gt;tv_nsec = 0;  
-</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>void __attribute__((weak)) read_boot_clock(struct timespec *ts)  
-</span><span class='line'>{  
-</span><span class='line'>&#9;ts-&gt;tv_sec = 0;  
-</span><span class='line'>&#9;ts-&gt;tv_nsec = 0;  
-</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
-
-
-<p>那么，其他ARM平台是如何初始化xtime的？答案就是CONFIG_RTC_HCTOSYS这个内核配置项，打开该配置后，driver/rtc/hctosys.c将会编译到系统中，由rtc_hctosys函数通过do_settimeofday在系统初始化时完成xtime变量的初始化：</p>
+<h4>server</h4>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -1603,42 +1165,160 @@ var ss360Config = {
 <span class='line-number'>9</span>
 <span class='line-number'>10</span>
 <span class='line-number'>11</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static int __init rtc_hctosys(void)   
-</span><span class='line'>{   
-</span><span class='line'>&#9;&#9;......   
-</span><span class='line'>&#9;&#9;err = rtc_read_time(rtc, &tm);   
-</span><span class='line'>&#9;&#9;......  
-</span><span class='line'>&#9;&#9;rtc_tm_to_time(&tm, &tv.tv_sec);   
-</span><span class='line'>&#9;&#9;do_settimeofday(&tv);   
-</span><span class='line'>&#9;&#9;......   
-</span><span class='line'>&#9;&#9;return err;   
-</span><span class='line'>}   
-</span><span class='line'>late_initcall(rtc_hctosys);  </span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;unistd.h&gt;
+</span><span class='line'>#include &lt;string.h&gt;
+</span><span class='line'>#include &lt;sys/types.h&gt;
+</span><span class='line'>#include &lt;sys/socket.h&gt;
+</span><span class='line'>#include &lt;netinet/in.h&gt;
+</span><span class='line'>#include &lt;netinet/tcp.h&gt;
+</span><span class='line'>#include &lt;stdio.h&gt;
+</span><span class='line'>
+</span><span class='line'>int main()
+</span><span class='line'>{
+</span><span class='line'>&#9;int serverSock, clientSock;
+</span><span class='line'>&#9;struct sockaddr_in addr, clientAddr;
+</span><span class='line'>&#9;int addrLen;
+</span><span class='line'>
+</span><span class='line'>&#9;char buf[10240];
+</span><span class='line'>&#9;int n, tot;
+</span><span class='line'>
+</span><span class='line'>&#9;serverSock = socket(AF_INET, SOCK_STREAM, 0);
+</span><span class='line'>&#9;if (serverSock == -1) {
+</span><span class='line'>&#9;&#9;printf("socket failed!\n");
+</span><span class='line'>&#9;&#9;return -1;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;memset(&addr, 0, sizeof(addr));
+</span><span class='line'>&#9;addr.sin_family = AF_INET;
+</span><span class='line'>&#9;addr.sin_port = htons(1935);
+</span><span class='line'>&#9;addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+</span><span class='line'>
+</span><span class='line'>&#9;if (bind(serverSock, (struct sockaddr*)&addr, sizeof(addr)) &lt; 0) {
+</span><span class='line'>&#9;&#9;printf("bind failed!\n");
+</span><span class='line'>&#9;&#9;return -2;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;int qlen = 5;
+</span><span class='line'>&#9;setsockopt(serverSock, SOL_TCP, TCP_FASTOPEN, &qlen, sizeof(qlen));
+</span><span class='line'>
+</span><span class='line'>&#9;if (listen(serverSock, 511) &lt; 0) {
+</span><span class='line'>&#9;&#9;printf("listen failed!\n");
+</span><span class='line'>&#9;&#9;return -3;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;while (1) {
+</span><span class='line'>&#9;&#9;addrLen = sizeof(clientAddr);
+</span><span class='line'>&#9;&#9;clientSock = accept(serverSock, (struct sockaddr*)&clientAddr, &addrLen);
+</span><span class='line'>&#9;&#9;if (clientSock &lt; 0) {
+</span><span class='line'>&#9;&#9;&#9;printf("accept failed!\n");
+</span><span class='line'>&#9;&#9;&#9;return -4;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if ((n = send(clientSock, buf, 10000, 0)) &lt; 0) {
+</span><span class='line'>&#9;&#9;&#9;printf("send error ret = %d\n", n);
+</span><span class='line'>&#9;&#9;&#9;return -5;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;printf("server send len = %d\n", n);
+</span><span class='line'>&#9;&#9;shutdown(clientSock, 1);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;sleep(1);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;tot = 0;
+</span><span class='line'>&#9;&#9;while ((n = recv(clientSock, buf, 1024, 0)) &gt; 0)
+</span><span class='line'>&#9;&#9;&#9;tot += n;
+</span><span class='line'>&#9;&#9;printf("server recv len = %d\n", tot);
+</span><span class='line'>&#9;&#9;close(clientSock);
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;return 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
-<h4>4. 时间的更新</h4>
+<h3>原理</h3>
 
-<p>xtime一旦初始化完成后，timekeeper就开始独立于RTC，利用自身关联的clocksource进行时间的更新操作，根据内核的配置项的不同，更新时间的操作发生的频度也不尽相同，如果没有配置NO_HZ选项，通常每个tick的定时中断周期，do_timer会被调用一次，相反，如果配置了NO_HZ选项，可能会在好几个tick后，do_timer才会被调用一次，当然传入的参数是本次更新离上一次更新时相隔了多少个tick周期，系统会保证在clocksource的max_idle_ns时间内调用do_timer，以防止clocksource的溢出：</p>
+<p>1.客户端发送一个SYN包到服务器，这个包中携带了Fast Open Cookie Request;</p>
 
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>void do_timer(unsigned long ticks)  
-</span><span class='line'>{  
-</span><span class='line'>&#9;jiffies_64 += ticks;  
-</span><span class='line'>&#9;update_wall_time();  
-</span><span class='line'>&#9;calc_global_load(ticks);  
-</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
+<p>2.服务器生成一个cookie，这个cookie是加密客户端的IP地址生成的。服务器给客户端发送SYN+ACK响应，在响应包的选项中包含了这个cookie;</p>
 
+<p>3.客户端存储这个cookie以便将来再次与这个服务器的IP建立TFO连接时使用;</p>
 
-<p>在do_timer中，jiffies_64变量被相应地累加，然后在update_wall_time中完成xtime等时间的更新操作，更新时间的核心操作就是读取关联clocksource的计数值，累加到xtime等字段中，其中还设计ntp时间的调整等代码，详细的代码就不贴了。</p>
+<p>也就是说，第一次TCP连接只是交换cookie信息，无法在SYN包中携带数据。在第一次交换之后，接下来的TCP连接就可以在SYN中携带数据了。流程如下：</p>
 
-<h4>5. 获取时间</h4>
+<p>4.客户端发送一个SYN包，这个包比较特殊，因为它携带应用数据和cookie;</p>
 
-<p>timekeeper提供了一系列的接口用于获取各种时间信息。</p>
+<p>5.服务器验证这个cookie，如果合法，服务器发送一个SYN+ACK，这个ACK同时确认SYN和数据。然后数据被传递到应用进程;</p>
+
+<p>如果不合法，服务器丢弃数据，发送一个SYN+ACK，这个ACK只确认SYN，接下来走三次握手的普通流程;</p>
+
+<p>6.如果验证合法(接收了SYN包中的数据)，服务器在接收到客户端的第一个ACK前可以发送其它响应数据;</p>
+
+<p>7.如果验证不合法(客户端在SYN中带的数据没被确认)，客户端发送ACK确认服务器的SYN;并且，数据会在ACK包中重传;</p>
+
+<p>8.下面的流程与普通的TCP交互流程无异。</p>
+
+<p><img src="/images/kernel/2018-01-25.jpeg" alt="" /></p>
+
+<h3>源码分析</h3>
+
+<p>TFO功能在Linux 2.6.34内核中开始集成。</p>
+
+<p>下面通过分析内核代码来了解TFO的运行机制。开启TFO功能后，server端进程在调用listen系统调用时会初始化TFO队列：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -1649,16 +1329,1094 @@ var ss360Config = {
 <span class='line-number'>7</span>
 <span class='line-number'>8</span>
 <span class='line-number'>9</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>void getboottime(struct timespec *ts);    获取系统启动时刻的实时时间
-</span><span class='line'>void get_monotonic_boottime(struct timespec *ts);     获取系统启动以来所经过的时间，包含休眠时间
-</span><span class='line'>ktime_t ktime_get_boottime(void);   获取系统启动以来所经过的c时间，包含休眠时间，返回ktime类型
-</span><span class='line'>ktime_t ktime_get(void);    获取系统启动以来所经过的c时间，不包含休眠时间，返回ktime类型
-</span><span class='line'>void ktime_get_ts(struct timespec *ts) ;   获取系统启动以来所经过的c时间，不包含休眠时间，返回timespec结构
-</span><span class='line'>unsigned long get_seconds(void);    返回xtime中的秒计数值
-</span><span class='line'>struct timespec current_kernel_time(void);    返回内核最后一次更新的xtime时间，不累计最后一次更新至今clocksource的计数值
-</span><span class='line'>void getnstimeofday(struct timespec *ts);    获取当前时间，返回timespec结构
-</span><span class='line'>void do_gettimeofday(struct timeval *tv);    获取当前时间，返回timeval结构</span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int inet_listen(struct socket *sock, int backlog)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct sock *sk = sock-&gt;sk;
+</span><span class='line'>&#9;unsigned char old_state;
+</span><span class='line'>&#9;int err;
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;if (old_state != TCP_LISTEN) {
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;&#9;if ((sysctl_tcp_fastopen & TFO_SERVER_ENABLE) != 0 &&
+</span><span class='line'>&#9;&#9;&#9;inet_csk(sk)-&gt;icsk_accept_queue.fastopenq == NULL) {
+</span><span class='line'>&#9;&#9;&#9;if ((sysctl_tcp_fastopen & TFO_SERVER_WO_SOCKOPT1) != 0)
+</span><span class='line'>&#9;&#9;&#9;&#9;err = fastopen_init_queue(sk, backlog);
+</span><span class='line'>&#9;&#9;&#9;else if ((sysctl_tcp_fastopen &
+</span><span class='line'>&#9;&#9;&#9;&#9;  TFO_SERVER_WO_SOCKOPT2) != 0)
+</span><span class='line'>&#9;&#9;&#9;&#9;err = fastopen_init_queue(sk,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;((uint)sysctl_tcp_fastopen) &gt;&gt; 16);
+</span><span class='line'>&#9;&#9;&#9;else
+</span><span class='line'>&#9;&#9;&#9;&#9;err = 0;
+</span><span class='line'>&#9;&#9;&#9;if (err)
+</span><span class='line'>&#9;&#9;&#9;&#9;goto out;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;err = inet_csk_listen_start(sk, backlog);
+</span><span class='line'>...</span></code></pre></td></tr></table></div></figure>
 
+
+<p>fastopen_init_queue函数</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static inline int fastopen_init_queue(struct sock *sk, int backlog)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct request_sock_queue *queue =
+</span><span class='line'>&#9;&#9;&inet_csk(sk)-&gt;icsk_accept_queue;
+</span><span class='line'>
+</span><span class='line'>&#9;if (queue-&gt;fastopenq == NULL) {
+</span><span class='line'>&#9;&#9;queue-&gt;fastopenq = kzalloc(
+</span><span class='line'>&#9;&#9;&#9;sizeof(struct fastopen_queue),
+</span><span class='line'>&#9;&#9;&#9;sk-&gt;sk_allocation);
+</span><span class='line'>&#9;&#9;if (queue-&gt;fastopenq == NULL)
+</span><span class='line'>&#9;&#9;&#9;return -ENOMEM;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;sk-&gt;sk_destruct = tcp_sock_destruct;
+</span><span class='line'>&#9;&#9;spin_lock_init(&queue-&gt;fastopenq-&gt;lock);
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;queue-&gt;fastopenq-&gt;max_qlen = backlog;
+</span><span class='line'>&#9;return 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>如果net.ipv4.tcp_fastopen &amp;&amp; (TFO_SERVER_WO_SOCKOPT1|TFO_SERVER_WO_SOCKOPT2)为假，则TFO队列不会被初始化。但setsockopt函数也可以初始化TFO队列：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int do_tcp_setsockopt(struct sock *sk, int level,
+</span><span class='line'>&#9;&#9;int optname, char __user *optval, unsigned int optlen)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>&#9;struct inet_connection_sock *icsk = inet_csk(sk);
+</span><span class='line'>&#9;int val;
+</span><span class='line'>&#9;int err = 0;
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;case TCP_FASTOPEN:
+</span><span class='line'>&#9;&#9;if (val &gt;= 0 && ((1 &lt;&lt; sk-&gt;sk_state) & (TCPF_CLOSE |
+</span><span class='line'>&#9;&#9;&#9;TCPF_LISTEN)))
+</span><span class='line'>&#9;&#9;&#9;err = fastopen_init_queue(sk, val);
+</span><span class='line'>&#9;&#9;else
+</span><span class='line'>&#9;&#9;&#9;err = -EINVAL;
+</span><span class='line'>&#9;&#9;break;
+</span><span class='line'>&#9;...</span></code></pre></td></tr></table></div></figure>
+
+
+<p>如果inet_csk(sk)->icsk_accept_queue.fastopenq为NULL的话意味着TFO功能未开启。</p>
+
+<p>轮到client端出场了！client端的sendto系统调用在内核中对应的TCP函数是tcp_sendmsg：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int tcp_sendmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
+</span><span class='line'>&#9;&#9;size_t size)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct iovec *iov;
+</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>&#9;struct sk_buff *skb;
+</span><span class='line'>&#9;int iovlen, flags, err, copied = 0;
+</span><span class='line'>&#9;int mss_now = 0, size_goal, copied_syn = 0, offset = 0;
+</span><span class='line'>&#9;bool sg;
+</span><span class='line'>&#9;long timeo;
+</span><span class='line'>
+</span><span class='line'>&#9;lock_sock(sk);
+</span><span class='line'>
+</span><span class='line'>&#9;flags = msg-&gt;msg_flags;
+</span><span class='line'>&#9;if (flags & MSG_FASTOPEN) {//要使用TFO功能
+</span><span class='line'>&#9;&#9;err = tcp_sendmsg_fastopen(sk, msg, &copied_syn);//发送TFO数据
+</span><span class='line'>&#9;&#9;if (err == -EINPROGRESS && copied_syn &gt; 0)
+</span><span class='line'>&#9;&#9;&#9;goto out;
+</span><span class='line'>&#9;&#9;else if (err)
+</span><span class='line'>&#9;&#9;&#9;goto out_err;
+</span><span class='line'>&#9;&#9;offset = copied_syn;
+</span><span class='line'>&#9;}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>tcp_sendmsg_fastopen函数用于发送带TFO请求的SYN或携带数据的SYN：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int tcp_sendmsg_fastopen(struct sock *sk, struct msghdr *msg, int *size)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>&#9;int err, flags;
+</span><span class='line'>
+</span><span class='line'>&#9;if (!(sysctl_tcp_fastopen & TFO_CLIENT_ENABLE))
+</span><span class='line'>&#9;&#9;return -EOPNOTSUPP;
+</span><span class='line'>&#9;if (tp-&gt;fastopen_req != NULL)
+</span><span class='line'>&#9;&#9;return -EALREADY; /* Another Fast Open is in progress */
+</span><span class='line'>
+</span><span class='line'>&#9;tp-&gt;fastopen_req = kzalloc(sizeof(struct tcp_fastopen_request),
+</span><span class='line'>&#9;&#9;&#9;&#9;   sk-&gt;sk_allocation);
+</span><span class='line'>&#9;if (unlikely(tp-&gt;fastopen_req == NULL))
+</span><span class='line'>&#9;&#9;return -ENOBUFS;
+</span><span class='line'>&#9;tp-&gt;fastopen_req-&gt;data = msg;
+</span><span class='line'>
+</span><span class='line'>&#9;flags = (msg-&gt;msg_flags & MSG_DONTWAIT) ? O_NONBLOCK : 0;
+</span><span class='line'>&#9;err = __inet_stream_connect(sk-&gt;sk_socket, msg-&gt;msg_name,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;msg-&gt;msg_namelen, flags);      //发送连接请求
+</span><span class='line'>&#9;*size = tp-&gt;fastopen_req-&gt;copied;　//记录发送了多少数据，如果发送的是TFO请求则*size为0
+</span><span class='line'>&#9;tcp_free_fastopen_req(tp);
+</span><span class='line'>&#9;return err;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>　　<code>__inet_stream_connect</code>函数会调用tcp_connect函数发送SYN：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int tcp_connect(struct sock *sk)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>&#9;struct sk_buff *buff;
+</span><span class='line'>&#9;int err;
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;/* Send off SYN; include data in Fast Open. */
+</span><span class='line'>&#9;err = tp-&gt;fastopen_req ? tcp_send_syn_data(sk, buff) :
+</span><span class='line'>&#9;&#9;  tcp_transmit_skb(sk, buff, 1, sk-&gt;sk_allocation); //如果使用TFO，则会调用tcp_send_syn_data发送SYN</span></code></pre></td></tr></table></div></figure>
+
+
+<p>tcp_send_syn_data函数：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int tcp_send_syn_data(struct sock *sk, struct sk_buff *syn)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>&#9;struct tcp_fastopen_request *fo = tp-&gt;fastopen_req;
+</span><span class='line'>&#9;int syn_loss = 0, space, i, err = 0, iovlen = fo-&gt;data-&gt;msg_iovlen;
+</span><span class='line'>&#9;struct sk_buff *syn_data = NULL, *data;
+</span><span class='line'>&#9;unsigned long last_syn_loss = 0;
+</span><span class='line'>
+</span><span class='line'>&#9;tp-&gt;rx_opt.mss_clamp = tp-&gt;advmss;  /* If MSS is not cached */
+</span><span class='line'>&#9;tcp_fastopen_cache_get(sk, &tp-&gt;rx_opt.mss_clamp, &fo-&gt;cookie,
+</span><span class='line'>&#9;&#9;&#9;&#9;   &syn_loss, &last_syn_loss);//查询缓存的TFO cookie信息
+</span><span class='line'>&#9;/* Recurring FO SYN losses: revert to regular handshake temporarily */
+</span><span class='line'>&#9;if (syn_loss &gt; 1 &&
+</span><span class='line'>&#9;&#9;time_before(jiffies, last_syn_loss + (60*HZ &lt;&lt; syn_loss))) {
+</span><span class='line'>&#9;&#9;fo-&gt;cookie.len = -1;
+</span><span class='line'>&#9;&#9;goto fallback;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;if (sysctl_tcp_fastopen & TFO_CLIENT_NO_COOKIE)//无论有没有cookie,都发送携带数据的SYN
+</span><span class='line'>&#9;&#9;fo-&gt;cookie.len = -1;
+</span><span class='line'>&#9;else if (fo-&gt;cookie.len &lt;= 0)      //没有cookie,发送携带TFO请求选项的SYN
+</span><span class='line'>&#9;&#9;goto fallback;
+</span><span class='line'>
+</span><span class='line'>&#9;/* MSS for SYN-data is based on cached MSS and bounded by PMTU and
+</span><span class='line'>&#9; * user-MSS. Reserve maximum option space for middleboxes that add
+</span><span class='line'>&#9; * private TCP options. The cost is reduced data space in SYN :(
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;if (tp-&gt;rx_opt.user_mss && tp-&gt;rx_opt.user_mss &lt; tp-&gt;rx_opt.mss_clamp)
+</span><span class='line'>&#9;&#9;tp-&gt;rx_opt.mss_clamp = tp-&gt;rx_opt.user_mss;
+</span><span class='line'>&#9;space = __tcp_mtu_to_mss(sk, inet_csk(sk)-&gt;icsk_pmtu_cookie) -
+</span><span class='line'>&#9;&#9;MAX_TCP_OPTION_SPACE;//计算SYN包中的能够携带的数据的最大大小
+</span><span class='line'>
+</span><span class='line'>&#9;syn_data = skb_copy_expand(syn, skb_headroom(syn), space,
+</span><span class='line'>&#9;&#9;&#9;&#9;   sk-&gt;sk_allocation);//复制SYN包中的内容，并扩展SKB中的空间
+</span><span class='line'>&#9;if (syn_data == NULL)
+</span><span class='line'>&#9;&#9;goto fallback;
+</span><span class='line'>
+</span><span class='line'>&#9;for (i = 0; i &lt; iovlen && syn_data-&gt;len &lt; space; ++i) {//将用户态中缓存的数据copy到内核
+</span><span class='line'>&#9;&#9;struct iovec *iov = &fo-&gt;data-&gt;msg_iov[i];
+</span><span class='line'>&#9;&#9;unsigned char __user *from = iov-&gt;iov_base;
+</span><span class='line'>&#9;&#9;int len = iov-&gt;iov_len;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (syn_data-&gt;len + len &gt; space)//数据总长度大于SKB中空间的总大小
+</span><span class='line'>&#9;&#9;&#9;len = space - syn_data-&gt;len;
+</span><span class='line'>&#9;&#9;else if (i + 1 == iovlen)
+</span><span class='line'>&#9;&#9;&#9;/* No more data pending in inet_wait_for_connect() */
+</span><span class='line'>&#9;&#9;&#9;fo-&gt;data = NULL;//数据全部发送完毕，不需要在inet_wait_for_connect中等待时发送
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (skb_add_data(syn_data, from, len))//将用户数据copy到SKB中
+</span><span class='line'>&#9;&#9;&#9;goto fallback;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;/* Queue a data-only packet after the regular SYN for retransmission */
+</span><span class='line'>&#9;data = pskb_copy(syn_data, sk-&gt;sk_allocation);
+</span><span class='line'>&#9;if (data == NULL)
+</span><span class='line'>&#9;&#9;goto fallback;
+</span><span class='line'>&#9;TCP_SKB_CB(data)-&gt;seq++;
+</span><span class='line'>&#9;TCP_SKB_CB(data)-&gt;tcp_flags &= ~TCPHDR_SYN;
+</span><span class='line'>&#9;TCP_SKB_CB(data)-&gt;tcp_flags = (TCPHDR_ACK|TCPHDR_PSH);
+</span><span class='line'>&#9;tcp_connect_queue_skb(sk, data);
+</span><span class='line'>&#9;fo-&gt;copied = data-&gt;len;
+</span><span class='line'>
+</span><span class='line'>&#9;if (tcp_transmit_skb(sk, syn_data, 0, sk-&gt;sk_allocation) == 0) {//发送携带数据的SYN
+</span><span class='line'>&#9;&#9;tp-&gt;syn_data = (fo-&gt;copied &gt; 0);
+</span><span class='line'>&#9;&#9;NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPFASTOPENACTIVE);
+</span><span class='line'>&#9;&#9;goto done;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;syn_data = NULL;
+</span><span class='line'>
+</span><span class='line'>fallback:
+</span><span class='line'>&#9;/* Send a regular SYN with Fast Open cookie request option */
+</span><span class='line'>&#9;if (fo-&gt;cookie.len &gt; 0)
+</span><span class='line'>&#9;&#9;fo-&gt;cookie.len = 0;
+</span><span class='line'>&#9;err = tcp_transmit_skb(sk, syn, 1, sk-&gt;sk_allocation);
+</span><span class='line'>&#9;if (err)
+</span><span class='line'>&#9;&#9;tp-&gt;syn_fastopen = 0;
+</span><span class='line'>&#9;kfree_skb(syn_data);
+</span><span class='line'>done:
+</span><span class='line'>&#9;fo-&gt;cookie.len = -1;  /* Exclude Fast Open option for SYN retries */
+</span><span class='line'>&#9;return err;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>如果client是发送TFO请求，则tcp_send_syn_data函数会发送一个不带数据的SYN包，数据部分则会由tcp_sendmsg函数放入发送队列中，等待三次握手完成后再发送。</p>
+
+<p>tcp_transmit_skb函数会调用tcp_syn_options函数构建选项信息，tcp_options_write函数负责将选项写入TCP报头中：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static unsigned int tcp_syn_options(struct sock *sk, struct sk_buff *skb,
+</span><span class='line'>&#9;&#9;&#9;&#9;struct tcp_out_options *opts,
+</span><span class='line'>&#9;&#9;&#9;&#9;struct tcp_md5sig_key **md5)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>&#9;unsigned int remaining = MAX_TCP_OPTION_SPACE;
+</span><span class='line'>&#9;struct tcp_fastopen_request *fastopen = tp-&gt;fastopen_req;
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;if (fastopen && fastopen-&gt;cookie.len &gt;= 0) {
+</span><span class='line'>&#9;&#9;u32 need = TCPOLEN_EXP_FASTOPEN_BASE + fastopen-&gt;cookie.len;
+</span><span class='line'>&#9;&#9;need = (need + 3) & ~3U;  /* Align to 32 bits */
+</span><span class='line'>&#9;&#9;if (remaining &gt;= need) {
+</span><span class='line'>&#9;&#9;&#9;opts-&gt;options |= OPTION_FAST_OPEN_COOKIE;
+</span><span class='line'>&#9;&#9;&#9;opts-&gt;fastopen_cookie = &fastopen-&gt;cookie;
+</span><span class='line'>&#9;&#9;&#9;remaining -= need;
+</span><span class='line'>&#9;&#9;&#9;tp-&gt;syn_fastopen = 1;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;}</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void tcp_options_write(__be32 *ptr, struct tcp_sock *tp,
+</span><span class='line'>&#9;&#9;&#9;&#9;  struct tcp_out_options *opts)
+</span><span class='line'>{
+</span><span class='line'>&#9;u16 options = opts-&gt;options;    /* mungable copy */
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;if (unlikely(OPTION_FAST_OPEN_COOKIE & options)) {
+</span><span class='line'>&#9;&#9;struct tcp_fastopen_cookie *foc = opts-&gt;fastopen_cookie;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;*ptr++ = htonl((TCPOPT_EXP &lt;&lt; 24) |
+</span><span class='line'>&#9;&#9;&#9;&#9;   ((TCPOLEN_EXP_FASTOPEN_BASE + foc-&gt;len) &lt;&lt; 16) |
+</span><span class='line'>&#9;&#9;&#9;&#9;   TCPOPT_FASTOPEN_MAGIC);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;memcpy(ptr, foc-&gt;val, foc-&gt;len);  //如果找到了TFO cookie，则写入；没有RFO cookie则仅仅是一个TFO请求
+</span><span class='line'>&#9;&#9;if ((foc-&gt;len & 3) == 2) {
+</span><span class='line'>&#9;&#9;&#9;u8 *align = ((u8 *)ptr) + foc-&gt;len;
+</span><span class='line'>&#9;&#9;&#9;align[0] = align[1] = TCPOPT_NOP;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;ptr += (foc-&gt;len + 3) &gt;&gt; 2;
+</span><span class='line'>&#9;}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>client端在每次使用TFO功能时都会在TCP的选项中添加一个TFO选项，与server端进行第一次TFO交互时TFO选项只有4字节长，其值是一个“MAGIC”，这种TFO被称为“TFO请求”；后续的TFO选项长度会增加一个从服务器端获得的TFO cookie的长度值，并且在这个SYN中会携带数据。</p>
+
+<p>server收到SYN后，会在tcp_v4_conn_request中进行处理：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int tcp_v4_conn_request(struct sock *sk, struct sk_buff *skb)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct tcp_options_received tmp_opt;
+</span><span class='line'>&#9;struct request_sock *req;
+</span><span class='line'>&#9;struct inet_request_sock *ireq;
+</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>&#9;struct dst_entry *dst = NULL;
+</span><span class='line'>&#9;__be32 saddr = ip_hdr(skb)-&gt;saddr;
+</span><span class='line'>&#9;__be32 daddr = ip_hdr(skb)-&gt;daddr;
+</span><span class='line'>&#9;__u32 isn = TCP_SKB_CB(skb)-&gt;when;
+</span><span class='line'>&#9;bool want_cookie = false;
+</span><span class='line'>&#9;struct flowi4 fl4;
+</span><span class='line'>&#9;struct tcp_fastopen_cookie foc = { .len = -1 };
+</span><span class='line'>&#9;struct tcp_fastopen_cookie valid_foc = { .len = -1 };
+</span><span class='line'>&#9;struct sk_buff *skb_synack;
+</span><span class='line'>&#9;int do_fastopen;
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;tcp_parse_options(skb, &tmp_opt, 0, want_cookie ? NULL : &foc);//解析TFO选项
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;do_fastopen = tcp_fastopen_check(sk, skb, req, &foc, &valid_foc);//检查TFO选项的合法性
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;skb_synack = tcp_make_synack(sk, dst, req,
+</span><span class='line'>&#9;&#9;fastopen_cookie_present(&valid_foc) ? &valid_foc : NULL);//如果客户端发送的是TFO请求则发送TFO cookie，否则不发送
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;if (likely(!do_fastopen)) {
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;} else if (tcp_v4_conn_req_fastopen(sk, skb, skb_synack, req))//创建子sock，将SYN中的数据放入socekt中的接收队列中
+</span><span class='line'>&#9;&#9;goto drop_and_free;
+</span><span class='line'>
+</span><span class='line'>&#9;return 0;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>tcp_fastopen_check函数用于检查SYN中TFO请求的合法性以及生成TFO cookie：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static bool tcp_fastopen_check(struct sock *sk, struct sk_buff *skb,
+</span><span class='line'>&#9;&#9;&#9;&#9;   struct request_sock *req,
+</span><span class='line'>&#9;&#9;&#9;&#9;   struct tcp_fastopen_cookie *foc,
+</span><span class='line'>&#9;&#9;&#9;&#9;   struct tcp_fastopen_cookie *valid_foc)
+</span><span class='line'>{
+</span><span class='line'>&#9;bool skip_cookie = false;
+</span><span class='line'>&#9;struct fastopen_queue *fastopenq;
+</span><span class='line'>
+</span><span class='line'>&#9;if (likely(!fastopen_cookie_present(foc))) {//SYN中没有携带TFO选项
+</span><span class='line'>&#9;&#9;/* See include/net/tcp.h for the meaning of these knobs */
+</span><span class='line'>&#9;&#9;if ((sysctl_tcp_fastopen & TFO_SERVER_ALWAYS) ||
+</span><span class='line'>&#9;&#9;&#9;((sysctl_tcp_fastopen & TFO_SERVER_COOKIE_NOT_REQD) &&
+</span><span class='line'>&#9;&#9;&#9;(TCP_SKB_CB(skb)-&gt;end_seq != TCP_SKB_CB(skb)-&gt;seq + 1)))
+</span><span class='line'>&#9;&#9;&#9;skip_cookie = true; /* no cookie to validate */  //无需校验cookie，直接允许SYN中携带数据
+</span><span class='line'>&#9;&#9;else
+</span><span class='line'>&#9;&#9;&#9;return false;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;fastopenq = inet_csk(sk)-&gt;icsk_accept_queue.fastopenq;
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;if ((sysctl_tcp_fastopen & TFO_SERVER_ENABLE) == 0 ||
+</span><span class='line'>&#9;&#9;fastopenq == NULL || fastopenq-&gt;max_qlen == 0)//未开启Server端TFO功能
+</span><span class='line'>&#9;&#9;return false;
+</span><span class='line'>
+</span><span class='line'>&#9;if (fastopenq-&gt;qlen &gt;= fastopenq-&gt;max_qlen) {//TFO队列已满
+</span><span class='line'>&#9;&#9;struct request_sock *req1;
+</span><span class='line'>&#9;&#9;spin_lock(&fastopenq-&gt;lock);
+</span><span class='line'>&#9;&#9;req1 = fastopenq-&gt;rskq_rst_head;
+</span><span class='line'>&#9;&#9;if ((req1 == NULL) || time_after(req1-&gt;expires, jiffies)) {
+</span><span class='line'>&#9;&#9;&#9;spin_unlock(&fastopenq-&gt;lock);
+</span><span class='line'>&#9;&#9;&#9;NET_INC_STATS_BH(sock_net(sk),
+</span><span class='line'>&#9;&#9;&#9;&#9;LINUX_MIB_TCPFASTOPENLISTENOVERFLOW);
+</span><span class='line'>&#9;&#9;&#9;/* Avoid bumping LINUX_MIB_TCPFASTOPENPASSIVEFAIL*/
+</span><span class='line'>&#9;&#9;&#9;foc-&gt;len = -1;
+</span><span class='line'>&#9;&#9;&#9;return false;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;fastopenq-&gt;rskq_rst_head = req1-&gt;dl_next;//替换队列中最老的一个
+</span><span class='line'>&#9;&#9;fastopenq-&gt;qlen--;
+</span><span class='line'>&#9;&#9;spin_unlock(&fastopenq-&gt;lock);
+</span><span class='line'>&#9;&#9;reqsk_free(req1);
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;if (skip_cookie) {//不使用cookie，直接接收数据
+</span><span class='line'>&#9;&#9;tcp_rsk(req)-&gt;rcv_nxt = TCP_SKB_CB(skb)-&gt;end_seq;
+</span><span class='line'>&#9;&#9;return true;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;if (foc-&gt;len == TCP_FASTOPEN_COOKIE_SIZE) {//SYN中携带了TFO cookie
+</span><span class='line'>&#9;&#9;if ((sysctl_tcp_fastopen & TFO_SERVER_COOKIE_NOT_CHKED) == 0) {
+</span><span class='line'>&#9;&#9;&#9;tcp_fastopen_cookie_gen(ip_hdr(skb)-&gt;saddr, valid_foc);//生成TFO cookie
+</span><span class='line'>&#9;&#9;&#9;if ((valid_foc-&gt;len != TCP_FASTOPEN_COOKIE_SIZE) ||　//TFO初始化不成功
+</span><span class='line'>&#9;&#9;&#9;&#9;memcmp(&foc-&gt;val[0], &valid_foc-&gt;val[0],　//TFO cookie不合法
+</span><span class='line'>&#9;&#9;&#9;&#9;TCP_FASTOPEN_COOKIE_SIZE) != 0)
+</span><span class='line'>&#9;&#9;&#9;&#9;return false;
+</span><span class='line'>&#9;&#9;&#9;valid_foc-&gt;len = -1;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;/* Acknowledge the data received from the peer. */
+</span><span class='line'>&#9;&#9;tcp_rsk(req)-&gt;rcv_nxt = TCP_SKB_CB(skb)-&gt;end_seq;
+</span><span class='line'>&#9;&#9;return true;
+</span><span class='line'>&#9;} else if (foc-&gt;len == 0) { /* Client requesting a cookie */
+</span><span class='line'>&#9;&#9;tcp_fastopen_cookie_gen(ip_hdr(skb)-&gt;saddr, valid_foc);//生成一个TFO cookie保存在valid_foc中
+</span><span class='line'>&#9;&#9;NET_INC_STATS_BH(sock_net(sk),
+</span><span class='line'>&#9;&#9;&#9;LINUX_MIB_TCPFASTOPENCOOKIEREQD);
+</span><span class='line'>&#9;} else {
+</span><span class='line'>&#9;&#9;/* Client sent a cookie with wrong size. Treat it
+</span><span class='line'>&#9;&#9; * the same as invalid and return a valid one.
+</span><span class='line'>&#9;&#9; */
+</span><span class='line'>&#9;&#9;tcp_fastopen_cookie_gen(ip_hdr(skb)-&gt;saddr, valid_foc);
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;return false;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>1327：rskq_rst_head为NULL的场景为有很多带TFO的SYN到来但SYN|ACK发送后并没有收到RST包，这意味着之前收到的那些带数据的TFO SYN可能是合法的；如果不为NULL但对立中最老的一个仍然没有超时的话，也不能将其替换</p>
+
+<p>1344-1351：如果clienet端的TFO不是请求，而是cookie，则不设置valid_foc；另外如果server端被设置为不检查cookie的合法性，则生成一个cookie再检查SYN中的TFO cookie的合法性，如果不合法则不使用TFO功能。</p>
+
+<p>tcp_make_synack函数会将tcp_fastopen_check中生成的TFO cookie写入TCP首部中，tcp_synack_options函数用来构建SYN|ACK报文的选项信息：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static unsigned int tcp_synack_options(struct sock *sk,
+</span><span class='line'>&#9;&#9;&#9;&#9;   struct request_sock *req,
+</span><span class='line'>&#9;&#9;&#9;&#9;   unsigned int mss, struct sk_buff *skb,
+</span><span class='line'>&#9;&#9;&#9;&#9;   struct tcp_out_options *opts,
+</span><span class='line'>&#9;&#9;&#9;&#9;   struct tcp_md5sig_key **md5,
+</span><span class='line'>&#9;&#9;&#9;&#9;   struct tcp_fastopen_cookie *foc)
+</span><span class='line'>{
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;if (foc != NULL) {
+</span><span class='line'>&#9;&#9;u32 need = TCPOLEN_EXP_FASTOPEN_BASE + foc-&gt;len;
+</span><span class='line'>&#9;&#9;need = (need + 3) & ~3U;  /* Align to 32 bits */
+</span><span class='line'>&#9;&#9;if (remaining &gt;= need) {
+</span><span class='line'>&#9;&#9;&#9;opts-&gt;options |= OPTION_FAST_OPEN_COOKIE;
+</span><span class='line'>&#9;&#9;&#9;opts-&gt;fastopen_cookie = foc;
+</span><span class='line'>&#9;&#9;&#9;remaining -= need;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;...</span></code></pre></td></tr></table></div></figure>
+
+
+<p>将选项信息写入SYN|ACK的方法与client发送SYN时一样，都是调用tcp_options_write函数。可以看出，TCP server端会返回给发送TFO请求的client端一个TFO cookie。client发送的下一个带数据的SYN必须携带这个cookie，而TCP server对这样的SYN回复的SYN|ACK中不会携带TFO选项。</p>
+
+<p>在SYN携带TFO cookie的情况下TCP server会在收到SYN时就创建sock，这个功能由cp_v4_conn_req_fastopen函数完成：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+<span class='line-number'>82</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int tcp_v4_conn_req_fastopen(struct sock *sk,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;struct sk_buff *skb,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;struct sk_buff *skb_synack,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;struct request_sock *req)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>&#9;struct request_sock_queue *queue = &inet_csk(sk)-&gt;icsk_accept_queue;
+</span><span class='line'>&#9;const struct inet_request_sock *ireq = inet_rsk(req);
+</span><span class='line'>&#9;struct sock *child;
+</span><span class='line'>&#9;...
+</span><span class='line'>
+</span><span class='line'>&#9;child = inet_csk(sk)-&gt;icsk_af_ops-&gt;syn_recv_sock(sk, skb, req, NULL);//生成子socket，其状态为TCP_SYN_RECV
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;err = ip_build_and_send_pkt(skb_synack, sk, ireq-&gt;loc_addr,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;ireq-&gt;rmt_addr, ireq-&gt;opt);//构建SYN|ACK的IP头并将其发送出去
+</span><span class='line'>&#9;err = net_xmit_eval(err);
+</span><span class='line'>&#9;if (!err)
+</span><span class='line'>&#9;&#9;tcp_rsk(req)-&gt;snt_synack = tcp_time_stamp;
+</span><span class='line'>&#9;/* XXX (TFO) - is it ok to ignore error and continue? */
+</span><span class='line'>
+</span><span class='line'>&#9;spin_lock(&queue-&gt;fastopenq-&gt;lock);
+</span><span class='line'>&#9;queue-&gt;fastopenq-&gt;qlen++;//将这个连接计入TFO queue
+</span><span class='line'>&#9;spin_unlock(&queue-&gt;fastopenq-&gt;lock);
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;tp = tcp_sk(child);
+</span><span class='line'>
+</span><span class='line'>&#9;tp-&gt;fastopen_rsk = req;
+</span><span class='line'>&#9;/* Do a hold on the listner sk so that if the listener is being
+</span><span class='line'>&#9; * closed, the child that has been accepted can live on and still
+</span><span class='line'>&#9; * access listen_lock.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;sock_hold(sk);
+</span><span class='line'>&#9;tcp_rsk(req)-&gt;listener = sk;
+</span><span class='line'>
+</span><span class='line'>&#9;/* RFC1323: The window in SYN & SYN/ACK segments is never
+</span><span class='line'>&#9; * scaled. So correct it appropriately.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;tp-&gt;snd_wnd = ntohs(tcp_hdr(skb)-&gt;window);
+</span><span class='line'>
+</span><span class='line'>&#9;/* Activate the retrans timer so that SYNACK can be retransmitted.
+</span><span class='line'>&#9; * The request socket is not added to the SYN table of the parent
+</span><span class='line'>&#9; * because it's been added to the accept queue directly.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;inet_csk_reset_xmit_timer(child, ICSK_TIME_RETRANS,
+</span><span class='line'>&#9;&#9;TCP_TIMEOUT_INIT, TCP_RTO_MAX);
+</span><span class='line'>
+</span><span class='line'>&#9;/* Add the child socket directly into the accept queue */
+</span><span class='line'>&#9;inet_csk_reqsk_queue_add(sk, req, child);
+</span><span class='line'>
+</span><span class='line'>&#9;/* Now finish processing the fastopen child socket. */
+</span><span class='line'>&#9;inet_csk(child)-&gt;icsk_af_ops-&gt;rebuild_header(child);
+</span><span class='line'>&#9;tcp_init_congestion_control(child);
+</span><span class='line'>&#9;tcp_mtup_init(child);
+</span><span class='line'>&#9;tcp_init_buffer_space(child);
+</span><span class='line'>&#9;tcp_init_metrics(child);
+</span><span class='line'>
+</span><span class='line'>&#9;/* Queue the data carried in the SYN packet. We need to first
+</span><span class='line'>&#9; * bump skb's refcnt because the caller will attempt to free it.
+</span><span class='line'>&#9; *
+</span><span class='line'>&#9; * XXX (TFO) - we honor a zero-payload TFO request for now.
+</span><span class='line'>&#9; * (Any reason not to?)
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;if (TCP_SKB_CB(skb)-&gt;end_seq == TCP_SKB_CB(skb)-&gt;seq + 1) {//SYN包中没有数据
+</span><span class='line'>&#9;&#9;/* Don't queue the skb if there is no payload in SYN.
+</span><span class='line'>&#9;&#9; * XXX (TFO) - How about SYN+FIN?
+</span><span class='line'>&#9;&#9; */
+</span><span class='line'>&#9;&#9;tp-&gt;rcv_nxt = TCP_SKB_CB(skb)-&gt;end_seq;
+</span><span class='line'>&#9;} else {
+</span><span class='line'>&#9;&#9;skb = skb_get(skb);
+</span><span class='line'>&#9;&#9;skb_dst_drop(skb);
+</span><span class='line'>&#9;&#9;__skb_pull(skb, tcp_hdr(skb)-&gt;doff * 4);
+</span><span class='line'>&#9;&#9;skb_set_owner_r(skb, child);
+</span><span class='line'>&#9;&#9;__skb_queue_tail(&child-&gt;sk_receive_queue, skb);//将数据放入child的接收队列中
+</span><span class='line'>&#9;&#9;tp-&gt;rcv_nxt = TCP_SKB_CB(skb)-&gt;end_seq;
+</span><span class='line'>&#9;&#9;tp-&gt;syn_data_acked = 1;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;sk-&gt;sk_data_ready(sk, 0);//通知持有listening socket的进程调用accept系统调用创建新连接
+</span><span class='line'>&#9;bh_unlock_sock(child);
+</span><span class='line'>&#9;sock_put(child);
+</span><span class='line'>&#9;WARN_ON(req-&gt;sk == NULL);
+</span><span class='line'>&#9;return 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>应用进程收到listening socket的可读通告后，使用accept系统调用建立socket，就可以立即从这个新的socket中读到数据，并开始与客户端进行数据交互。</p>
+
+<p>如果client的TFO是cookie，则SYN|ACK的处理过程与不使用TFO的情况是一样的；如果client发送的TFO是请求，则在收到SYN|ACK时需要将包中的TFO cookie保存下来：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int tcp_rcv_synsent_state_process(struct sock *sk, struct sk_buff *skb,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9; const struct tcphdr *th, unsigned int len)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct inet_connection_sock *icsk = inet_csk(sk);
+</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>&#9;struct tcp_fastopen_cookie foc = { .len = -1 };
+</span><span class='line'>&#9;int saved_clamp = tp-&gt;rx_opt.mss_clamp;
+</span><span class='line'>
+</span><span class='line'>&#9;tcp_parse_options(skb, &tp-&gt;rx_opt, 0, &foc);//解析TFO选项
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;&#9;if ((tp-&gt;syn_fastopen || tp-&gt;syn_data) && //如果发送过TFO选项或在SYN中发送过数据
+</span><span class='line'>&#9;&#9;&#9;tcp_rcv_fastopen_synack(sk, skb, &foc))//记录SYN｜ACK中的FTO cookie
+</span><span class='line'>&#9;&#9;&#9;return -1;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>tcp_rcv_fastopen_synack函数检查并保存server端发送的TFO cookie：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static bool tcp_rcv_fastopen_synack(struct sock *sk, struct sk_buff *synack,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;struct tcp_fastopen_cookie *cookie)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>&#9;struct sk_buff *data = tp-&gt;syn_data ? tcp_write_queue_head(sk) : NULL;
+</span><span class='line'>&#9;u16 mss = tp-&gt;rx_opt.mss_clamp;
+</span><span class='line'>&#9;bool syn_drop;
+</span><span class='line'>
+</span><span class='line'>&#9;if (mss == tp-&gt;rx_opt.user_mss) {
+</span><span class='line'>&#9;&#9;struct tcp_options_received opt;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;/* Get original SYNACK MSS value if user MSS sets mss_clamp */
+</span><span class='line'>&#9;&#9;tcp_clear_options(&opt);
+</span><span class='line'>&#9;&#9;opt.user_mss = opt.mss_clamp = 0;
+</span><span class='line'>&#9;&#9;tcp_parse_options(synack, &opt, 0, NULL);
+</span><span class='line'>&#9;&#9;mss = opt.mss_clamp;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;if (!tp-&gt;syn_fastopen)  /* Ignore an unsolicited cookie */
+</span><span class='line'>&#9;&#9;cookie-&gt;len = -1;//如果客户端没有发送TFO请求但服务器给出了TFO cookie，忽略之
+</span><span class='line'>
+</span><span class='line'>&#9;/* The SYN-ACK neither has cookie nor acknowledges the data. Presumably
+</span><span class='line'>&#9; * the remote receives only the retransmitted (regular) SYNs: either
+</span><span class='line'>&#9; * the original SYN-data or the corresponding SYN-ACK is lost.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;syn_drop = (cookie-&gt;len &lt;= 0 && data && tp-&gt;total_retrans); //客户端认为发生了SYN丢失事件
+</span><span class='line'>
+</span><span class='line'>&#9;tcp_fastopen_cache_set(sk, mss, cookie, syn_drop);//存储SYN｜ACK包中的TFO cookie，并记录发现SYN丢失事件的时间
+</span><span class='line'>
+</span><span class='line'>&#9;if (data) { /* Retransmit unacked data in SYN */
+</span><span class='line'>&#9;&#9;tcp_for_write_queue_from(data, sk) {
+</span><span class='line'>&#9;&#9;&#9;if (data == tcp_send_head(sk) ||
+</span><span class='line'>&#9;&#9;&#9;&#9;__tcp_retransmit_skb(sk, data))
+</span><span class='line'>&#9;&#9;&#9;&#9;break;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;tcp_rearm_rto(sk);
+</span><span class='line'>&#9;&#9;return true;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;tp-&gt;syn_data_acked = tp-&gt;syn_data;
+</span><span class='line'>&#9;return false;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>在保存了TFO cookie后，client在向相同IP地址的server发送SYN时都可以携带数据（这时必须发送TFO cookie）。client在收到SYN|ACK后需要回复ACK报文，服务器端在接收ACK时对TFO的处理如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int tcp_rcv_state_process(struct sock *sk, struct sk_buff *skb,
+</span><span class='line'>&#9;&#9;&#9;  const struct tcphdr *th, unsigned int len)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>&#9;struct inet_connection_sock *icsk = inet_csk(sk);
+</span><span class='line'>&#9;struct request_sock *req;
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;req = tp-&gt;fastopen_rsk;//找到在SYN请求到来后创建子socket时使用的request sock
+</span><span class='line'>&#9;if (req != NULL) {
+</span><span class='line'>&#9;&#9;WARN_ON_ONCE(sk-&gt;sk_state != TCP_SYN_RECV &&
+</span><span class='line'>&#9;&#9;&#9;sk-&gt;sk_state != TCP_FIN_WAIT1);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (tcp_check_req(sk, skb, req, NULL, true) == NULL)//检查包的合法性
+</span><span class='line'>&#9;&#9;&#9;goto discard;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;&#9;switch (sk-&gt;sk_state) {
+</span><span class='line'>&#9;&#9;case TCP_SYN_RECV:
+</span><span class='line'>&#9;&#9;&#9;if (acceptable) {
+</span><span class='line'>&#9;&#9;&#9;&#9;/* Once we leave TCP_SYN_RECV, we no longer
+</span><span class='line'>&#9;&#9;&#9;&#9; * need req so release it.
+</span><span class='line'>&#9;&#9;&#9;&#9; */
+</span><span class='line'>&#9;&#9;&#9;&#9;if (req) {//使用了TFO cookie
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;tcp_synack_rtt_meas(sk, req);
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;tp-&gt;total_retrans = req-&gt;num_retrans;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;reqsk_fastopen_remove(sk, req, false);//将request sock从TFO queue中删除，TFO流程全部结束
+</span><span class='line'>&#9;&#9;&#9;&#9;} else {
+</span><span class='line'>&#9;...</span></code></pre></td></tr></table></div></figure>
+
+
+<p>综上，TFO在收到SYN的时候就创建socket并将数据提交给应用进程，这样就比普通模式节省了SYN|ACK与ACK的交互时间，减小了通信延迟。</p>
 </div>
   
   
@@ -1680,7 +2438,7 @@ var ss360Config = {
   
     <section>
 <h1>Categories
-<span class='right_span'>(943)</span>
+<span class='right_span'>(959)</span>
 
 </h1>
 <head>
@@ -1688,6 +2446,12 @@ var ss360Config = {
 <body>
 <div id="menu">
 <ul>
+<li class='catclass'><a href='/blog/cats/medicine/'>medicine</a><a href='##' onmousedown=showDiv('medicine') id='aexp_medicine'><span class='exp_style' id='exp_medicine'>[+]</span></a><span class='right_span'>(4)</span></li>
+<div id='medicine' class='catsub'><li><a href='/blog/cats/medicine~mimic/?opendiv=medicine'>mimic</a><a href='##' onmousedown=showDiv('medicine~mimic') id='aexp_medicine~mimic'><span class='exp_style' id='exp_medicine~mimic'>[+]</span></a><span class='right_span'>4</span></li>
+</div><script language='javascript' type='text/javascript'>
+if (!document.getElementById('medicine')) document.getElementById('aexp_medicine').style.visibility = 'hidden';
+if (!document.getElementById('medicine~mimic')) document.getElementById('aexp_medicine~mimic').style.visibility = 'hidden';
+</script>
 <li class='catclass'><a href='/blog/cats/blog/'>blog</a><a href='##' onmousedown=showDiv('blog') id='aexp_blog'><span class='exp_style' id='exp_blog'>[+]</span></a><span class='right_span'>(13)</span></li>
 <div id='blog' class='catsub'><li><a href='/blog/cats/blog~hello/?opendiv=blog'>hello</a><a href='##' onmousedown=showDiv('blog~hello') id='aexp_blog~hello'><span class='exp_style' id='exp_blog~hello'>[+]</span></a><span class='right_span'>1</span></li>
 <div id='blog~hello' class='catsub2'><li><a href='/blog/cats/blog~hello~hi/?opendiv=blog~hello'>hi</a><span class='right_span'>1</span></li>
@@ -1711,7 +2475,7 @@ if (!document.getElementById('blog~octopress')) document.getElementById('aexp_bl
 if (!document.getElementById('blog')) document.getElementById('aexp_blog').style.visibility = 'hidden';
 if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ruby').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(161)</span></li>
+<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(168)</span></li>
 <div id='language' class='catsub'><li><a href='/blog/cats/language~c/?opendiv=language'>c</a><a href='##' onmousedown=showDiv('language~c') id='aexp_language~c'><span class='exp_style' id='exp_language~c'>[+]</span></a><span class='right_span'>33</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~c')) document.getElementById('aexp_language~c').style.visibility = 'hidden';
@@ -1736,7 +2500,7 @@ if (!document.getElementById('language~php')) document.getElementById('aexp_lang
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~python')) document.getElementById('aexp_language~python').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/language~web/?opendiv=language'>web</a><a href='##' onmousedown=showDiv('language~web') id='aexp_language~web'><span class='exp_style' id='exp_language~web'>[+]</span></a><span class='right_span'>54</span></li>
+<li><a href='/blog/cats/language~web/?opendiv=language'>web</a><a href='##' onmousedown=showDiv('language~web') id='aexp_language~web'><span class='exp_style' id='exp_language~web'>[+]</span></a><span class='right_span'>61</span></li>
 </div><script language='javascript' type='text/javascript'>
 if (!document.getElementById('language')) document.getElementById('aexp_language').style.visibility = 'hidden';
 if (!document.getElementById('language~web')) document.getElementById('aexp_language~web').style.visibility = 'hidden';
@@ -1875,8 +2639,8 @@ if (!document.getElementById('tools~vim')) document.getElementById('aexp_tools~v
 if (!document.getElementById('tools')) document.getElementById('aexp_tools').style.visibility = 'hidden';
 if (!document.getElementById('tools~wxwork')) document.getElementById('aexp_tools~wxwork').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/system/'>system</a><a href='##' onmousedown=showDiv('system') id='aexp_system'><span class='exp_style' id='exp_system'>[+]</span></a><span class='right_span'>(121)</span></li>
-<div id='system' class='catsub'><li><a href='/blog/cats/system~base/?opendiv=system'>base</a><a href='##' onmousedown=showDiv('system~base') id='aexp_system~base'><span class='exp_style' id='exp_system~base'>[+]</span></a><span class='right_span'>31</span></li>
+<li class='catclass'><a href='/blog/cats/system/'>system</a><a href='##' onmousedown=showDiv('system') id='aexp_system'><span class='exp_style' id='exp_system'>[+]</span></a><span class='right_span'>(126)</span></li>
+<div id='system' class='catsub'><li><a href='/blog/cats/system~base/?opendiv=system'>base</a><a href='##' onmousedown=showDiv('system~base') id='aexp_system~base'><span class='exp_style' id='exp_system~base'>[+]</span></a><span class='right_span'>36</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('system~base')) document.getElementById('aexp_system~base').style.visibility = 'hidden';
 </script>
@@ -2114,7 +2878,7 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 
 <section>
 <h1>Date Categories
-<span class='right_span'>(943)</span>
+<span class='right_span'>(959)</span>
 
 </h1>
 <head>
@@ -2122,8 +2886,9 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(63)</span></li>
-<div id='2024' class='catsub'><li><a href='/blog/cats/2024~08/?opendiv=2024'>2024-08</a><span class='right_span'>14</span></li>
+<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(79)</span></li>
+<div id='2024' class='catsub'><li><a href='/blog/cats/2024~09/?opendiv=2024'>2024-09</a><span class='right_span'>12</span></li>
+<li><a href='/blog/cats/2024~08/?opendiv=2024'>2024-08</a><span class='right_span'>18</span></li>
 <li><a href='/blog/cats/2024~07/?opendiv=2024'>2024-07</a><span class='right_span'>26</span></li>
 <li><a href='/blog/cats/2024~06/?opendiv=2024'>2024-06</a><span class='right_span'>2</span></li>
 <li><a href='/blog/cats/2024~05/?opendiv=2024'>2024-05</a><span class='right_span'>5</span></li>
@@ -2293,43 +3058,43 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
   <ul id="recent_posts">
     
       <li class="post">
-        <a href="/blog/2024/08/15/lang-web-js-copy/">禁止网页内容复制另存为</a>
+        <a href="/blog/2024/09/14/lang-web-ding/">钉钉开放平台API</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/08/15/lang-web-iframe/">iframe网页嵌套</a>
+        <a href="/blog/2024/09/14/lang-web-staticmap/">腾讯地图--静态地图API</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/08/15/lang-web-auto-textarea/">textarea自动调整高宽</a>
+        <a href="/blog/2024/09/14/lang-web-js-screen-on/">JS 保持屏幕常亮</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/08/09/ntpd-log/">NTP log 记录每次发包</a>
+        <a href="/blog/2024/09/14/lang-web-js-date/">JS 获取当前的日期和时间</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/08/09/ntpd/">NTP服务配置</a>
+        <a href="/blog/2024/09/14/lang-web-js-dist/">GPS 两点距离</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/08/09/lang-date/">unix时间戳, excel date, 儒略日julian date</a>
+        <a href="/blog/2024/09/14/lang-web-js-position/">JS获取当前地理位置</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/08/09/lang-web-times/">&amp;times被替换成x</a>
+        <a href="/blog/2024/09/14/lang-web-js-work/">前端缓存之：Service Worker</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/08/09/lang-c-localtime/">localtime函数</a>
+        <a href="/blog/2024/09/14/mimiciv3.0/">MIMIC IV 3.0数据库</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/08/02/ups-webpower/">山特UPS NMC卡 USHA卡</a>
+        <a href="/blog/2024/09/14/mimiciii1.4-show/">MIMIC III v1.4 数据简介</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/08/01/lang-web-holiday/">节假日 API</a>
+        <a href="/blog/2024/09/14/mimiciii1.4/">MIMIC III v1.4 数据入库</a>
       </li>
     
   </ul>
