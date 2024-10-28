@@ -131,7 +131,7 @@ var ss360Config = {
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2015/04/01/kernel-net-estab/">Linux TCP数据包接收处理tcp_rcv_established</a></h2>
+      <h2 class="entry-title"><a href="/blog/2015/04/10/kernel-net-skbuff/">sk_buff详解</a></h2>
     
     
       <p class="meta">
@@ -140,845 +140,14 @@ var ss360Config = {
 
 
 
-<time class='entry-date' datetime='2015-04-01T17:50:00+08:00'><span class='date'>2015-04-01</span> <span class='time'>17:50:00</span></time>
+<time class='entry-date' datetime='2015-04-10T15:46:00+08:00'><span class='date'>2015-04-10</span> <span class='time'>15:46:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><p><a href="http://www.cppblog.com/fwxjj/archive/2013/02/18/197906.aspx">http://www.cppblog.com/fwxjj/archive/2013/02/18/197906.aspx</a></p>
-
-<p>tcp_rcv_established函数的工作原理是把数据包的处理分为2类：fast path和slow path，其含义显而易见。这样分类的目的当然是加快数据包的处理，因为在正常情况下，数据包是按顺序到达的，网络状况也是稳定的，这时可以按照fast path直接把数据包存放到receive queue了。而在其他的情况下则需要走slow path流程了。</p>
-
-<p>在协议栈中，是用头部预测来实现的，每个tcp sock有个pred_flags成员，它就是判别的依据。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static inline void __tcp_fast_path_on(struct tcp_sock *tp, u32 snd_wnd)
-</span><span class='line'>{
-</span><span class='line'>&#9;tp-&gt;pred_flags = htonl((tp-&gt;tcp_header_len &lt;&lt; 26) |
-</span><span class='line'>&#9;&#9;&#9;&#9;   ntohl(TCP_FLAG_ACK) |
-</span><span class='line'>&#9;&#9;&#9;&#9;   snd_wnd);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>可以看出头部预测依赖的是头部长度字段和通告窗口。也就是说标志位除了ACK和PSH外，如果其他的存在的话，就不能用</p>
-
-<h5>fast path处理，其揭示的含义如下：</h5>
-
-<p>1 Either the data transaction is taking place in only one direction (which means that we are the receiver and not transmitting any data) or in the case where we are sending out data also, the window advertised from the other end is constant. The latter means that we have not transmitted any data from our side for quite some time but are receiving data from the other end. The receive window advertised by the other end is constant.</p>
-
-<ol>
-<li><p>Other than PSH|ACK flags in the TCP header, no other flag is set (ACK is set for each TCP segment). <br/>
-This means that if any other flag is set such as URG, FIN, SYN, ECN, RST, and CWR, we know that something important is there to be attended and we need to move into the SLOW path.</p></li>
-<li><p>The header length has unchanged. If the TCP header length remains unchanged, we have not added/reduced any TCP option and we can safely assume that there is nothing important to be attended, if the above two conditions are TRUE.</p></li>
-</ol>
-
-
-<h5>fast path工作的条件</h5>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static inline void tcp_fast_path_check(struct sock *sk)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
-</span><span class='line'>
-</span><span class='line'>&#9;if (skb_queue_empty(&tp-&gt;out_of_order_queue) &&
-</span><span class='line'>&#9;&#9;tp-&gt;rcv_wnd &&
-</span><span class='line'>&#9;&#9;atomic_read(&sk-&gt;sk_rmem_alloc) &lt; sk-&gt;sk_rcvbuf &&
-</span><span class='line'>&#9;&#9;!tp-&gt;urg_data)
-</span><span class='line'>&#9;&#9;tcp_fast_path_on(tp);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>1 没有乱序数据包<br/>
-2 接收窗口不为0<br/>
-3 还有接收缓存空间<br/>
-4 没有紧急数据</p>
-
-<p>反之，则进入slow path处理；另外当连接新建立时处于slow path。</p>
-
-<h5>从fast path进入slow path的触发条件（进入slow path 后pred_flags清除为0）：</h5>
-
-<p>1 在tcp_data_queue中接收到乱序数据包<br/>
-2 在tcp_prune_queue中用完缓存并且开始丢弃数据包<br/>
-3 在tcp_urgent_check中遇到紧急指针<br/>
-4 在tcp_select_window中发送的通告窗口下降到0.</p>
-
-<h5>从slow_path进入fast_path的触发条件：</h5>
-
-<p>1 When we have read past an urgent byte in tcp_recvmsg() . Wehave gotten an urgent byte and we remain in the slow path mode until we receive the urgent byte because it is handled in the slow path in tcp_rcv_established().<br/>
-2 当在tcp_data_queue中乱序队列由于gap被填充而处理完毕时，运行tcp_fast_path_check。<br/>
-3 tcp_ack_update_window()中更新了通告窗口。</p>
-
-<h4>fast path处理流程</h4>
-
-<p>A 判断能否进入fast path</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if ((tcp_flag_word(th) & TCP_HP_BITS) == tp-&gt;pred_flags &&
-</span><span class='line'>&#9;&#9;TCP_SKB_CB(skb)-&gt;seq == tp-&gt;rcv_nxt) {</span></code></pre></td></tr></table></div></figure>
-
-
-<p>TCP_HP_BITS的作用就是排除flag中的PSH标志位。只有在头部预测满足并且数据包以正确的顺序（该数据包的第一个序号就是下个要接收的序号）到达时才进入fast path。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>int tcp_header_len = tp-&gt;tcp_header_len;
-</span><span class='line'>
-</span><span class='line'>/* Timestamp header prediction: tcp_header_len
-</span><span class='line'> * is automatically equal to th-&gt;doff*4 due to pred_flags
-</span><span class='line'> * match.
-</span><span class='line'> */
-</span><span class='line'>
-</span><span class='line'>/* Check timestamp */
-</span><span class='line'>//相等说明tcp timestamp option被打开。
-</span><span class='line'>if (tcp_header_len == sizeof(struct tcphdr) + TCPOLEN_TSTAMP_ALIGNED) {
-</span><span class='line'>&#9;/* No? Slow path! */
-</span><span class='line'>&#9;//这里主要是parse timestamp选项，如果返回0则表明pase出错，此时我们进入slow_path
-</span><span class='line'>&#9;if (!tcp_parse_aligned_timestamp(tp, th))
-</span><span class='line'>&#9;&#9;goto slow_path;
-</span><span class='line'>
-</span><span class='line'>&#9;/* If PAWS failed, check it more carefully in slow path */
-</span><span class='line'>&#9;//如果上面pase成功，则tp对应的rx_opt域已经被正确赋值，此时如果rcv_tsval（新的接收的数据段的时间戳)比ts_recent(对端发送过来的数据(也就是上一次)的最新的一个时间戳)小，则我们要进入slow path 处理paws。
-</span><span class='line'>&#9;if ((s32)(tp-&gt;rx_opt.rcv_tsval - tp-&gt;rx_opt.ts_recent) &lt; 0)
-</span><span class='line'>&#9;&#9;goto slow_path;
-</span><span class='line'>
-</span><span class='line'>&#9;/* DO NOT update ts_recent here, if checksum fails
-</span><span class='line'>&#9; * and timestamp was corrupted part, it will result
-</span><span class='line'>&#9; * in a hung connection since we will drop all
-</span><span class='line'>&#9; * future packets due to the PAWS test.
-</span><span class='line'>&#9; */
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>该代码段是依据时戳选项来检查PAWS（Protect Against Wrapped Sequence numbers）。
-如果发送来的仅是一个TCP头的话（没有捎带数据或者接收端检测到有乱序数据这些情况时都会发送一个纯粹的ACK包）</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/* Bulk data transfer: sender */
-</span><span class='line'>if (len == tcp_header_len) {
-</span><span class='line'>&#9;/* Predicted packet is in window by definition.
-</span><span class='line'>&#9; * seq == rcv_nxt and rcv_wup &lt;= rcv_nxt.
-</span><span class='line'>&#9; * Hence, check seq&lt;=rcv_wup reduces to:
-</span><span class='line'>&#9; */
-</span><span class='line'>&#9;if (tcp_header_len ==
-</span><span class='line'>&#9;&#9;(sizeof(struct tcphdr) + TCPOLEN_TSTAMP_ALIGNED) &&
-</span><span class='line'>&#9;&#9;tp-&gt;rcv_nxt == tp-&gt;rcv_wup)
-</span><span class='line'>&#9;&#9;tcp_store_ts_recent(tp);
-</span><span class='line'>
-</span><span class='line'>&#9;/* We know that such packets are checksummed
-</span><span class='line'>&#9; * on entry.
-</span><span class='line'>&#9; */
-</span><span class='line'>&#9;tcp_ack(sk, skb, 0);
-</span><span class='line'>&#9;__kfree_skb(skb);
-</span><span class='line'>&#9;tcp_data_snd_check(sk);
-</span><span class='line'>&#9;return 0;
-</span><span class='line'>} else { /* Header too small */
-</span><span class='line'>&#9;TCP_INC_STATS_BH(sock_net(sk), TCP_MIB_INERRS);
-</span><span class='line'>&#9;goto discard;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>主要的工作如下：<br/>
-1 保存对方的最近时戳 tcp_store_ts_recent。通过前面的if判断可以看出tcp总是回显2次时戳回显直接最先到达的数据包的时戳，<br/>
-  rcv_wup只在发送数据（这时回显时戳）时重置为rcv_nxt，所以接收到前一次回显后第一个数据包后，rcv_nxt增加了，但是<br/>
-  rcv_wup没有更新，所以后面的数据包处理时不会调用该函数来保存时戳。<br/>
-2 ACK处理。这个函数非常复杂，包含了拥塞控制机制，确认处理等等。<br/>
-3 检查是否有数据待发送 tcp_data_snd_check。</p>
-
-<p>如果该数据包中包含了数据的话</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-<span class='line-number'>58</span>
-<span class='line-number'>59</span>
-<span class='line-number'>60</span>
-<span class='line-number'>61</span>
-<span class='line-number'>62</span>
-<span class='line-number'>63</span>
-<span class='line-number'>64</span>
-<span class='line-number'>65</span>
-<span class='line-number'>66</span>
-<span class='line-number'>67</span>
-<span class='line-number'>68</span>
-<span class='line-number'>69</span>
-<span class='line-number'>70</span>
-<span class='line-number'>71</span>
-<span class='line-number'>72</span>
-<span class='line-number'>73</span>
-<span class='line-number'>74</span>
-<span class='line-number'>75</span>
-<span class='line-number'>76</span>
-<span class='line-number'>77</span>
-<span class='line-number'>78</span>
-<span class='line-number'>79</span>
-<span class='line-number'>80</span>
-<span class='line-number'>81</span>
-<span class='line-number'>82</span>
-<span class='line-number'>83</span>
-<span class='line-number'>84</span>
-<span class='line-number'>85</span>
-<span class='line-number'>86</span>
-<span class='line-number'>87</span>
-<span class='line-number'>88</span>
-<span class='line-number'>89</span>
-<span class='line-number'>90</span>
-<span class='line-number'>91</span>
-<span class='line-number'>92</span>
-<span class='line-number'>93</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>&#9;&#9;} else {
-</span><span class='line'>&#9;&#9;&#9;int eaten = 0;
-</span><span class='line'>&#9;&#9;&#9;int copied_early = 0;
-</span><span class='line'>&#9;&#9;&#9;/* 此数据包刚好是下一个读取的数据，并且用户空间可存放下该数据包*/
-</span><span class='line'>&#9;&#9;&#9;if (tp-&gt;copied_seq == tp-&gt;rcv_nxt &&
-</span><span class='line'>&#9;&#9;&#9;&#9;len - tcp_header_len &lt;= tp-&gt;ucopy.len) {
-</span><span class='line'>#ifdef CONFIG_NET_DMA
-</span><span class='line'>&#9;&#9;&#9;&#9;if (tcp_dma_try_early_copy(sk, skb, tcp_header_len)) {
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;copied_early = 1;
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;eaten = 1;
-</span><span class='line'>&#9;&#9;&#9;&#9;}
-</span><span class='line'>#endif          /* 如果该函数在进程上下文中调用并且sock被用户占用的话*/
-</span><span class='line'>&#9;&#9;&#9;&#9;if (tp-&gt;ucopy.task == current &&
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;sock_owned_by_user(sk) && !copied_early) {
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;/* 进程有可能被设置为TASK_INTERRUPTIBLE */
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;__set_current_state(TASK_RUNNING);
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;/* 直接copy数据到用户空间*/
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;if (!tcp_copy_to_iovec(sk, skb, tcp_header_len))
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;eaten = 1;
-</span><span class='line'>&#9;&#9;&#9;&#9;}
-</span><span class='line'>&#9;&#9;&#9;&#9;if (eaten) {
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;/* Predicted packet is in window by definition.
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9; * seq == rcv_nxt and rcv_wup &lt;= rcv_nxt.
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9; * Hence, check seq&lt;=rcv_wup reduces to:
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9; */
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;if (tcp_header_len ==
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;(sizeof(struct tcphdr) +
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9; TCPOLEN_TSTAMP_ALIGNED) &&
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;tp-&gt;rcv_nxt == tp-&gt;rcv_wup)
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;tcp_store_ts_recent(tp);
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;/* 更新RCV RTT，Dynamic Right-Sizing算法*/
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;tcp_rcv_rtt_measure_ts(sk, skb);
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;__skb_pull(skb, tcp_header_len);
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;tp-&gt;rcv_nxt = TCP_SKB_CB(skb)-&gt;end_seq;
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_TCPHPHITSTOUSER);
-</span><span class='line'>&#9;&#9;&#9;&#9;}
-</span><span class='line'>&#9;&#9;&#9;&#9;if (copied_early)
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;tcp_cleanup_rbuf(sk, skb-&gt;len);
-</span><span class='line'>&#9;&#9;&#9;}
-</span><span class='line'>&#9;&#9;&#9;if (!eaten) { /* 没有直接读到用户空间*/
-</span><span class='line'>&#9;&#9;&#9;&#9;if (tcp_checksum_complete_user(sk, skb))
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;goto csum_error;
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;&#9;/* Predicted packet is in window by definition.
-</span><span class='line'>&#9;&#9;&#9;&#9; * seq == rcv_nxt and rcv_wup &lt;= rcv_nxt.
-</span><span class='line'>&#9;&#9;&#9;&#9; * Hence, check seq&lt;=rcv_wup reduces to:
-</span><span class='line'>&#9;&#9;&#9;&#9; */
-</span><span class='line'>&#9;&#9;&#9;&#9;if (tcp_header_len ==
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;(sizeof(struct tcphdr) + TCPOLEN_TSTAMP_ALIGNED) &&
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;tp-&gt;rcv_nxt == tp-&gt;rcv_wup)
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;tcp_store_ts_recent(tp);
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;&#9;tcp_rcv_rtt_measure_ts(sk, skb);
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;&#9;if ((int)skb-&gt;truesize &gt; sk-&gt;sk_forward_alloc)
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;goto step5;
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;&#9;NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_TCPHPHITS);
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;&#9;/* Bulk data transfer: receiver */
-</span><span class='line'>&#9;&#9;&#9;&#9;__skb_pull(skb, tcp_header_len);
-</span><span class='line'>&#9;&#9;&#9;&#9;/* 进入receive queue 排队，以待tcp_recvmsg读取*/
-</span><span class='line'>&#9;&#9;&#9;&#9;__skb_queue_tail(&sk-&gt;sk_receive_queue, skb);
-</span><span class='line'>&#9;&#9;&#9;&#9;skb_set_owner_r(skb, sk);
-</span><span class='line'>&#9;&#9;&#9;&#9;tp-&gt;rcv_nxt = TCP_SKB_CB(skb)-&gt;end_seq;
-</span><span class='line'>&#9;&#9;&#9;}
-</span><span class='line'>&#9;&#9;&#9;/* 数据包接收后续处理*/
-</span><span class='line'>&#9;&#9;&#9;tcp_event_data_recv(sk, skb);
-</span><span class='line'>&#9;&#9;&#9;/* ACK 处理*/
-</span><span class='line'>&#9;&#9;&#9;if (TCP_SKB_CB(skb)-&gt;ack_seq != tp-&gt;snd_una) {
-</span><span class='line'>&#9;&#9;&#9;&#9;/* Well, only one small jumplet in fast path... */
-</span><span class='line'>&#9;&#9;&#9;&#9;tcp_ack(sk, skb, FLAG_DATA);
-</span><span class='line'>&#9;&#9;&#9;&#9;tcp_data_snd_check(sk);
-</span><span class='line'>&#9;&#9;&#9;&#9;if (!inet_csk_ack_scheduled(sk))
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;goto no_ack;
-</span><span class='line'>&#9;&#9;&#9;}
-</span><span class='line'>&#9;&#9;&#9;/* ACK发送处理*/
-</span><span class='line'>&#9;&#9;&#9;if (!copied_early || tp-&gt;rcv_nxt != tp-&gt;rcv_wup)
-</span><span class='line'>&#9;&#9;&#9;&#9;__tcp_ack_snd_check(sk, 0);
-</span><span class='line'>no_ack:
-</span><span class='line'>#ifdef CONFIG_NET_DMA
-</span><span class='line'>&#9;&#9;&#9;if (copied_early)
-</span><span class='line'>&#9;&#9;&#9;&#9;__skb_queue_tail(&sk-&gt;sk_async_wait_queue, skb);
-</span><span class='line'>&#9;&#9;&#9;else
-</span><span class='line'>#endif
-</span><span class='line'>&#9;&#9;&#9;/* eaten为1，表示数据直接copy到了用户空间，这时无需提醒用户进程数据的到达，否则需调用sk_data_ready来通知，因为此时数据到达了receive queue*/
-</span><span class='line'>&#9;&#9;&#9;if (eaten)
-</span><span class='line'>&#9;&#9;&#9;&#9;__kfree_skb(skb);
-</span><span class='line'>&#9;&#9;&#9;else
-</span><span class='line'>&#9;&#9;&#9;&#9;sk-&gt;sk_data_ready(sk, 0);
-</span><span class='line'>&#9;&#9;&#9;return 0;
-</span><span class='line'>&#9;&#9;}</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>tcp_event_data_recv函数</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static void tcp_event_data_recv(struct sock *sk, struct sk_buff *skb)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
-</span><span class='line'>&#9;struct inet_connection_sock *icsk = inet_csk(sk);
-</span><span class='line'>&#9;u32 now;
-</span><span class='line'>&#9;/* 接收到了数据，设置ACK需调度标志*/
-</span><span class='line'>&#9;inet_csk_schedule_ack(sk);
-</span><span class='line'>
-</span><span class='line'>&#9;tcp_measure_rcv_mss(sk, skb);
-</span><span class='line'>
-</span><span class='line'>&#9;tcp_rcv_rtt_measure(tp);
-</span><span class='line'>
-</span><span class='line'>&#9;now = tcp_time_stamp;
-</span><span class='line'>&#9;/* 以下为根据接收间隔更新icsk_ack.ato，该值主要用于判断pingpong模式见函数tcp_event_data_sent */
-</span><span class='line'>&#9;if (!icsk-&gt;icsk_ack.ato) {
-</span><span class='line'>&#9;&#9;/* The _first_ data packet received, initialize
-</span><span class='line'>&#9;&#9; * delayed ACK engine.
-</span><span class='line'>&#9;&#9; */
-</span><span class='line'>&#9;&#9;tcp_incr_quickack(sk);
-</span><span class='line'>&#9;&#9;icsk-&gt;icsk_ack.ato = TCP_ATO_MIN;
-</span><span class='line'>&#9;} else {
-</span><span class='line'>&#9;&#9;int m = now - icsk-&gt;icsk_ack.lrcvtime;
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;if (m &lt;= TCP_ATO_MIN / 2) {
-</span><span class='line'>&#9;&#9;&#9;/* The fastest case is the first. */
-</span><span class='line'>&#9;&#9;&#9;icsk-&gt;icsk_ack.ato = (icsk-&gt;icsk_ack.ato &gt;&gt; 1) + TCP_ATO_MIN / 2;
-</span><span class='line'>&#9;&#9;} else if (m &lt; icsk-&gt;icsk_ack.ato) {
-</span><span class='line'>&#9;&#9;&#9;icsk-&gt;icsk_ack.ato = (icsk-&gt;icsk_ack.ato &gt;&gt; 1) + m;
-</span><span class='line'>&#9;&#9;&#9;if (icsk-&gt;icsk_ack.ato &gt; icsk-&gt;icsk_rto)
-</span><span class='line'>&#9;&#9;&#9;&#9;icsk-&gt;icsk_ack.ato = icsk-&gt;icsk_rto;
-</span><span class='line'>&#9;&#9;} else if (m &gt; icsk-&gt;icsk_rto) {
-</span><span class='line'>&#9;&#9;&#9;/* Too long gap. Apparently sender failed to
-</span><span class='line'>&#9;&#9;&#9; * restart window, so that we send ACKs quickly.
-</span><span class='line'>&#9;&#9;&#9; */
-</span><span class='line'>&#9;&#9;&#9;tcp_incr_quickack(sk);
-</span><span class='line'>&#9;&#9;&#9;sk_mem_reclaim(sk);
-</span><span class='line'>&#9;&#9;}
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;icsk-&gt;icsk_ack.lrcvtime = now;
-</span><span class='line'>
-</span><span class='line'>&#9;TCP_ECN_check_ce(tp, skb);
-</span><span class='line'>&#9;/* 每次接收到来自对方的一个TCP数据报，且数据报长度大于128字节时，我们需要调用tcp_grow_window，增加rcv_ssthresh的值，一般每次为rcv_ssthresh增长两倍的mss，增加的条件是rcv_ssthresh小于window_clamp,并且 rcv_ssthresh小于接收缓存剩余空间的3/4，同时tcp_memory_pressure没有被置位(即接收缓存中的数据量没有太大)。 tcp_grow_window中对新收到的skb的长度还有一些限制，并不总是增长rcv_ssthresh的值*/
-</span><span class='line'>&#9;if (skb-&gt;len &gt;= 128)
-</span><span class='line'>&#9;&#9;tcp_grow_window(sk, skb);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>rcv_ssthresh是当前的接收窗口大小的一个阀值，其初始值就置为rcv_wnd。它跟rcv_wnd配合工作，当本地socket收到数据报，并满足一定条件时，增长rcv_ssthresh的值，在下一次发送数据报组建TCP首部时，需要通告对方当前的接收窗口大小，这时需要更新rcv_wnd，此时rcv_wnd的取值不能超过rcv_ssthresh的值。两者配合，达到一个滑动窗口大小缓慢增长的效果。</p>
-
-<p><code>__tcp_ack_snd_check</code>用来判断ACK的发送方式</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/*
-</span><span class='line'> * Check if sending an ack is needed.
-</span><span class='line'> */
-</span><span class='line'>static void __tcp_ack_snd_check(struct sock *sk, int ofo_possible)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
-</span><span class='line'>
-</span><span class='line'>&#9;/* More than one full frame received... */
-</span><span class='line'>&#9;if (((tp-&gt;rcv_nxt - tp-&gt;rcv_wup) &gt; inet_csk(sk)-&gt;icsk_ack.rcv_mss
-</span><span class='line'>&#9;&#9; /* ... and right edge of window advances far enough.
-</span><span class='line'>&#9;&#9;  * (tcp_recvmsg() will send ACK otherwise). Or...
-</span><span class='line'>&#9;&#9;  */
-</span><span class='line'>&#9;&#9; && __tcp_select_window(sk) &gt;= tp-&gt;rcv_wnd) ||
-</span><span class='line'>&#9;&#9;/* We ACK each frame or... */
-</span><span class='line'>&#9;&#9;tcp_in_quickack_mode(sk) ||
-</span><span class='line'>&#9;&#9;/* We have out of order data. */
-</span><span class='line'>&#9;&#9;(ofo_possible && skb_peek(&tp-&gt;out_of_order_queue))) {
-</span><span class='line'>&#9;&#9;/* Then ack it now */
-</span><span class='line'>&#9;&#9;tcp_send_ack(sk);
-</span><span class='line'>&#9;} else {
-</span><span class='line'>&#9;&#9;/* Else, send delayed ack. */
-</span><span class='line'>&#9;&#9;tcp_send_delayed_ack(sk);
-</span><span class='line'>&#9;}
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>这里有个疑问，就是当ucopy应用读到需要读取到的数据包后，也即在一次处理中</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if (tp-&gt;copied_seq == tp-&gt;rcv_nxt &&
-</span><span class='line'>&#9;&#9;len - tcp_header_len &lt;= tp-&gt;ucopy.len) {</span></code></pre></td></tr></table></div></figure>
-
-
-<p>的第二个条件的等号为真 len - tcp_header_len == tp->ucopy.len，然后执行流程到后面eaten为1，所以函数以释放skb结束，没有调用sk_data_ready函数。假设这个处理调用流程如下：<br/>
-tcp_recvmsg-> sk_wait_data  -> sk_wait_event -> release_sock -> __release_sock-> sk_backlog_rcv-> tcp_rcv_established那么即使此时用户得到了所需的数据，但是在tcp_rcv_established返回前没有提示数据已得到，</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#define sk_wait_event(__sk, __timeo, __condition)       /
-</span><span class='line'>&#9;({  int __rc;                                       /
-</span><span class='line'>&#9;&#9;release_sock(__sk);                             /
-</span><span class='line'>&#9;&#9;__rc = __condition;                             /
-</span><span class='line'>&#9;&#9;if (!__rc) {                                    /
-</span><span class='line'>&#9;&#9;&#9;*(__timeo) = schedule_timeout(*(__timeo));  /
-</span><span class='line'>&#9;&#9;}                                               /
-</span><span class='line'>&#9;&#9;lock_sock(__sk);                                /
-</span><span class='line'>&#9;&#9;__rc = __condition;                             /
-</span><span class='line'>&#9;&#9;__rc;                                           /
-</span><span class='line'>&#9;})</span></code></pre></td></tr></table></div></figure>
-
-
-<p>但是在回到sk_wait_event后，由于__condition为 !skb_queue_empty(&amp;sk->sk_receive_queue)，所以还是会调用schedule_timeout来等待。这点显然是浪费时间，所以这个condition应该考虑下这个数据已经读满的情况，而不能光靠观察receive queue来判断是否等待。</p>
-
-<p>接下来分析slow path</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>slow_path:
-</span><span class='line'>&#9;if (len &lt; (th-&gt;doff &lt;&lt; 2) || tcp_checksum_complete_user(sk, skb))
-</span><span class='line'>&#9;&#9;goto csum_error;
-</span><span class='line'>
-</span><span class='line'>&#9;/*
-</span><span class='line'>&#9; *  Standard slow path.
-</span><span class='line'>&#9; */
-</span><span class='line'>&#9;/* 检查到达的数据包 */
-</span><span class='line'>&#9;res = tcp_validate_incoming(sk, skb, th, 1);
-</span><span class='line'>&#9;if (res &lt;= 0)
-</span><span class='line'>&#9;&#9;return -res;
-</span><span class='line'>
-</span><span class='line'>step5:  /* 如果设置了ACK，则调用tcp_ack处理，后面再分析该函数*/
-</span><span class='line'>&#9;if (th-&gt;ack)
-</span><span class='line'>&#9;&#9;tcp_ack(sk, skb, FLAG_SLOWPATH);
-</span><span class='line'>
-</span><span class='line'>&#9;tcp_rcv_rtt_measure_ts(sk, skb);
-</span><span class='line'>
-</span><span class='line'>&#9;/* Process urgent data. */
-</span><span class='line'>&#9;tcp_urg(sk, skb, th);
-</span><span class='line'>
-</span><span class='line'>&#9;/* step 7: process the segment text */
-</span><span class='line'>&#9;tcp_data_queue(sk, skb);
-</span><span class='line'>
-</span><span class='line'>&#9;tcp_data_snd_check(sk);
-</span><span class='line'>&#9;tcp_ack_snd_check(sk);
-</span><span class='line'>&#9;return 0;</span></code></pre></td></tr></table></div></figure>
-
-
-<p>先看看tcp_validate_incoming函数，在slow path处理前检查输入数据包的合法性。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-<span class='line-number'>58</span>
-<span class='line-number'>59</span>
-<span class='line-number'>60</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/* Does PAWS and seqno based validation of an incoming segment, flags will
-</span><span class='line'> * play significant role here.
-</span><span class='line'> */
-</span><span class='line'>static int tcp_validate_incoming(struct sock *sk, struct sk_buff *skb,
-</span><span class='line'>&#9;&#9;&#9;&#9;  struct tcphdr *th, int syn_inerr)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
-</span><span class='line'>
-</span><span class='line'>&#9;/* RFC1323: H1. Apply PAWS check first. */
-</span><span class='line'>&#9;if (tcp_fast_parse_options(skb, th, tp) && tp-&gt;rx_opt.saw_tstamp &&
-</span><span class='line'>&#9;&#9;tcp_paws_discard(sk, skb)) {
-</span><span class='line'>&#9;&#9;if (!th-&gt;rst) {
-</span><span class='line'>&#9;&#9;&#9;NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_PAWSESTABREJECTED);
-</span><span class='line'>&#9;&#9;&#9;tcp_send_dupack(sk, skb);
-</span><span class='line'>&#9;&#9;&#9;goto discard;
-</span><span class='line'>&#9;&#9;}
-</span><span class='line'>&#9;&#9;/* Reset is accepted even if it did not pass PAWS. */
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;/* Step 1: check sequence number */
-</span><span class='line'>&#9;if (!tcp_sequence(tp, TCP_SKB_CB(skb)-&gt;seq, TCP_SKB_CB(skb)-&gt;end_seq)) {
-</span><span class='line'>&#9;&#9;/* RFC793, page 37: "In all states except SYN-SENT, all reset
-</span><span class='line'>&#9;&#9; * (RST) segments are validated by checking their SEQ-fields."
-</span><span class='line'>&#9;&#9; * And page 69: "If an incoming segment is not acceptable,
-</span><span class='line'>&#9;&#9; * an acknowledgment should be sent in reply (unless the RST
-</span><span class='line'>&#9;&#9; * bit is set, if so drop the segment and return)".
-</span><span class='line'>&#9;&#9; */
-</span><span class='line'>&#9;&#9;if (!th-&gt;rst)
-</span><span class='line'>&#9;&#9;&#9;tcp_send_dupack(sk, skb);
-</span><span class='line'>&#9;&#9;goto discard;
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;/* Step 2: check RST bit */
-</span><span class='line'>&#9;if (th-&gt;rst) {
-</span><span class='line'>&#9;&#9;tcp_reset(sk);
-</span><span class='line'>&#9;&#9;goto discard;
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;/* ts_recent update must be made after we are sure that the packet
-</span><span class='line'>&#9; * is in window.
-</span><span class='line'>&#9; */
-</span><span class='line'>&#9;tcp_replace_ts_recent(tp, TCP_SKB_CB(skb)-&gt;seq);
-</span><span class='line'>
-</span><span class='line'>&#9;/* step 3: check security and precedence [ignored] */
-</span><span class='line'>
-</span><span class='line'>&#9;/* step 4: Check for a SYN in window. */
-</span><span class='line'>&#9;if (th-&gt;syn && !before(TCP_SKB_CB(skb)-&gt;seq, tp-&gt;rcv_nxt)) {
-</span><span class='line'>&#9;&#9;if (syn_inerr)
-</span><span class='line'>&#9;&#9;&#9;TCP_INC_STATS_BH(sock_net(sk), TCP_MIB_INERRS);
-</span><span class='line'>&#9;&#9;NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_TCPABORTONSYN);
-</span><span class='line'>&#9;&#9;tcp_reset(sk);
-</span><span class='line'>&#9;&#9;return -1;
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;return 1;
-</span><span class='line'>
-</span><span class='line'>discard:
-</span><span class='line'>&#9;__kfree_skb(skb);
-</span><span class='line'>&#9;return 0;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>第一步：检查PAWS tcp_paws_discard</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static inline int tcp_paws_discard(const struct sock *sk,
-</span><span class='line'>&#9;&#9;&#9;&#9;   const struct sk_buff *skb)
-</span><span class='line'>{
-</span><span class='line'>&#9;const struct tcp_sock *tp = tcp_sk(sk);
-</span><span class='line'>&#9;return ((s32)(tp-&gt;rx_opt.ts_recent - tp-&gt;rx_opt.rcv_tsval) &gt; TCP_PAWS_WINDOW &&
-</span><span class='line'>&#9;&#9;get_seconds() &lt; tp-&gt;rx_opt.ts_recent_stamp + TCP_PAWS_24DAYS &&
-</span><span class='line'>&#9;&#9;!tcp_disordered_ack(sk, skb));
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>PAWS丢弃数据包要满足以下条件</p>
-
-<p>1 The difference between the timestamp value obtained in the current segmentand last seen timestamp on the incoming TCP segment should be more than TCP_PAWS_WINDOW (= 1), which means that if the segment that was transmitted 1 clock tick before the segment that reached here earlier TCP seq should be acceptable.
-It may be because of reordering of the segments that the latter reached earlier.
-2 the 24 days have not elapsed since last time timestamp was stored,
-3 tcp_disordered_ack返回0.</p>
-
-<h2>以下转载自CU论坛<a href="http://linux.chinaunix.net/bbs/viewthread.php?tid=1130308">http://linux.chinaunix.net/bbs/viewthread.php?tid=1130308</a></h2>
-
-<p>在实际进行PAWS预防时，Linux是通过如下代码调用来完成的</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>tcp_rcv_established
-</span><span class='line'>  |
-</span><span class='line'>  |--&gt;tcp_paws_discard
-</span><span class='line'>        |
-</span><span class='line'>        |--&gt;tcp_disordered_ack</span></code></pre></td></tr></table></div></figure>
-
-
-<p>其中关键是local方通过tcp_disordered_ack函数对一个刚收到的数据分段进行判断，下面我们对该函数的判断逻辑进行下总结：<br/>
-大前提：该收到分段的TS值表明有回绕现象发生<br/>
-a）若该分段不是一个纯ACK，则丢弃。因为显然这个分段所携带的数据是一个老数据了，不是local方目前希望接收的（参见PAWS的处理依据一节）<br/>
-b）若该分段不是local所希望接收的，则丢弃。这个原因很显然<br/>
-c）若该分段是一个纯ACK，但该ACK并不是一个重复ACK（由local方后续数据正确到达所引发的），则丢弃。因为显然该ACK是一个老的ACK，并不是由于为了加快local方重发而在每收到一个丢失分段后的分段而发出的ACK。<br/>
-d）若该分段是一个ACK，且为重复ACK，并且该ACK的TS值超过了local方那个丢失分段后的重发rto，则丢弃。因为显然此时local方已经重发了那个导致此重复ACK产生的分段，因此再收到此重复ACK就可以直接丢弃。<br/>
-e）若该分段是一个ACK，且为重复ACK，但是没有超过一个rto的时间，则不能丢弃，因为这正代表peer方收到了local方发出的丢失分段后的分段，local方要对此ACK进行处理（例如立刻重传）</p>
-
-<p>  这里有一个重要概念需要理解，即在出现TS问题后，纯ACK和带ACK的数据分段二者是显著不同的，对于后者，可以立刻丢弃掉，因为从一个窗口的某个seq到下一个窗口的同一个seq过程中，一定有窗口变化曾经发生过，从而TS记录值ts_recent也一定更新过，此时一定可以通过PAWS进行丢弃处理。但是对于前者，一个纯ACK，就不能简单丢弃了，因为有这样一个现象是合理的，即假定local方的接收缓存很大，并且peer方在发送时很快就回绕了，于是在local方的某个分段丢失后，peer方需要在每收到的后续分段时发送重复ACK，而此时该重发ACK的ack_seq就是这个丢失分段的序号，而该重发ACK的seq已经是回绕后的重复序号了，尽管此时到底是回绕后的那个重复ACK还是之前的那个同样序号seq的重复ACK，对于local方来都需要处理（立刻启动重发动作），而不能简单丢弃掉。</p>
-
-<hr />
-
-<p>第2步 检查数据包的序号是否正确，该判断失败后调用tcp_send_dupack发送一个duplicate acknowledge（未设置RST标志位时）。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static inline int tcp_sequence(struct tcp_sock *tp, u32 seq, u32 end_seq)
-</span><span class='line'>{
-</span><span class='line'>&#9;return  !before(end_seq, tp-&gt;rcv_wup) &&
-</span><span class='line'>&#9;&#9;!after(seq, tp-&gt;rcv_nxt + tcp_receive_window(tp));
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>由rcv_wup的更新时机（发送ACK时的tcp_select_window）可知位于序号rcv_wup前面的数据都已确认，所以待检查数据包的结束序号至少要大于该值；同时开始序号要落在接收窗口内。</p>
-
-<p>第3步 如果设置了RST，则调用tcp_reset处理</p>
-
-<p>第4步 更新ts_recent，</p>
-
-<p>第5步 检查SYN，因为重发的SYN和原来的SYN之间不会发送数据，所以这2个SYN的序号是相同的，如果不满足则reset连接。</p>
+  <div class="entry-content"><p><a href="/download/kernel/sk_buff%E8%AF%A6%E8%A7%A3.pdf">sk_buff详解</a></p>
 </div>
   
   
@@ -991,7 +160,7 @@ e）若该分段是一个ACK，且为重复ACK，但是没有超过一个rto的�
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2015/04/01/kernel-net-skb_mem/">skb 申请释放</a></h2>
+      <h2 class="entry-title"><a href="/blog/2015/04/10/kernel-net-rcvmsg/">Linux TCP数据包接收处理 tcp_recvmsg</a></h2>
     
     
       <p class="meta">
@@ -1000,810 +169,14 @@ e）若该分段是一个ACK，且为重复ACK，但是没有超过一个rto的�
 
 
 
-<time class='entry-date' datetime='2015-04-01T17:20:00+08:00'><span class='date'>2015-04-01</span> <span class='time'>17:20:00</span></time>
+<time class='entry-date' datetime='2015-04-10T15:29:00+08:00'><span class='date'>2015-04-10</span> <span class='time'>15:29:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><p><a href="http://book.51cto.com/art/201206/345040.htm">http://book.51cto.com/art/201206/345040.htm</a></p>
-
-<hr />
-
-<h3>一、SKB的缓存池</h3>
-
-<p>网络模块中，有两个用来分配SKB描述符的高速缓存，在SKB模块初始函数skb_init()中被创建。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>2048 void __init skb_init(void)  
-</span><span class='line'>2049 {  
-</span><span class='line'>2050     skbuff_head_cache = kmem_cache_create("skbuff_head_cache",  
-</span><span class='line'>2051                           sizeof(struct sk_buff),  
-</span><span class='line'>2052                           0,  
-</span><span class='line'>2053                           SLAB_HWCACHE_ALIGN|SLAB_PANIC,  
-</span><span class='line'>2054                           NULL, NULL);  
-</span><span class='line'>2055     skbuff_fclone_cache = kmem_cache_create("skbuff_fclone_cache",  
-</span><span class='line'>2056                         (2*sizeof(struct sk_buff)) +  
-</span><span class='line'>2057                         sizeof(atomic_t),  
-</span><span class='line'>2058                         0,  
-</span><span class='line'>2059                         SLAB_HWCACHE_ALIGN|SLAB_PANIC,  
-</span><span class='line'>2060                         NULL, NULL);  
-</span><span class='line'>2061 }</span></code></pre></td></tr></table></div></figure>
-
-
-<p>2050-2054 创建skbuff_head_cache高速缓存，一般情况下，SKB都是从该高速缓存中分配的。</p>
-
-<p>2055-2060 创建每次以两倍SKB描述符长度来分配空间的skbuff_fclone_cache高速缓存。如果在分配SKB时就知道可能被克隆，那么应该从这个高速缓存中分配空间，因为在这个高速缓存中分配SKB时，会同时分配一个后备的SKB，以便将来用于克隆，这样在克隆时就不用再次分配SKB了，直接使用后备的SKB即可，这样做的目的主要是提高效率。</p>
-
-<p>两个高速缓存的区别在于创建时指定的单位内存区域大小不同，skbuff_head_cache的单位内存区域长度是sizeof(struct sk_buff)，而skbuff_fclone_cache的单位内存区域长度是2*sizeof(struct sk_buff)+sizeof(atomic_t)，即一对SKB和一个引用计数，可以说这一对SKB是"父子"关系，指向同一个数据缓存区，引用计数值为0,1或2，用来表示这一对SKB中有几个已被使用，如图3-12所示。</p>
-
-<p><img src="/images/kernel/2015-04-01-0.jpg" alt="" /></p>
-
-<hr />
-
-<h3>二、分配SKB</h3>
-
-<h4>1. alloc_skb()</h4>
-
-<p>alloc_skb()用来分配SKB。数据缓存区和SKB描述符是两个不同的实体，这就意味着，在分配一个SKB时，需要分配两块内存，一块是数据缓存区，一块是SKB描述符。__alloc_skb()调用kmem_cache_alloc_node()从高速缓存中获取一个sk_buff结构的空间，然后调用kmalloc_node_track_caller()分配数据缓存区。参数说明如下：</p>
-
-<p>size，待分配SKB的线性存储区的长度。</p>
-
-<p>gfp_mask，分配内存的方式，见表25-3。</p>
-
-<p>fclone，预测是否会克隆，用于确定从哪个高速缓存中分配。</p>
-
-<p>node，当支持NUMA（非均匀质存储结构）时，用于确定何种区域中分配SKB。NUMA参见相关资料。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>144 struct sk_buff *__alloc_skb(unsigned int size, gfp_t gfp_mask,  
-</span><span class='line'>145                 int fclone, int node)  
-</span><span class='line'>146 {  
-</span><span class='line'>147     struct kmem_cache *cache;  
-</span><span class='line'>148     struct skb_shared_info *shinfo;  
-</span><span class='line'>149     struct sk_buff *skb;  
-</span><span class='line'>150     u8 *data;  
-</span><span class='line'>151  
-</span><span class='line'>152     cache = fclone ? skbuff_fclone_cache : skbuff_head_cache;  
-</span><span class='line'>153  
-</span><span class='line'>154     /* Get the HEAD */  
-</span><span class='line'>155     skb = kmem_cache_alloc_node(cache, gfp_mask & ~__GFP_DMA, node);  
-</span><span class='line'>156     if (!skb)  
-</span><span class='line'>157         goto out;  
-</span><span class='line'>158  
-</span><span class='line'>159     /* Get the DATA. Size must match skb_add_mtu(). */  
-</span><span class='line'>160     size = SKB_DATA_ALIGN(size);  
-</span><span class='line'>161     data = kmalloc_node_track_caller(size + sizeof(struct skb_shared_info),  
-</span><span class='line'>162             gfp_mask, node);  
-</span><span class='line'>163     if (!data)  
-</span><span class='line'>164         goto nodata;  
-</span><span class='line'>165  
-</span><span class='line'>166     memset(skb, 0, offsetof(struct sk_buff, truesize));  
-</span><span class='line'>167     skb-&gt;truesize = size + sizeof(struct sk_buff);  
-</span><span class='line'>168     atomic_set(&skb-&gt;users, 1);  
-</span><span class='line'>169     skb-&gt;head = data;  
-</span><span class='line'>170     skb-&gt;datadata = data;  
-</span><span class='line'>171     skb-&gt;tail = data;  
-</span><span class='line'>172     skb-&gt;end  = data + size;  
-</span><span class='line'>173     /* make sure we initialize shinfo sequentially */  
-</span><span class='line'>174     shinfo = skb_shinfo(skb);  
-</span><span class='line'>175     atomic_set(&shinfo-&gt;dataref, 1);  
-</span><span class='line'>176     shinfo-&gt;nr_frags  = 0;  
-</span><span class='line'>177     shinfo-&gt;gso_size = 0;  
-</span><span class='line'>178     shinfo-&gt;gso_segs = 0;  
-</span><span class='line'>179     shinfo-&gt;gso_type = 0;  
-</span><span class='line'>180     shinfo-&gt;ip6_frag_id = 0;  
-</span><span class='line'>181     shinfo-&gt;frag_list = NULL;  
-</span><span class='line'>182  
-</span><span class='line'>183     if (fclone) {  
-</span><span class='line'>184         struct sk_buff *child = skb + 1;  
-</span><span class='line'>185         atomic_t *fclone_ref = (atomic_t *) (child + 1);  
-</span><span class='line'>186  
-</span><span class='line'>187         skb-&gt;fclone = SKB_FCLONE_ORIG;  
-</span><span class='line'>188         atomic_set(fclone_ref, 1);  
-</span><span class='line'>189  
-</span><span class='line'>190         child-&gt;fclone = SKB_FCLONE_UNAVAILABLE;  
-</span><span class='line'>191     }  
-</span><span class='line'>192 out:  
-</span><span class='line'>193     return skb;  
-</span><span class='line'>194 nodata:  
-</span><span class='line'>195     kmem_cache_free(cache, skb);  
-</span><span class='line'>196     skb = NULL;  
-</span><span class='line'>197     goto out;  
-</span><span class='line'>198 }</span></code></pre></td></tr></table></div></figure>
-
-
-<p>152 根据参数fclone确定从哪个高速缓存中分配SKB。</p>
-
-<p>155 调用kmem_cache_alloc_node()从选定的高速缓存中分配一个SKB。在此从分配标志中去除GFP_DMA，是为了不从DMA内存区域中分配SKB描述符，因为DMA内存区域比较小且有特定用途，没有必要用来分配SKB描述符。而后面分配数据缓存区时，就不会去掉GFP_DMA标志，因为很有可能数据缓存区就需要在DMA内存区域中分配，这样硬件可以直接进行DMA操作，参见161~162行。</p>
-
-<p>160 在分配数据缓存区之前，强制对给定的数据缓存区大小size作对齐操作。</p>
-
-<p>161-165 调用kmalloc_node_track_caller()分配数据缓存区，其长度为size和sizeof(struct skb_shared_info)之和，因为在缓存区尾部紧跟着一个skb_shared_info结构。</p>
-
-<p>168-181 初始化新分配SKB描述符和skb_shared_info结构。</p>
-
-<p>183-191 如果是skbuff_fclone_cache高速缓存中分配SKB描述符，则还需置父SKB描述符的fclone为SKB_FCLONE_ORIG，表示可以被克隆；同时将子SKB描述符的fclone成员置为SKB_FCLONE_UNAVAILABLE，表示该SKB还没有被创建出来；最后将引用计数置为1。</p>
-
-<p>最后SKB结构如图3-13所示，在图右边所示的内存块中部，可以看到对齐操作所带来的填充区域。需要说明的是，<code>__alloc_skb()</code>一般不被直接调用，而是被封装函数调用，如<code>__netdev_alloc_skb()</code>、alloc_skb()、alloc_skb_fclone()等函数。</p>
-
-<p><img src="/images/kernel/2015-04-01-1.jpg" alt="" /></p>
-
-<h4>2. dev_alloc_skb()</h4>
-
-<p>dev_alloc_skb()也是一个缓存区分配函数，通常被设备驱动用在中断上下文中。这是一个alloc_skb()的封装函数，因为是在中断处理函数中被调用的，因此要求原子操作（GFP_ATOMIC）。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>1124 static inline struct sk_buff *dev_alloc_skb(unsigned int length)  
-</span><span class='line'>1125 {  
-</span><span class='line'>1126     return __dev_alloc_skb(length, GFP_ATOMIC);  
-</span><span class='line'>1127 }  
-</span><span class='line'>... ...  
-</span><span class='line'>1103 static inline struct sk_buff *__dev_alloc_skb(unsigned int length,  
-</span><span class='line'>1104                           gfp_t gfp_mask)  
-</span><span class='line'>1105 {  
-</span><span class='line'>1106     struct sk_buff *skb = alloc_skb(length + NET_SKB_PAD, gfp_mask);  
-</span><span class='line'>1107     if (likely(skb))  
-</span><span class='line'>1108         skb_reserve(skb, NET_SKB_PAD);  
-</span><span class='line'>1109     return skb;  
-</span><span class='line'>1110 }</span></code></pre></td></tr></table></div></figure>
-
-
-<p>1108 调用skb_reserve()在skb->head与skb->data之间预留NET_SKB_PAD个字节。NET_SKB_PAD的定义在skbuff.h中，其值为 16。这部分空间将被填入硬件帧头，如14B的以太网帧头。</p>
-
-<p>1126 以GFP_ATOMIC为内存分配优先级，表示分配过程为原子操作，不能被中断。</p>
-
-<hr />
-
-<h3>三、释放SKB</h3>
-
-<p>dev_kfree_skb()和kfree_skb()用来释放SKB，把它返回给高速缓存。kfree_skb()可以直接调用，也可以通过封装函数dev_kfree_skb()来调用。而dev_kfree_skb()只是一个简单调用kfree_skb()的宏，一般为设备驱动使用，与之功能相反的函数是dev_alloc_skb()。这些函数只在skb->users为1的情况下才释放内存，否则只简单地递减skb->users，因此假设SKB有三个引用者，那么只有第三次调用dev_kfree_skb()或kfree_skb()时才释放内存。kfree_skb()的流程如图3-14所示。</p>
-
-<p><img src="/images/kernel/2015-04-01-2.jpg" alt="" /></p>
-
-<p>图3-14所示的流程显示了释放一个SKB的步骤：</p>
-
-<p>1）kfree_skb()检测sk_buff结构的引用计数users，如果不为1，则说明此次释放后该SKB还将被用户占用，因此递减引用计数users后即返回；否则说明不再有其他用户占用该sk_buff结构，调用__kfree_skb()释放之。</p>
-
-<p>2）SKB描述符中包含一个dst_entry结构的引用，在释放SKB后，会调用dst_release()来递减dst_entry结构的引用计数。</p>
-
-<p>3）如果初始化了SKB的析构函数，则调用相应的函数。</p>
-
-<p>4）一个SKB描述符是与一个存有真正数据的内存块，即数据区相关的。如果存在聚合分散I/O数据，该数据区底部的skb_shared_info结构还会包含指向聚合分散I/O数据的指针，同样需要释放这些分片所占用的内存。最后需把SKB描述符所占内存返回给skbuff_head_cache缓存。释放内存由kfree_skbmem()处理，过程如下：</p>
-
-<p>如果SKB没有被克隆，或者payload没有被单独引用，则释放SKB的数据缓存区，包括存储聚合分散I/O数据的缓存区和SKB描述符。</p>
-
-<p>如果是释放从skbuff_fclone_cache中分配的父SKB描述符，且克隆计数为1，则释放父SKB描述符。</p>
-
-<p>如果是释放从skbuff_fclone_cache中分配的子SKB描述符，设置父SKLB的fclone字段为SKB_FCLONE_UNAVAILABLE，在克隆计数为1的情况下，释放子SKB描述符。</p>
-
-<hr />
-
-<h3>四、数据预留和对齐</h3>
-
-<p>数据预留和对齐主要由skb_reserve()、skb_put()、skb_push()以及skb_pull()这几个函数来完成。</p>
-
-<h4>1. skb_reserve()</h4>
-
-<p>skb_reserve()在数据缓存区头部预留一定的空间，通常被用来在数据缓存区中插入协议首部或者在某个边界上对齐。它并没有把数据移出或移入数据缓存区，而只是简单地更新了数据缓存区的两个指针-分别指向负载起始和结尾的data和tail指针，图3-15 展示了调用skb_reserve()前后这两个指针的变化。</p>
-
-<p>请注意：skb_reserve()只能用于空的SKB，通常会在分配SKB之后就调用该函数，此时data和tail指针还一同指向数据区的起始位置，如图3-15a所示。例如，某个以太网设备驱动的接收函数，在分配SKB之后，向数据缓存区填充数据之前，会有这样的一条语句skb_reserve(skb, 2)，这是因为以太网头长度为14B，再加上2B就正好16字节边界对齐，所以大多数以太网设备都会在数据包之前保留2B。</p>
-
-<p>当SKB在协议栈中向下传递时，每一层协议都把skb->data指针向上移动，然后复制本层首部，同时更新skb->len。这些操作都使用图3-15 中所示的函数完成。</p>
-
-<p><img src="/images/kernel/2015-04-01-3.jpg" alt="" /></p>
-
-<h4>2．skb_push()</h4>
-
-<p>skb_push()在数据缓存区的前头加入一块数据，与skb_reserve()类似，也并没有真正向数据缓存区中添加数据，而只是移动数据缓存区的头指针data和尾指针tail。数据由其他函数复制到数据缓存区中。</p>
-
-<p>函数执行步骤如下：</p>
-
-<p>1）当TCP发送数据时，会根据一些条件，如TCP最大分段长度MSS、是否支持聚合分散I/O等，分配一个SKB。</p>
-
-<p>2）TCP需在数据缓存区的头部预留足够的空间，用来填充各层首部。MAX_TCP_HEADER是各层首部长度的总和，它考虑了最坏的情况：由于TCP层不知道将要用哪个接口发送包，它为每一层预留了最大的首部长度，甚至还考虑了出现多个IP首部的可能性，因为在内核编译支持IP over IP的情况下，会遇到多个IP首部。</p>
-
-<p>3）把TCP负载复制到数据缓存区。需要注意的是，图3-16 只是一个例子，TCP负载可能会被组织成其他形式，例如分片，在后续章节中将会看到一个分片的数据缓存区是什么样的。</p>
-
-<p><img src="/images/kernel/2015-04-01-4.jpg" alt="" /></p>
-
-<p>4）TCP层添加TCP首部。</p>
-
-<p>5）SKB传递到IP层，IP层为数据包添加IP首部。</p>
-
-<p>6）SKB传递到链路层，链路层为数据包添加链路层首部。</p>
-
-<h4>3．skb_put()</h4>
-
-<p>skb_put()修改指向数据区末尾的指针tail，使之往下移len字节，即使数据区向下扩大len字节，并更新数据区长度len。调用skb_put()前后，SKB结构变化如图3-17所示。</p>
-
-<p><img src="/images/kernel/2015-04-01-5.jpg" alt="" /></p>
-
-<h4>4．skb_pull()</h4>
-
-<p>skb_pull()通过将data指针往下移动，在数据区首部忽略len字节长度的数据，通常用于接收到数据包后在各层间由下往上传递时，上层忽略下层的首部。调用skb_pull()前后，SKB结构变化如图3-18所示。</p>
-
-<p><img src="/images/kernel/2015-04-01-6.jpg" alt="" /></p>
-
-<hr />
-
-<h3>五、克隆和复制SKB</h3>
-
-<h4>1．skb_clone()</h4>
-
-<p>如果一个SKB会被不同的用户独立操作，而这些用户可能只是修改SKB描述符中的某些字段值，如h、nh，则内核没有必要为每个用户复制一份完整的SKB描述及其相应的数据缓存区，而会为了提高性能，只作克隆操作。克隆过程只复制SKB描述符，同时增加数据缓存区的引用计数，以免共享数据被提前释放。完成这些功能的是skb_clone()。一个使用包克隆的场景是，一个接收包程序要把该包传递给多个接收者，例如包处理函数或者一个或多个网络模块。原始的及克隆的SKB描述符的cloned值都会被设置为1，克隆SKB描述符的users值置为1，这样在第一次释放时就会释放掉。同时将数据缓存区引用计数dataref递增1，因为又多了一个克隆SKB描述符指向它。<br/>
-图3-19 演示的是已克隆的SKB。</p>
-
-<p><img src="/images/kernel/2015-04-01-7.jpg" alt="" /></p>
-
-<p>图3-19 所示是一个存在聚合分散I/O缓存区的例子，这个数据缓存区的一些数据保存在分片结构数组frags中。skb_share_check()用来检查SKB引用计数users，如果该字段表明SKB是被共享的，则克隆一个新的SKB。一个SKB被克隆后，该SKB数据缓存区中的内容就不能再被修改，这也意味着访问数据的函数没有必要加锁。skb_cloned()可以用来测试skb的克隆状态。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-<span class='line-number'>58</span>
-<span class='line-number'>59</span>
-<span class='line-number'>60</span>
-<span class='line-number'>61</span>
-<span class='line-number'>62</span>
-<span class='line-number'>63</span>
-<span class='line-number'>64</span>
-<span class='line-number'>65</span>
-<span class='line-number'>66</span>
-<span class='line-number'>67</span>
-<span class='line-number'>68</span>
-<span class='line-number'>69</span>
-<span class='line-number'>70</span>
-<span class='line-number'>71</span>
-<span class='line-number'>72</span>
-<span class='line-number'>73</span>
-<span class='line-number'>74</span>
-<span class='line-number'>75</span>
-<span class='line-number'>76</span>
-<span class='line-number'>77</span>
-<span class='line-number'>78</span>
-<span class='line-number'>79</span>
-<span class='line-number'>80</span>
-<span class='line-number'>81</span>
-<span class='line-number'>82</span>
-<span class='line-number'>83</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>432 struct sk_buff *skb_clone(struct sk_buff *skb, gfp_t gfp_mask)  
-</span><span class='line'>433 {  
-</span><span class='line'>434     struct sk_buff *n;  
-</span><span class='line'>435  
-</span><span class='line'>436     n = skb + 1;  
-</span><span class='line'>437     if (skb-&gt;fclone == SKB_FCLONE_ORIG &&  
-</span><span class='line'>438         n-&gt;fclone == SKB_FCLONE_UNAVAILABLE) {  
-</span><span class='line'>439         atomic_t *fclone_ref = (atomic_t *) (n + 1);  
-</span><span class='line'>440         n-&gt;fclone = SKB_FCLONE_CLONE;  
-</span><span class='line'>441         atomic_inc(fclone_ref);  
-</span><span class='line'>442     } else {  
-</span><span class='line'>443         n = kmem_cache_alloc(skbuff_head_cache, gfp_mask);  
-</span><span class='line'>444         if (!n)  
-</span><span class='line'>445             return NULL;  
-</span><span class='line'>446         n-&gt;fclone = SKB_FCLONE_UNAVAILABLE;  
-</span><span class='line'>447     }  
-</span><span class='line'>448  
-</span><span class='line'>449 #define C(x) n-&gt;x = skb-&gt;x  
-</span><span class='line'>450  
-</span><span class='line'>451     n-&gt;nnext = n-&gt;prev = NULL;  
-</span><span class='line'>452     n-&gt;sk = NULL;  
-</span><span class='line'>453     C(tstamp);  
-</span><span class='line'>454     C(dev);  
-</span><span class='line'>455     C(h);  
-</span><span class='line'>456     C(nh);  
-</span><span class='line'>457     C(mac);  
-</span><span class='line'>458     C(dst);  
-</span><span class='line'>459     dst_clone(skb-&gt;dst);  
-</span><span class='line'>460     C(sp);  
-</span><span class='line'>461 #ifdef CONFIG_INET  
-</span><span class='line'>462     secpath_get(skb-&gt;sp);  
-</span><span class='line'>463 #endif  
-</span><span class='line'>464     memcpy(n-&gt;cb, skb-&gt;cb, sizeof(skb-&gt;cb));  
-</span><span class='line'>465     C(len);  
-</span><span class='line'>466     C(data_len);  
-</span><span class='line'>467     C(csum);  
-</span><span class='line'>468     C(local_df);  
-</span><span class='line'>469     n-&gt;cloned = 1;  
-</span><span class='line'>470     n-&gt;nohdr = 0;  
-</span><span class='line'>471     C(pkt_type);  
-</span><span class='line'>472     C(ip_summed);  
-</span><span class='line'>473     C(priority);  
-</span><span class='line'>474 #if defined(CONFIG_IP_VS) || defined(CONFIG_IP_VS_MODULE)  
-</span><span class='line'>475     C(ipvs_property);  
-</span><span class='line'>476 #endif  
-</span><span class='line'>477     C(protocol);  
-</span><span class='line'>478     n-&gt;destructor = NULL;  
-</span><span class='line'>479     C(mark);  
-</span><span class='line'>480 #ifdef CONFIG_NETFILTER  
-</span><span class='line'>481     C(nfct);  
-</span><span class='line'>482     nf_conntrack_get(skb-&gt;nfct);  
-</span><span class='line'>483     C(nfctinfo);  
-</span><span class='line'>484 #if defined(CONFIG_NF_CONNTRACK) || defined(CONFIG_NF_CONNTRACK_MODULE)  
-</span><span class='line'>485     C(nfct_reasm);  
-</span><span class='line'>486     nf_conntrack_get_reasm(skb-&gt;nfct_reasm);  
-</span><span class='line'>487 #endif  
-</span><span class='line'>488 #ifdef CONFIG_BRIDGE_NETFILTER  
-</span><span class='line'>489     C(nf_bridge);  
-</span><span class='line'>490     nf_bridge_get(skb-&gt;nf_bridge);  
-</span><span class='line'>491 #endif  
-</span><span class='line'>492 #endif /*CONFIG_NETFILTER*/  
-</span><span class='line'>493 #ifdef CONFIG_NET_SCHED  
-</span><span class='line'>494     C(tc_index);  
-</span><span class='line'>495 #ifdef CONFIG_NET_CLS_ACT  
-</span><span class='line'>496     n-&gt;tc_verd = SET_TC_VERD(skb-&gt;tc_verd,0);  
-</span><span class='line'>497     n-&gt;tc_verd = CLR_TC_OK2MUNGE(n-&gt;tc_verd);  
-</span><span class='line'>498     n-&gt;tc_verd = CLR_TC_MUNGED(n-&gt;tc_verd);  
-</span><span class='line'>499     C(input_dev);  
-</span><span class='line'>500 #endif  
-</span><span class='line'>501     skb_copy_secmark(n, skb);  
-</span><span class='line'>502 #endif  
-</span><span class='line'>503     C(truesize);  
-</span><span class='line'>504     atomic_set(&n-&gt;users, 1);  
-</span><span class='line'>505     C(head);  
-</span><span class='line'>506     C(data);  
-</span><span class='line'>507     C(tail);  
-</span><span class='line'>508     C(end);  
-</span><span class='line'>509  
-</span><span class='line'>510     atomic_inc(&(skb_shinfo(skb)-&gt;dataref));  
-</span><span class='line'>511     skb-&gt;cloned = 1;  
-</span><span class='line'>512  
-</span><span class='line'>513     return n;  
-</span><span class='line'>514 }</span></code></pre></td></tr></table></div></figure>
-
-
-<p>436-438 由fclone标志来决定从哪个缓冲池中分配SKB描述符。如果紧邻的两个父子SKB描述符，前一个的fclone为SKB_FCLONE_ORIG，后一个的fclone为SKB_FCLONE_ UNAVAILABLE，则说明这两个SKB描述符是从skbuff_fclone_cache缓冲池中分配的，且父SKB描述符还没有被克隆，即子SKB描述符还是空的。否则即从skbuff_head_cache缓冲池中分配一个新的SKB来用于克隆。</p>
-
-<p>451-508 将父SKB描述符各字段值赋给子SKB描述符的对应字段。</p>
-
-<p>504 设置子SKB描述符引用计数users为1。</p>
-
-<p>510 递增父SKB描述符中的数据区引用计数skb_shared_info结构的dataref。</p>
-
-<p>511 设置父SKB描述符的成员cloned为1，表示该SKB已被克隆。</p>
-
-<h4>2．pskb_copy()</h4>
-
-<p>当一个函数不仅要修改SKB描述符，而且还要修改数据缓存区中的数据时，就需要同时复制数据缓存区。在这种情况下，程序员有两个选择。如果所修改的数据在skb->head和skb->end之间，可使用pskb_copy()来复制这部分数据，如图3-20所示。</p>
-
-<p><img src="/images/kernel/2015-04-01-8.jpg" alt="" /></p>
-
-<h4>3．skb_copy()</h4>
-
-<p>如果同时需要修改聚合分散I/O存储区中的数据，就必须使用skb_copy()，如图3-21所示。从前面的章节中看到，skb_shared_info结构中也包含一个SKB链表frag_list。该链表在pskb_copy()和skb_copy()中的处理方式与frags数组处理方式相同。</p>
-
-<p><img src="/images/kernel/2015-04-01-9.jpg" alt="" /></p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>587 struct sk_buff *skb_copy(const struct sk_buff *skb, gfp_t gfp_mask)  
-</span><span class='line'>588 {  
-</span><span class='line'>589     int headerlen = skb-&gt;data - skb-&gt;head;  
-</span><span class='line'>590     /*  
-</span><span class='line'>591      *    Allocate the copy buffer  
-</span><span class='line'>592      */  
-</span><span class='line'>593     struct sk_buff *n = alloc_skb(skb-&gt;end - skb-&gt;head + skb-&gt;data_len,  
-</span><span class='line'>594                       gfp_mask);  
-</span><span class='line'>595     if (!n)  
-</span><span class='line'>596         return NULL;  
-</span><span class='line'>597  
-</span><span class='line'>598     /* Set the data pointer */  
-</span><span class='line'>599     skb_reserve(n, headerlen);  
-</span><span class='line'>600     /* Set the tail pointer and length */  
-</span><span class='line'>601     skb_put(n, skb-&gt;len);  
-</span><span class='line'>602     n-&gt;csum         = skb-&gt;csum;  
-</span><span class='line'>603     n-&gt;ip_summed = skb-&gt;ip_summed;  
-</span><span class='line'>604  
-</span><span class='line'>605     if (skb_copy_bits(skb, -headerlen, n-&gt;head, headerlen + skb-&gt;len))  
-</span><span class='line'>606         BUG();  
-</span><span class='line'>607  
-</span><span class='line'>608     copy_skb_header(n, skb);  
-</span><span class='line'>609     return n;  
-</span><span class='line'>610 }</span></code></pre></td></tr></table></div></figure>
-
-
-<p>589-599 分配一个新的SKB，即包括SKB描述符和数据缓存区，然后在指针head和data之间预留源数据缓存区headroom长度的空间。</p>
-
-<p>601 将新SKB的tail指针和数据区长度len设置为与源SKB的一样。</p>
-
-<p>605-608 复制数据。</p>
-
-<p>在讨论本书中不同主题时，有时会强调某个特定函数需要克隆或者复制一个SKB。在决定克隆或复制SKB时，各子系统程序员不能预测其他内核组件是否需要使用SKB中的原始数据。内核是模块化的，其状态变化是不可预测的，每个子系统都不知道其他子系统是如何操作数据缓存区的。因此，内核程序员需要记录各子系统对数据缓存区的修改，并且在修改数据缓存区前，复制一个新的数据缓存区，以免其他子系统需使用数据缓存区原始数据时出现错误。</p>
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/03/27/kernel-net-netdevice/">内核网络设备的注册与初始化(eth0...)</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-03-27T17:56:00+08:00'><span class='date'>2015-03-27</span> <span class='time'>17:56:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><h4>找到eth0&hellip;之类的设备的数据结构</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'># crash vmlinux
-</span><span class='line'>
-</span><span class='line'>p init_net
-</span><span class='line'>找到：
-</span><span class='line'>  dev_base_head = {
-</span><span class='line'>&#9;next = 0xffff88003e48b070, 
-</span><span class='line'>&#9;prev = 0xffff880037582070
-</span><span class='line'>  },
-</span><span class='line'>next 就是 struct net_device *dev; 中 dev-&gt;dev_list;
-</span><span class='line'>算算 dev_list 在 dev 中的偏移为0x50（可能会不同）
-</span><span class='line'>
-</span><span class='line'>struct net_device 0xffff88003e48b020
-</span><span class='line'>然后根据 dev中的dev_list.next取下一个net_device
-</span><span class='line'>  dev_list = {
-</span><span class='line'>&#9;next = 0xffff880037582070, 
-</span><span class='line'>&#9;prev = 0xffffffff81b185b0
-</span><span class='line'>  },</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>找到net_device对应的XXX_adapter, 如ixgbe_adapter</h4>
-
-<p>ixgbe模块在申请net_device时会把需要预留给ixgbe_adapter的空间大小传给alloc_etherdev</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>netdev = alloc_etherdev(sizeof(struct ixgbe_adapter));
-</span><span class='line'>
-</span><span class='line'>adapter = netdev_priv(netdev);
-</span><span class='line'>
-</span><span class='line'>static inline void *netdev_priv(const struct net_device *dev)
-</span><span class='line'>{
-</span><span class='line'>&#9;return (char *)dev + ALIGN(sizeof(struct net_device), NETDEV_ALIGN);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>所以ixgbe_adapter在net_device结构按32位对其后面，偏移0x6c0（视内核而定）</p>
-
-<hr />
-
-<p><a href="http://blog.csdn.net/sfrysh/article/details/5736752">http://blog.csdn.net/sfrysh/article/details/5736752</a></p>
-
-<p>首先来看如何分配内存给一个网络设备。</p>
-
-<p>内核通过alloc_netdev来分配内存给一个指定的网络设备:</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#define alloc_netdev(sizeof_priv, name, setup) /   
-</span><span class='line'>&#9;alloc_netdev_mq(sizeof_priv, name, setup, 1)   
-</span><span class='line'>  
-</span><span class='line'>struct net_device *alloc_netdev_mq(int sizeof_priv, const char *name,   
-</span><span class='line'>&#9;&#9;void (*setup)(struct net_device *), unsigned int queue_count)  </span></code></pre></td></tr></table></div></figure>
-
-
-<p>其中alloc_netdev_mq中的第一个元素是每个网络设备的私有数据(主要是包含一些硬件参数，比如中断之类的)的大小，也就是net_device结构中的priv的大小。第二个参数是设备名，我们传递进来一般都是一个待format的字符串，比如"eth%d",到时多个相同类型网卡设备就会依次为eth0,1(内核会通过dev_alloc_name来进行设置)&hellip; 第三个参数setup是一个初始化net_device结构的回调函数。</p>
-
-<p>可是一般我们不需要直接调用alloc_netdev的，内核提供了一些包装好的函数：</p>
-
-<p>这里我们只看alloc_etherdev：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#define alloc_etherdev(sizeof_priv) alloc_etherdev_mq(sizeof_priv, 1)   
-</span><span class='line'>struct net_device *alloc_etherdev_mq(int sizeof_priv, unsigned int queue_count)   
-</span><span class='line'>{   
-</span><span class='line'>&#9;return alloc_netdev_mq(sizeof_priv, "eth%d", ether_setup, queue_count);   
-</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
-
-
-<p>这里实际是根据网卡的类型进行包装，也就类似于oo中的基类，ether_setup初始化一些所有相同类型的网络设备的一些相同配置的域：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>void ether_setup(struct net_device *dev)   
-</span><span class='line'>{   
-</span><span class='line'>&#9;dev-&gt;header_ops      = &eth_header_ops;   
-</span><span class='line'>  
-</span><span class='line'>&#9;dev-&gt;change_mtu      = eth_change_mtu;   
-</span><span class='line'>&#9;dev-&gt;set_mac_address     = eth_mac_addr;   
-</span><span class='line'>&#9;dev-&gt;validate_addr   = eth_validate_addr;   
-</span><span class='line'>  
-</span><span class='line'>&#9;dev-&gt;type        = ARPHRD_ETHER;   
-</span><span class='line'>&#9;dev-&gt;hard_header_len     = ETH_HLEN;   
-</span><span class='line'>&#9;dev-&gt;mtu     = ETH_DATA_LEN;   
-</span><span class='line'>&#9;dev-&gt;addr_len        = ETH_ALEN;   
-</span><span class='line'>&#9;dev-&gt;tx_queue_len    = 1000; /* Ethernet wants good queues */  
-</span><span class='line'>&#9;dev-&gt;flags       = IFF_BROADCAST|IFF_MULTICAST;   
-</span><span class='line'>  
-</span><span class='line'>&#9;memset(dev-&gt;broadcast, 0xFF, ETH_ALEN);   
-</span><span class='line'>  
-</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
-
-
-<p>接下来我们来看注册网络设备的一些细节。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>int register_netdev(struct net_device *dev)   
-</span><span class='line'>{   
-</span><span class='line'>&#9;int err;   
-</span><span class='line'>  
-</span><span class='line'>&#9;rtnl_lock();   
-</span><span class='line'>  
-</span><span class='line'>&#9;/*  
-</span><span class='line'>&#9; * If the name is a format string the caller wants us to do a  
-</span><span class='line'>&#9; * name allocation.  
-</span><span class='line'>&#9; */  
-</span><span class='line'>&#9;if (strchr(dev-&gt;name, '%')) {   
-</span><span class='line'>&#9;&#9;// 这里通过dev_alloc_name函数来对设备名进行设置。   
-</span><span class='line'>&#9;&#9;err = dev_alloc_name(dev, dev-&gt;name);   
-</span><span class='line'>&#9;&#9;if (err &lt; 0)   
-</span><span class='line'>&#9;&#9;&#9;goto out;   
-</span><span class='line'>&#9;}   
-</span><span class='line'>&#9;// 注册当前的网络设备到全局的网络设备链表中.下面会详细看这个函数.   
-</span><span class='line'>&#9;err = register_netdevice(dev);   
-</span><span class='line'>out:   
-</span><span class='line'>&#9;rtnl_unlock();   
-</span><span class='line'>&#9;return err;   
-</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
-
-
-<p>整个网络设备就是一个链表，他需要很方便的遍历所有设备，以及很快的定位某个指定的设备。为此net_device包含了下面3个链表(有关内核中数据结构的介绍，可以去自己google下)：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>// 可以根据index来定位设备   
-</span><span class='line'>struct hlist_node   index_hlist;   
-</span><span class='line'>// 可以根据name来定位设备   
-</span><span class='line'>struct hlist_node   name_hlist;   
-</span><span class='line'>// 通过dev_list，将此设备插入到全局的dev_base_head中，我们下面会介绍这个。   
-</span><span class='line'>struct list_head    dev_list;  </span></code></pre></td></tr></table></div></figure>
-
-
-<p>当设备注册成功后，还需要通知内核的其他组件，这里通过netdev_chain类型的notifier chain来通知其他组件。事件是NETDEV_REGISTER..其他设备通过register_netdevice_notifier来注册自己感兴趣的事件到此notifier chain上。</p>
-
-<p>网络设备(比如打开或关闭一个设备)，与用户空间的通信通过rtmsg_ifinfo函数，也就是RTMGRP_LINK的netlink。</p>
-
-<p>每个设备还包含两个状态，一个是state字段，表示排队策略状态(用位图表示)，一个是注册状态。</p>
-
-<p>包的排队策略也就是qos了。。</p>
+  <div class="entry-content"><p><a href="http://blog.csdn.net/mrpre/article/details/33347221">http://blog.csdn.net/mrpre/article/details/33347221</a></p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -1947,223 +320,738 @@ e）若该分段是一个ACK，且为重复ACK，但是没有超过一个rto的�
 <span class='line-number'>140</span>
 <span class='line-number'>141</span>
 <span class='line-number'>142</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>int register_netdevice(struct net_device *dev)   
-</span><span class='line'>{   
-</span><span class='line'>&#9;struct hlist_head *head;   
-</span><span class='line'>&#9;struct hlist_node *p;   
-</span><span class='line'>&#9;int ret;   
-</span><span class='line'>&#9;struct net *net;   
-</span><span class='line'>  
-</span><span class='line'>&#9;BUG_ON(dev_boot_phase);   
-</span><span class='line'>&#9;ASSERT_RTNL();   
-</span><span class='line'>  
-</span><span class='line'>&#9;might_sleep();   
-</span><span class='line'>  
-</span><span class='line'>&#9;/* When net_device's are persistent, this will be fatal. */  
-</span><span class='line'>&#9;BUG_ON(dev-&gt;reg_state != NETREG_UNINITIALIZED);   
-</span><span class='line'>&#9;BUG_ON(!dev_net(dev));   
-</span><span class='line'>&#9;net = dev_net(dev);   
-</span><span class='line'>  
-</span><span class='line'>&#9;// 初始化相关的锁   
-</span><span class='line'>&#9;spin_lock_init(&dev-&gt;addr_list_lock);   
-</span><span class='line'>&#9;netdev_set_addr_lockdep_class(dev);   
-</span><span class='line'>&#9;netdev_init_queue_locks(dev);   
-</span><span class='line'>  
-</span><span class='line'>&#9;dev-&gt;iflink = -1;   
-</span><span class='line'>  
-</span><span class='line'>&#9;/* Init, if this function is available */  
-</span><span class='line'>&#9;if (dev-&gt;init) {   
-</span><span class='line'>&#9;&#9;ret = dev-&gt;init(dev);   
-</span><span class='line'>&#9;&#9;if (ret) {   
-</span><span class='line'>&#9;&#9;&#9;if (ret &gt; 0)   
-</span><span class='line'>&#9;&#9;&#9;&#9;ret = -EIO;   
-</span><span class='line'>&#9;&#9;&#9;goto out;   
-</span><span class='line'>&#9;&#9;}   
-</span><span class='line'>&#9;}   
-</span><span class='line'>  
-</span><span class='line'>&#9;if (!dev_valid_name(dev-&gt;name)) {   
-</span><span class='line'>&#9;&#9;ret = -EINVAL;   
-</span><span class='line'>&#9;&#9;goto err_uninit;   
-</span><span class='line'>&#9;}   
-</span><span class='line'>&#9;// 给设备分配一个唯一的identifier.   
-</span><span class='line'>&#9;dev-&gt;ifindex = dev_new_index(net);   
-</span><span class='line'>&#9;if (dev-&gt;iflink == -1)   
-</span><span class='line'>&#9;&#9;dev-&gt;iflink = dev-&gt;ifindex;   
-</span><span class='line'>  
-</span><span class='line'>&#9;// 在全局的链表中检测是否有重复的名字   
-</span><span class='line'>&#9;head = dev_name_hash(net, dev-&gt;name);   
-</span><span class='line'>&#9;hlist_for_each(p, head) {   
-</span><span class='line'>&#9;&#9;struct net_device *d   
-</span><span class='line'>&#9;&#9;&#9;= hlist_entry(p, struct net_device, name_hlist);   
-</span><span class='line'>&#9;&#9;if (!strncmp(d-&gt;name, dev-&gt;name, IFNAMSIZ)) {   
-</span><span class='line'>&#9;&#9;&#9;ret = -EEXIST;   
-</span><span class='line'>&#9;&#9;&#9;goto err_uninit;   
-</span><span class='line'>&#9;&#9;}   
-</span><span class='line'>&#9;}   
-</span><span class='line'>&#9;// 下面是检测一些特性的组合是否合法。   
-</span><span class='line'>&#9;/* Fix illegal checksum combinations */  
-</span><span class='line'>&#9;if ((dev-&gt;features & NETIF_F_HW_CSUM) &&   
-</span><span class='line'>&#9;&#9;(dev-&gt;features & (NETIF_F_IP_CSUM|NETIF_F_IPV6_CSUM))) {   
-</span><span class='line'>&#9;&#9;printk(KERN_NOTICE "%s: mixed HW and IP checksum settings./n",   
-</span><span class='line'>&#9;&#9;&#9;   dev-&gt;name);   
-</span><span class='line'>&#9;&#9;dev-&gt;features &= ~(NETIF_F_IP_CSUM|NETIF_F_IPV6_CSUM);   
-</span><span class='line'>&#9;}   
-</span><span class='line'>  
-</span><span class='line'>&#9;if ((dev-&gt;features & NETIF_F_NO_CSUM) &&   
-</span><span class='line'>&#9;&#9;(dev-&gt;features & (NETIF_F_HW_CSUM|NETIF_F_IP_CSUM|NETIF_F_IPV6_CSUM))) {   
-</span><span class='line'>&#9;&#9;printk(KERN_NOTICE "%s: mixed no checksumming and other settings./n",   
-</span><span class='line'>&#9;&#9;&#9;   dev-&gt;name);   
-</span><span class='line'>&#9;&#9;dev-&gt;features &= ~(NETIF_F_IP_CSUM|NETIF_F_IPV6_CSUM|NETIF_F_HW_CSUM);   
-</span><span class='line'>&#9;}   
-</span><span class='line'>  
-</span><span class='line'>  
-</span><span class='line'>&#9;/* Fix illegal SG+CSUM combinations. */  
-</span><span class='line'>&#9;if ((dev-&gt;features & NETIF_F_SG) &&   
-</span><span class='line'>&#9;&#9;!(dev-&gt;features & NETIF_F_ALL_CSUM)) {   
-</span><span class='line'>&#9;&#9;printk(KERN_NOTICE "%s: Dropping NETIF_F_SG since no checksum feature./n",   
-</span><span class='line'>&#9;&#9;&#9;   dev-&gt;name);   
-</span><span class='line'>&#9;&#9;dev-&gt;features &= ~NETIF_F_SG;   
-</span><span class='line'>&#9;}   
-</span><span class='line'>  
-</span><span class='line'>&#9;/* TSO requires that SG is present as well. */  
-</span><span class='line'>&#9;if ((dev-&gt;features & NETIF_F_TSO) &&   
-</span><span class='line'>&#9;&#9;!(dev-&gt;features & NETIF_F_SG)) {   
-</span><span class='line'>&#9;&#9;printk(KERN_NOTICE "%s: Dropping NETIF_F_TSO since no SG feature./n",   
-</span><span class='line'>&#9;&#9;&#9;   dev-&gt;name);   
-</span><span class='line'>&#9;&#9;dev-&gt;features &= ~NETIF_F_TSO;   
-</span><span class='line'>&#9;}   
-</span><span class='line'>&#9;if (dev-&gt;features & NETIF_F_UFO) {   
-</span><span class='line'>&#9;&#9;if (!(dev-&gt;features & NETIF_F_HW_CSUM)) {   
-</span><span class='line'>&#9;&#9;&#9;printk(KERN_ERR "%s: Dropping NETIF_F_UFO since no "  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;"NETIF_F_HW_CSUM feature./n",   
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9;dev-&gt;name);   
-</span><span class='line'>&#9;&#9;&#9;dev-&gt;features &= ~NETIF_F_UFO;   
-</span><span class='line'>&#9;&#9;}   
-</span><span class='line'>&#9;&#9;if (!(dev-&gt;features & NETIF_F_SG)) {   
-</span><span class='line'>&#9;&#9;&#9;printk(KERN_ERR "%s: Dropping NETIF_F_UFO since no "  
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;"NETIF_F_SG feature./n",   
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9;dev-&gt;name);   
-</span><span class='line'>&#9;&#9;&#9;dev-&gt;features &= ~NETIF_F_UFO;   
-</span><span class='line'>&#9;&#9;}   
-</span><span class='line'>&#9;}   
-</span><span class='line'>  
-</span><span class='line'>&#9;/* Enable software GSO if SG is supported. */  
-</span><span class='line'>&#9;if (dev-&gt;features & NETIF_F_SG)   
-</span><span class='line'>&#9;&#9;dev-&gt;features |= NETIF_F_GSO;   
-</span><span class='line'>  
-</span><span class='line'>&#9;// 初始化设备驱动的kobject并创建相关的sysfs   
-</span><span class='line'>&#9;netdev_initialize_kobject(dev);   
-</span><span class='line'>&#9;ret = netdev_register_kobject(dev);   
-</span><span class='line'>&#9;if (ret)   
-</span><span class='line'>&#9;&#9;goto err_uninit;   
-</span><span class='line'>&#9;// 设置注册状态。   
-</span><span class='line'>&#9;dev-&gt;reg_state = NETREG_REGISTERED;   
-</span><span class='line'>  
-</span><span class='line'>&#9;/*  
-</span><span class='line'>&#9; *  Default initial state at registry is that the  
-</span><span class='line'>&#9; *  device is present.  
-</span><span class='line'>&#9; */  
-</span><span class='line'>  
-</span><span class='line'>&#9;// 设置排队策略状态。   
-</span><span class='line'>&#9;set_bit(__LINK_STATE_PRESENT, &dev-&gt;state);   
-</span><span class='line'>&#9;// 初始化排队规则   
-</span><span class='line'>&#9;dev_init_scheduler(dev);   
-</span><span class='line'>&#9;dev_hold(dev);   
-</span><span class='line'>&#9;// 将相应的链表插入到全局的链表中。紧接着会介绍这个函数   
-</span><span class='line'>&#9;list_netdevice(dev);   
-</span><span class='line'>  
-</span><span class='line'>&#9;/* Notify protocols, that a new device appeared. */  
-</span><span class='line'>&#9;// 调用netdev_chain通知内核其他子系统。   
-</span><span class='line'>&#9;ret = call_netdevice_notifiers(NETDEV_REGISTER, dev);   
-</span><span class='line'>&#9;ret = notifier_to_errno(ret);   
-</span><span class='line'>&#9;if (ret) {   
-</span><span class='line'>&#9;&#9;rollback_registered(dev);   
-</span><span class='line'>&#9;&#9;dev-&gt;reg_state = NETREG_UNREGISTERED;   
-</span><span class='line'>&#9;}   
-</span><span class='line'>  
-</span><span class='line'>out:   
-</span><span class='line'>&#9;return ret;   
-</span><span class='line'>  
-</span><span class='line'>err_uninit:   
-</span><span class='line'>&#9;if (dev-&gt;uninit)   
-</span><span class='line'>&#9;&#9;dev-&gt;uninit(dev);   
-</span><span class='line'>&#9;goto out;   
-</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>143</span>
+<span class='line-number'>144</span>
+<span class='line-number'>145</span>
+<span class='line-number'>146</span>
+<span class='line-number'>147</span>
+<span class='line-number'>148</span>
+<span class='line-number'>149</span>
+<span class='line-number'>150</span>
+<span class='line-number'>151</span>
+<span class='line-number'>152</span>
+<span class='line-number'>153</span>
+<span class='line-number'>154</span>
+<span class='line-number'>155</span>
+<span class='line-number'>156</span>
+<span class='line-number'>157</span>
+<span class='line-number'>158</span>
+<span class='line-number'>159</span>
+<span class='line-number'>160</span>
+<span class='line-number'>161</span>
+<span class='line-number'>162</span>
+<span class='line-number'>163</span>
+<span class='line-number'>164</span>
+<span class='line-number'>165</span>
+<span class='line-number'>166</span>
+<span class='line-number'>167</span>
+<span class='line-number'>168</span>
+<span class='line-number'>169</span>
+<span class='line-number'>170</span>
+<span class='line-number'>171</span>
+<span class='line-number'>172</span>
+<span class='line-number'>173</span>
+<span class='line-number'>174</span>
+<span class='line-number'>175</span>
+<span class='line-number'>176</span>
+<span class='line-number'>177</span>
+<span class='line-number'>178</span>
+<span class='line-number'>179</span>
+<span class='line-number'>180</span>
+<span class='line-number'>181</span>
+<span class='line-number'>182</span>
+<span class='line-number'>183</span>
+<span class='line-number'>184</span>
+<span class='line-number'>185</span>
+<span class='line-number'>186</span>
+<span class='line-number'>187</span>
+<span class='line-number'>188</span>
+<span class='line-number'>189</span>
+<span class='line-number'>190</span>
+<span class='line-number'>191</span>
+<span class='line-number'>192</span>
+<span class='line-number'>193</span>
+<span class='line-number'>194</span>
+<span class='line-number'>195</span>
+<span class='line-number'>196</span>
+<span class='line-number'>197</span>
+<span class='line-number'>198</span>
+<span class='line-number'>199</span>
+<span class='line-number'>200</span>
+<span class='line-number'>201</span>
+<span class='line-number'>202</span>
+<span class='line-number'>203</span>
+<span class='line-number'>204</span>
+<span class='line-number'>205</span>
+<span class='line-number'>206</span>
+<span class='line-number'>207</span>
+<span class='line-number'>208</span>
+<span class='line-number'>209</span>
+<span class='line-number'>210</span>
+<span class='line-number'>211</span>
+<span class='line-number'>212</span>
+<span class='line-number'>213</span>
+<span class='line-number'>214</span>
+<span class='line-number'>215</span>
+<span class='line-number'>216</span>
+<span class='line-number'>217</span>
+<span class='line-number'>218</span>
+<span class='line-number'>219</span>
+<span class='line-number'>220</span>
+<span class='line-number'>221</span>
+<span class='line-number'>222</span>
+<span class='line-number'>223</span>
+<span class='line-number'>224</span>
+<span class='line-number'>225</span>
+<span class='line-number'>226</span>
+<span class='line-number'>227</span>
+<span class='line-number'>228</span>
+<span class='line-number'>229</span>
+<span class='line-number'>230</span>
+<span class='line-number'>231</span>
+<span class='line-number'>232</span>
+<span class='line-number'>233</span>
+<span class='line-number'>234</span>
+<span class='line-number'>235</span>
+<span class='line-number'>236</span>
+<span class='line-number'>237</span>
+<span class='line-number'>238</span>
+<span class='line-number'>239</span>
+<span class='line-number'>240</span>
+<span class='line-number'>241</span>
+<span class='line-number'>242</span>
+<span class='line-number'>243</span>
+<span class='line-number'>244</span>
+<span class='line-number'>245</span>
+<span class='line-number'>246</span>
+<span class='line-number'>247</span>
+<span class='line-number'>248</span>
+<span class='line-number'>249</span>
+<span class='line-number'>250</span>
+<span class='line-number'>251</span>
+<span class='line-number'>252</span>
+<span class='line-number'>253</span>
+<span class='line-number'>254</span>
+<span class='line-number'>255</span>
+<span class='line-number'>256</span>
+<span class='line-number'>257</span>
+<span class='line-number'>258</span>
+<span class='line-number'>259</span>
+<span class='line-number'>260</span>
+<span class='line-number'>261</span>
+<span class='line-number'>262</span>
+<span class='line-number'>263</span>
+<span class='line-number'>264</span>
+<span class='line-number'>265</span>
+<span class='line-number'>266</span>
+<span class='line-number'>267</span>
+<span class='line-number'>268</span>
+<span class='line-number'>269</span>
+<span class='line-number'>270</span>
+<span class='line-number'>271</span>
+<span class='line-number'>272</span>
+<span class='line-number'>273</span>
+<span class='line-number'>274</span>
+<span class='line-number'>275</span>
+<span class='line-number'>276</span>
+<span class='line-number'>277</span>
+<span class='line-number'>278</span>
+<span class='line-number'>279</span>
+<span class='line-number'>280</span>
+<span class='line-number'>281</span>
+<span class='line-number'>282</span>
+<span class='line-number'>283</span>
+<span class='line-number'>284</span>
+<span class='line-number'>285</span>
+<span class='line-number'>286</span>
+<span class='line-number'>287</span>
+<span class='line-number'>288</span>
+<span class='line-number'>289</span>
+<span class='line-number'>290</span>
+<span class='line-number'>291</span>
+<span class='line-number'>292</span>
+<span class='line-number'>293</span>
+<span class='line-number'>294</span>
+<span class='line-number'>295</span>
+<span class='line-number'>296</span>
+<span class='line-number'>297</span>
+<span class='line-number'>298</span>
+<span class='line-number'>299</span>
+<span class='line-number'>300</span>
+<span class='line-number'>301</span>
+<span class='line-number'>302</span>
+<span class='line-number'>303</span>
+<span class='line-number'>304</span>
+<span class='line-number'>305</span>
+<span class='line-number'>306</span>
+<span class='line-number'>307</span>
+<span class='line-number'>308</span>
+<span class='line-number'>309</span>
+<span class='line-number'>310</span>
+<span class='line-number'>311</span>
+<span class='line-number'>312</span>
+<span class='line-number'>313</span>
+<span class='line-number'>314</span>
+<span class='line-number'>315</span>
+<span class='line-number'>316</span>
+<span class='line-number'>317</span>
+<span class='line-number'>318</span>
+<span class='line-number'>319</span>
+<span class='line-number'>320</span>
+<span class='line-number'>321</span>
+<span class='line-number'>322</span>
+<span class='line-number'>323</span>
+<span class='line-number'>324</span>
+<span class='line-number'>325</span>
+<span class='line-number'>326</span>
+<span class='line-number'>327</span>
+<span class='line-number'>328</span>
+<span class='line-number'>329</span>
+<span class='line-number'>330</span>
+<span class='line-number'>331</span>
+<span class='line-number'>332</span>
+<span class='line-number'>333</span>
+<span class='line-number'>334</span>
+<span class='line-number'>335</span>
+<span class='line-number'>336</span>
+<span class='line-number'>337</span>
+<span class='line-number'>338</span>
+<span class='line-number'>339</span>
+<span class='line-number'>340</span>
+<span class='line-number'>341</span>
+<span class='line-number'>342</span>
+<span class='line-number'>343</span>
+<span class='line-number'>344</span>
+<span class='line-number'>345</span>
+<span class='line-number'>346</span>
+<span class='line-number'>347</span>
+<span class='line-number'>348</span>
+<span class='line-number'>349</span>
+<span class='line-number'>350</span>
+<span class='line-number'>351</span>
+<span class='line-number'>352</span>
+<span class='line-number'>353</span>
+<span class='line-number'>354</span>
+<span class='line-number'>355</span>
+<span class='line-number'>356</span>
+<span class='line-number'>357</span>
+<span class='line-number'>358</span>
+<span class='line-number'>359</span>
+<span class='line-number'>360</span>
+<span class='line-number'>361</span>
+<span class='line-number'>362</span>
+<span class='line-number'>363</span>
+<span class='line-number'>364</span>
+<span class='line-number'>365</span>
+<span class='line-number'>366</span>
+<span class='line-number'>367</span>
+<span class='line-number'>368</span>
+<span class='line-number'>369</span>
+<span class='line-number'>370</span>
+<span class='line-number'>371</span>
+<span class='line-number'>372</span>
+<span class='line-number'>373</span>
+<span class='line-number'>374</span>
+<span class='line-number'>375</span>
+<span class='line-number'>376</span>
+<span class='line-number'>377</span>
+<span class='line-number'>378</span>
+<span class='line-number'>379</span>
+<span class='line-number'>380</span>
+<span class='line-number'>381</span>
+<span class='line-number'>382</span>
+<span class='line-number'>383</span>
+<span class='line-number'>384</span>
+<span class='line-number'>385</span>
+<span class='line-number'>386</span>
+<span class='line-number'>387</span>
+<span class='line-number'>388</span>
+<span class='line-number'>389</span>
+<span class='line-number'>390</span>
+<span class='line-number'>391</span>
+<span class='line-number'>392</span>
+<span class='line-number'>393</span>
+<span class='line-number'>394</span>
+<span class='line-number'>395</span>
+<span class='line-number'>396</span>
+<span class='line-number'>397</span>
+<span class='line-number'>398</span>
+<span class='line-number'>399</span>
+<span class='line-number'>400</span>
+<span class='line-number'>401</span>
+<span class='line-number'>402</span>
+<span class='line-number'>403</span>
+<span class='line-number'>404</span>
+<span class='line-number'>405</span>
+<span class='line-number'>406</span>
+<span class='line-number'>407</span>
+<span class='line-number'>408</span>
+<span class='line-number'>409</span>
+<span class='line-number'>410</span>
+<span class='line-number'>411</span>
+<span class='line-number'>412</span>
+<span class='line-number'>413</span>
+<span class='line-number'>414</span>
+<span class='line-number'>415</span>
+<span class='line-number'>416</span>
+<span class='line-number'>417</span>
+<span class='line-number'>418</span>
+<span class='line-number'>419</span>
+<span class='line-number'>420</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* 
+</span><span class='line'> *    This routine copies from a sock struct into the user buffer.
+</span><span class='line'> *
+</span><span class='line'> *    Technical note: in 2.3 we work on _locked_ socket, so that
+</span><span class='line'> *    tricks with *seq access order and skb-&gt;users are not required.
+</span><span class='line'> *    Probably, code can be easily improved even more.
+</span><span class='line'> */
+</span><span class='line'>
+</span><span class='line'>int tcp_recvmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
+</span><span class='line'>&#9;&#9;size_t len, int nonblock, int flags, int *addr_len)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>&#9;int copied = 0;
+</span><span class='line'>&#9;u32 peek_seq;
+</span><span class='line'>&#9;u32 *seq;
+</span><span class='line'>&#9;unsigned long used;
+</span><span class='line'>&#9;int err;
+</span><span class='line'>&#9;int target;    /* Read at least this many bytes */
+</span><span class='line'>&#9;long timeo;
+</span><span class='line'>&#9;struct task_struct *user_recv = NULL;
+</span><span class='line'>&#9;int copied_early = 0;
+</span><span class='line'>&#9;struct sk_buff *skb;
+</span><span class='line'>&#9;u32 urg_hole = 0;
+</span><span class='line'>
+</span><span class='line'>&#9;//功能：“锁住sk”，并非真正的加锁，而是执行sk-&gt;sk_lock.owned = 1 
+</span><span class='line'>&#9;//目的：这样软中断上下文能够通过owned ，判断该sk是否处于进程上下文。
+</span><span class='line'>&#9;//提供一种同步机制。
+</span><span class='line'>&#9;lock_sock(sk);
+</span><span class='line'>
+</span><span class='line'>&#9;TCP_CHECK_TIMER(sk);
+</span><span class='line'>
+</span><span class='line'>&#9;err = -ENOTCONN;
+</span><span class='line'>&#9;if (sk-&gt;sk_state == TCP_LISTEN)
+</span><span class='line'>&#9;&#9;goto out;
+</span><span class='line'>
+</span><span class='line'>&#9;//获取延迟，如果用户设置为非阻塞，那么timeo ==0000 0000 0000 0000
+</span><span class='line'>&#9;//如果用户使用默认recv系统调用
+</span><span class='line'>&#9;//则为阻塞，此时timeo ==0111 1111 1111 1111
+</span><span class='line'>&#9;//timeo 就2个值
+</span><span class='line'>&#9;timeo = sock_rcvtimeo(sk, nonblock);
+</span><span class='line'>
+</span><span class='line'>&#9;/* Urgent data needs to be handled specially. */
+</span><span class='line'>&#9;if (flags & MSG_OOB)
+</span><span class='line'>&#9;&#9;goto recv_urg;
+</span><span class='line'>
+</span><span class='line'>&#9;//待拷贝的下一个序列号
+</span><span class='line'>&#9;seq = &tp-&gt;copied_seq;
+</span><span class='line'>
+</span><span class='line'>&#9;//设置了MSG_PEEK，表示不让数据从缓冲区移除，目的是下一次调用recv函数
+</span><span class='line'>&#9;//仍然能够读到相同数据
+</span><span class='line'>&#9;if (flags & MSG_PEEK) {
+</span><span class='line'>&#9;&#9;peek_seq = tp-&gt;copied_seq;
+</span><span class='line'>&#9;&#9;seq = &peek_seq;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;//如果设置了MSG_WAITALL，则target  ==len，即recv函数中的参数len
+</span><span class='line'>&#9;//如果没设置MSG_WAITALL，则target  == 1
+</span><span class='line'>&#9;target = sock_rcvlowat(sk, flags & MSG_WAITALL, len);
+</span><span class='line'>
+</span><span class='line'>&#9;//大循环
+</span><span class='line'>&#9;do {
+</span><span class='line'>&#9;&#9;u32 offset;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;/* Are we at urgent data? Stop if we have read anything or have SIGURG pending. */
+</span><span class='line'>&#9;&#9;if (tp-&gt;urg_data && tp-&gt;urg_seq == *seq) {
+</span><span class='line'>&#9;&#9;&#9;if (copied)
+</span><span class='line'>&#9;&#9;&#9;&#9;break;
+</span><span class='line'>&#9;&#9;&#9;if (signal_pending(current)) {
+</span><span class='line'>&#9;&#9;&#9;&#9;copied = timeo ? sock_intr_errno(timeo) : -EAGAIN;
+</span><span class='line'>&#9;&#9;&#9;&#9;break;
+</span><span class='line'>&#9;&#9;&#9;}
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;/* Next get a buffer. */
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;//小循环
+</span><span class='line'>&#9;&#9;skb_queue_walk(&sk-&gt;sk_receive_queue, skb) {
+</span><span class='line'>&#9;&#9;&#9;/* Now that we have two receive queues this
+</span><span class='line'>&#9;&#9;&#9;&#9;* shouldn't happen.
+</span><span class='line'>&#9;&#9;&#9;&#9;*/
+</span><span class='line'>&#9;&#9;&#9;if (WARN(before(*seq, TCP_SKB_CB(skb)-&gt;seq),
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9;&#9;KERN_INFO "recvmsg bug: copied %X "
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9;&#9;&#9;      "seq %X rcvnxt %X fl %X\n", *seq,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9;&#9;&#9;      TCP_SKB_CB(skb)-&gt;seq, tp-&gt;rcv_nxt,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9;&#9;&#9;      flags))
+</span><span class='line'>&#9;&#9;&#9;&#9;break;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;//如果用户的缓冲区(即用户malloc的buf)长度够大，offset一般是0。
+</span><span class='line'>&#9;&#9;&#9;//即 “下次准备拷贝数据的序列号”==此时获取报文的起始序列号
+</span><span class='line'>&#9;&#9;&#9;//什么情况下offset &gt;0呢？很简答，如果用户缓冲区12字节，而这个skb有120字节
+</span><span class='line'>&#9;&#9;&#9;//那么一次recv系统调用，只能获取skb中的前12个字节，下一次执行recv系统调用
+</span><span class='line'>&#9;&#9;&#9;//offset就是12了，offset表示从第12个字节开始读取数据，前12个字节已经读取了。
+</span><span class='line'>&#9;&#9;&#9;//那这个"已经读取12字节"这个消息，存在哪呢？
+</span><span class='line'>&#9;&#9;&#9;//在*seq = &tp-&gt;copied_seq;中
+</span><span class='line'>&#9;&#9;&#9;offset = *seq - TCP_SKB_CB(skb)-&gt;seq;
+</span><span class='line'>&#9;&#9;&#9;if (tcp_hdr(skb)-&gt;syn)
+</span><span class='line'>&#9;&#9;&#9;&#9;offset--;
+</span><span class='line'>&#9;&#9;&#9;if (offset &lt; skb-&gt;len)
+</span><span class='line'>&#9;&#9;&#9;&#9;goto found_ok_skb;
+</span><span class='line'>&#9;&#9;&#9;if (tcp_hdr(skb)-&gt;fin)
+</span><span class='line'>&#9;&#9;&#9;&#9;goto found_fin_ok;
+</span><span class='line'>&#9;&#9;&#9;WARN(!(flags & MSG_PEEK), KERN_INFO "recvmsg bug 2: "
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;"copied %X seq %X rcvnxt %X fl %X\n",
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;*seq, TCP_SKB_CB(skb)-&gt;seq,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;tp-&gt;rcv_nxt, flags);
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;//执行到了这里，表明小循环中break了，既然break了，说明sk_receive_queue中
+</span><span class='line'>&#9;&#9;//已经没有skb可以读取了
+</span><span class='line'>&#9;&#9;//如果没有执行到这里说明前面的小循环中执行了goto，读到有用的skb，或者读到fin都会goto。
+</span><span class='line'>&#9;&#9;//没有skb可以读取，说明什么？
+</span><span class='line'>&#9;&#9;//可能性1：当用户第一次调用recv时，压根没有数据到来
+</span><span class='line'>&#9;&#9;//可能性2：skb-&gt;len一共20字节，假设用户调用一次 recv，读取12字节，再调用recv，
+</span><span class='line'>&#9;&#9;//读取12字节，此时skb由于上次已经被读取了12字节，只剩下8字节。
+</span><span class='line'>&#9;&#9;//于是代码的逻辑上，再会要求获取skb，来读取剩下的8字节。
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;//可能性1的情况下，copied == 0，肯定不会进这个if。后续将执行休眠
+</span><span class='line'>&#9;&#9;//可能性2的情况下，情况比较复杂。可能性2表明数据没有读够用户想要的len长度
+</span><span class='line'>&#9;&#9;//虽然进程上下文中，没有读够数据，但是可能我们在读数据的时候
+</span><span class='line'>&#9;&#9;//软中断把数据放到backlog队列中了，而backlog对队列中的数据或许恰好让我们读够数
+</span><span class='line'>&#9;&#9;//据。
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;//copied了数据的，copied肯定&gt;=1，而target 是1或者len
+</span><span class='line'>&#9;&#9;//copied只能取0(可能性1)，或者0~len(可能性2)
+</span><span class='line'>&#9;&#9;//copied &gt;= target 表示我们取得我们想要的数据了，何必进行休眠，直接return
+</span><span class='line'>&#9;&#9;//如果copied 没有达到我们想要的数据，则看看sk_backlog是否为空
+</span><span class='line'>&#9;&#9;//空的话，尽力了，只能尝试休眠
+</span><span class='line'>&#9;&#9;//非空的话，还有一线希望，我们去sk_backlog找找数据，看看是否能够达到我们想要的
+</span><span class='line'>&#9;&#9;//数据大小
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;//我觉得copied == target是会出现的，但是出现的话，也不会进现在这个流程
+</span><span class='line'>&#9;&#9;//，如有不对，请各位大神指正，告诉我
+</span><span class='line'>&#9;&#9;//说明情况下copied == target
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;/* Well, if we have backlog, try to process it now yet. */
+</span><span class='line'>&#9;&#9;if (copied &gt;= target && !sk-&gt;sk_backlog.tail)
+</span><span class='line'>&#9;&#9;&#9;break;
+</span><span class='line'>
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (copied) {
+</span><span class='line'>&#9;&#9;&#9;//可能性2，拷贝了数据，但是没有拷贝到指定大小
+</span><span class='line'>&#9;&#9;&#9;if (sk-&gt;sk_err ||
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9;sk-&gt;sk_state == TCP_CLOSE ||
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9;(sk-&gt;sk_shutdown & RCV_SHUTDOWN) ||
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9;!timeo ||
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9;signal_pending(current))
+</span><span class='line'>&#9;&#9;&#9;&#9;break;
+</span><span class='line'>&#9;&#9;} else {
+</span><span class='line'>&#9;&#9;&#9;//可能性1
+</span><span class='line'>&#9;&#9;&#9;if (sock_flag(sk, SOCK_DONE))
+</span><span class='line'>&#9;&#9;&#9;&#9;break;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;if (sk-&gt;sk_err) {
+</span><span class='line'>&#9;&#9;&#9;&#9;copied = sock_error(sk);
+</span><span class='line'>&#9;&#9;&#9;&#9;break;
+</span><span class='line'>&#9;&#9;&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;if (sk-&gt;sk_shutdown & RCV_SHUTDOWN)
+</span><span class='line'>&#9;&#9;&#9;&#9;break;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;if (sk-&gt;sk_state == TCP_CLOSE) {
+</span><span class='line'>&#9;&#9;&#9;&#9;if (!sock_flag(sk, SOCK_DONE)) {
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;/* This occurs when user tries to read
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;* from never connected socket.
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;*/
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;copied = -ENOTCONN;
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;break;
+</span><span class='line'>&#9;&#9;&#9;&#9;}
+</span><span class='line'>&#9;&#9;&#9;&#9;break;
+</span><span class='line'>&#9;&#9;&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;//是否是阻塞的，不是，就return了。
+</span><span class='line'>&#9;&#9;&#9;if (!timeo) {
+</span><span class='line'>&#9;&#9;&#9;&#9;copied = -EAGAIN;
+</span><span class='line'>&#9;&#9;&#9;&#9;break;
+</span><span class='line'>&#9;&#9;&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;if (signal_pending(current)) {
+</span><span class='line'>&#9;&#9;&#9;&#9;copied = sock_intr_errno(timeo);
+</span><span class='line'>&#9;&#9;&#9;&#9;break;
+</span><span class='line'>&#9;&#9;&#9;}
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;tcp_cleanup_rbuf(sk, copied);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;//sysctl_tcp_low_latency 默认0tp-&gt;ucopy.task == user_recv肯定也成立
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (!sysctl_tcp_low_latency && tp-&gt;ucopy.task == user_recv) {
+</span><span class='line'>&#9;&#9;&#9;/* Install new reader */
+</span><span class='line'>&#9;&#9;&#9;if (!user_recv && !(flags & (MSG_TRUNC | MSG_PEEK))) {
+</span><span class='line'>&#9;&#9;&#9;&#9;user_recv = current;
+</span><span class='line'>&#9;&#9;&#9;&#9;tp-&gt;ucopy.task = user_recv;
+</span><span class='line'>&#9;&#9;&#9;&#9;tp-&gt;ucopy.iov = msg-&gt;msg_iov;
+</span><span class='line'>&#9;&#9;&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;tp-&gt;ucopy.len = len;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;WARN_ON(tp-&gt;copied_seq != tp-&gt;rcv_nxt &&
+</span><span class='line'>&#9;&#9;&#9;&#9;!(flags & (MSG_PEEK | MSG_TRUNC)));
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;/* Ugly... If prequeue is not empty, we have to
+</span><span class='line'>&#9;&#9;&#9;&#9;* process it before releasing socket, otherwise
+</span><span class='line'>&#9;&#9;&#9;&#9;* order will be broken at second iteration.
+</span><span class='line'>&#9;&#9;&#9;&#9;* More elegant solution is required!!!
+</span><span class='line'>&#9;&#9;&#9;&#9;*
+</span><span class='line'>&#9;&#9;&#9;&#9;* Look: we have the following (pseudo)queues:
+</span><span class='line'>&#9;&#9;&#9;&#9;*
+</span><span class='line'>&#9;&#9;&#9;&#9;* 1. packets in flight
+</span><span class='line'>&#9;&#9;&#9;&#9;* 2. backlog
+</span><span class='line'>&#9;&#9;&#9;&#9;* 3. prequeue
+</span><span class='line'>&#9;&#9;&#9;&#9;* 4. receive_queue
+</span><span class='line'>&#9;&#9;&#9;&#9;*
+</span><span class='line'>&#9;&#9;&#9;&#9;* Each queue can be processed only if the next ones
+</span><span class='line'>&#9;&#9;&#9;&#9;* are empty. At this point we have empty receive_queue.
+</span><span class='line'>&#9;&#9;&#9;&#9;* But prequeue _can_ be not empty after 2nd iteration,
+</span><span class='line'>&#9;&#9;&#9;&#9;* when we jumped to start of loop because backlog
+</span><span class='line'>&#9;&#9;&#9;&#9;* processing added something to receive_queue.
+</span><span class='line'>&#9;&#9;&#9;&#9;* We cannot release_sock(), because backlog contains
+</span><span class='line'>&#9;&#9;&#9;&#9;* packets arrived _after_ prequeued ones.
+</span><span class='line'>&#9;&#9;&#9;&#9;*
+</span><span class='line'>&#9;&#9;&#9;&#9;* Shortly, algorithm is clear --- to process all
+</span><span class='line'>&#9;&#9;&#9;&#9;* the queues in order. We could make it more directly,
+</span><span class='line'>&#9;&#9;&#9;&#9;* requeueing packets from backlog to prequeue, if
+</span><span class='line'>&#9;&#9;&#9;&#9;* is not empty. It is more elegant, but eats cycles,
+</span><span class='line'>&#9;&#9;&#9;&#9;* unfortunately.
+</span><span class='line'>&#9;&#9;&#9;&#9;*/
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;if (!skb_queue_empty(&tp-&gt;ucopy.prequeue))
+</span><span class='line'>&#9;&#9;&#9;&#9;goto do_prequeue;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;/* __ Set realtime policy in scheduler __ */
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (copied &gt;= target) {
+</span><span class='line'>&#9;&#9;&#9;/* Do not sleep, just process backlog. */
+</span><span class='line'>&#9;&#9;&#9;release_sock(sk);
+</span><span class='line'>&#9;&#9;&#9;lock_sock(sk);
+</span><span class='line'>&#9;&#9;} else
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;sk_wait_data(sk, &timeo); 
+</span><span class='line'>&#9;&#9;//在此处睡眠了，将在tcp_prequeue函数中调用wake_up_interruptible_poll唤醒
+</span><span class='line'>&#9;&#9;
+</span><span class='line'>&#9;&#9;//软中断会判断用户是正在读取检查并且睡眠了，如果是的话，就直接把数据拷贝
+</span><span class='line'>&#9;&#9;//到prequeue队列，然后唤醒睡眠的进程。因为进程睡眠，表示没有读到想要的字节数
+</span><span class='line'>&#9;&#9;//此时，软中断有数据到来，直接给进程，这样进程就能以最快的速度被唤醒。
+</span><span class='line'>
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (user_recv) {
+</span><span class='line'>&#9;&#9;&#9;int chunk;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;/* __ Restore normal policy in scheduler __ */
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;if ((chunk = len - tp-&gt;ucopy.len) != 0) {
+</span><span class='line'>&#9;&#9;&#9;&#9;NET_ADD_STATS_USER(sock_net(sk), LINUX_MIB_TCPDIRECTCOPYFROMBACKLOG, chunk);
+</span><span class='line'>&#9;&#9;&#9;&#9;len -= chunk;
+</span><span class='line'>&#9;&#9;&#9;&#9;copied += chunk;
+</span><span class='line'>&#9;&#9;&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;if (tp-&gt;rcv_nxt == tp-&gt;copied_seq &&
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9;!skb_queue_empty(&tp-&gt;ucopy.prequeue)) {
+</span><span class='line'>do_prequeue:
+</span><span class='line'>&#9;&#9;&#9;&#9;tcp_prequeue_process(sk);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;&#9;if ((chunk = len - tp-&gt;ucopy.len) != 0) {
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;NET_ADD_STATS_USER(sock_net(sk), LINUX_MIB_TCPDIRECTCOPYFROMPREQUEUE, chunk);
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;len -= chunk;
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;copied += chunk;
+</span><span class='line'>&#9;&#9;&#9;&#9;}
+</span><span class='line'>&#9;&#9;&#9;}
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;if ((flags & MSG_PEEK) &&
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;(peek_seq - copied - urg_hole != tp-&gt;copied_seq)) {
+</span><span class='line'>&#9;&#9;&#9;if (net_ratelimit())
+</span><span class='line'>&#9;&#9;&#9;&#9;printk(KERN_DEBUG "TCP(%s:%d): Application bug, race in MSG_PEEK.\n",
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9;&#9;&#9;      current-&gt;comm, task_pid_nr(current));
+</span><span class='line'>&#9;&#9;&#9;peek_seq = tp-&gt;copied_seq;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;continue;
+</span><span class='line'>
+</span><span class='line'>&#9;found_ok_skb:
+</span><span class='line'>&#9;&#9;/* Ok so how much can we use? */
+</span><span class='line'>&#9;&#9;//skb中还有多少聚聚没有拷贝。
+</span><span class='line'>&#9;&#9;//正如前面所说的，offset是上次已经拷贝了的，这次从offset开始接下去拷贝
+</span><span class='line'>&#9;&#9;&#9;&#9;used = skb-&gt;len - offset;
+</span><span class='line'>&#9;&#9;//很有可能used的大小，即skb剩余长度，依然大于用户的缓冲区大小(len)。所以依然
+</span><span class='line'>&#9;&#9;//只能拷贝len长度。一般来说，用户还得执行一次recv系统调用。直到skb中的数据读完
+</span><span class='line'>&#9;&#9;if (len &lt; used)
+</span><span class='line'>&#9;&#9;&#9;used = len;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;/* Do we have urgent data here? */
+</span><span class='line'>&#9;&#9;if (tp-&gt;urg_data) {
+</span><span class='line'>&#9;&#9;&#9;u32 urg_offset = tp-&gt;urg_seq - *seq;
+</span><span class='line'>&#9;&#9;&#9;if (urg_offset &lt; used) {
+</span><span class='line'>&#9;&#9;&#9;&#9;if (!urg_offset) {
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;if (!sock_flag(sk, SOCK_URGINLINE)) {
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;++*seq;
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;urg_hole++;
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;offset++;
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;used--;
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;if (!used)
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9;goto skip_copy;
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;}
+</span><span class='line'>&#9;&#9;&#9;&#9;} else
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;used = urg_offset;
+</span><span class='line'>&#9;&#9;&#9;}
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (!(flags & MSG_TRUNC)) {
+</span><span class='line'>&#9;&#9;&#9;{
+</span><span class='line'>&#9;&#9;&#9;&#9;//一般都会进这个if，进行数据的拷贝，把能够读到的数据，放到用户的缓冲区
+</span><span class='line'>&#9;&#9;&#9;&#9;err = skb_copy_datagram_iovec(skb, offset,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;msg-&gt;msg_iov, used);
+</span><span class='line'>&#9;&#9;&#9;&#9;if (err) {
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;/* Exception. Bailout! */
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;if (!copied)
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;copied = -EFAULT;
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;break;
+</span><span class='line'>&#9;&#9;&#9;&#9;}
+</span><span class='line'>&#9;&#9;&#9;}
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;//更新标志位，seq 是指针，指向了tp-&gt;copied_seq
+</span><span class='line'>&#9;&#9;//used是我们有能力拷贝的数据大小，即已经拷贝到用户缓冲区的大小
+</span><span class='line'>&#9;&#9;//正如前面所说，如果用户的缓冲区很小，一次recv拷贝不玩skb中的数据，
+</span><span class='line'>&#9;&#9;//我们需要保存已经拷贝了的大小，下次recv时，从这个大小处继续拷贝。
+</span><span class='line'>&#9;&#9;//所以需要更新copied_seq。
+</span><span class='line'>&#9;&#9;*seq += used;
+</span><span class='line'>&#9;&#9;copied += used;
+</span><span class='line'>&#9;&#9;len -= used;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;tcp_rcv_space_adjust(sk);
+</span><span class='line'>
+</span><span class='line'>skip_copy:
+</span><span class='line'>&#9;&#9;if (tp-&gt;urg_data && after(tp-&gt;copied_seq, tp-&gt;urg_seq)) {
+</span><span class='line'>&#9;&#9;&#9;tp-&gt;urg_data = 0;
+</span><span class='line'>&#9;&#9;&#9;tcp_fast_path_check(sk);
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;//这个就是判断我们是否拷贝完了skb中的数据，如果没有continue
+</span><span class='line'>&#9;&#9;//这种情况下，len经过 len -= used; ，已经变成0，所以continue的效果相当于
+</span><span class='line'>&#9;&#9;//退出了这个大循环。可以理解，你只能拷贝len长度，拷贝完之后，那就return了。
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;//还有一种情况used + offset ==  skb-&gt;len，表示skb拷贝完了。这时我们只需要释放skb
+</span><span class='line'>&#9;&#9;//下面会讲到
+</span><span class='line'>&#9;&#9;if (used + offset &lt; skb-&gt;len)
+</span><span class='line'>&#9;&#9;&#9;continue;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;//看看这个数据报文是否含有fin，含有fin，则goto到found_fin_ok
+</span><span class='line'>&#9;&#9;if (tcp_hdr(skb)-&gt;fin)
+</span><span class='line'>&#9;&#9;&#9;goto found_fin_ok;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;//执行到这里，标明used + offset ==  skb-&gt;len，报文也拷贝完了，那就把skb摘链释放
+</span><span class='line'>&#9;&#9;if (!(flags & MSG_PEEK)) {
+</span><span class='line'>&#9;&#9;&#9;sk_eat_skb(sk, skb, copied_early);
+</span><span class='line'>&#9;&#9;&#9;copied_early = 0;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;//这个cintinue不一定是退出大循环，可能还会执行循环。
+</span><span class='line'>&#9;&#9;//假设用户设置缓冲区12字节，你skb-&gt;len长度20字节。
+</span><span class='line'>&#9;&#9;//第一次recv读取了12字节，skb剩下8，下一次调用recv再想读取12，
+</span><span class='line'>&#9;&#9;//但是只能读取到这8字节了。
+</span><span class='line'>&#9;&#9;//此时len 变量长度为4，那么这个continue依旧在这个循环中，
+</span><span class='line'>&#9;&#9;//函数还是再次从do开始，使用skb_queue_walk，找skb
+</span><span class='line'>&#9;&#9;//如果sk_receive_queue中skb仍旧有，那么继续读，直到len == 0
+</span><span class='line'>&#9;&#9;//如果没有skb了，我们怎么办？我们的len还有4字节怎么办？
+</span><span class='line'>&#9;&#9;//这得看用户设置的recv函数阻塞与否，即和timeo变量相关了。
+</span><span class='line'>&#9;&#9;continue;
+</span><span class='line'>
+</span><span class='line'>&#9;found_fin_ok:
+</span><span class='line'>&#9;&#9;/* Process the FIN. */
+</span><span class='line'>&#9;&#9;++*seq;
+</span><span class='line'>&#9;&#9;if (!(flags & MSG_PEEK)) {
+</span><span class='line'>&#9;&#9;&#9;//把skb从sk_receive_queue中摘链
+</span><span class='line'>&#9;&#9;&#9;sk_eat_skb(sk, skb, copied_early);
+</span><span class='line'>&#9;&#9;&#9;copied_early = 0;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;break;
+</span><span class='line'>&#9;} while (len &gt; 0);
+</span><span class='line'>
+</span><span class='line'>&#9;//到这里是大循环退出
+</span><span class='line'>&#9;//休眠过的进程，然后退出大循环 ，才满足 if (user_recv) 条件
+</span><span class='line'>&#9;if (user_recv) {
+</span><span class='line'>&#9;&#9;if (!skb_queue_empty(&tp-&gt;ucopy.prequeue)) {
+</span><span class='line'>&#9;&#9;&#9;int chunk;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;tp-&gt;ucopy.len = copied &gt; 0 ? len : 0;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;tcp_prequeue_process(sk);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;if (copied &gt; 0 && (chunk = len - tp-&gt;ucopy.len) != 0) {
+</span><span class='line'>&#9;&#9;&#9;&#9;NET_ADD_STATS_USER(sock_net(sk), LINUX_MIB_TCPDIRECTCOPYFROMPREQUEUE, chunk);
+</span><span class='line'>&#9;&#9;&#9;&#9;len -= chunk;
+</span><span class='line'>&#9;&#9;&#9;&#9;copied += chunk;
+</span><span class='line'>&#9;&#9;&#9;}
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;//数据读取完毕，清零
+</span><span class='line'>&#9;&#9;tp-&gt;ucopy.task = NULL;
+</span><span class='line'>&#9;&#9;tp-&gt;ucopy.len = 0;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;/* According to UNIX98, msg_name/msg_namelen are ignored
+</span><span class='line'>&#9;&#9;* on connected socket. I was just happy when found this 8) --ANK
+</span><span class='line'>&#9;&#9;*/
+</span><span class='line'>
+</span><span class='line'>&#9;/* Clean up data we have read: This will do ACK frames. */
+</span><span class='line'>&#9;//很重要，将更新缓存，并且适当的时候发送ack
+</span><span class='line'>&#9;tcp_cleanup_rbuf(sk, copied);
+</span><span class='line'>
+</span><span class='line'>&#9;TCP_CHECK_TIMER(sk);
+</span><span class='line'>&#9;release_sock(sk);
+</span><span class='line'>&#9;return copied;
+</span><span class='line'>
+</span><span class='line'>out:
+</span><span class='line'>&#9;TCP_CHECK_TIMER(sk);
+</span><span class='line'>&#9;release_sock(sk);
+</span><span class='line'>&#9;return err;
+</span><span class='line'>
+</span><span class='line'>recv_urg:
+</span><span class='line'>&#9;err = tcp_recv_urg(sk, msg, len, flags);
+</span><span class='line'>&#9;goto out;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
-<p>这里要注意有一个全局的struct net init_net;变量，这个变量保存了全局的name,index  hlist以及全局的网络设备链表。</p>
 
-<p>net结构我们这里所需要的也就三个链表：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>// 设备链表   
-</span><span class='line'>struct list_head    dev_base_head;   
-</span><span class='line'>// 名字为索引的hlist   
-</span><span class='line'>struct hlist_head   *dev_name_head;   
-</span><span class='line'>// index为索引的hlist   
-</span><span class='line'>struct hlist_head   *dev_index_head;  </span></code></pre></td></tr></table></div></figure>
+</div>
+  
+  
 
 
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2015/04/10/kernel-net-v4rcv/">Linux TCP数据包接收处理 tcp_v4_rcv</a></h2>
+    
+    
+      <p class="meta">
+        
 
 
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static int list_netdevice(struct net_device *dev)   
-</span><span class='line'>{   
-</span><span class='line'>&#9;struct net *net = dev_net(dev);   
-</span><span class='line'>  
-</span><span class='line'>&#9;ASSERT_RTNL();   
-</span><span class='line'>  
-</span><span class='line'>&#9;write_lock_bh(&dev_base_lock);   
-</span><span class='line'>&#9;// 插入全局的list   
-</span><span class='line'>&#9;list_add_tail(&dev-&gt;dev_list, &net-&gt;dev_base_head);   
-</span><span class='line'>&#9;// 插入全局的name_list以及index_hlist   
-</span><span class='line'>&#9;hlist_add_head(&dev-&gt;name_hlist, dev_name_hash(net, dev-&gt;name));   
-</span><span class='line'>&#9;hlist_add_head(&dev-&gt;index_hlist, dev_index_hash(net, dev-&gt;ifindex));   
-</span><span class='line'>&#9;write_unlock_bh(&dev_base_lock);   
-</span><span class='line'>&#9;return 0;   
-</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
 
 
-<p>最终执行完之后，注册函数将会执行rtnl_unlock函数，而此函数则会执行netdev_run_todo方法。也就是完成最终的注册。(要注意，当取消注册这个设备时也会调用这个函数来完成最终的取消注册)</p>
-
-<p>这里有一个全局的net_todo_list的链表：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static LIST_HEAD(net_todo_list);  </span></code></pre></td></tr></table></div></figure>
-
-
-<p>而在取消注册的函数中会调用这个函数：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static void net_set_todo(struct net_device *dev)   
-</span><span class='line'>{   
-</span><span class='line'>&#9;list_add_tail(&dev-&gt;todo_list, &net_todo_list);   
-</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
+<time class='entry-date' datetime='2015-04-10T15:23:00+08:00'><span class='date'>2015-04-10</span> <span class='time'>15:23:00</span></time>
+        
+      </p>
+    
+  </header>
 
 
-<p>也就是把当前将要取消注册的函数加入到todo_list链表中。</p>
+  <div class="entry-content"><p><a href="http://blog.sina.com.cn/s/blog_52355d840100b6sd.html">http://blog.sina.com.cn/s/blog_52355d840100b6sd.html</a></p>
+
+<h4>tcp_v4_rcv函数</h4>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -2210,135 +1098,285 @@ e）若该分段是一个ACK，且为重复ACK，但是没有超过一个rto的�
 <span class='line-number'>43</span>
 <span class='line-number'>44</span>
 <span class='line-number'>45</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>void netdev_run_todo(void)   
-</span><span class='line'>{   
-</span><span class='line'>&#9;struct list_head list;   
-</span><span class='line'>  
-</span><span class='line'>&#9;/* Snapshot list, allow later requests */  
-</span><span class='line'>&#9;// replace掉net_todo_list用list代替。   
-</span><span class='line'>&#9;list_replace_init(&net_todo_list, &list);   
-</span><span class='line'>  
-</span><span class='line'>&#9;__rtnl_unlock();   
-</span><span class='line'>&#9;// 当注册设备时没有调用net_set_todo函数来设置net_todo_list，因此list为空，所以就会直接跳过。   
-</span><span class='line'>&#9;while (!list_empty(&list)) {   
-</span><span class='line'>&#9;&#9;// 通过todo_list得到当前的device对象。   
-</span><span class='line'>&#9;&#9;struct net_device *dev   
-</span><span class='line'>&#9;&#9;&#9;= list_entry(list.next, struct net_device, todo_list);   
-</span><span class='line'>&#9;&#9;// 删除此todo_list;   
-</span><span class='line'>&#9;&#9;list_del(&dev-&gt;todo_list);   
-</span><span class='line'>  
-</span><span class='line'>  
-</span><span class='line'>&#9;&#9;if (unlikely(dev-&gt;reg_state != NETREG_UNREGISTERING)) {   
-</span><span class='line'>&#9;&#9;&#9;printk(KERN_ERR "network todo '%s' but state %d/n",   
-</span><span class='line'>&#9;&#9;&#9;&#9;   dev-&gt;name, dev-&gt;reg_state);   
-</span><span class='line'>&#9;&#9;&#9;dump_stack();   
-</span><span class='line'>&#9;&#9;&#9;continue;   
-</span><span class='line'>&#9;&#9;}   
-</span><span class='line'>&#9;&#9;// 设置注册状态为NETREG_UNREGISTERED.   
-</span><span class='line'>&#9;&#9;dev-&gt;reg_state = NETREG_UNREGISTERED;   
-</span><span class='line'>&#9;&#9;// 在每个cpu上调用刷新函数。   
-</span><span class='line'>&#9;&#9;on_each_cpu(flush_backlog, dev, 1);   
-</span><span class='line'>  
-</span><span class='line'>&#9;&#9;// 等待引用此设备的所有系统释放资源，也就是引用计数清0.   
-</span><span class='line'>&#9;&#9;netdev_wait_allrefs(dev);   
-</span><span class='line'>  
-</span><span class='line'>&#9;&#9;/* paranoia */  
-</span><span class='line'>&#9;&#9;BUG_ON(atomic_read(&dev-&gt;refcnt));   
-</span><span class='line'>&#9;&#9;WARN_ON(dev-&gt;ip_ptr);   
-</span><span class='line'>&#9;&#9;WARN_ON(dev-&gt;ip6_ptr);   
-</span><span class='line'>&#9;&#9;WARN_ON(dev-&gt;dn_ptr);   
-</span><span class='line'>  
-</span><span class='line'>&#9;&#9;if (dev-&gt;destructor)   
-</span><span class='line'>&#9;&#9;&#9;dev-&gt;destructor(dev);   
-</span><span class='line'>  
-</span><span class='line'>&#9;&#9;/* Free network device */  
-</span><span class='line'>&#9;&#9;kobject_put(&dev-&gt;dev.kobj);   
-</span><span class='line'>&#9;}   
-</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
-
-
-<p>下面来看netdev_wait_allrefs函数，我们先看它的调用流程:</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static void netdev_wait_allrefs(struct net_device *dev)   
-</span><span class='line'>{   
-</span><span class='line'>&#9;unsigned long rebroadcast_time, warning_time;   
-</span><span class='line'>  
-</span><span class='line'>&#9;rebroadcast_time = warning_time = jiffies;   
-</span><span class='line'>&#9;while (atomic_read(&dev-&gt;refcnt) != 0) {   
-</span><span class='line'>&#9;&#9;if (time_after(jiffies, rebroadcast_time + 1 * HZ)) {   
-</span><span class='line'>&#9;&#9;&#9;rtnl_lock();   
-</span><span class='line'>  
-</span><span class='line'>&#9;&#9;&#9;// 给netdev_chain发送NETDEV_UNREGISTER事件，通知各个子模块释放资源   
-</span><span class='line'>&#9;&#9;&#9;/* Rebroadcast unregister notification */  
-</span><span class='line'>&#9;&#9;&#9;call_netdevice_notifiers(NETDEV_UNREGISTER, dev);   
-</span><span class='line'>  
-</span><span class='line'>&#9;&#9;&#9;if (test_bit(__LINK_STATE_LINKWATCH_PENDING,   
-</span><span class='line'>&#9;&#9;&#9;&#9;&#9; &dev-&gt;state)) {   
-</span><span class='line'>&#9;&#9;&#9;&#9;/* We must not have linkwatch events  
-</span><span class='line'>&#9;&#9;&#9;&#9; * pending on unregister. If this  
-</span><span class='line'>&#9;&#9;&#9;&#9; * happens, we simply run the queue  
-</span><span class='line'>&#9;&#9;&#9;&#9; * unscheduled, resulting in a noop  
-</span><span class='line'>&#9;&#9;&#9;&#9; * for this device.  
-</span><span class='line'>&#9;&#9;&#9;&#9; */  
-</span><span class='line'>&#9;&#9;&#9;&#9;linkwatch_run_queue();   
-</span><span class='line'>&#9;&#9;&#9;}   
-</span><span class='line'>  
-</span><span class='line'>&#9;&#9;&#9;__rtnl_unlock();   
-</span><span class='line'>  
-</span><span class='line'>&#9;&#9;&#9;rebroadcast_time = jiffies;   
-</span><span class='line'>&#9;&#9;}   
-</span><span class='line'>  
-</span><span class='line'>&#9;&#9;msleep(250);   
-</span><span class='line'>  
-</span><span class='line'>&#9;&#9;if (time_after(jiffies, warning_time + 10 * HZ)) {   
-</span><span class='line'>&#9;&#9;&#9;printk(KERN_EMERG "unregister_netdevice: "  
-</span><span class='line'>&#9;&#9;&#9;&#9;   "waiting for %s to become free. Usage "  
-</span><span class='line'>&#9;&#9;&#9;&#9;   "count = %d/n",   
-</span><span class='line'>&#9;&#9;&#9;&#9;   dev-&gt;name, atomic_read(&dev-&gt;refcnt));   
-</span><span class='line'>&#9;&#9;&#9;warning_time = jiffies;   
-</span><span class='line'>&#9;&#9;}   
-</span><span class='line'>&#9;}   
-</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+<span class='line-number'>82</span>
+<span class='line-number'>83</span>
+<span class='line-number'>84</span>
+<span class='line-number'>85</span>
+<span class='line-number'>86</span>
+<span class='line-number'>87</span>
+<span class='line-number'>88</span>
+<span class='line-number'>89</span>
+<span class='line-number'>90</span>
+<span class='line-number'>91</span>
+<span class='line-number'>92</span>
+<span class='line-number'>93</span>
+<span class='line-number'>94</span>
+<span class='line-number'>95</span>
+<span class='line-number'>96</span>
+<span class='line-number'>97</span>
+<span class='line-number'>98</span>
+<span class='line-number'>99</span>
+<span class='line-number'>100</span>
+<span class='line-number'>101</span>
+<span class='line-number'>102</span>
+<span class='line-number'>103</span>
+<span class='line-number'>104</span>
+<span class='line-number'>105</span>
+<span class='line-number'>106</span>
+<span class='line-number'>107</span>
+<span class='line-number'>108</span>
+<span class='line-number'>109</span>
+<span class='line-number'>110</span>
+<span class='line-number'>111</span>
+<span class='line-number'>112</span>
+<span class='line-number'>113</span>
+<span class='line-number'>114</span>
+<span class='line-number'>115</span>
+<span class='line-number'>116</span>
+<span class='line-number'>117</span>
+<span class='line-number'>118</span>
+<span class='line-number'>119</span>
+<span class='line-number'>120</span>
+<span class='line-number'>121</span>
+<span class='line-number'>122</span>
+<span class='line-number'>123</span>
+<span class='line-number'>124</span>
+<span class='line-number'>125</span>
+<span class='line-number'>126</span>
+<span class='line-number'>127</span>
+<span class='line-number'>128</span>
+<span class='line-number'>129</span>
+<span class='line-number'>130</span>
+<span class='line-number'>131</span>
+<span class='line-number'>132</span>
+<span class='line-number'>133</span>
+<span class='line-number'>134</span>
+<span class='line-number'>135</span>
+<span class='line-number'>136</span>
+<span class='line-number'>137</span>
+<span class='line-number'>138</span>
+<span class='line-number'>139</span>
+<span class='line-number'>140</span>
+<span class='line-number'>141</span>
+<span class='line-number'>142</span>
+<span class='line-number'>143</span>
+<span class='line-number'>144</span>
+<span class='line-number'>145</span>
+<span class='line-number'>146</span>
+<span class='line-number'>147</span>
+<span class='line-number'>148</span>
+<span class='line-number'>149</span>
+<span class='line-number'>150</span>
+<span class='line-number'>151</span>
+<span class='line-number'>152</span>
+<span class='line-number'>153</span>
+<span class='line-number'>154</span>
+<span class='line-number'>155</span>
+<span class='line-number'>156</span>
+<span class='line-number'>157</span>
+<span class='line-number'>158</span>
+<span class='line-number'>159</span>
+<span class='line-number'>160</span>
+<span class='line-number'>161</span>
+<span class='line-number'>162</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int tcp_v4_rcv(struct sk_buff *skb)
+</span><span class='line'>{
+</span><span class='line'>&#9;const struct iphdr *iph;
+</span><span class='line'>&#9;struct tcphdr *th;
+</span><span class='line'>&#9;struct sock *sk;
+</span><span class='line'>&#9;int ret;
+</span><span class='line'>&#9;  
+</span><span class='line'>&#9;//如果不是发往本地的数据包，则直接丢弃
+</span><span class='line'>&#9;if (skb-&gt;pkt_type != PACKET_HOST)
+</span><span class='line'>&#9;&#9;goto discard_it;
+</span><span class='line'>
+</span><span class='line'>&#9;TCP_INC_STATS_BH(TCP_MIB_INSEGS);
+</span><span class='line'>
+</span><span class='line'>&#9;//包长是否大于TCP头的长度
+</span><span class='line'>&#9;if (!pskb_may_pull(skb, sizeof(struct tcphdr)))
+</span><span class='line'>&#9;&#9;goto discard_it;
+</span><span class='line'>
+</span><span class='line'>&#9;//取得TCP首部
+</span><span class='line'>&#9;th = tcp_hdr(skb);
+</span><span class='line'>
+</span><span class='line'>&#9;//检查TCP首部的长度和TCP首部中的doff字段是否匹配
+</span><span class='line'>&#9;if (th-&gt;doff &lt; sizeof(struct tcphdr) / 4)
+</span><span class='line'>&#9;&#9;goto bad_packet;
+</span><span class='line'>
+</span><span class='line'>&#9;//检查TCP首部到TCP数据之间的偏移是否越界
+</span><span class='line'>&#9;if (!pskb_may_pull(skb, th-&gt;doff * 4))
+</span><span class='line'>&#9;&#9;goto discard_it;
+</span><span class='line'>
+</span><span class='line'>&#9;if (!skb_csum_unnecessary(skb) && tcp_v4_checksum_init(skb))
+</span><span class='line'>&#9;&#9;goto bad_packet;
+</span><span class='line'>
+</span><span class='line'>&#9; th = tcp_hdr(skb);
+</span><span class='line'>&#9;iph = ip_hdr(skb);
+</span><span class='line'>&#9;TCP_SKB_CB(skb)-&gt;seq = ntohl(th-&gt;seq);
+</span><span class='line'>
+</span><span class='line'>&#9;//计算end_seq,实际上，end_seq是数据包的结束序列号，实际上是期待TCP确认
+</span><span class='line'>&#9;//包中ACK的数值，在数据传输过程中，确认包ACK的数值等于本次数据包SEQ
+</span><span class='line'>&#9;//号加上本数据包的有效载荷，即skb-&gt;len - th-&gt;doff * 4,但是在处理SYN报文或者
+</span><span class='line'>&#9;//FIN报文的时候，确认包的ACK等于本次处理数据包的SEQ+1,考虑到这种情况，
+</span><span class='line'>&#9;//期待下一个数据包的ACK就变成了TCP_SKB_CB(skb)-&gt;seq + th-&gt;syn + th-&gt;fin +
+</span><span class='line'>&#9;//skb-&gt;len - th-&gt;doff * 4
+</span><span class='line'>
+</span><span class='line'>&#9;// TCP_SKB_CB宏会返回skb-&gt;cb[0],一个类型为tcp_skb_cb的结构指针，这个结
+</span><span class='line'>&#9;//构保存了TCP首部选项和其他的一些状态信息
+</span><span class='line'>
+</span><span class='line'>&#9;TCP_SKB_CB(skb)-&gt;end_seq = (TCP_SKB_CB(skb)-&gt;seq + th-&gt;syn + th-&gt;fin +
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;skb-&gt;len - th-&gt;doff * 4);
+</span><span class='line'>&#9;TCP_SKB_CB(skb)-&gt;ack_seq = ntohl(th-&gt;ack_seq);
+</span><span class='line'>&#9;TCP_SKB_CB(skb)-&gt;when   = 0;
+</span><span class='line'>&#9;TCP_SKB_CB(skb)-&gt;flags    = iph-&gt;tos;
+</span><span class='line'>&#9;TCP_SKB_CB(skb)-&gt;sacked = 0;
+</span><span class='line'>
+</span><span class='line'>&#9;//根据四元组查找相应连接的sock结构，大体有两个步骤，
+</span><span class='line'>&#9;//首先用__inet_lookup_established函数查找已经处于establish状态的连接，
+</span><span class='line'>&#9;//如果查找不到的话，就调用__inet_lookup_listener函数查找是否存在四元组相
+</span><span class='line'>&#9;//匹配的处于listen状态的sock,这个时候实际上是被动的接收来自其他主机的连接
+</span><span class='line'>&#9;//请求
+</span><span class='line'>
+</span><span class='line'>&#9;//如果查找不到匹配的sock,则直接丢弃数据包
+</span><span class='line'>&#9;sk = __inet_lookup(&tcp_hashinfo, iph-&gt;saddr, th-&gt;source,
+</span><span class='line'>&#9;&#9;&#9;   iph-&gt;daddr, th-&gt;dest, inet_iif(skb));
+</span><span class='line'>&#9;if (!sk)
+</span><span class='line'>&#9;&#9;goto no_tcp_socket;
+</span><span class='line'>
+</span><span class='line'>&#9;//检查sock是否处于半关闭状态
+</span><span class='line'>&#9;process:
+</span><span class='line'>&#9;if (sk-&gt;sk_state == TCP_TIME_WAIT)
+</span><span class='line'>&#9;&#9;goto do_time_wait;
+</span><span class='line'> 
+</span><span class='line'>&#9;//检查IPSEC规则
+</span><span class='line'>&#9;if (!xfrm4_policy_check(sk, XFRM_POLICY_IN, skb))
+</span><span class='line'>&#9;&#9;goto discard_and_relse;
+</span><span class='line'>&#9;nf_reset(skb);
+</span><span class='line'>
+</span><span class='line'>&#9;//检查BPF规则
+</span><span class='line'>&#9;if (sk_filter(sk, skb))
+</span><span class='line'>&#9;&#9;goto discard_and_relse;
+</span><span class='line'>
+</span><span class='line'>&#9;skb-&gt;dev = NULL;
+</span><span class='line'>
+</span><span class='line'>&#9;//这里主要是和release_sock函数实现互斥，release_sock中调用了
+</span><span class='line'>&#9;// spin_lock_bh(&sk-&gt;sk_lock.slock);
+</span><span class='line'>&#9;bh_lock_sock_nested(sk);
+</span><span class='line'>&#9;ret = 0;
+</span><span class='line'>
+</span><span class='line'>&#9;//查看是否有用户态进程对该sock进行了锁定
+</span><span class='line'>&#9;//如果sock_owned_by_user为真，则sock的状态不能进行更改
+</span><span class='line'>&#9;if (!sock_owned_by_user(sk)) {
+</span><span class='line'>
+</span><span class='line'>#ifdef CONFIG_NET_DMA
+</span><span class='line'>&#9;&#9;struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>&#9;&#9;if (!tp-&gt;ucopy.dma_chan && tp-&gt;ucopy.pinned_list)
+</span><span class='line'>&#9;&#9;&#9;tp-&gt;ucopy.dma_chan = get_softnet_dma();
+</span><span class='line'>&#9;&#9;if (tp-&gt;ucopy.dma_chan)
+</span><span class='line'>&#9;&#9;&#9;ret = tcp_v4_do_rcv(sk, skb);
+</span><span class='line'>&#9;&#9;else
+</span><span class='line'>#endif
+</span><span class='line'>&#9;&#9;{
+</span><span class='line'>&#9;&#9;&#9;//进入预备处理队列
+</span><span class='line'>&#9;&#9;&#9;if (!tcp_prequeue(sk, skb))
+</span><span class='line'>&#9;&#9;&#9;&#9;ret = tcp_v4_do_rcv(sk, skb);
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;} else
+</span><span class='line'>&#9;&#9;//如果数据包被用户进程锁定，则数据包进入后备处理队列，并且该进程进入
+</span><span class='line'>&#9;&#9;//套接字的后备处理等待队列sk-&gt;lock.wq
+</span><span class='line'>&#9;&#9;sk_add_backlog(sk, skb);
+</span><span class='line'>&#9;bh_unlock_sock(sk);
+</span><span class='line'>
+</span><span class='line'>&#9;sock_put(sk);
+</span><span class='line'>&#9;return ret;
+</span><span class='line'>
+</span><span class='line'>no_tcp_socket:
+</span><span class='line'>&#9;if (!xfrm4_policy_check(NULL, XFRM_POLICY_IN, skb))
+</span><span class='line'>&#9;&#9;goto discard_it;
+</span><span class='line'>
+</span><span class='line'>&#9;if (skb-&gt;len &lt; (th-&gt;doff &lt;&lt; 2) || tcp_checksum_complete(skb)) {
+</span><span class='line'>bad_packet:
+</span><span class='line'>&#9;&#9;TCP_INC_STATS_BH(TCP_MIB_INERRS);
+</span><span class='line'>&#9;} else {
+</span><span class='line'>&#9;&#9;tcp_v4_send_reset(NULL, skb);
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>discard_it:
+</span><span class='line'>&#9;kfree_skb(skb);
+</span><span class='line'>&#9;return 0;
+</span><span class='line'>
+</span><span class='line'>discard_and_relse:
+</span><span class='line'>&#9;sock_put(sk);
+</span><span class='line'>&#9;goto discard_it;
+</span><span class='line'>
+</span><span class='line'>do_time_wait:
+</span><span class='line'>&#9;if (!xfrm4_policy_check(NULL, XFRM_POLICY_IN, skb)) {
+</span><span class='line'>&#9;&#9;inet_twsk_put(inet_twsk(sk));
+</span><span class='line'>&#9;&#9;goto discard_it;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;if (skb-&gt;len &lt; (th-&gt;doff &lt;&lt; 2) || tcp_checksum_complete(skb)) {
+</span><span class='line'>&#9;&#9;TCP_INC_STATS_BH(TCP_MIB_INERRS);
+</span><span class='line'>&#9;&#9;inet_twsk_put(inet_twsk(sk));
+</span><span class='line'>&#9;&#9;goto discard_it;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;switch (tcp_timewait_state_process(inet_twsk(sk), skb, th)) {
+</span><span class='line'>&#9;case TCP_TW_SYN: {
+</span><span class='line'>&#9;&#9;struct sock *sk2 = inet_lookup_listener(&tcp_hashinfo,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9;iph-&gt;daddr, th-&gt;dest,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9;inet_iif(skb));
+</span><span class='line'>&#9;&#9;if (sk2) {
+</span><span class='line'>&#9;&#9;&#9;inet_twsk_deschedule(inet_twsk(sk), &tcp_death_row);
+</span><span class='line'>&#9;&#9;&#9;inet_twsk_put(inet_twsk(sk));
+</span><span class='line'>&#9;&#9;&#9;sk = sk2;
+</span><span class='line'>&#9;&#9;&#9;goto process;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;case TCP_TW_ACK:
+</span><span class='line'>&#9;&#9;tcp_v4_timewait_ack(sk, skb);
+</span><span class='line'>&#9;&#9;break;
+</span><span class='line'>&#9;case TCP_TW_RST:
+</span><span class='line'>&#9;&#9;goto no_tcp_socket;
+</span><span class='line'>&#9;case TCP_TW_SUCCESS:;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;goto discard_it;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
 
@@ -2363,7 +1401,7 @@ e）若该分段是一个ACK，且为重复ACK，但是没有超过一个rto的�
   
     <section>
 <h1>Categories
-<span class='right_span'>(959)</span>
+<span class='right_span'>(967)</span>
 
 </h1>
 <head>
@@ -2515,7 +1553,7 @@ if (!document.getElementById('tools~openvpn')) document.getElementById('aexp_too
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~oracle')) document.getElementById('aexp_tools~oracle').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/tools~picture/?opendiv=tools'>picture</a><a href='##' onmousedown=showDiv('tools~picture') id='aexp_tools~picture'><span class='exp_style' id='exp_tools~picture'>[+]</span></a><span class='right_span'>2</span></li>
+<li><a href='/blog/cats/tools~picture/?opendiv=tools'>picture</a><a href='##' onmousedown=showDiv('tools~picture') id='aexp_tools~picture'><span class='exp_style' id='exp_tools~picture'>[+]</span></a><span class='right_span'>3</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~picture')) document.getElementById('aexp_tools~picture').style.visibility = 'hidden';
 </script>
@@ -2535,7 +1573,7 @@ if (!document.getElementById('tools~socksvpn')) document.getElementById('aexp_to
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~sqlmap')) document.getElementById('aexp_tools~sqlmap').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/tools~sqlserver/?opendiv=tools'>sqlserver</a><a href='##' onmousedown=showDiv('tools~sqlserver') id='aexp_tools~sqlserver'><span class='exp_style' id='exp_tools~sqlserver'>[+]</span></a><span class='right_span'>11</span></li>
+<li><a href='/blog/cats/tools~sqlserver/?opendiv=tools'>sqlserver</a><a href='##' onmousedown=showDiv('tools~sqlserver') id='aexp_tools~sqlserver'><span class='exp_style' id='exp_tools~sqlserver'>[+]</span></a><span class='right_span'>12</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~sqlserver')) document.getElementById('aexp_tools~sqlserver').style.visibility = 'hidden';
 </script>
@@ -2550,10 +1588,6 @@ if (!document.getElementById('tools~ssh')) document.getElementById('aexp_tools~s
 <li><a href='/blog/cats/tools~ssl/?opendiv=tools'>ssl</a><a href='##' onmousedown=showDiv('tools~ssl') id='aexp_tools~ssl'><span class='exp_style' id='exp_tools~ssl'>[+]</span></a><span class='right_span'>3</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~ssl')) document.getElementById('aexp_tools~ssl').style.visibility = 'hidden';
-</script>
-<li><a href='/blog/cats/tools~switch/?opendiv=tools'>switch</a><a href='##' onmousedown=showDiv('tools~switch') id='aexp_tools~switch'><span class='exp_style' id='exp_tools~switch'>[+]</span></a><span class='right_span'>2</span></li>
-<script language='javascript' type='text/javascript'>
-if (!document.getElementById('tools~switch')) document.getElementById('aexp_tools~switch').style.visibility = 'hidden';
 </script>
 <li><a href='/blog/cats/tools~vim/?opendiv=tools'>vim</a><a href='##' onmousedown=showDiv('tools~vim') id='aexp_tools~vim'><span class='exp_style' id='exp_tools~vim'>[+]</span></a><span class='right_span'>8</span></li>
 <script language='javascript' type='text/javascript'>
@@ -2696,6 +1730,12 @@ if (!document.getElementById('kernel~tcp')) document.getElementById('aexp_kernel
 if (!document.getElementById('kernel')) document.getElementById('aexp_kernel').style.visibility = 'hidden';
 if (!document.getElementById('kernel~vpn')) document.getElementById('aexp_kernel~vpn').style.visibility = 'hidden';
 </script>
+<li class='catclass'><a href='/blog/cats/network/'>network</a><a href='##' onmousedown=showDiv('network') id='aexp_network'><span class='exp_style' id='exp_network'>[+]</span></a><span class='right_span'>(8)</span></li>
+<div id='network' class='catsub'><li><a href='/blog/cats/network~base/?opendiv=network'>base</a><a href='##' onmousedown=showDiv('network~base') id='aexp_network~base'><span class='exp_style' id='exp_network~base'>[+]</span></a><span class='right_span'>8</span></li>
+</div><script language='javascript' type='text/javascript'>
+if (!document.getElementById('network')) document.getElementById('aexp_network').style.visibility = 'hidden';
+if (!document.getElementById('network~base')) document.getElementById('aexp_network~base').style.visibility = 'hidden';
+</script>
 <li class='catclass'><a href='/blog/cats/debug/'>debug</a><a href='##' onmousedown=showDiv('debug') id='aexp_debug'><span class='exp_style' id='exp_debug'>[+]</span></a><span class='right_span'>(84)</span></li>
 <div id='debug' class='catsub'><li><a href='/blog/cats/debug~base/?opendiv=debug'>base</a><a href='##' onmousedown=showDiv('debug~base') id='aexp_debug~base'><span class='exp_style' id='exp_debug~base'>[+]</span></a><span class='right_span'>19</span></li>
 <script language='javascript' type='text/javascript'>
@@ -2803,7 +1843,7 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 
 <section>
 <h1>Date Categories
-<span class='right_span'>(959)</span>
+<span class='right_span'>(967)</span>
 
 </h1>
 <head>
@@ -2811,8 +1851,9 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(79)</span></li>
-<div id='2024' class='catsub'><li><a href='/blog/cats/2024~09/?opendiv=2024'>2024-09</a><span class='right_span'>12</span></li>
+<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(87)</span></li>
+<div id='2024' class='catsub'><li><a href='/blog/cats/2024~10/?opendiv=2024'>2024-10</a><span class='right_span'>5</span></li>
+<li><a href='/blog/cats/2024~09/?opendiv=2024'>2024-09</a><span class='right_span'>15</span></li>
 <li><a href='/blog/cats/2024~08/?opendiv=2024'>2024-08</a><span class='right_span'>18</span></li>
 <li><a href='/blog/cats/2024~07/?opendiv=2024'>2024-07</a><span class='right_span'>26</span></li>
 <li><a href='/blog/cats/2024~06/?opendiv=2024'>2024-06</a><span class='right_span'>2</span></li>
@@ -2983,43 +2024,43 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
   <ul id="recent_posts">
     
       <li class="post">
+        <a href="/blog/2024/10/27/network-ap-ac/">无线AP与AC详解</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2024/10/27/network-arp-mac/">为什么二层交换机上没有arp表项</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2024/10/27/network-hybrid/">Hybrid端口模式详解</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2024/10/27/network-telnet-proto/">telnet 协议详解</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2024/10/27/network-php-telnet/">交换机php telnet</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2024/09/26/network-telnet/">交换机开启telnet</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2024/09/20/ffmpeg-mp3/">ffmpeg分离MP3文件报错</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2024/09/20/sqlserver-_/">`_` 通配符 -- 匹配一个字符</a>
+      </li>
+    
+      <li class="post">
         <a href="/blog/2024/09/14/lang-web-ding/">钉钉开放平台API</a>
       </li>
     
       <li class="post">
         <a href="/blog/2024/09/14/lang-web-staticmap/">腾讯地图--静态地图API</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/09/14/lang-web-js-screen-on/">JS 保持屏幕常亮</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/09/14/lang-web-js-date/">JS 获取当前的日期和时间</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/09/14/lang-web-js-dist/">GPS 两点距离</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/09/14/lang-web-js-position/">JS获取当前地理位置</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/09/14/lang-web-js-work/">前端缓存之：Service Worker</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/09/14/mimiciv3.0/">MIMIC IV 3.0数据库</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/09/14/mimiciii1.4-show/">MIMIC III v1.4 数据简介</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/09/14/mimiciii1.4/">MIMIC III v1.4 数据入库</a>
       </li>
     
   </ul>
