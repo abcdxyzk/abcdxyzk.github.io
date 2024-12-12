@@ -131,6 +131,1713 @@ var ss360Config = {
       
   <header>
     
+      <h2 class="entry-title"><a href="/blog/2015/09/29/kernel-net-timewait_state/">TIME_WAIT状态下对接收到的数据包如何处理</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-09-29T17:53:00+08:00'><span class='date'>2015-09-29</span> <span class='time'>17:53:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://www.educity.cn/linux/1605134.html">http://www.educity.cn/linux/1605134.html</a></p>
+
+<p>正常情况下主动关闭连接的一端在连接正常终止后，会进入TIME_WAIT状态，存在这个状态有以下两个原因（参考《Unix网络编程》）：</p>
+
+<p>《UNIX网络编程.卷2：进程间通信(第2版)》[PDF]下载</p>
+
+<p>1、保证TCP连接关闭的可靠性。如果最终发送的ACK丢失，被动关闭的一端会重传最终的FIN包，如果执行主动关闭的一端没有维护这个连接的状态信息，会发送RST包响应，导致连接不正常关闭。</p>
+
+<p>2、允许老的重复分组在网络中消逝。假设在一个连接关闭后，发起建立连接的一端（客户端）立即重用原来的端口、IP地址和服务端建立新的连接。老的连接上的分组可能在新的连接建立后到达服务端，TCP必须防止来自某个连接的老的重复分组在连接终止后再现，从而被误解为同一个连接的化身。要实现这种功能，TCP不能给处于TIME_WAIT状态的连接启动新的连接。TIME_WAIT的持续时间是2MSL，保证在建立新的连接之前老的重复分组在网络中消逝。这个规则有一个例外：如果到达的SYN的序列号大于前一个连接的结束序列号，源自Berkeley的实现将给当前处于TIME_WAIT状态的连接启动新的化身。</p>
+
+<p>最初在看《Unix网络编程》 的时候看到这个状态，但是在项目中发现对这个状态的理解有误，特别是第二个理由。原本认为在TIME_WAIT状态下肯定不会再使用相同的五元组（协议类型，源目的IP、源目的端口号）建立一个新的连接，看书还是不认真啊！为了加深理解，决定结合内核代码，好好来看下内核在TIME_WAIT状态下的处理。其实TIME_WAIT存在的第二个原因的解释更多的是从被动关闭一方的角度来说明的。如果是执行主动关闭的是客户端，客户端户进入TIME_WAIT状态，假设客户端重用端口号来和服务器建立连接，内核会不会允许客户端来建立连接？内核如何来处理这种情况？书本中不会对这些点讲的那么详细，要从内核源码中来找答案。</p>
+
+<p>我们先来看服务器段进入TIME_WAIT后内核的处理，即服务器主动关闭连接。TCP层的接收函数是tcp_v4_rcv()，和TIME_WAIT状态相关的主要代码如下所示：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int tcp_v4_rcv(struct sk_buff *skb)
+</span><span class='line'>{
+</span><span class='line'>&#9;......
+</span><span class='line'>
+</span><span class='line'>&#9;sk = __inet_lookup_skb(&tcp_hashinfo, skb, th-&gt;source, th-&gt;dest);
+</span><span class='line'>&#9;if (!sk)
+</span><span class='line'>&#9;&#9;goto no_tcp_socket;
+</span><span class='line'>process:
+</span><span class='line'>&#9;if (sk-&gt;sk_state == TCP_TIME_WAIT)
+</span><span class='line'>&#9;&#9;goto do_time_wait;   
+</span><span class='line'>&#9;&#9;......
+</span><span class='line'>
+</span><span class='line'>discard_it:
+</span><span class='line'>&#9;/* Discard frame. */
+</span><span class='line'>&#9;kfree_skb(skb);
+</span><span class='line'>&#9;return 0;
+</span><span class='line'>&#9;......
+</span><span class='line'>do_time_wait:
+</span><span class='line'>&#9;......
+</span><span class='line'>
+</span><span class='line'>switch (tcp_timewait_state_process(inet_twsk(sk), skb, th)) {
+</span><span class='line'>&#9;case TCP_TW_SYN: {
+</span><span class='line'>&#9;&#9;struct sock *sk2 = inet_lookup_listener(dev_net(skb-&gt;dev),
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9;&tcp_hashinfo,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9;iph-&gt;daddr, th-&gt;dest,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;&#9;inet_iif(skb));
+</span><span class='line'>&#9;&#9;if (sk2) {
+</span><span class='line'>&#9;&#9;&#9;inet_twsk_deschedule(inet_twsk(sk), &tcp_death_row);
+</span><span class='line'>&#9;&#9;&#9;inet_twsk_put(inet_twsk(sk));
+</span><span class='line'>&#9;&#9;&#9;sk = sk2;
+</span><span class='line'>&#9;&#9;&#9;goto process;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;/* Fall through to ACK */
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;case TCP_TW_ACK:
+</span><span class='line'>&#9;&#9;tcp_v4_timewait_ack(sk, skb);
+</span><span class='line'>&#9;&#9;break;
+</span><span class='line'>&#9;case TCP_TW_RST:
+</span><span class='line'>&#9;&#9;goto no_tcp_socket;
+</span><span class='line'>&#9;case TCP_TW_SUCCESS:;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;goto discard_it;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>接收到SKb包后，会调用__inet_lookup_skb()查找对应的sock结构。如果套接字状态是TIME_WAIT状态，会跳转到do_time_wait标签处处理。从代码中可以看到，主要由tcp_timewait_state_process()函数来处理SKB包，处理后根据返回值来做相应的处理。</p>
+
+<p>在看tcp_timewait_state_process()函数中的处理之前，需要先看一看不同的返回值会对应什么样的处理。</p>
+
+<p>如果返回值是TCP_TW_SYN，则说明接收到的是一个“合法”的SYN包（也就是说这个SYN包可以接受），这时会首先查找内核中是否有对应的监听套接字，如果存在相应的监听套接字，则会释放TIME_WAIT状态的传输控制结构，跳转到process处开始处理，开始建立一个新的连接。如果没有找到监听套接字会执行到TCP_TW_ACK分支。</p>
+
+<p>如果返回值是TCP_TW_ACK，则会调用tcp_v4_timewait_ack()发送ACK，然后跳转到discard_it标签处，丢掉数据包。</p>
+
+<p>如果返回值是TCP_TW_RST，则会调用tcp_v4_send_reset()给对端发送RST包，然后丢掉数据包。</p>
+
+<p>如果返回值是TCP_TW_SUCCESS，则会直接丢掉数据包。</p>
+
+<p>接下来我们通过tcp_timewait_state_process()函数来看TIME_WAIT状态下的数据包处理。</p>
+
+<p>为了方便讨论，假设数据包中没有时间戳选项，在这个前提下，tcp_timewait_state_process()中的局部变量paws_reject的值为0。</p>
+
+<p>如果需要保持在FIN_WAIT_2状态的时间小于等于TCP_TIMEWAIT_LEN，则会从FIN_WAIT_2状态直接迁移到TIME_WAIT状态，也就是使用描述TIME_WAIT状态的sock结构代替当前的传输控制块。虽然这时的sock结构处于TIME_WAIT结构，但是还要区分内部状态，这个内部状态存储在inet_timewait_sock结构的tw_substate成员中。</p>
+
+<p>如果内部状态为FIN_WAIT_2，tcp_timewait_state_process()中处理的关键代码片段如下所示：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (tw-&gt;tw_substate == TCP_FIN_WAIT2) {
+</span><span class='line'>&#9;/* Just repeat all the checks of tcp_rcv_state_process() */
+</span><span class='line'>
+</span><span class='line'>&#9;/* Out of window, send ACK */
+</span><span class='line'>&#9;if (paws_reject ||
+</span><span class='line'>&#9;&#9;!tcp_in_window(TCP_SKB_CB(skb)-&gt;seq, TCP_SKB_CB(skb)-&gt;end_seq,
+</span><span class='line'>&#9;&#9;&#9;  tcptw-&gt;tw_rcv_nxt,
+</span><span class='line'>&#9;&#9;&#9;  tcptw-&gt;tw_rcv_nxt + tcptw-&gt;tw_rcv_wnd))
+</span><span class='line'>&#9;&#9;return TCP_TW_ACK;
+</span><span class='line'>
+</span><span class='line'>&#9;if (th-&gt;rst)
+</span><span class='line'>&#9;&#9;goto kill;
+</span><span class='line'>
+</span><span class='line'>&#9;if (th-&gt;syn && !before(TCP_SKB_CB(skb)-&gt;seq, tcptw-&gt;tw_rcv_nxt))
+</span><span class='line'>&#9;&#9;goto kill_with_rst;
+</span><span class='line'>
+</span><span class='line'>&#9;/* Dup ACK? */
+</span><span class='line'>&#9;if (!th-&gt;ack ||
+</span><span class='line'>&#9;&#9;!after(TCP_SKB_CB(skb)-&gt;end_seq, tcptw-&gt;tw_rcv_nxt) ||
+</span><span class='line'>&#9;&#9;TCP_SKB_CB(skb)-&gt;end_seq == TCP_SKB_CB(skb)-&gt;seq) {
+</span><span class='line'>&#9;&#9;inet_twsk_put(tw);
+</span><span class='line'>&#9;&#9;return TCP_TW_SUCCESS;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;/* New data or FIN. If new data arrive after half-duplex close,
+</span><span class='line'>&#9; * reset.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;if (!th-&gt;fin ||
+</span><span class='line'>&#9;&#9;TCP_SKB_CB(skb)-&gt;end_seq != tcptw-&gt;tw_rcv_nxt + 1) {
+</span><span class='line'>kill_with_rst:
+</span><span class='line'>&#9;&#9;inet_twsk_deschedule(tw, &tcp_death_row);
+</span><span class='line'>&#9;&#9;inet_twsk_put(tw);
+</span><span class='line'>&#9;&#9;return TCP_TW_RST;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;/* FIN arrived, enter true time-wait state. */
+</span><span class='line'>&#9;tw-&gt;tw_substate      = TCP_TIME_WAIT;
+</span><span class='line'>&#9;tcptw-&gt;tw_rcv_nxt = TCP_SKB_CB(skb)-&gt;end_seq;
+</span><span class='line'>&#9;if (tmp_opt.saw_tstamp) {
+</span><span class='line'>&#9;&#9;tcptw-&gt;tw_ts_recent_stamp = get_seconds();
+</span><span class='line'>&#9;&#9;tcptw-&gt;tw_ts_recent      = tmp_opt.rcv_tsval;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;/* I am shamed, but failed to make it more elegant.
+</span><span class='line'>&#9; * Yes, it is direct reference to IP, which is impossible
+</span><span class='line'>&#9; * to generalize to IPv6. Taking into account that IPv6
+</span><span class='line'>&#9; * do not understand recycling in any case, it not
+</span><span class='line'>&#9; * a big problem in practice. --ANK 
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;if (tw-&gt;tw_family == AF_INET &&
+</span><span class='line'>&#9;&#9;tcp_death_row.sysctl_tw_recycle && tcptw-&gt;tw_ts_recent_stamp &&
+</span><span class='line'>&#9;&#9;tcp_v4_tw_remember_stamp(tw))
+</span><span class='line'>&#9;&#9;inet_twsk_schedule(tw, &tcp_death_row, tw-&gt;tw_timeout,
+</span><span class='line'>&#9;&#9;&#9;&#9;  TCP_TIMEWAIT_LEN);
+</span><span class='line'>&#9;else
+</span><span class='line'>&#9;&#9;inet_twsk_schedule(tw, &tcp_death_row, TCP_TIMEWAIT_LEN,
+</span><span class='line'>&#9;&#9;&#9;&#9;  TCP_TIMEWAIT_LEN);
+</span><span class='line'>
+</span><span class='line'>&#9;return TCP_TW_ACK;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>如果TCP段序号不完全在接收窗口内，则返回TCP_TW_ACK，表示需要给对端发送ACK。</p>
+
+<p>如果在FIN_WAIT_2状态下接收到的是RST包，则跳转到kill标签处处理，立即释放timewait控制块，并返回TCP_TW_SUCCESS。</p>
+
+<p>如果是SYN包，但是SYN包的序列号在要接收的序列号之前，则表示这是一个过期的SYN包，则跳转到kill_with_rst标签处处理，此时不仅会释放TIME_WAIT传输控制块，还会返回TCP_TW_RST，要给对端发送RST包。</p>
+
+<p>如果接收到DACK，则释放timewait控制块，并返回TCP_TW_SUCCESS。在这种情况下有一个判断条件是看包的结束序列号和起始序列号相同时，会作为DACK处理，所以之后的处理是在数据包中的数据不为空的情况下处理。前面的处理中已经处理了SYN包、RST包的情况，接下来就剩以下三种情况：</p>
+
+<p>1、不带FIN标志的数据包</p>
+
+<p>2、带FIN标志，但是还包含数据</p>
+
+<p>3、FIN包，不包含数据</p>
+
+<p>如果是前两种情况，则会调用inet_twsk_deschedule()释放time_wait控制块。inet_twsk_deschedule()中会调用到inet_twsk_put()减少time_wait控制块的引用，在外层函数中再次调用inet_twsk_put()函数时，就会真正释放time_wait控制块。</p>
+
+<p>如果接收的是对端的FIN包，即第3种情况，则将time_wait控制块的子状态设置为TCP_TIME_WAIT，此时才是进入真正的TIME_WAIT状态。然后根据TIME_WAIT的持续时间的长短来确定是加入到twcal_row队列还是启动一个定时器，最后会返回TCP_TW_ACK，给对端发送TCP连接关闭时最后的ACK包。</p>
+
+<p>到这里，我们看到了对FIN_WAIT_2状态（传输控制块状态为TIME_WAIT状态下，但是子状态为FIN_WAIT_2）的完整处理。</p>
+
+<p>接下来的处理才是对真正的TIME_WAIT状态的处理，即子状态也是TIME_WAIT。</p>
+
+<p>如果在TIME_WAIT状态下，接收到ACK包（不带数据）或RST包，并且包的序列号刚好是下一个要接收的序列号，由以下代码片段处理：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (!paws_reject &&
+</span><span class='line'>&#9;(TCP_SKB_CB(skb)-&gt;seq == tcptw-&gt;tw_rcv_nxt &&
+</span><span class='line'>&#9;(TCP_SKB_CB(skb)-&gt;seq == TCP_SKB_CB(skb)-&gt;end_seq || th-&gt;rst))) {
+</span><span class='line'>&#9;/* In window segment, it may be only reset or bare ack. */
+</span><span class='line'>&#9;if (th-&gt;rst) {
+</span><span class='line'>&#9;&#9;/* This is TIME_WAIT assassination, in two flavors.
+</span><span class='line'>&#9;&#9;* Oh well... nobody has a sufficient solution to this
+</span><span class='line'>&#9;&#9;* protocol bug yet.
+</span><span class='line'>&#9;&#9;*/
+</span><span class='line'>&#9;&#9;if (sysctl_tcp_rfc1337 == 0) {
+</span><span class='line'>kill:
+</span><span class='line'>&#9;&#9;&#9;inet_twsk_deschedule(tw, &tcp_death_row);
+</span><span class='line'>&#9;&#9;&#9;inet_twsk_put(tw);
+</span><span class='line'>&#9;&#9;&#9;return TCP_TW_SUCCESS;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;inet_twsk_schedule(tw, &tcp_death_row, TCP_TIMEWAIT_LEN,
+</span><span class='line'>&#9;&#9;&#9;  TCP_TIMEWAIT_LEN);
+</span><span class='line'>
+</span><span class='line'>&#9;if (tmp_opt.saw_tstamp) {
+</span><span class='line'>&#9;&#9;tcptw-&gt;tw_ts_recent      = tmp_opt.rcv_tsval;
+</span><span class='line'>&#9;&#9;tcptw-&gt;tw_ts_recent_stamp = get_seconds();
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;inet_twsk_put(tw);
+</span><span class='line'>&#9;return TCP_TW_SUCCESS;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>如果是RST包的话，并且系统配置sysctl_tcp_rfc1337（默认情况下为0，参见/proc/sys/net/ipv4/tcp_rfc1337）的值为0，这时会立即释放time_wait传输控制块，丢掉接收的RST包。</p>
+
+<p>如果是ACK包，则会启动TIME_WAIT定时器后丢掉接收到的ACK包。</p>
+
+<p>接下来是对SYN包的处理。前面提到了，如果在TIME_WAIT状态下接收到序列号比上一个连接的结束序列号大的SYN包，可以接受，并建立新的连接，下面这段代码就是来处理这样的情况：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (th-&gt;syn && !th-&gt;rst && !th-&gt;ack && !paws_reject &&
+</span><span class='line'>&#9;(after(TCP_SKB_CB(skb)-&gt;seq, tcptw-&gt;tw_rcv_nxt) ||
+</span><span class='line'>&#9;(tmp_opt.saw_tstamp &&
+</span><span class='line'>&#9;  (s32)(tcptw-&gt;tw_ts_recent - tmp_opt.rcv_tsval) &lt; 0))) {
+</span><span class='line'>&#9;u32 isn = tcptw-&gt;tw_snd_nxt + 65535 + 2;
+</span><span class='line'>&#9;if (isn == 0)
+</span><span class='line'>&#9;&#9;isn++;
+</span><span class='line'>&#9;TCP_SKB_CB(skb)-&gt;when = isn;
+</span><span class='line'>&#9;return TCP_TW_SYN;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>当返回TCP_TW_SYN时，在tcp_v4_rcv()中会立即释放time_wait控制块，并且开始进行正常的连接建立过程。</p>
+
+<p>如果数据包不是上述几种类型的包，可能的情况有：</p>
+
+<p>1、不是有效的SYN包。不考虑时间戳的话，就是序列号在上一次连接的结束序列号之前</p>
+
+<p>2、ACK包，起始序列号不是下一个要接收的序列号</p>
+
+<p>3、RST包，起始序列号不是下一个要接收的序列号</p>
+
+<p>4、带数据的SKB包</p>
+
+<p>这几种情况由以下代码处理：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (!th-&gt;rst) {
+</span><span class='line'>&#9;/* In this case we must reset the TIMEWAIT timer.
+</span><span class='line'>&#9; *
+</span><span class='line'>&#9; * If it is ACKless SYN it may be both old duplicate
+</span><span class='line'>&#9; * and new good SYN with random sequence number &lt;rcv_nxt.
+</span><span class='line'>&#9; * Do not reschedule in the last case.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;if (paws_reject || th-&gt;ack)
+</span><span class='line'>&#9;&#9;inet_twsk_schedule(tw, &tcp_death_row, TCP_TIMEWAIT_LEN,
+</span><span class='line'>&#9;&#9;&#9;&#9;  TCP_TIMEWAIT_LEN);
+</span><span class='line'>
+</span><span class='line'>&#9;/* Send ACK. Note, we do not put the bucket,
+</span><span class='line'>&#9; * it will be released by caller.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;return TCP_TW_ACK;
+</span><span class='line'>}
+</span><span class='line'>inet_twsk_put(tw);
+</span><span class='line'>return TCP_TW_SUCCESS;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>如果是RST包，即第3种情况，则直接返回TCP_TW_SUCCESS，丢掉RST包。</p>
+
+<p>如果带有ACK标志的话，则会启动TIME_WAIT定时器，然后给对端发送ACK。我们知道SYN包正常情况下不会设置ACK标志，所以如果是SYN包不会启动TIME_WAIT定时器，只会给对端发送ACK，告诉对端已经收到SYN包，避免重传，但连接应该不会继续建立。</p>
+
+<p>还有一个细节需要提醒下，就是我们看到在返回TCP_TW_ACK时，没有调用inet_twsk_put()释放对time_wait控制块的引用。这时因为在tcp_v4_rcv()中调用tcp_v4_timewait_ack()发送ACK时会用到time_wait控制块，所以需要保持对time_wait控制块的引用。在tcp_v4_timewait_ack()中发送完ACK后，会调用inet_twsk_put()释放对time_wait控制块的引用。</p>
+
+<p>OK，现在我们对TIME_WAIT状态下接收到数据包的情况有了一个了解，知道内核会如何来处理这些包。但是看到的这些更多的是以服务器端的角度来看的，如果客户端主动关闭连接的话，进入TIME_WAIT状态的是客户端。如果客户端在TIME_WAIT状态下重用端口号来和服务器建立连接，内核会如何处理呢？</p>
+
+<p>我编写了一个测试程序：创建一个套接字，设置SO_REUSEADDR选项，建立连接后立即关闭，关闭后立即又重复同样的过程，发现在第二次调用connect()的时候返回EADDRNOTAVAIL错误。这个测试程序很容易理解，写起来也很容易，就不贴出来了。</p>
+
+<p>要找到这个错误是怎么返回的，需要从TCP层的连接函数tcp_4_connect()开始。在tcp_v4_connect()中没有显示返回EADDRNOTAVAIL错误的地方，可能的地方就是在调用inet_hash_connect()返回的。为了确定是不是在inet_hash_connect()中返回的，使用systemtap编写了一个脚本，发现确实是在这个函数中返回的-99错误（EADDRNOTAVAIL的值为99）。其实这个通过代码也可以看出来，在这个函数之前会先查找目的主机的路由缓存项，调用的是ip_route_connect（）函数，跟着这个函数的调用轨迹，没有发现返回EADDRNOTAVAIL错误的地方。</p>
+
+<p>inet_hash_connect()函数只是对<code>__inet_hash_connect()</code>函数进行了简单的封装。在<code>__inet_hash_connect()</code>中如果已绑定了端口号，并且是和其他传输控制块共享绑定的端口号，则会调用check_established参数指向的函数来检查这个绑定的端口号是否可用，代码如下所示：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int __inet_hash_connect(struct inet_timewait_death_row *death_row,
+</span><span class='line'>&#9;&#9;struct sock *sk, u32 port_offset,
+</span><span class='line'>&#9;&#9;int (*check_established)(struct inet_timewait_death_row *,
+</span><span class='line'>&#9;&#9;&#9;struct sock *, __u16, struct inet_timewait_sock **),
+</span><span class='line'>&#9;&#9;void (*hash)(struct sock *sk))
+</span><span class='line'>{
+</span><span class='line'>&#9;struct inet_hashinfo *hinfo = death_row-&gt;hashinfo;
+</span><span class='line'>&#9;const unsigned short snum = inet_sk(sk)-&gt;num;
+</span><span class='line'>&#9;struct inet_bind_hashbucket *head;
+</span><span class='line'>&#9;struct inet_bind_bucket *tb;
+</span><span class='line'>&#9;int ret;
+</span><span class='line'>&#9;struct net *net = sock_net(sk);
+</span><span class='line'>
+</span><span class='line'>&#9;if (!snum) {
+</span><span class='line'>&#9;&#9;......
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;head = &hinfo-&gt;bhash[inet_bhashfn(net, snum, hinfo-&gt;bhash_size)];
+</span><span class='line'>&#9;tb  = inet_csk(sk)-&gt;icsk_bind_hash;
+</span><span class='line'>&#9;spin_lock_bh(&head-&gt;lock);
+</span><span class='line'>&#9;if (sk_head(&tb-&gt;owners) == sk && !sk-&gt;sk_bind_node.next) {
+</span><span class='line'>&#9;&#9;hash(sk);
+</span><span class='line'>&#9;&#9;spin_unlock_bh(&head-&gt;lock);
+</span><span class='line'>&#9;&#9;return 0;
+</span><span class='line'>&#9;} else {
+</span><span class='line'>&#9;&#9;spin_unlock(&head-&gt;lock);
+</span><span class='line'>&#9;&#9;/* No definite answer... Walk to established hash table */
+</span><span class='line'>&#9;&#9;ret = check_established(death_row, sk, snum, NULL);
+</span><span class='line'>out:
+</span><span class='line'>&#9;&#9;local_bh_enable();
+</span><span class='line'>&#9;&#9;return ret;
+</span><span class='line'>&#9;}
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>(sk_head(&amp;tb->owners) == sk &amp;&amp; !sk->sk_bind_node.next)这个判断条件就是用来判断是不是只有当前传输控制块在使用已绑定的端口，条件为false时，会执行else分支，检查是否可用。这么看来，调用bind()成功并不意味着这个端口就真的可以用。</p>
+
+<p>check_established参数对应的函数是__inet_check_established()，在inet_hash_connect()中可以看到。在上面的代码中我们还注意到调用check_established()时第三个参数为NULL，这在后面的分析中会用到。</p>
+
+<p><code>__inet_check_established()</code>函数中，会分别在TIME_WAIT传输控制块和除TIME_WIAT、LISTEN状态外的传输控制块中查找是已绑定的端口是否已经使用，代码片段如下所示：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* called with local bh disabled */
+</span><span class='line'>static int __inet_check_established(struct inet_timewait_death_row *death_row,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;struct sock *sk, __u16 lport,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;struct inet_timewait_sock **twp)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct inet_hashinfo *hinfo = death_row-&gt;hashinfo;
+</span><span class='line'>&#9;struct inet_sock *inet = inet_sk(sk);
+</span><span class='line'>&#9;__be32 daddr = inet-&gt;rcv_saddr;
+</span><span class='line'>&#9;__be32 saddr = inet-&gt;daddr;
+</span><span class='line'>&#9;int dif = sk-&gt;sk_bound_dev_if;
+</span><span class='line'>&#9;INET_ADDR_COOKIE(acookie, saddr, daddr)
+</span><span class='line'>&#9;const __portpair ports = INET_COMBINED_PORTS(inet-&gt;dport, lport);
+</span><span class='line'>&#9;struct net *net = sock_net(sk);
+</span><span class='line'>&#9;unsigned int hash = inet_ehashfn(net, daddr, lport, saddr, inet-&gt;dport);
+</span><span class='line'>&#9;struct inet_ehash_bucket *head = inet_ehash_bucket(hinfo, hash);
+</span><span class='line'>&#9;spinlock_t *lock = inet_ehash_lockp(hinfo, hash);
+</span><span class='line'>&#9;struct sock *sk2;
+</span><span class='line'>&#9;const struct hlist_nulls_node *node;
+</span><span class='line'>&#9;struct inet_timewait_sock *tw;
+</span><span class='line'>
+</span><span class='line'>&#9;spin_lock(lock);
+</span><span class='line'>
+</span><span class='line'>&#9;/* Check TIME-WAIT sockets first. */
+</span><span class='line'>&#9;sk_nulls_for_each(sk2, node, &head-&gt;twchain) {
+</span><span class='line'>&#9;&#9;tw = inet_twsk(sk2);
+</span><span class='line'>
+</span><span class='line'>&#9;if (INET_TW_MATCH(sk2, net, hash, acookie,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;saddr, daddr, ports, dif)) {
+</span><span class='line'>&#9;&#9;&#9;if (twsk_unique(sk, sk2, twp))
+</span><span class='line'>&#9;&#9;&#9;&#9;goto unique;
+</span><span class='line'>&#9;&#9;&#9;else
+</span><span class='line'>&#9;&#9;&#9;&#9;goto not_unique;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;tw = NULL;
+</span><span class='line'>
+</span><span class='line'>&#9;/* And established part... */
+</span><span class='line'>&#9;sk_nulls_for_each(sk2, node, &head-&gt;chain) {
+</span><span class='line'>&#9;&#9;if (INET_MATCH(sk2, net, hash, acookie,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;saddr, daddr, ports, dif))
+</span><span class='line'>&#9;&#9;&#9;goto not_unique;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>unique:
+</span><span class='line'>&#9;......
+</span><span class='line'>&#9;return 0;
+</span><span class='line'>
+</span><span class='line'>not_unique:
+</span><span class='line'>&#9;spin_unlock(lock);
+</span><span class='line'>&#9;return -EADDRNOTAVAIL;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>可以看到返回EADDRNOTVAIL错误的有两种情况：</p>
+
+<p>1、在TIME_WAIT传输控制块中找到匹配的端口，并且twsk_unique()返回true时</p>
+
+<p>2、在除TIME_WAIT和LISTEN状态外的传输块中存在匹配的端口。</p>
+
+<p>第二种情况很好容易理解了，只要状态在FIN_WAIT_1、ESTABLISHED等的传输控制块使用的端口和要查找的匹配，就会返回EADDRNOTVAIL错误。第一种情况还要取决于twsk_uniqueue()的返回值，所以接下来我们看twsk_uniqueue()中什么情况下会返回true。</p>
+
+<p>如果是TCP套接字，twsk_uniqueue()中会调用tcp_twsk_uniqueue()来判断，返回true的条件如下所示：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int tcp_twsk_unique(struct sock *sk, struct sock *sktw, void *twp)
+</span><span class='line'>{
+</span><span class='line'>&#9;const struct tcp_timewait_sock *tcptw = tcp_twsk(sktw);
+</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
+</span><span class='line'>
+</span><span class='line'>&#9;if (tcptw-&gt;tw_ts_recent_stamp &&
+</span><span class='line'>&#9;&#9;(twp == NULL || (sysctl_tcp_tw_reuse &&
+</span><span class='line'>&#9;&#9;&#9;&#9;get_seconds() - tcptw-&gt;tw_ts_recent_stamp &gt; 1))) {
+</span><span class='line'>&#9;&#9;......
+</span><span class='line'>&#9;&#9;return 1;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;return 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>我们前面提到过，<code>__inet_hash_connect()</code>函数调用check_established指向的函数时第三个参数为NULL，所以现在我们只需要关心tcptw->tw_ts_recent_stamp是否非零，只要这个值非零，tcp_twsk_unique()就会返回true， 在上层connect（）函数中就会返回EADDRNOTVAIL错误。tcptw->tw_ts_recent_stamp存储的是最近接收到段的时间戳值，所以正常情况下这个值不会为零。当然也可以通过调整系统的参数，让这个值可以为零，这不是本文讨论的重点，感兴趣的可以参考tcp_v4_connect()中的代码进行修改。</p>
+
+<p>在导致返回EADDRNOTVAIL的两种情况中，第一种情况可以有办法避免，但是如果的第二次建立连接的时间和第一次关闭连接之间的时间间隔太小的话，此时第一个连接可能处在FIN_WAIT_1、FIN_WAIT_2等状态，此时没有系统参数可以用来避免返回EADDRNOTVAIL。如果你还是想无论如何都要在很短的时间内重用客户端的端口，这样也有办法，要么是用kprobe机制，要么用systemtap脚本，改变<code>__inet_check_established()</code>函数的返回值。</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2015/09/29/kernel-net-timewait/">内核处理time_wait状态详解</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-09-29T17:40:00+08:00'><span class='date'>2015-09-29</span> <span class='time'>17:40:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://simohayha.iteye.com/blog/566980">http://simohayha.iteye.com/blog/566980</a></p>
+
+<p>这次来详细看内核的time_wait状态的实现，在前面介绍定时器的时候，time_wait就简单的介绍了下。这里我们会先介绍tw状态的实现，然后来介绍内核协议栈如何处理tw状态。</p>
+
+<p>首先我们要知道在linux内核中time_wait的处理是由tcp_time_wait这个函数来做得，比如我们在closing状态收到一个fin，就会调用tcp_time_wait.而内核为time_wait状态的socket专门设计了一个结构就是inet_timewait_sock，并且是挂载在inet_ehash_bucket的tw上(这个结构前面也已经介绍过了)。这里要注意，端口号的那个hash链表中也是会保存time_wait状态的socket的。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct inet_timewait_sock {  
+</span><span class='line'>
+</span><span class='line'>&#9;//common也就是包含了一些socket的必要信息。  
+</span><span class='line'>&#9;struct sock_common  __tw_common;  
+</span><span class='line'>#define tw_family       __tw_common.skc_family  
+</span><span class='line'>#define tw_state        __tw_common.skc_state  
+</span><span class='line'>#define tw_reuse        __tw_common.skc_reuse  
+</span><span class='line'>#define tw_bound_dev_if     __tw_common.skc_bound_dev_if  
+</span><span class='line'>#define tw_node         __tw_common.skc_nulls_node  
+</span><span class='line'>#define tw_bind_node        __tw_common.skc_bind_node  
+</span><span class='line'>#define tw_refcnt       __tw_common.skc_refcnt  
+</span><span class='line'>#define tw_hash         __tw_common.skc_hash  
+</span><span class='line'>#define tw_prot         __tw_common.skc_prot  
+</span><span class='line'>#define tw_net          __tw_common.skc_net  
+</span><span class='line'>
+</span><span class='line'>&#9; //tw状态的超时时间  
+</span><span class='line'>&#9;int         tw_timeout;  
+</span><span class='line'>&#9;//这个用来标记我们是正常进入tw还是说由于超时等一系列原因进入(比如超时等一系列原因)  
+</span><span class='line'>&#9;volatile unsigned char  tw_substate;  
+</span><span class='line'>&#9;/* 3 bits hole, try to pack */  
+</span><span class='line'>&#9;//和tcp option中的接收窗口比例类似  
+</span><span class='line'>&#9;unsigned char       tw_rcv_wscale;  
+</span><span class='line'>
+</span><span class='line'>&#9;//也就是标示sock的4个域，源目的端口和地址  
+</span><span class='line'>&#9;__be16          tw_sport;  
+</span><span class='line'>&#9;__be32          tw_daddr __attribute__((aligned(INET_TIMEWAIT_ADDRCMP_ALIGN_BYTES)));  
+</span><span class='line'>&#9;__be32          tw_rcv_saddr;  
+</span><span class='line'>&#9;__be16          tw_dport;  
+</span><span class='line'>&#9;//本地端口。  
+</span><span class='line'>&#9;__u16           tw_num;  
+</span><span class='line'>&#9;kmemcheck_bitfield_begin(flags);  
+</span><span class='line'>&#9;/* And these are ours. */  
+</span><span class='line'>&#9;//几个标记位。  
+</span><span class='line'>&#9;unsigned int        tw_ipv6only     : 1,  
+</span><span class='line'>&#9;&#9;&#9;&#9;tw_transparent  : 1,  
+</span><span class='line'>&#9;&#9;&#9;&#9;tw_pad      : 14,   /* 14 bits hole */  
+</span><span class='line'>&#9;&#9;&#9;&#9;tw_ipv6_offset  : 16;  
+</span><span class='line'>&#9;kmemcheck_bitfield_end(flags);  
+</span><span class='line'>&#9;unsigned long       tw_ttd;  
+</span><span class='line'>&#9;//链接到端口的hash表中。  
+</span><span class='line'>&#9;struct inet_bind_bucket *tw_tb;  
+</span><span class='line'>&#9;//链接到全局的tw状态hash表中。  
+</span><span class='line'>&#9;struct hlist_node   tw_death_node;  
+</span><span class='line'>};  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>然后我们要知道linux有两种方式执行tw状态的socket，一种是等待2×MSL时间（内核中是60秒)，一种是基于RTO来计算超时时间。</p>
+
+<p>基于RTO的超时时间也叫做recycle模式，这里内核会通过sysctl_tw_recycle（也就是说我们能通过sysctl来打开这个值)以及是否我们还保存有从对端接收到的最近的数据包的时间戳来判断是否进入打开recycle模式的处理。如果进入则会调用tcp_v4_remember_stamp来得到是否打开recycle模式。</p>
+
+<p>下面就是这个片断的代码片断：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>//必须要设置sysctl_tw_recycle以及保存有最后一次的时间戳.  
+</span><span class='line'>if (tcp_death_row.sysctl_tw_recycle && tp-&gt;rx_opt.ts_recent_stamp)  
+</span><span class='line'>&#9;//然后调用remember_stamp（在ipv4中被初始化为tcp_v4_remember_stamp）来得到是否要打开recycle模式。  
+</span><span class='line'>&#9;recycle_ok = icsk-&gt;icsk_af_ops-&gt;remember_stamp(sk);  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>然后我们来看tcp_v4_remember_stamp，在看这个之前，我们需要理解inet_peer结构，这个结构也就是保存了何当前主机通信的主机的一些信息，我前面在分析ip层的时候有详细分析这个结构，因此可以看我前面的blog：</p>
+
+<p><a href="http://simohayha.iteye.com/blog/437695">http://simohayha.iteye.com/blog/437695</a></p>
+
+<p>tcp_v4_remember_stamp主要用来从全局的inet_peer中得到对应的当前sock的对端的信息(通过ip地址).然后设置相关的时间戳(tcp_ts_stamp和tcp_ts）.这里要特别注意一个东西，那就是inet_peer是ip层的东西，因此它的key是ip地址，它会忽略端口号。所以说这里inet_peer的这两个时间戳是专门为解决tw状态而设置的。</p>
+
+<p>然后我们来看下tcp option的几个关键的域：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct tcp_options_received {  
+</span><span class='line'>&#9;/*  PAWS/RTTM data  */  
+</span><span class='line'>
+</span><span class='line'>&#9;//这个值为我们本机更新ts_recent的时间  
+</span><span class='line'>&#9;long    ts_recent_stamp;  
+</span><span class='line'>&#9;//这个表示最近接收的那个数据包的时间戳  
+</span><span class='line'>&#9;u32 ts_recent;  
+</span><span class='line'>&#9;//这个表示这个数据包发送时的时间戳    
+</span><span class='line'>&#9;u32 rcv_tsval;  
+</span><span class='line'>&#9;//这个表示当前数据包所回应的数据包的时间戳。  
+</span><span class='line'>&#9;u32 rcv_tsecr;  
+</span><span class='line'>&#9;//如果上面两个时间戳都有设置，则saw_tstamp设置为1.  
+</span><span class='line'>&#9;u16 saw_tstamp : 1,   //TIMESTAMP seen on SYN packet  
+</span><span class='line'>&#9;&#9;tstamp_ok : 1,    //d-scack标记  
+</span><span class='line'>&#9;&#9;dsack : 1,        //Wscale seen on SYN packet  
+</span><span class='line'>&#9;&#9;wscale_ok : 1,    //SACK seen on SYN packet     
+</span><span class='line'>&#9;&#9;sack_ok : 4,      //下面两个是窗口扩大倍数，主要是为了解决一些特殊网络下大窗口的问题。  
+</span><span class='line'>&#9;&#9;snd_wscale : 4,   
+</span><span class='line'>&#9;&#9;rcv_wscale : 4;   
+</span><span class='line'>&#9;/*  SACKs data  */  
+</span><span class='line'>&#9;u8  num_sacks;    
+</span><span class='line'>&#9;u16 user_mss;     
+</span><span class='line'>&#9;u16 mss_clamp;    
+</span><span class='line'>};  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>而inet_peer中的两个时间戳与option中的ts_recent和ts_recent_stamp类似。</p>
+
+<p>来看tcp_v4_remember_stamp的实现：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int tcp_v4_remember_stamp(struct sock *sk)  
+</span><span class='line'>{  
+</span><span class='line'>&#9;struct inet_sock *inet = inet_sk(sk);  
+</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);  
+</span><span class='line'>&#9;struct rtable *rt = (struct rtable *)__sk_dst_get(sk);  
+</span><span class='line'>&#9;struct inet_peer *peer = NULL;  
+</span><span class='line'>&#9;int release_it = 0;  
+</span><span class='line'>
+</span><span class='line'>&#9;//得到对应peer（两种得到的方式)。  
+</span><span class='line'>&#9;if (!rt || rt-&gt;rt_dst != inet-&gt;daddr) {  
+</span><span class='line'>&#9;&#9;peer = inet_getpeer(inet-&gt;daddr, 1);  
+</span><span class='line'>&#9;&#9;release_it = 1;  
+</span><span class='line'>&#9;} else {  
+</span><span class='line'>&#9;&#9;if (!rt-&gt;peer)  
+</span><span class='line'>&#9;&#9;&#9;rt_bind_peer(rt, 1);  
+</span><span class='line'>&#9;&#9;peer = rt-&gt;peer;  
+</span><span class='line'>&#9;}  
+</span><span class='line'>
+</span><span class='line'>&#9;//如果peer不存在则会返回0,也就是关闭recycle模式。  
+</span><span class='line'>&#9;if (peer) {  
+</span><span class='line'>&#9;//这里tcp_ts以及tcp_ts_stamp保存的是最新的时间戳，所以这里与当前的sock的时间戳比较小的话就要更新。  
+</span><span class='line'>&#9;if ((s32)(peer-&gt;tcp_ts - tp-&gt;rx_opt.ts_recent) &lt;= 0 ||(peer-&gt;tcp_ts_stamp + TCP_PAWS_MSL &lt; get_seconds() &&  
+</span><span class='line'>&#9; peer-&gt;tcp_ts_stamp &lt;= tp-&gt;rx_opt.ts_recent_stamp)) {  
+</span><span class='line'>
+</span><span class='line'>&#9;//更新时间戳。  
+</span><span class='line'>&#9;peer-&gt;tcp_ts_stamp = tp-&gt;rx_opt.ts_recent_stamp;  
+</span><span class='line'>&#9;&#9;peer-&gt;tcp_ts = tp-&gt;rx_opt.ts_recent;  
+</span><span class='line'>&#9;&#9;}  
+</span><span class='line'>&#9;&#9;if (release_it)  
+</span><span class='line'>&#9;&#9;&#9;inet_putpeer(peer);  
+</span><span class='line'>&#9;&#9;return 1;  
+</span><span class='line'>&#9;}  
+</span><span class='line'>
+</span><span class='line'>&#9;//关闭recycle模式。  
+</span><span class='line'>&#9;return 0;  
+</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>ok,我们来看tcp_time_wait的实现，这里删掉了ipv6以及md5的部分：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>//这里也就是2*MSL=60秒。  
+</span><span class='line'>#define TCP_TIMEWAIT_LEN (60*HZ)   
+</span><span class='line'>
+</span><span class='line'>//这里的state标记我们是正常进入tw状态，还是由于死在fin-wait-2状态才进入tw状态的。  
+</span><span class='line'>void tcp_time_wait(struct sock *sk, int state, int timeo)  
+</span><span class='line'>{  
+</span><span class='line'>&#9;//TW的socket  
+</span><span class='line'>&#9;struct inet_timewait_sock *tw = NULL;  
+</span><span class='line'>&#9;const struct inet_connection_sock *icsk = inet_csk(sk);  
+</span><span class='line'>&#9;const struct tcp_sock *tp = tcp_sk(sk);  
+</span><span class='line'>
+</span><span class='line'>&#9;//recycle模式的标记。  
+</span><span class='line'>&#9;int recycle_ok = 0;  
+</span><span class='line'>
+</span><span class='line'>&#9;//上面已经分析过了。  
+</span><span class='line'>&#9;if (tcp_death_row.sysctl_tw_recycle && tp-&gt;rx_opt.ts_recent_stamp)  
+</span><span class='line'>&#9;recycle_ok = icsk-&gt;icsk_af_ops-&gt;remember_stamp(sk);  
+</span><span class='line'>&#9;//然后判断tw状态的sock数量是否已经超过限制。  
+</span><span class='line'>&#9;if (tcp_death_row.tw_count &lt; tcp_death_row.sysctl_max_tw_buckets)  
+</span><span class='line'>&#9;//没有的话alloc一个新的。  
+</span><span class='line'>&#9;&#9;tw = inet_twsk_alloc(sk, state);  
+</span><span class='line'>
+</span><span class='line'>&#9;//如果tw不为空才会进入处理。  
+</span><span class='line'>&#9;if (tw != NULL) {  
+</span><span class='line'>&#9;&#9;struct tcp_timewait_sock *tcptw = tcp_twsk((struct sock *)tw);  
+</span><span class='line'>&#9;&#9;//计算对应的超时时间，这里可以看到刚好是3.5*rto.  
+</span><span class='line'>&#9;&#9;const int rto = (icsk-&gt;icsk_rto &lt;&lt; 2) - (icsk-&gt;icsk_rto &gt;&gt; 1);  
+</span><span class='line'>&#9;&#9;//更新对应的域。  
+</span><span class='line'>&#9;&#9;tw-&gt;tw_rcv_wscale    = tp-&gt;rx_opt.rcv_wscale;  
+</span><span class='line'>&#9;&#9;tcptw-&gt;tw_rcv_nxt    = tp-&gt;rcv_nxt;  
+</span><span class='line'>&#9;&#9;tcptw-&gt;tw_snd_nxt    = tp-&gt;snd_nxt;  
+</span><span class='line'>&#9;&#9;tcptw-&gt;tw_rcv_wnd    = tcp_receive_window(tp);  
+</span><span class='line'>&#9;&#9;tcptw-&gt;tw_ts_recent  = tp-&gt;rx_opt.ts_recent;  
+</span><span class='line'>&#9;&#9;tcptw-&gt;tw_ts_recent_stamp = tp-&gt;rx_opt.ts_recent_stamp;  
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;//更新链表(下面会分析)。  
+</span><span class='line'>&#9;&#9;__inet_twsk_hashdance(tw, sk, &tcp_hashinfo);  
+</span><span class='line'>&#9;&#9;//如果传递进来的超时时间小于我们计算的，则让他等于我们计算的超时时间。  
+</span><span class='line'>&#9;&#9;/* Get the TIME_WAIT timeout firing. */  
+</span><span class='line'>&#9;&#9;if (timeo &lt; rto)  
+</span><span class='line'>&#9;&#9;&#9;timeo = rto;  
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;//如果打开recycle模式，则超时时间为我们基于rto计算的时间。  
+</span><span class='line'>&#9;&#9;if (recycle_ok) {  
+</span><span class='line'>&#9;&#9;&#9;tw-&gt;tw_timeout = rto;  
+</span><span class='line'>&#9;&#9;} else {  
+</span><span class='line'>&#9;&#9;&#9;//否则为2*MSL=60秒  
+</span><span class='line'>&#9;&#9;&#9;tw-&gt;tw_timeout = TCP_TIMEWAIT_LEN;  
+</span><span class='line'>&#9;&#9;&#9;//如果正常进入则timeo也就是超时时间为2*MSL.  
+</span><span class='line'>&#9;&#9;&#9;if (state == TCP_TIME_WAIT)  
+</span><span class='line'>&#9;&#9;&#9;&#9;timeo = TCP_TIMEWAIT_LEN;  
+</span><span class='line'>&#9;&#9;}  
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;//最关键的一个函数，我们后面会详细分析。  
+</span><span class='line'>&#9;&#9;inet_twsk_schedule(tw, &tcp_death_row, timeo,  
+</span><span class='line'>&#9;&#9;&#9;&#9;   TCP_TIMEWAIT_LEN);  
+</span><span class='line'>&#9;&#9;//更新引用计数。  
+</span><span class='line'>&#9;&#9;inet_twsk_put(tw);  
+</span><span class='line'>&#9;} else {  
+</span><span class='line'>&#9;&#9;LIMIT_NETDEBUG(KERN_INFO "TCP: time wait bucket table overflow\n");  
+</span><span class='line'>&#9;}  
+</span><span class='line'>&#9;tcp_update_metrics(sk);  
+</span><span class='line'>&#9;tcp_done(sk);  
+</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>然后我们来看__inet_twsk_hashdance函数，这个函数主要是用于更新对应的全局hash表。有关这几个hash表的结构可以去看我前面的blog。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void __inet_twsk_hashdance(struct inet_timewait_sock *tw, struct sock *sk,  
+</span><span class='line'>&#9;&#9;&#9;   struct inet_hashinfo *hashinfo)  
+</span><span class='line'>{  
+</span><span class='line'>&#9;const struct inet_sock *inet = inet_sk(sk);  
+</span><span class='line'>&#9;const struct inet_connection_sock *icsk = inet_csk(sk);  
+</span><span class='line'>&#9;//得到ehash。  
+</span><span class='line'>&#9;struct inet_ehash_bucket *ehead = inet_ehash_bucket(hashinfo, sk-&gt;sk_hash);  
+</span><span class='line'>&#9;spinlock_t *lock = inet_ehash_lockp(hashinfo, sk-&gt;sk_hash);  
+</span><span class='line'>&#9;struct inet_bind_hashbucket *bhead;  
+</span><span class='line'>
+</span><span class='line'>&#9;//下面这几步是将tw sock链接到bhash中。  
+</span><span class='line'>&#9;bhead = &hashinfo-&gt;bhash[inet_bhashfn(twsk_net(tw), inet-&gt;num,hashinfo-&gt;bhash_size)];  
+</span><span class='line'>&#9;spin_lock(&bhead-&gt;lock);  
+</span><span class='line'>&#9;//链接到bhash。这里icsk的icsk_bind_hash也就是bash的一个元素。  
+</span><span class='line'>&#9;tw-&gt;tw_tb = icsk-&gt;icsk_bind_hash;  
+</span><span class='line'>&#9;WARN_ON(!icsk-&gt;icsk_bind_hash);  
+</span><span class='line'>&#9;//将tw加入到bash中。  
+</span><span class='line'>&#9;inet_twsk_add_bind_node(tw, &tw-&gt;tw_tb-&gt;owners);  
+</span><span class='line'>&#9;spin_unlock(&bhead-&gt;lock);  
+</span><span class='line'>
+</span><span class='line'>&#9;spin_lock(lock);  
+</span><span class='line'>
+</span><span class='line'>
+</span><span class='line'>&#9;atomic_inc(&tw-&gt;tw_refcnt);  
+</span><span class='line'>&#9;//将tw sock加入到ehash的tw chain中。  
+</span><span class='line'>&#9;inet_twsk_add_node_rcu(tw, &ehead-&gt;twchain);  
+</span><span class='line'>
+</span><span class='line'>&#9;//然后从全局的establish hash中remove掉这个socket。详见sock的sk_common域。  
+</span><span class='line'>&#9;if (__sk_nulls_del_node_init_rcu(sk))  
+</span><span class='line'>&#9;&#9;sock_prot_inuse_add(sock_net(sk), sk-&gt;sk_prot, -1);  
+</span><span class='line'>
+</span><span class='line'>&#9;spin_unlock(lock);  
+</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>这里我们要知道还有一个专门的全局的struct inet_timewait_death_row类型的变量tcp_death_row来保存所有的tw状态的socket。而整个tw状态的socket并不是全部加入到定时器中，而是将tcp_death_row加入到定时器中，然后每次定时器超时通过tcp_death_row来查看定时器的超时情况，从而处理tw状态的sock。</p>
+
+<p>而这里定时器分为两种，一种是长时间的定时器，它也就是tw_timer域，一种是短时间的定时器，它也就是twcal_timer域。</p>
+
+<p>而这里还有两个hash表，一个是twcal_row，它对应twcal_timer这个定时器，也就是说当twcal_timer超时，它就会从twcal_row中取得对应的twsock。对应的cells保存的就是tw_timer定时器超时所用的twsock。</p>
+
+<p>还有两个slot，一个是slot域，一个是twcal_hand域，分别表示当前对应的定时器(上面介绍的两个)所正在执行的定时器的slot。</p>
+
+<p>而上面所说的recycle模式也就是指twcal_timer定时器。</p>
+
+<p>来看结构。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct inet_timewait_death_row {  
+</span><span class='line'>
+</span><span class='line'>&#9;//这几个域会在tcp_death_row中被初始化。  
+</span><span class='line'>&#9;int         twcal_hand;  
+</span><span class='line'>&#9;unsigned long       twcal_jiffie;  
+</span><span class='line'>&#9;//短时间定时器。  
+</span><span class='line'>&#9;struct timer_list   twcal_timer;  
+</span><span class='line'>&#9;//twcal_timer定时器对应的hash表  
+</span><span class='line'>&#9;struct hlist_head   twcal_row[INET_TWDR_RECYCLE_SLOTS];  
+</span><span class='line'>
+</span><span class='line'>&#9;spinlock_t      death_lock;  
+</span><span class='line'>&#9;//tw的个数。  
+</span><span class='line'>&#9;int         tw_count;  
+</span><span class='line'>&#9;//超时时间。  
+</span><span class='line'>&#9;int         period;  
+</span><span class='line'>&#9;u32         thread_slots;  
+</span><span class='line'>&#9;struct work_struct  twkill_work;  
+</span><span class='line'>&#9;//长时间定时器  
+</span><span class='line'>&#9;struct timer_list   tw_timer;  
+</span><span class='line'>&#9;int         slot;  
+</span><span class='line'>
+</span><span class='line'>&#9;//短时间的定时器对应的hash表  
+</span><span class='line'>&#9;struct hlist_head   cells[INET_TWDR_TWKILL_SLOTS];  
+</span><span class='line'>&#9;struct inet_hashinfo    *hashinfo;  
+</span><span class='line'>&#9;int         sysctl_tw_recycle;  
+</span><span class='line'>&#9;int         sysctl_max_tw_buckets;  
+</span><span class='line'>};  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>这里要注意INET_TWDR_TWKILL_SLOTS为8,而INET_TWDR_RECYCLE_SLOTS为32。</p>
+
+<p>ok我们接着来看tcp_death_row的初始化。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct inet_timewait_death_row tcp_death_row = {  
+</span><span class='line'>
+</span><span class='line'>&#9;//最大桶的个数。  
+</span><span class='line'>&#9;.sysctl_max_tw_buckets = NR_FILE * 2,  
+</span><span class='line'>&#9;//超时时间，  
+</span><span class='line'>&#9;.period     = TCP_TIMEWAIT_LEN / INET_TWDR_TWKILL_SLOTS,  
+</span><span class='line'>&#9;//锁  
+</span><span class='line'>&#9;.death_lock = __SPIN_LOCK_UNLOCKED(tcp_death_row.death_lock),  
+</span><span class='line'>
+</span><span class='line'>&#9;//可以看到它是链接到全局的inet_hashinfo中的。  
+</span><span class='line'>&#9;.hashinfo   = &tcp_hashinfo,  
+</span><span class='line'>&#9;//定时器，这里要注意超时函数。  
+</span><span class='line'>&#9;.tw_timer   = TIMER_INITIALIZER(inet_twdr_hangman, 0,(unsigned long)&tcp_death_row),  
+</span><span class='line'>&#9;//工作队列。其实也就是销毁twsock工作的工作队列。  
+</span><span class='line'>&#9;.twkill_work    = __WORK_INITIALIZER(tcp_death_row.twkill_work,                   inet_twdr_twkill_work),  
+</span><span class='line'>&#9;/* Short-time timewait calendar */  
+</span><span class='line'>
+</span><span class='line'>&#9;//twcal_hand用来标记twcal_timer定时器是否还在工作。  
+</span><span class='line'>&#9;.twcal_hand = -1,  
+</span><span class='line'>&#9;.twcal_timer    = TIMER_INITIALIZER(inet_twdr_twcal_tick, 0,(unsigned long)&tcp_death_row),  
+</span><span class='line'>};  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>然后就是inet_twsk_schedule的实现，这个函数也就是tw状态的处理函数。他主要是用来基于超时时间来计算当前twsock的可用的位置。也就是来判断启动那个定时器，然后加入到那个队列。</p>
+
+<p>因此这里的关键就是slot的计算。这里slot的计算是根据我们传递进来的timeo来计算的。</p>
+
+<p>recycle模式下tcp_death_row的超时时间的就为2的INET_TWDR_RECYCLE_TICK幂。</p>
+
+<p>我们一般桌面的hz为100,来看对应的值：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#elif HZ &lt;= 128  
+</span><span class='line'># define INET_TWDR_RECYCLE_TICK (7 + 2 - INET_TWDR_RECYCLE_SLOTS_LOG)  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>可以看到这时它的值就为4.</p>
+
+<p>而tw_timer的slot也就是长时间定时器的slot的计算是这样的，它也就是用我们传递进来的超时时间timeo/16(可以看到就是2的INET_TWDR_RECYCLE_TICK次方)然后向上取整。</p>
+
+<p>而这里twdr的period被设置为</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>TCP_TIMEWAIT_LEN / INET_TWDR_TWKILL_SLOTS,  
+</span><span class='line'>
+</span><span class='line'>//取slot的代码片断。  
+</span><span class='line'>slot = DIV_ROUND_UP(timeo, twdr-&gt;period);  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>而我们下面取slot的时候也就是会用这个值来散列。可以看到散列表的桶的数目就为INET_TWDR_TWKILL_SLOTS个，因此这里也就是把时间分为INET_TWDR_TWKILL_SLOTS份，每一段时间内的超时twsock都放在一个桶里面，而大于60秒的都放在最后一个桶。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void inet_twsk_schedule(struct inet_timewait_sock *tw,  
+</span><span class='line'>&#9;&#9;&#9;   struct inet_timewait_death_row *twdr,  
+</span><span class='line'>&#9;&#9;&#9;   const int timeo, const int timewait_len)  
+</span><span class='line'>{  
+</span><span class='line'>&#9;struct hlist_head *list;  
+</span><span class='line'>&#9;int slot;  
+</span><span class='line'>
+</span><span class='line'>&#9;//得到slot。  
+</span><span class='line'>&#9;slot = (timeo + (1 &lt;&lt; INET_TWDR_RECYCLE_TICK) - 1) &gt;&gt; INET_TWDR_RECYCLE_TICK;  
+</span><span class='line'>
+</span><span class='line'>&#9;spin_lock(&twdr-&gt;death_lock);  
+</span><span class='line'>
+</span><span class='line'>&#9;/* Unlink it, if it was scheduled */  
+</span><span class='line'>&#9;if (inet_twsk_del_dead_node(tw))  
+</span><span class='line'>&#9;&#9;twdr-&gt;tw_count--;  
+</span><span class='line'>&#9;else  
+</span><span class='line'>&#9;&#9;atomic_inc(&tw-&gt;tw_refcnt);  
+</span><span class='line'>
+</span><span class='line'>&#9;//判断该添加到那个定时器。  
+</span><span class='line'>&#9;if (slot &gt;= INET_TWDR_RECYCLE_SLOTS) {  
+</span><span class='line'>&#9;&#9;/* Schedule to slow timer */  
+</span><span class='line'>&#9;&#9;//如果大于timewait_len也就是2*MSL=60秒，则slot为cells的最后一项。  
+</span><span class='line'>&#9;&#9;if (timeo &gt;= timewait_len) {  
+</span><span class='line'>&#9;&#9;&#9;//设为最后一项。  
+</span><span class='line'>&#9;&#9;&#9;slot = INET_TWDR_TWKILL_SLOTS - 1;  
+</span><span class='line'>&#9;&#9;} else {  
+</span><span class='line'>&#9;&#9;&#9;//否则timeo除于period然后向上取整。  
+</span><span class='line'>&#9;&#9;&#9;slot = DIV_ROUND_UP(timeo, twdr-&gt;period);  
+</span><span class='line'>&#9;&#9;&#9;//如果大于cells的桶的大小，则也是放到最后一个位置。  
+</span><span class='line'>&#9;&#9;&#9;if (slot &gt;= INET_TWDR_TWKILL_SLOTS)  
+</span><span class='line'>&#9;&#9;&#9;&#9;slot = INET_TWDR_TWKILL_SLOTS - 1;  
+</span><span class='line'>&#9;&#9;}  
+</span><span class='line'>&#9;&#9;//然后设置超时时间，  
+</span><span class='line'>&#9;&#9;tw-&gt;tw_ttd = jiffies + timeo;  
+</span><span class='line'>&#9;&#9;//而twdr的slot为当前正在处理的slot，因此我们需要以这个slot为基准来计算真正的slot  
+</span><span class='line'>&#9;&#9;slot = (twdr-&gt;slot + slot) & (INET_TWDR_TWKILL_SLOTS - 1);  
+</span><span class='line'>&#9;&#9;//最后取得对应的链表。  
+</span><span class='line'>&#9;&#9;list = &twdr-&gt;cells[slot];  
+</span><span class='line'>&#9;} else {  
+</span><span class='line'>&#9;&#9;//设置应当超时的时间。  
+</span><span class='line'>&#9;&#9;tw-&gt;tw_ttd = jiffies + (slot &lt;&lt; INET_TWDR_RECYCLE_TICK);  
+</span><span class='line'>&#9;&#9;//判断定时器是否还在工作。如果是第一次我们一定会进入下面的处理  
+</span><span class='line'>&#9;&#9;if (twdr-&gt;twcal_hand &lt; 0) {  
+</span><span class='line'>&#9;&#9;&#9;//如果没有或者第一次进入，则修改定时器然后重新启动定时器  
+</span><span class='line'>&#9;&#9;&#9;twdr-&gt;twcal_hand = 0;  
+</span><span class='line'>&#9;&#9;&#9;twdr-&gt;twcal_jiffie = jiffies;  
+</span><span class='line'>&#9;&#9;&#9;//定时器的超时时间。可以看到时间为我们传进来的timeo(只不过象tick对齐了)  
+</span><span class='line'>&#9;&#9;&#9;twdr-&gt;twcal_timer.expires = twdr-&gt;twcal_jiffie +(slot &lt;&lt; INET_TWDR_RECYCLE_TICK);  
+</span><span class='line'>&#9;&#9;&#9;//重新添加定时器。  
+</span><span class='line'>&#9;&#9;&#9;add_timer(&twdr-&gt;twcal_timer);  
+</span><span class='line'>&#9;&#9;} else {  
+</span><span class='line'>&#9;&#9;&#9;//如果原本超时时间太小，则修改定时器的超时时间  
+</span><span class='line'>&#9;&#9;&#9;if (time_after(twdr-&gt;twcal_timer.expires,  
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;jiffies + (slot &lt;&lt; INET_TWDR_RECYCLE_TICK)))  
+</span><span class='line'>&#9;&#9;&#9;&#9;mod_timer(&twdr-&gt;twcal_timer,  
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;jiffies + (slot &lt;&lt; INET_TWDR_RECYCLE_TICK));  
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;&#9;//和上面的tw_timer定时器类似，我们要通过当前正在执行的slot也就是twcal_hand来得到真正的slot。  
+</span><span class='line'>&#9;&#9;&#9;&#9;slot = (twdr-&gt;twcal_hand + slot) & (INET_TWDR_RECYCLE_SLOTS - 1);  
+</span><span class='line'>&#9;&#9;&#9;}  
+</span><span class='line'>&#9;&#9;//取得该插入的桶。  
+</span><span class='line'>&#9;&#9;list = &twdr-&gt;twcal_row[slot];  
+</span><span class='line'>&#9;}  
+</span><span class='line'>
+</span><span class='line'>&#9;//将tw加入到对应的链表中。  
+</span><span class='line'>&#9;hlist_add_head(&tw-&gt;tw_death_node, list);  
+</span><span class='line'>&#9;//如果第一次则启动定时器。  
+</span><span class='line'>&#9;if (twdr-&gt;tw_count++ == 0)  
+</span><span class='line'>&#9;&#9;mod_timer(&twdr-&gt;tw_timer, jiffies + twdr-&gt;period);  
+</span><span class='line'>&#9;spin_unlock(&twdr-&gt;death_lock);  
+</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>我们先来总结一下上面的代码。当我们进入tw状态，然后我们会根据计算出来的timeo的不同来加载到不同的hash表中。而对应的定时器一个（tw_timer)是每peroid启动一次，一个是每(slot &lt;&lt; INET_TWDR_RECYCLE_TICK)启动一次。</p>
+
+<p>下面的两张图很好的表示了recycle模式(twcal定时器)和非recycle模式的区别：</p>
+
+<p>先是非recycle模式：</p>
+
+<p><img src="/images/kernel/2015-09-29-1.jpeg" alt="" /></p>
+
+<p>然后是recycle模式：</p>
+
+<p><img src="/images/kernel/2015-09-29-2.jpeg" alt="" /></p>
+
+<p>接下来我们来看两个超时函数的实现，这里我只简单的介绍下两个超时函数，一个是inet_twdr_hangman，一个是inet_twdr_twcal_tick。</p>
+
+<p>在inet_twdr_hangman中，每次只是遍历对应的slot的队列，然后将队列中的所有sock删除，同时也从bind_hash中删除对应的端口信息。这个函数就不详细分析了。</p>
+
+<p>而在inet_twdr_twcal_tick中，每次遍历所有的twcal_row，然后超时的进行处理(和上面一样),然后没有超时的继续处理).</p>
+
+<p>这里有一个j的计算要注意，前面我们知道我们的twcal的超时时间可以说都是以INET_TWDR_RECYCLE_SLOTS对齐的，而我们这里在处理超时的同时，有可能上面又有很多sock加入到了tw状态，因此这里我们的超时检测的间隔就是1 &lt;&lt; INET_TWDR_RECYCLE_TICK。</p>
+
+<p>来看inet_twdr_twcal_tick的实现：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void inet_twdr_twcal_tick(unsigned long data)  
+</span><span class='line'>{  
+</span><span class='line'>&#9;............................  
+</span><span class='line'>&#9;if (twdr-&gt;twcal_hand &lt; 0)  
+</span><span class='line'>&#9;&#9;goto out;  
+</span><span class='line'>
+</span><span class='line'>&#9;//得到slot。  
+</span><span class='line'>&#9;slot = twdr-&gt;twcal_hand;  
+</span><span class='line'>&#9;//得到定时器启动时候的jiffes。  
+</span><span class='line'>&#9;j = twdr-&gt;twcal_jiffie;  
+</span><span class='line'>
+</span><span class='line'>&#9;//遍历所有的twscok。  
+</span><span class='line'>&#9;for (n = 0; n &lt; INET_TWDR_RECYCLE_SLOTS; n++) {  
+</span><span class='line'>&#9;&#9;//判断是否超时。  
+</span><span class='line'>&#9;&#9;if (time_before_eq(j, now)) {  
+</span><span class='line'>&#9;&#9;&#9;//处理超时的socket  
+</span><span class='line'>&#9;&#9;&#9;struct hlist_node *node, *safe;  
+</span><span class='line'>&#9;&#9;&#9;struct inet_timewait_sock *tw;  
+</span><span class='line'>&#9;&#9;&#9;.......................................  
+</span><span class='line'>&#9;&#9;} else {  
+</span><span class='line'>&#9;&#9;&#9;if (!adv) {  
+</span><span class='line'>&#9;&#9;&#9;&#9;adv = 1;  
+</span><span class='line'>&#9;&#9;&#9;&#9;twdr-&gt;twcal_jiffie = j;  
+</span><span class='line'>&#9;&#9;&#9;&#9;twdr-&gt;twcal_hand = slot;  
+</span><span class='line'>&#9;&#9;&#9;}  
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;//如果不为空，则将重新添加这些定时器  
+</span><span class='line'>&#9;&#9;if (!hlist_empty(&twdr-&gt;twcal_row[slot])) {  
+</span><span class='line'>&#9;&#9;&#9;mod_timer(&twdr-&gt;twcal_timer, j);  
+</span><span class='line'>&#9;&#9;&#9;&#9;goto out;  
+</span><span class='line'>&#9;&#9;&#9;}  
+</span><span class='line'>&#9;&#9;}  
+</span><span class='line'>&#9;&#9;//设置间隔  
+</span><span class='line'>&#9;&#9;j += 1 &lt;&lt; INET_TWDR_RECYCLE_TICK;  
+</span><span class='line'>&#9;&#9;//更新  
+</span><span class='line'>&#9;&#9;slot = (slot + 1) & (INET_TWDR_RECYCLE_SLOTS - 1);  
+</span><span class='line'>&#9;}  
+</span><span class='line'>&#9;//处理完毕则将twcal_hand设为-1.  
+</span><span class='line'>&#9;twdr-&gt;twcal_hand = -1;  
+</span><span class='line'>
+</span><span class='line'>&#9;...............................  
+</span><span class='line'>}  
+</span></code></pre></td></tr></table></div></figure>
+
+
+<p>然后我们来看tcp怎么样进入tw状态。这里分为两种，一种是正常进入也就是在wait2收到一个fin，或者closing收到ack。这种都是比较简单的。我们就不分析了。</p>
+
+<p>比较特殊的是，我们有可能会直接从wait1进入tw状态，或者是在wait2等待超时也将会直接进入tw状态。这个时候也就是没有收到对端的fin。</p>
+
+<p>这个主要是为了处理当对端死在close_wait状态的时候，我们需要自己能够恢复到close状态，而不是一直处于wait2状态。</p>
+
+<p>在看代码之前我们需要知道一个东西，那就是fin超时时间，这个超时时间我们可以通过TCP_LINGER2这个option来设置，并且这个值的最大值是sysctl_tcp_fin_timeout/HZ. 这里可以看到sysctl_tcp_fin_timeout是jiffies数，所以要转成秒。我这里简单的测试了下，linger2的默认值也就是60,刚好是2*MSL.</p>
+
+<p>这里linger2也就是代表在tcp_wait2的最大生命周期。如果小于0则说明我们要跳过tw状态。</p>
+
+<p>先来看在tcp_close中的处理，不过这里不理解为什么这么做的原因。</p>
+
+<p>这里为什么有可能会为wait2状态呢，原因是如果设置了linger，则我们就会休眠掉，而休眠的时间可能我们已经收到ack，此时将会进入wait2的处理。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (sk-&gt;sk_state == TCP_FIN_WAIT2) {  
+</span><span class='line'>&#9;&#9;struct tcp_sock *tp = tcp_sk(sk);  
+</span><span class='line'>&#9;&#9;//如果小于0,则说明从wait2立即超时此时也就是相当于跳过tw状态，所以我们直接发送rst，然后进入close。  
+</span><span class='line'>&#9;&#9;if (tp-&gt;linger2 &lt; 0) {  
+</span><span class='line'>&#9;&#9;&#9;tcp_set_state(sk, TCP_CLOSE);  
+</span><span class='line'>&#9;&#9;&#9;tcp_send_active_reset(sk, GFP_ATOMIC);  
+</span><span class='line'>&#9;&#9;&#9;NET_INC_STATS_BH(sock_net(sk),  
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;LINUX_MIB_TCPABORTONLINGER);  
+</span><span class='line'>&#9;&#9;} else {  
+</span><span class='line'>&#9;&#9;&#9;//否则计算fin的时间，这里的超时时间是在linger2和3.5RTO之间取最大值。  
+</span><span class='line'>&#9;&#9;&#9;const int tmo = tcp_fin_time(sk);  
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;//如果超时时间很大，则说明我们需要等待时间很长，因此我们启动keepalive探测对端是否存活。  
+</span><span class='line'>&#9;&#9;&#9;if (tmo &gt; TCP_TIMEWAIT_LEN) {  
+</span><span class='line'>&#9;&#9;&#9;inet_csk_reset_keepalive_timer(sk,  
+</span><span class='line'>&#9;&#9;&#9;&#9;tmo - TCP_TIMEWAIT_LEN);  
+</span><span class='line'>&#9;&#9;&#9;} else {  
+</span><span class='line'>&#9;&#9;&#9;&#9;//否则我们直接进入tw状态。  
+</span><span class='line'>&#9;&#9;&#9;&#9;tcp_time_wait(sk, TCP_FIN_WAIT2, tmo);  
+</span><span class='line'>&#9;&#9;&#9;&#9;goto out;  
+</span><span class='line'>&#9;&#9;&#9;}  
+</span><span class='line'>&#9;&#9;}  
+</span><span class='line'>&#9;}  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>还有从wait1直接进入tw，和上面类似，我就不介绍了。</p>
+
+<p>最后我们来看当内核处于tw状态后，再次接收到数据包后如何处理。这里的处理函数就是tcp_timewait_state_process，而他是在tcp_v4_rcv中被调用的，它会先判断是否处于tw状态，如果是的话，进入tw的处理。</p>
+
+<p>这个函数的返回值分为4种。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>enum tcp_tw_status  
+</span><span class='line'>{  
+</span><span class='line'>&#9;//这个代表我们成功处理了数据包。  
+</span><span class='line'>&#9;TCP_TW_SUCCESS = 0,  
+</span><span class='line'>&#9;//我们需要发送给对端一个rst。  
+</span><span class='line'>&#9;TCP_TW_RST = 1,  
+</span><span class='line'>&#9;//我们接收到了重传的fin，因此我们需要重传ack。  
+</span><span class='line'>&#9;TCP_TW_ACK = 2,  
+</span><span class='line'>&#9;//这个表示我们需要重新建立一个连接。  
+</span><span class='line'>&#9;TCP_TW_SYN = 3  
+</span><span class='line'>};  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>这里可能最后一个比较难理解，这里内核注释得很详细，主要是实现了RFC1122:</p>
+
+<p>引用</p>
+
+<p>RFC 1122:</p>
+
+<p>&ldquo;When a connection is [&hellip;] on TIME-WAIT state [&hellip;] [a TCP] MAY accept a new SYN from the remote TCP to reopen the connection directly, if it:
+(1)  assigns its initial sequence number for the new  connection to be larger than the largest sequence number it used on the previous connection incarnation,and</p>
+
+<p>(2)  returns to TIME-WAIT state if the SYN turns out
+to be an old duplicate".</p>
+
+<p>来看这段处理代码：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>switch (tcp_timewait_state_process(inet_twsk(sk), skb, th)) {  
+</span><span class='line'>&#9;case TCP_TW_SYN: {  
+</span><span class='line'>&#9;&#9;//取得一个sk。  
+</span><span class='line'>&#9;&#9;struct sock *sk2 = inet_lookup_listener(dev_net(skb-&gt;dev),&tcp_hashinfo,  
+</span><span class='line'>&#9;&#9;&#9;iph-&gt;daddr, th-&gt;dest,inet_iif(skb));  
+</span><span class='line'>&#9;&#9;if (sk2) {  
+</span><span class='line'>&#9;&#9;&#9;//从tw中删除，然后继续执行（也就是开始三次握手)。  
+</span><span class='line'>&#9;&#9;&#9;inet_twsk_deschedule(inet_twsk(sk), &tcp_death_row);  
+</span><span class='line'>&#9;&#9;&#9;inet_twsk_put(inet_twsk(sk));  
+</span><span class='line'>&#9;&#9;&#9;sk = sk2;  
+</span><span class='line'>&#9;&#9;&#9;goto process;  
+</span><span class='line'>&#9;&#9;}  
+</span><span class='line'>&#9;&#9;/* Fall through to ACK */  
+</span><span class='line'>&#9;}  
+</span><span class='line'>&#9;case TCP_TW_ACK:  
+</span><span class='line'>&#9;&#9;//发送ack  
+</span><span class='line'>&#9;&#9;tcp_v4_timewait_ack(sk, skb);  
+</span><span class='line'>&#9;&#9;break;  
+</span><span class='line'>&#9;//发送给对端rst。  
+</span><span class='line'>&#9;case TCP_TW_RST:  
+</span><span class='line'>&#9;&#9;goto no_tcp_socket;  
+</span><span class='line'>&#9;//处理成功  
+</span><span class='line'>&#9;case TCP_TW_SUCCESS:;  
+</span><span class='line'>&#9;}  
+</span><span class='line'>&#9;goto discard_it;  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>tcp_timewait_state_process这个函数具体的实现我就不介绍了，它就是分为两部分，一部分处理tw_substate == TCP_FIN_WAIT2的情况，一部分是正常情况。在前一种情况，我们对于syn的相应是直接rst的。而后一种我们需要判断是否新建连接。</p>
+
+<p>而对于fin的处理他们也是不一样的，wait2的话，它会将当前的tw重新加入到定时器列表(inet_twsk_schedule).而后一种则只是重新发送ack。</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
       <h2 class="entry-title"><a href="/blog/2015/09/23/kernel-fs-inode/">Linux的inode的理解</a></h2>
     
     
@@ -278,364 +1985,6 @@ var ss360Config = {
 
     </article>
   
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/09/23/kernel-mm-buffer/">Linux中Buffer cache</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-09-23T17:15:00+08:00'><span class='date'>2015-09-23</span> <span class='time'>17:15:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://www.linuxidc.com/Linux/2013-01/78140.htm">http://www.linuxidc.com/Linux/2013-01/78140.htm</a></p>
-
-<h4>buffer cache和page cache的区别</h4>
-
-<p>Page cache和buffer cache到底有什么区别呢？很多时候我们不知道系统在做IO操作的时候到底是走了page cache还是buffer cache？其实，buffer cache和page  cache是Linux中两个比较简单的概念，在此对其总结说明。</p>
-
-<p>Page cache是vfs文件系统层的cache，例如 对于一个ext3文件系统而言，每个文件都会有一棵radix树管理文件的缓存页，这些被管理的缓存页被称之为page cache。所以，page cache是针对文件系统而言的。例如，ext3文件系统的页缓存就是page cache。Buffer cache是针对设备的，每个设备都会有一棵radix树管理数据缓存块，这些缓存块被称之为buffer cache。通常对于ext3文件系统而言，page cache的大小为4KB，所以ext3每次操作的数据块大小都是4KB的整数倍。Buffer cache的缓存块大小通常由块设备的大小来决定，取值范围在512B~4KB之间，取块设备大小的最大公约数。</p>
-
-<hr />
-
-<p><a href="http://alanwu.blog.51cto.com/3652632/1112079">http://alanwu.blog.51cto.com/3652632/1112079</a></p>
-
-<h3>Linux中Buffer cache性能问题一探究竟</h3>
-
-<h4>1, Buffer cache的作用</h4>
-
-<p>为了提高磁盘设备的IO性能，我们采用内存作为磁盘设备的cache。用户操作磁盘设备的时候，首先将数据写入内存，然后再将内存中的脏数据定时刷新到磁盘。这个用作磁盘数据缓存的内存就是所谓的buffer cache。在以前的Linux系统中，有很完善的buffer cache软件层，专门负责磁盘数据的缓存。在磁盘设备的上层往往会架构文件系统，为了提高文件系统的性能，VFS层同样会提供文件系统级别的page cache。这样就导致系统中存在两个cache，并且重叠在一起，显得没有必要和冗余。为了解决这个问题，在现有的Linux系统中对buffer cache软件层进行了弱化，并且和page cache进行了整合。Buffer cache和page cache都采用radix tree进行维护，只有当访问裸设备的时候才会使用buffer cache，正常走文件系统的IO不会使用buffer cache。</p>
-
-<p>我们知道ext3文件系统的page cache都是以page页大小为单位的，那么buffer cache中缓存块大小究竟是多大呢？其对性能影响如何呢？这两天我在Linux-2.6.23平台上针对这个问题做了很多实验，得到了一些数据结果，并从源代码分析中得到设置缓存块大小的方法。在此对这个buffer cache的性能问题进行分析说明，供大家讨论。</p>
-
-<h4>2, Buffer cache的性能问题</h4>
-
-<h5>2.1 测试实验</h5>
-
-<p>首先让我们来做一个实验，在Linux-2.6.23平台上，采用dd工具对一个块设备进行顺序写操作，可以采用如下的命令格式：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>dd if=/dev/zero of=/dev/sda2 bs=&lt;request_size&gt; count=100</span></code></pre></td></tr></table></div></figure>
-
-
-<p>采用该命令在不同buffer cache块（blk_size）大小配置的情况下测试不同请求大小（req_size）的IO性能，可以得到如下表所示的测试数据：</p>
-
-<p>表：不同buffer cache块大小配置下的吞吐量</p>
-
-<p><img src="/images/kernel/2015-09-23-1.jpg" alt="" /></p>
-
-<p>将表中的数据做成性能对比图，如下图所示：</p>
-
-<p><img src="/images/kernel/2015-09-23-2.jpg" alt="" /></p>
-
-<p>从图中可以看出，在请求大小小于Cache块大小的时候，Cache块越大，IO性能越高；但是，请求大小大于Cache块大小之后，性能都有明显的飞跃。</p>
-
-<p>例如，当buffer cache块大小被配置成2KB时，小于2KB的块性能基本都在19MB/s左右；当buffer cache块大小被配置成512B时，小于512B的写性能都保持在5MB/s；当buffer cache块大小被配置成1024B时，小于1KB的写性能基本都保持在9.5MB/s上下。这就说明对于小于cache块大小的small_write，buffer cache越大，其性能会越好，反之，性能越差，这就是buffer cache的作用。</p>
-
-<p>观察发现一旦请求大小大于等于cache块大小之后，性能急剧提升，由于测试工具的IO压力足够大，能够一下子将磁盘性能耗尽。这是为什么呢？其实，当请求块比较小时，对于cache块而言是“局部操作”，这种“局部操作”会引入buffer cache的数据读操作，并且数据读操作和用户写操作存在顺序关系，这就极大的影响了IO的写性能。因此，当请求大小大于cache块时，并且能够和Cache块对齐时，就能够充分利用磁盘的IO带宽，所以就产生了上图中所示的性能飞跃。</p>
-
-<p>看到上图中的测试结果之后，我们就会想在实际应用中，我们该如何选择buffer cache的块大小？如果请求大小是512B时，显然将buffer cache块设置成512比较合适；如果请求大小是256B时，显然将buffer cache块设置成2KB比较合适。所以，个人认为块大小的设置还需要根据实际的应用来决定，不同的应用需要设置不同的块大小，这样才能使整体性能达到最佳。</p>
-
-<h5>2.2 Buffer cache块大小</h5>
-
-<p>Linux系统在创建块设备的时候是如何设置块大小的呢？这里面涉及到Linux针对块大小设置的一个小小算法。在此结合源码对Linux的这个方法加以说明。</p>
-
-<p>总体来说，Linux决定buffer cache块大小采用的是“最大块大小”的设计思想。Linux根据块设备容量决定buffer cache的块大小，并且将值域限定在512B和4KB之间。当然，这个值域内的元素不是连续的，并且都是2的幂。在这个值域的基础上取块设备大小的最大公约数，这个值就是buffer cache的块大小。这种算法的指导思想就是buffer cache的块越大越好，因此，能够取2KB就不会选择512B。Linux中算法实现代码如下所示：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>void bd_set_size(struct block_device *bdev, loff_t size)
-</span><span class='line'>{
-</span><span class='line'>&#9;unsigned bsize = bdev_logical_block_size(bdev);
-</span><span class='line'>
-</span><span class='line'>&#9;bdev-&gt;bd_inode-&gt;i_size = size;      //size为块设备大小
-</span><span class='line'>&#9;while (bsize &lt; PAGE_CACHE_SIZE) {   //bsize不能大于Page size
-</span><span class='line'>&#9;&#9;if (size & bsize)
-</span><span class='line'>&#9;&#9;&#9;break;
-</span><span class='line'>&#9;&#9;bsize &lt;&lt;= 1;    //bsize只能取2的幂
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;bdev-&gt;bd_block_size = bsize;
-</span><span class='line'>&#9;/* 设置buffer cache块大小 */
-</span><span class='line'>&#9;bdev-&gt;bd_inode-&gt;i_blkbits = blksize_bits(bsize);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>3, 小结</h4>
-
-<p>本文对buffer cache的性能问题进行了分析，通过实验发现当请求块比较小时，buffer cache块大小对IO性能有很大的影响。Linux根据块设备的容量采用“最大cache块”的思想决定buffer cache的块大小。在实际应用中，我们应该根据应用特征，通过实际测试来决定buffer cache块大小。</p>
-
-<hr />
-
-<p>通常Linux的“block size”指的是1024 bytes，Linux用1024-byte blocks 作为buffer cache的基本单位。但linux的文件系统的block确不一样。例如ext3系统，block size是4096。使用tune2fs可以查看带文件系统的磁盘分区的相关信息，包括block size。</p>
-
-<p>例如：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>tune2fs -l /dev/sda2 |grep "Block size"
-</span><span class='line'>Block size:               4096</span></code></pre></td></tr></table></div></figure>
-
-
-<p>另一个工具dumpe2fs也可以。 dumpe2fs /dev/sda2 | grep &ldquo;Block size&rdquo;</p>
-
-<p>其实本来这几个概念不是很难，主要是NND他们的名字都一样，都叫“Block Size”。</p>
-
-<p>1.硬件上的 block size, 应该是"sector size"，linux的扇区大小是512byte</p>
-
-<p>2.有文件系统的分区的block size, 是"block size"，大小不一，可以用工具查看</p>
-
-<p>3.没有文件系统的分区的block size，也叫“block size”，大小指的是1024 byte</p>
-
-<p>4.Kernel buffer cache 的block size, 就是"block size"，大部分PC是1024</p>
-
-<p>5.磁盘分区的"cylinder size"，用fdisk -l可以查看。</p>
-
-<p>我们来看看fdisk显示的不同的信息，理解一下这几个概念：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>Disk /dev/hda: 250.0 GB, 250059350016 bytes
-</span><span class='line'>255 heads, 63 sectors/track, 30401 cylinders
-</span><span class='line'>Units = cylinders of 16065 * 512 = 8225280 bytes
-</span><span class='line'>   Device Boot    Start       End    Blocks   Id  System
-</span><span class='line'>/dev/hda1   *         1      1305  10482381   83  Linux
-</span><span class='line'>/dev/hda2          1306      1566   2096482+  82  Linux swap
-</span><span class='line'>/dev/hda3          1567     30401 231617137+  83  Linux</span></code></pre></td></tr></table></div></figure>
-
-
-<p>8225280就是cylinder size。一共有30401个cylinder。Start和End分别标记的是各个分区的起始cylinder。第4列显示的就是以1024为单位的block（这一列最容易把人搞晕）。为什么“2096482+”有个“+”号呢？因为啊，总size除1024除不尽，是个约数。</p>
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/09/18/kernel-mm-swappiness/">Linux内核页回收 swappiness参数</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-09-18T11:21:00+08:00'><span class='date'>2015-09-18</span> <span class='time'>11:21:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://www.douban.com/note/349467816/">http://www.douban.com/note/349467816/</a></p>
-
-<p>本文主要尝试解释两个问题：<br/>
-1. swappiness的确切含义是什么，它对内核进行页回收机制的影响。<br/>
-2. swappiness设置成0，为什么系统仍然可能会有swap发生。</p>
-
-<h4>一. 关于内存分配与页回收(page reclaim)</h4>
-
-<p>page reclaim发生的场景主要有两类，一个是kswapd后台线程进行的活动，另一个是direct reclaim，即分配页时没有空闲内存满足，需要立即直接进行的页回收。大体上内存分配的流程会分为两部分，一部分是fast path，另一部分是slow path，通常内存使用非紧张情况下，都会在fast path就可以满足要求。并且fast path下的内存分配不会出现dirty writeback及swap等页回收引起的IO阻塞情况。</p>
-
-<p>fast path大体流程如下：</p>
-
-<p>1.如果系统挂载使用了memory cgroup，则首先检查是否超过cgroup限额，如果超过则进行direct reclaim，通过do_try_to_free_pages完成。如果没超过则进行cgroup的charge工作（charge是通过两阶段提交完成的，这里不展开了）。</p>
-
-<p>2.从本地prefered zone内存节点查找空闲页，需要判断是否满足系统watermark及dirty ratio的要求，如果满足则从buddy system上摘取相应page,否则尝试对本地prefered zone进行页回收,本次fast path下页回收只会回收clean page，即不会考虑dirty page以及mapped page，这样就不会产生任何swap及writeback，即不会引起任何blocking的IO操作，如果这次回收仍然无法满足请求的内存页数目则进入slow path</p>
-
-<p>slow path大体流程如下：</p>
-
-<ol>
-<li><p>首先唤醒kswapd进行page reclaim后台操作。</p></li>
-<li><p>重新尝试本地prefered zone进行分配内存，如果失败会根据请求的GFP相关参数决定是否尝试忽略watermark, dirty ratio以及本地节点分配等要求进行再次重试，这一步中如果分配页时有指定<code>__GFP_NOFAIL</code>标记，则分配失败会一直等待重试。</p></li>
-<li><p>如果没有<code>__GFP_NOFAIL</code>标记，则会需开始进行page compact及page direct reclaim操作，之后如果仍然没有可用内存，则进入OOM流程。</p></li>
-</ol>
-
-
-<p>相关内容可以参阅内核代码<code>__alloc_pages</code>函数的逻辑，另外无论page reclaim是由谁发起的，最终都会统一入口到shrink_zone，即针对每个zone独立进行reclaim操作，最终会进入shrink_lruvec函数，进行每个zone相应page lru链表的扫描与回收操作。</p>
-
-<h4>二. 关于页回收的一些背景知识</h4>
-
-<p>页回收大体流程会先在每个zone上扫描相应的page链表，主要包括inactive anon/active anon(匿名页链表)以及inactive file/active file链表（file cache/映射页链表），一共四条链表，我们所有使用过的page在被回收前基本是保存在这四条链表中的某一条中的（还有一部分在unevictable链表中，忽略），根据其被引用的次数会决定其处于active还是inactive链表中，根据其类型决定处于anon还是file链表中。</p>
-
-<p>页回收总体会扫描逐个内存节点的所有zone，然后先扫描active，将不频繁访问的页挪到inactive链表中，随后扫描inactive链表，会将其中被频繁引用的页重新挪回到active中，确认不频繁的页则最终被回收，如果是file based的页则根据是否clean进行释放或回写(writeback，filecache则直接释放)，如果是anon则进行swap，所以本文实际关心的是swappiness参数对anon链表扫描的影响。</p>
-
-<p>另外还需要了解前面描述的四个链表原来是放在zone数据结构上的，后来引入了mem_cgroup则，重新定义了一组mem_cgroup_per_zone/mem_cgroup_per_node的数据结构，这四个链表同时定义在这组数据结构上，如果系统开启了mem cgroup则使用后者，否则用前者。</p>
-
-<p>另外再重点说下swap只是page reclaim的一种处理措施，主要针对anon page，我们最终来看下swappiness的确切含义</p>
-
-<h4>三. swappiness对page reclaim的确切影响</h4>
-
-<p>page reclaim逻辑中对前面所述四个链表进行扫描的逻辑在vmscan.c中的get_scan_count函数内，该函数大部分逻辑注释写得非常清楚，我们简单梳理下，主要关注scan_balance变量的取值：</p>
-
-<ol>
-<li>首先如果系统禁用了swap或者没有swap空间，则只扫描file based的链表，即不进行匿名页链表扫描
-代码：</li>
-</ol>
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if (!sc-&gt;may_swap || (get_nr_swap_pages() &lt;= 0)) {
-</span><span class='line'>&#9;scan_balance = SCAN_FILE;
-</span><span class='line'>&#9;goto out;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<ol>
-<li>如果当前进行的不是全局页回收（cgroup资源限额引起的页回收），并且swappiness设为0，则不进行匿名页链表扫描，这个是没得商量，这里swappiness值直接决定了是否有swap发生，设成0则肯定不会发生，另外需要注意，这种情况下需要设置的是cgroup配置文件memory.swappiness，而不是全局的sysctl vm.swappiness
-代码：</li>
-</ol>
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if (!global_reclaim(sc) && !vmscan_swappiness(sc)) {
-</span><span class='line'>&#9;scan_balance = SCAN_FILE;
-</span><span class='line'>&#9;goto out;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<ol>
-<li>如果进行链表扫描前设置的priority(这个值决定扫描多少分之一的链表元素)为0，且swappiness非0，则可能会进行swap
-代码：</li>
-</ol>
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if (!sc-&gt;priority && vmscan_swappiness(sc)) {
-</span><span class='line'>&#9;scan_balance = SCAN_EQUAL;
-</span><span class='line'>&#9;goto out;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<ol>
-<li>如果是全局页回收，并且当前空闲内存和所有file based链表page数目的加和都小于系统的high watermark，则必须进行匿名页回收，则必然会发生swap,可以看到这里swappiness的值如何设置是完全无关的，这也解释了为什么其为0，系统也会进行swap的原因，另外最后我们会详细解释系统page watermark是如何计算的。
-代码：</li>
-</ol>
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>anon = get_lru_size(lruvec, LRU_ACTIVE_ANON) +
-</span><span class='line'>&#9;&#9;get_lru_size(lruvec, LRU_INACTIVE_ANON);
-</span><span class='line'>file = get_lru_size(lruvec, LRU_ACTIVE_FILE) +
-</span><span class='line'>&#9;&#9;get_lru_size(lruvec, LRU_INACTIVE_FILE);
-</span><span class='line'>
-</span><span class='line'>if (global_reclaim(sc)) {
-</span><span class='line'>&#9;free = zone_page_state(zone, NR_FREE_PAGES);
-</span><span class='line'>&#9;if (unlikely(file + free &lt;= high_wmark_pages(zone))) {
-</span><span class='line'>&#9;&#9;scan_balance = SCAN_ANON;
-</span><span class='line'>&#9;&#9;goto out;
-</span><span class='line'>&#9;}
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<ol>
-<li>如果系统inactive file链表比较充足，则不考虑进行匿名页的回收，即不进行swap
-代码：</li>
-</ol>
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if (!inactive_file_is_low(lruvec)) {
-</span><span class='line'>&#9;scan_balance = SCAN_FILE;
-</span><span class='line'>&#9;goto out;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<ol>
-<li>最后一种情况则要根据swappiness值与之前统计的file与anon哪个更有价值来综合决定file和anon链表扫描的比例，这时如果swappiness设置成0，则也不会扫描anon链表，即不进行swap,代码比较多，不再贴出。</li>
-</ol>
-
-
-<h4>四. 系统内存watermark的计算</h4>
-
-<p>前面看到系统内存watermark对页回收机制是有决定影响的，其实在内存分配中也会频繁用到这个值，确切的说它有三个值，分别是low,min和high,根据分配页时来指定用哪个，如果系统空闲内存低于相应watermark则分配会失败，这也是进入slow path或者wakeup kswapd的依据。</p>
-
-<p>实际这个值的计算是通过sysctl里的vm.min_free_kbytes来决定的，大体的计算公式如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>pages_min = min_free_kbytes &gt;&gt; (PAGE_SHIFT - 10);
-</span><span class='line'>tmp = (u64)pages_min * zone-&gt;managed_pages;
-</span><span class='line'>do_div(tmp, lowmem_pages);
-</span><span class='line'>zone-&gt;watermark[WMARK_MIN] = tmp;
-</span><span class='line'>zone-&gt;watermark[WMARK_LOW] = min_wmark_pages(zone) + (tmp &gt;&gt; 2);
-</span><span class='line'>zone-&gt;watermark[WMARK_HIGH] = min_wmark_pages(zone) + (tmp &gt;&gt; 1);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>即根据min_free_kbytes的值按照每个zone管理页面的比例算出zone的min_watermark，然后再加min的1/4就是low，加1/2就是high了</p>
-
-<h4>总结：</h4>
-
-<p>swappiness的值是个参考值，是否会发生swap跟当前是哪种page reclaim及系统当前状态都有关系，所以设置了swappiness=0并不代表一定没有swap发生，同时设为0也确实会可能发生OOM。</p>
-
-<p>个人仍然认为线上环境设置swappiness=0是没有任何问题的。</p>
-</div>
-  
-  
-
-
-    </article>
-  
   <div class="pagination">
     
       <a class="prev" href="/posts/179">&larr; Older</a>
@@ -650,7 +1999,7 @@ var ss360Config = {
   
     <section>
 <h1>Categories
-<span class='right_span'>(967)</span>
+<span class='right_span'>(969)</span>
 
 </h1>
 <head>
@@ -741,7 +2090,7 @@ if (!document.getElementById('assembly~base')) document.getElementById('aexp_ass
 if (!document.getElementById('assembly')) document.getElementById('aexp_assembly').style.visibility = 'hidden';
 if (!document.getElementById('assembly~win')) document.getElementById('aexp_assembly~win').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(199)</span></li>
+<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(200)</span></li>
 <div id='tools' class='catsub'><li><a href='/blog/cats/tools~apache2/?opendiv=tools'>apache2</a><a href='##' onmousedown=showDiv('tools~apache2') id='aexp_tools~apache2'><span class='exp_style' id='exp_tools~apache2'>[+]</span></a><span class='right_span'>9</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~apache2')) document.getElementById('aexp_tools~apache2').style.visibility = 'hidden';
@@ -782,7 +2131,7 @@ if (!document.getElementById('tools~haproxy')) document.getElementById('aexp_too
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~isal')) document.getElementById('aexp_tools~isal').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/tools~mysql/?opendiv=tools'>mysql</a><a href='##' onmousedown=showDiv('tools~mysql') id='aexp_tools~mysql'><span class='exp_style' id='exp_tools~mysql'>[+]</span></a><span class='right_span'>30</span></li>
+<li><a href='/blog/cats/tools~mysql/?opendiv=tools'>mysql</a><a href='##' onmousedown=showDiv('tools~mysql') id='aexp_tools~mysql'><span class='exp_style' id='exp_tools~mysql'>[+]</span></a><span class='right_span'>31</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~mysql')) document.getElementById('aexp_tools~mysql').style.visibility = 'hidden';
 </script>
@@ -979,8 +2328,8 @@ if (!document.getElementById('kernel~tcp')) document.getElementById('aexp_kernel
 if (!document.getElementById('kernel')) document.getElementById('aexp_kernel').style.visibility = 'hidden';
 if (!document.getElementById('kernel~vpn')) document.getElementById('aexp_kernel~vpn').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/network/'>network</a><a href='##' onmousedown=showDiv('network') id='aexp_network'><span class='exp_style' id='exp_network'>[+]</span></a><span class='right_span'>(8)</span></li>
-<div id='network' class='catsub'><li><a href='/blog/cats/network~base/?opendiv=network'>base</a><a href='##' onmousedown=showDiv('network~base') id='aexp_network~base'><span class='exp_style' id='exp_network~base'>[+]</span></a><span class='right_span'>8</span></li>
+<li class='catclass'><a href='/blog/cats/network/'>network</a><a href='##' onmousedown=showDiv('network') id='aexp_network'><span class='exp_style' id='exp_network'>[+]</span></a><span class='right_span'>(9)</span></li>
+<div id='network' class='catsub'><li><a href='/blog/cats/network~base/?opendiv=network'>base</a><a href='##' onmousedown=showDiv('network~base') id='aexp_network~base'><span class='exp_style' id='exp_network~base'>[+]</span></a><span class='right_span'>9</span></li>
 </div><script language='javascript' type='text/javascript'>
 if (!document.getElementById('network')) document.getElementById('aexp_network').style.visibility = 'hidden';
 if (!document.getElementById('network~base')) document.getElementById('aexp_network~base').style.visibility = 'hidden';
@@ -1092,7 +2441,7 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 
 <section>
 <h1>Date Categories
-<span class='right_span'>(967)</span>
+<span class='right_span'>(969)</span>
 
 </h1>
 <head>
@@ -1100,8 +2449,9 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(87)</span></li>
-<div id='2024' class='catsub'><li><a href='/blog/cats/2024~10/?opendiv=2024'>2024-10</a><span class='right_span'>5</span></li>
+<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(89)</span></li>
+<div id='2024' class='catsub'><li><a href='/blog/cats/2024~12/?opendiv=2024'>2024-12</a><span class='right_span'>2</span></li>
+<li><a href='/blog/cats/2024~10/?opendiv=2024'>2024-10</a><span class='right_span'>5</span></li>
 <li><a href='/blog/cats/2024~09/?opendiv=2024'>2024-09</a><span class='right_span'>15</span></li>
 <li><a href='/blog/cats/2024~08/?opendiv=2024'>2024-08</a><span class='right_span'>18</span></li>
 <li><a href='/blog/cats/2024~07/?opendiv=2024'>2024-07</a><span class='right_span'>26</span></li>
@@ -1273,6 +2623,14 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
   <ul id="recent_posts">
     
       <li class="post">
+        <a href="/blog/2024/12/12/tools-mysql-bin/">删除MySQL下的bin</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2024/12/12/network-sfp/">光模块配置</a>
+      </li>
+    
+      <li class="post">
         <a href="/blog/2024/10/27/network-ap-ac/">无线AP与AC详解</a>
       </li>
     
@@ -1302,14 +2660,6 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
     
       <li class="post">
         <a href="/blog/2024/09/20/sqlserver-_/">`_` 通配符 -- 匹配一个字符</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/09/14/lang-web-ding/">钉钉开放平台API</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/09/14/lang-web-staticmap/">腾讯地图--静态地图API</a>
       </li>
     
   </ul>

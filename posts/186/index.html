@@ -131,6 +131,578 @@ var ss360Config = {
       
   <header>
     
+      <h2 class="entry-title"><a href="/blog/2015/08/07/cgroup-9/">cpuset子系统</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-08-07T17:26:00+08:00'><span class='date'>2015-08-07</span> <span class='time'>17:26:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://www.cnblogs.com/lisperl/archive/2012/05/02/2478817.html">http://www.cnblogs.com/lisperl/archive/2012/05/02/2478817.html</a></p>
+
+<p>cpuset子系统为cgroup 中的任务分配独立 CPU（在多核系统）和内存节点。Cpuset子系统为定义了一个叫cpuset的数据结构来管理cgroup中的任务能够使用的cpu和内存节点。Cpuset定义如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct cpuset {
+</span><span class='line'>&#9;struct cgroup_subsys_state css;
+</span><span class='line'> 
+</span><span class='line'>&#9;unsigned long flags; /* "unsigned long" so bitops work */
+</span><span class='line'>&#9;cpumask_var_t cpus_allowed; /* CPUs allowed to tasks in cpuset */
+</span><span class='line'>&#9;nodemask_t mems_allowed; /* Memory Nodes allowed to tasks */
+</span><span class='line'> 
+</span><span class='line'>&#9;struct cpuset *parent; /* my parent */
+</span><span class='line'> 
+</span><span class='line'>&#9;struct fmeter fmeter; /* memory_pressure filter */
+</span><span class='line'> 
+</span><span class='line'>&#9;/* partition number for rebuild_sched_domains() */
+</span><span class='line'>&#9;int pn;
+</span><span class='line'> 
+</span><span class='line'>&#9;/* for custom sched domain */
+</span><span class='line'>&#9;int relax_domain_level;
+</span><span class='line'> 
+</span><span class='line'>&#9;/* used for walking a cpuset heirarchy */
+</span><span class='line'>&#9;struct list_head stack_list;
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>其中css字段用于task或cgroup获取cpuset结构。</p>
+
+<p>cpus_allowed和mems_allowed定义了该cpuset包含的cpu和内存节点。</p>
+
+<p>Parent字段用于维持cpuset的树状结构，stack_list则用于遍历cpuset的层次结构。</p>
+
+<p>Pn和relax_domain_level是跟Linux 调度域相关的字段，pn指定了cpuset的调度域的分区号，而relax_domain_level表示进行cpu负载均衡寻找空闲cpu的策略。</p>
+
+<p>除此之外，进程的task_struct结构体里面还有一个cpumask_t cpus_allowed成员，用以存储进程的cpus_allowed信息;一个nodemask_t mems_allowed成员，用于存储进程的mems_allowed信息。</p>
+
+<p>Cpuset子系统的实现是通过在内核代码加入一些hook代码。由于代码比较散，我们逐条分析。</p>
+
+<p>在内核初始化代码（即start_kernel函数）中插入了对cpuset_init调用的代码，这个函数用于cpuset的初始化。</p>
+
+<p>下面我们来看这个函数：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int __init cpuset_init(void)
+</span><span class='line'>{
+</span><span class='line'>&#9;int err = 0;
+</span><span class='line'> 
+</span><span class='line'>&#9;if (!alloc_cpumask_var(&top_cpuset.cpus_allowed, GFP_KERNEL))
+</span><span class='line'>&#9;&#9;BUG();
+</span><span class='line'> 
+</span><span class='line'>&#9;cpumask_setall(top_cpuset.cpus_allowed);
+</span><span class='line'>&#9;nodes_setall(top_cpuset.mems_allowed);
+</span><span class='line'> 
+</span><span class='line'>&#9;fmeter_init(&top_cpuset.fmeter);
+</span><span class='line'>&#9;set_bit(CS_SCHED_LOAD_BALANCE, &top_cpuset.flags);
+</span><span class='line'>&#9;top_cpuset.relax_domain_level = -1;
+</span><span class='line'> 
+</span><span class='line'>&#9;err = register_filesystem(&cpuset_fs_type);
+</span><span class='line'>&#9;if (err &lt; 0)
+</span><span class='line'>&#9;&#9;return err;
+</span><span class='line'> 
+</span><span class='line'>&#9;if (!alloc_cpumask_var(&cpus_attach, GFP_KERNEL))
+</span><span class='line'>&#9;&#9;BUG();
+</span><span class='line'> 
+</span><span class='line'>&#9;number_of_cpusets = 1;
+</span><span class='line'>&#9;return 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>cpumask_setall和nodes_setall将top_cpuset能使用的cpu和内存节点设置成所有节点。紧接着，初始化fmeter，设置top_cpuset的load balance标志。最后注册cpuset文件系统，这个是为了兼容性，因为在cgroups之前就有cpuset了，不过在具体实现时，对cpuset文件系统的操作都被重定向了cgroup文件系统。</p>
+
+<p>除了这些初始化工作，cpuset子系统还在do_basic_setup函数（此函数在kernel_init中被调用）中插入了对cpuset_init_smp的调用代码，用于smp相关的初始化工作。</p>
+
+<p>下面我们看这个函数：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void __init cpuset_init_smp(void)
+</span><span class='line'>{
+</span><span class='line'>&#9;cpumask_copy(top_cpuset.cpus_allowed, cpu_active_mask);
+</span><span class='line'>&#9;top_cpuset.mems_allowed = node_states[N_HIGH_MEMORY];
+</span><span class='line'> 
+</span><span class='line'>&#9;hotcpu_notifier(cpuset_track_online_cpus, 0);
+</span><span class='line'>&#9;hotplug_memory_notifier(cpuset_track_online_nodes, 10);
+</span><span class='line'> 
+</span><span class='line'>&#9;cpuset_wq = create_singlethread_workqueue("cpuset");
+</span><span class='line'>&#9;BUG_ON(!cpuset_wq);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>首先，将top_cpuset的cpu和memory节点设置成所有online的节点，之前初始化时还不知道有哪些online节点所以只是简单设成所有，在smp初始化后就可以将其设成所有online节点了。然后加入了两个hook函数，cpuset_track_online_cpus和cpuset_track_online_nodes，这个两个函数将在cpu和memory热插拔时被调用。</p>
+
+<p>cpuset_track_online_cpus函数中调用scan_for_empty_cpusets函数扫描空的cpuset，并将其下的进程移到其非空的parent下，同时更新cpuset的cpus_allowed信息。cpuset_track_online_nodes的处理类似。</p>
+
+<p>那cpuset又是怎么对进程的调度起作用的呢？</p>
+
+<p>这个就跟task_struct中cpu_allowed字段有关了。首先，这个cpu_allowed和进程所属的cpuset的cpus_allowed保持一致；其次，在进程被fork出来的时候，进程继承了父进程的cpuset和cpus_allowed字段；最后，进程被fork出来后，除非指定CLONE_STOPPED标记，都会被调用wake_up_new_task唤醒，在wake_up_new_task中有：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>cpu = select_task_rq(rq, p, SD_BALANCE_FORK, 0);
+</span><span class='line'>set_task_cpu(p, cpu);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>即为新fork出来的进程选择运行的cpu，而select_task_rq会调用进程所属的调度器的函数，对于普通进程，其调度器是CFS，CFS对应的函数是select_task_rq_fair。在select_task_rq_fair返回选到的cpu后，select_task_rq会对结果和cpu_allowed比较：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (unlikely(!cpumask_test_cpu(cpu, &p-&gt;cpus_allowed) ||
+</span><span class='line'>     !cpu_online(cpu)))
+</span><span class='line'>cpu = select_fallback_rq(task_cpu(p), p);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这就保证了新fork出来的进程只能在cpu_allowed中的cpu上运行。</p>
+
+<p>对于被wake up的进程来说，在被调度之前，也会调用select_task_rq选择可运行的cpu。</p>
+
+<p>这就保证了进程任何时候都只会在cpu_allowed中的cpu上运行。</p>
+
+<p>最后说一下，如何保证task_struct中的cpus_allowd和进程所属的cpuset中的cpus_allowed一致。首先，在cpu热插拔时，scan_for_empty_cpusets会更新task_struct中的cpus_allowed信息，其次对cpuset下的控制文件写入操作时也会更新task_struct中的cpus_allowed信息,最后当一个进程被attach到其他cpuset时，同样会更新task_struct中的cpus_allowed信息。</p>
+
+<p>在cpuset之前，Linux内核就提供了指定进程可以运行的cpu的方法。通过调用sched_setaffinity可以指定进程可以运行的cpu。Cpuset对其进行了扩展，保证此调用设定的cpu仍然在cpu_allowed的范围内。在sched_setaffinity中，插入了这样两行代码：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>cpuset_cpus_allowed(p, cpus_allowed);
+</span><span class='line'>cpumask_and(new_mask, in_mask, cpus_allowed);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>其中cpuset_cpus_allowed返回进程对应的cpuset中的cpus_allowed，cpumask_and则将cpus_allowed和调用sched_setaffinity时的参数in_mask相与得出进程新的cpus_allowed。</p>
+
+<p>通过以上代码的嵌入，Linux内核实现了对进程可调度的cpu的控制。下面我们来分析一下cpuset对memory节点的控制。</p>
+
+<p>Linux中内核分配物理页框的函数有6个:alloc_pages,alloc_page,<strong>get_free_pages,</strong>get_free_page,get_zeroed_page,<strong>get_dma_pages,这些函数最终都通过alloc_pages实现，而alloc_pages又通过</strong>alloc_pages_nodemask实现，在__alloc_pages_nodemask中，调用get_page_from_freelist从zone list中分配一个page，在get_page_from_freelist中调用cpuset_zone_allowed_softwall判断当前节点是否属于mems_allowed。通过附加这样一个判断，保证进程从mems_allowed中的节点分配内存。</p>
+
+<p>Linux在cpuset出现之前，也提供了mbind, set_mempolicy来限定进程可用的内存节点。Cpuset子系统对其做了扩展，扩展的方法跟扩展sched_setaffinity类似，通过导出cpuset_mems_allowed，返回进程所属的cupset允许的内存节点，对mbind，set_mempolicy的参数进行过滤。</p>
+
+<p>最后让我们来看一下，cpuset子系统最重要的两个控制文件：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>{
+</span><span class='line'>&#9;.name = "cpus",
+</span><span class='line'>&#9;.read = cpuset_common_file_read,
+</span><span class='line'>&#9;.write_string = cpuset_write_resmask,
+</span><span class='line'>&#9;.max_write_len = (100U + 6 * NR_CPUS),
+</span><span class='line'>&#9;.private = FILE_CPULIST,
+</span><span class='line'>},
+</span><span class='line'> 
+</span><span class='line'>{
+</span><span class='line'>&#9;.name = "mems",
+</span><span class='line'>&#9;.read = cpuset_common_file_read,
+</span><span class='line'>&#9;.write_string = cpuset_write_resmask,
+</span><span class='line'>&#9;.max_write_len = (100U + 6 * MAX_NUMNODES),
+</span><span class='line'>&#9;.private = FILE_MEMLIST,
+</span><span class='line'>},</span></code></pre></td></tr></table></div></figure>
+
+
+<p>通过cpus文件，我们可以指定进程可以使用的cpu节点，通过mems文件，我们可以指定进程可以使用的memory节点。</p>
+
+<p>这两个文件的读写都是通过cpuset_common_file_read和cpuset_write_resmask实现的，通过private属性区分。</p>
+
+<p>在cpuset_common_file_read中读出可用的cpu或memory节点；在cpuset_write_resmask中则根据文件类型分别调用update_cpumask和update_nodemask更新cpu或memory节点信息。</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2015/08/07/cgroup-8/">memory子系统</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-08-07T17:22:00+08:00'><span class='date'>2015-08-07</span> <span class='time'>17:22:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://www.cnblogs.com/lisperl/archive/2012/04/28/2474872.html">http://www.cnblogs.com/lisperl/archive/2012/04/28/2474872.html</a></p>
+
+<p>memory 子系统可以设定 cgroup 中任务使用的内存限制，并自动生成由那些任务使用的内存资源报告。memory子系统是通过linux的resource counter机制实现的。下面我们就先来看一下resource counter机制。</p>
+
+<p>resource counter是内核为子系统提供的一种资源管理机制。这个机制的实现包括了用于记录资源的数据结构和相关函数。Resource counter定义了一个res_counter的结构体来管理特定资源，定义如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct res_counter {
+</span><span class='line'>&#9;unsigned long long usage;
+</span><span class='line'>&#9;unsigned long long max_usage;
+</span><span class='line'>&#9;unsigned long long limit;
+</span><span class='line'>&#9;unsigned long long soft_limit;
+</span><span class='line'>&#9;unsigned long long failcnt; /*
+</span><span class='line'>&#9;spinlock_t lock;
+</span><span class='line'>&#9;struct res_counter *parent;
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>Usage用于记录当前已使用的资源，max_usage用于记录使用过的最大资源量，limit用于设置资源的使用上限，进程组不能使用超过这个限制的资源，soft_limit用于设定一个软上限，进程组使用的资源可以超过这个限制，failcnt用于记录资源分配失败的次数，管理可以根据这个记录，调整上限值。Parent指向父节点，这个变量用于处理层次性的资源管理。</p>
+
+<p>除了这个关键的数据结构，resource counter还定义了一系列相关的函数。下面我们来看几个关键的函数。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void res_counter_init(struct res_counter *counter, struct res_counter *parent)
+</span><span class='line'>{
+</span><span class='line'>&#9;spin_lock_init(&counter-&gt;lock);
+</span><span class='line'>&#9;counter-&gt;limit = RESOURCE_MAX;
+</span><span class='line'>&#9;counter-&gt;soft_limit = RESOURCE_MAX;
+</span><span class='line'>&#9;counter-&gt;parent = parent;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这个函数用于初始化一个res_counter。</p>
+
+<p>第二个关键的函数是int res_counter_charge(struct res_counter *counter, unsigned long val, struct res_counter **limit_fail_at)。当资源将要被分配的时候，资源就要被记录到相应的res_counter里。这个函数作用就是记录进程组使用的资源。在这个函数中有：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>for (c = counter; c != NULL; c = c-&gt;parent) {
+</span><span class='line'>&#9;spin_lock(&c-&gt;lock);
+</span><span class='line'>&#9;ret = res_counter_charge_locked(c, val);
+</span><span class='line'>&#9;spin_unlock(&c-&gt;lock);
+</span><span class='line'>&#9;if (ret &lt; 0) {
+</span><span class='line'>&#9;&#9;*limit_fail_at = c;
+</span><span class='line'>&#9;&#9;goto undo;
+</span><span class='line'>&#9;}
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>在这个循环里，从当前res_counter开始，从下往上逐层增加资源的使用量。我们来看一下res_counter_charge_locked这个函数，这个函数顾名思义就是在加锁的情况下增加使用量。实现如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>{
+</span><span class='line'>&#9;if (counter-&gt;usage + val &gt; counter-&gt;limit) {
+</span><span class='line'>&#9;&#9;counter-&gt;failcnt++;
+</span><span class='line'>&#9;&#9;return -ENOMEM;
+</span><span class='line'>&#9;}
+</span><span class='line'> 
+</span><span class='line'>&#9;counter-&gt;usage += val;
+</span><span class='line'>&#9;if (counter-&gt;usage &gt; counter-&gt;max_usage)
+</span><span class='line'>&#9;&#9;counter-&gt;max_usage = counter-&gt;usage;
+</span><span class='line'>&#9;return 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>首先判断是否已经超过使用上限，如果是的话就增加失败次数，返回相关代码；否则就增加使用量的值，如果这个值已经超过历史最大值，则更新最大值。</p>
+
+<p>第三个关键的函数是void res_counter_uncharge(struct res_counter *counter, unsigned long val)。当资源被归还到系统的时候，要在相应的res_counter减轻相应的使用量。这个函数作用就在于在于此。实现如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>for (c = counter; c != NULL; c = c-&gt;parent) {
+</span><span class='line'>&#9;spin_lock(&c-&gt;lock);
+</span><span class='line'>&#9;res_counter_uncharge_locked(c, val);
+</span><span class='line'>&#9;spin_unlock(&c-&gt;lock);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>从当前counter开始，从下往上逐层减少使用量，其中调用了res_counter_uncharge_locked，这个函数的作用就是在加锁的情况下减少相应的counter的使用量。</p>
+
+<p>有这些数据结构和函数，只需要在内核分配资源的时候，植入相应的charge函数，释放资源时，植入相应的uncharge函数，就能实现对资源的控制了。</p>
+
+<p>介绍完resource counter，我们再来看memory子系统是利用resource counter实现对内存资源的管理的。</p>
+
+<p>memory子系统定义了一个叫mem_cgroup的结构体来管理cgroup相关的内存使用信息，定义如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct mem_cgroup {
+</span><span class='line'>&#9;struct cgroup_subsys_state css;
+</span><span class='line'>&#9;struct res_counter res;
+</span><span class='line'>&#9;struct res_counter memsw;
+</span><span class='line'>&#9;struct mem_cgroup_lru_info info;
+</span><span class='line'>&#9;spinlock_t reclaim_param_lock;
+</span><span class='line'>&#9;int prev_priority;
+</span><span class='line'>&#9;int last_scanned_child;
+</span><span class='line'>&#9;bool use_hierarchy;
+</span><span class='line'>&#9;atomic_t oom_lock;
+</span><span class='line'>&#9;atomic_t refcnt;
+</span><span class='line'>&#9;unsigned int swappiness;
+</span><span class='line'>&#9;int oom_kill_disable;
+</span><span class='line'>&#9;bool memsw_is_minimum;
+</span><span class='line'>&#9;struct mutex thresholds_lock;
+</span><span class='line'>&#9;struct mem_cgroup_thresholds thresholds;
+</span><span class='line'>&#9;struct mem_cgroup_thresholds memsw_thresholds;
+</span><span class='line'>&#9;struct list_head oom_notify;
+</span><span class='line'>&#9;unsigned long  move_charge_at_immigrate;
+</span><span class='line'>&#9;struct mem_cgroup_stat_cpu *stat;
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>跟其他子系统一样，mem_cgroup也包含了一个cgroup_subsys_state成员，便于task或cgroup获取mem_cgroup。</p>
+
+<p>mem_cgroup中包含了两个res_counter成员，分别用于管理memory资源和memory+swap资源，如果memsw_is_minimum为true，则res.limit=memsw.limit，即当进程组使用的内存超过memory的限制时，不能通过swap来缓解。</p>
+
+<p>use_hierarchy则用来标记资源控制和记录时是否是层次性的。</p>
+
+<p>oom_kill_disable则表示是否使用oom-killer。</p>
+
+<p>oom_notify指向一个oom notifier event fd链表。</p>
+
+<p>另外memory子系统还定义了一个叫page_cgroup的结构体：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct page_cgroup {
+</span><span class='line'>&#9;unsigned long flags;
+</span><span class='line'>&#9;struct mem_cgroup *mem_cgroup;
+</span><span class='line'>&#9;struct page *page;
+</span><span class='line'>&#9;struct list_head lru; /* per cgroup LRU list */
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>此结构体可以看作是mem_map的一个扩展，每个page_cgroup都和所有的page关联，而其中的mem_cgroup成员，则将page与特定的mem_cgroup关联起来。</p>
+
+<p>我们知道在linux系统中，page结构体是用来管理物理页框的，一个物理页框对应一个page结构体，而每个进程中的task_struct中都有一个mm_struct来管理进程的内存信息。每个mm_struct知道它属于的进程，进而知道所属的mem_cgroup，而每个page都知道它属于的page_cgroup，进而也知道所属的mem_cgroup，而内存使用量的计算是按cgroup为单位的，这样以来，内存资源的管理就可以实现了。</p>
+
+<p>memory子系统既然是通过resource counter实现的，那肯定会在内存分配给进程时进行charge操作的。下面我们就来看一下这些charge操作：</p>
+
+<p>1.page fault发生时，有两种情况内核需要给进程分配新的页框。一种是进程请求调页（demand paging），另一种是copy on write。内核在handle_pte_fault中进行处理。其中，do_linear_fault处理pte不存在且页面线性映射了文件的情况，do_anonymous_page处理pte不存在且页面没有映射文件的情况，do_nonlinear_fault处理pte存在且页面非线性映射文件的情况，do_wp_page则处理copy on write的情况。其中do_linear_fault和do_nonlinear_fault都会调用<strong>do_fault来处理。Memory子系统则</strong>do_fault、do_anonymous_page、do_wp_page植入mem_cgroup_newpage_charge来进行charge操作。</p>
+
+<p>2.内核在handle_pte_fault中进行处理时，还有一种情况是pte存在且页又没有映射文件。这种情况说明页面之前在内存中，但是后面被换出到swap空间了。内核用do_swap_page函数处理这种情况，memory子系统在do_swap_page加入了mem_cgroup_try_charge_swapin函数进行charge。mem_cgroup_try_charge_swapin是处理页面换入时的charge的，当执行swapoff系统调用（关掉swap空间），内核也会执行页面换入操作，因此mem_cgroup_try_charge_swapin也被植入到了相应的函数中。</p>
+
+<p>3.当内核将page加入到page cache中时，也需要进行charge操作，mem_cgroup_cache_charge函数正是处理这种情况，它被植入到系统处理page cache的add_to_page_cache_locked函数中。</p>
+
+<p>4.最后mem_cgroup_prepare_migration是用于处理内存迁移中的charge操作。</p>
+
+<p>除了charge操作，memory子系统还需要处理相应的uncharge操作。下面我们来看一下uncharge操作：</p>
+
+<p>1.mem_cgroup_uncharge_page用于当匿名页完全unmaped的时候。但是如果该page是swap cache的话，uncharge操作延迟到mem_cgroup_uncharge_swapcache被调用时执行。</p>
+
+<p>2.mem_cgroup_uncharge_cache_page用于page cache从radix-tree删除的时候。但是如果该page是swap cache的话，uncharge操作延迟到mem_cgroup_uncharge_swapcache被调用时执行。</p>
+
+<p>3.mem_cgroup_uncharge_swapcache用于swap cache从radix-tree删除的时候。Charge的资源会被算到swap_cgroup，如果mem+swap controller被禁用了，就不需要这样做了。</p>
+
+<p>4.mem_cgroup_uncharge_swap用于swap_entry的引用数减到0的时候。这个函数主要在mem+swap controller可用的情况下使用的。</p>
+
+<p>5.mem_cgroup_end_migration用于内存迁移结束时相关的uncharge操作。</p>
+
+<p>Charge函数最终都是通过调用<strong>mem_cgroup_try_charge来实现的。在</strong>mem_cgroup_try_charge函数中，调用res_counter_charge(&amp;mem->res, csize, &amp;fail_res)对memory进行charge，调用res_counter_charge(&amp;mem->memsw, csize, &amp;fail_res)对memory+swap进行charge。</p>
+
+<p>Uncharge函数最终都是通过调用<strong>do_uncharge来实现的。在</strong>do_uncharge中，分别调用res_counter_uncharge(&amp;mem->res,PAGE_SIZE)和res_counter_uncharge(&amp;mem->memsw, PAGE_SIZE)来uncharge memory和memory+swap。</p>
+
+<p>跟其他子系统一样，memory子系统也实现了一个cgroup_subsys。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct cgroup_subsys mem_cgroup_subsys = {
+</span><span class='line'>&#9;.name = "memory",
+</span><span class='line'>&#9;.subsys_id = mem_cgroup_subsys_id,
+</span><span class='line'>&#9;.create = mem_cgroup_create,
+</span><span class='line'>&#9;.pre_destroy = mem_cgroup_pre_destroy,
+</span><span class='line'>&#9;.destroy = mem_cgroup_destroy,
+</span><span class='line'>&#9;.populate = mem_cgroup_populate,
+</span><span class='line'>&#9;.can_attach = mem_cgroup_can_attach,
+</span><span class='line'>&#9;.cancel_attach = mem_cgroup_cancel_attach,
+</span><span class='line'>&#9;.attach = mem_cgroup_move_task,
+</span><span class='line'>&#9;.early_init = 0,
+</span><span class='line'>&#9;.use_id = 1,
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>Memory子系统中重要的文件有</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>memsw.limit_in_bytes
+</span><span class='line'>{
+</span><span class='line'>&#9;.name = "memsw.limit_in_bytes",
+</span><span class='line'>&#9;.private = MEMFILE_PRIVATE(_MEMSWAP, RES_LIMIT),
+</span><span class='line'>&#9;.write_string = mem_cgroup_write,
+</span><span class='line'>&#9;.read_u64 = mem_cgroup_read,
+</span><span class='line'>},</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这个文件用于设定memory+swap上限值。</p>
+
+<p>Limit_in_bytes</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>{
+</span><span class='line'>&#9;.name = "limit_in_bytes",
+</span><span class='line'>&#9;.private = MEMFILE_PRIVATE(_MEM, RES_LIMIT),
+</span><span class='line'>&#9;.write_string = mem_cgroup_write,
+</span><span class='line'>&#9;.read_u64 = mem_cgroup_read,
+</span><span class='line'>},</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这个文件用于设定memory上限值。</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
       <h2 class="entry-title"><a href="/blog/2015/08/07/cgroup-7/">ns子系统</a></h2>
     
     
@@ -189,668 +761,6 @@ var ss360Config = {
 
     </article>
   
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/08/07/cgroup-6/">freezer子系统</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-08-07T17:15:00+08:00'><span class='date'>2015-08-07</span> <span class='time'>17:15:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://www.cnblogs.com/lisperl/archive/2012/04/25/2469587.html">http://www.cnblogs.com/lisperl/archive/2012/04/25/2469587.html</a></p>
-
-<p>freezer子系统用于挂起和恢复cgroup中的进程。freezer有一个控制文件：freezer.state，将FROZEN写入该文件，可以将cgroup中的进程挂起，将THAWED写入该文件，可以将已挂起的进程恢复。该文件可能读出的值有三种，其中两种就是前面已提到的FROZEN和THAWED，分别代表进程已挂起和已恢复（正常运行），还有一种可能的值为FREEZING，显示该值表示该cgroup中有些进程现在不能被frozen。当这些不能被frozen的进程从该cgroup中消失的时候，FREEZING会变成FROZEN，或者手动将FROZEN或THAWED写入一次。</p>
-
-<p>Freezer子系统用来管理cgroup状态的数据结构：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct freezer {
-</span><span class='line'>&#9;struct cgroup_subsys_state css;
-</span><span class='line'>&#9;enum freezer_state state;
-</span><span class='line'>&#9;spinlock_t lock; /* protects _writes_ to state */
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
-
-
-<p>其中内嵌一个cgroup_subsys_state，便于从cgroup或task获得freezer结构，另一个字段存储cgroup当前的状态。</p>
-
-<p>Freezer子系统是通过对freezer.state文件进行写入来控制进程的，那我们就从这个文件的cftype定义出发。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static struct cftype files[] = {
-</span><span class='line'>&#9;{
-</span><span class='line'>&#9;&#9;.name = "state",
-</span><span class='line'>&#9;&#9;.read_seq_string = freezer_read,
-</span><span class='line'>&#9;&#9;.write_string = freezer_write,
-</span><span class='line'>&#9;},
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
-
-
-<p>从文件读取是freezer_read实现的，该函数比较简单，主要就是从freezer结构体从读出状态，但是对FREEZING状态做了特殊处理：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>state = freezer-&gt;state;
-</span><span class='line'>if (state == CGROUP_FREEZING) {
-</span><span class='line'>&#9;/* We change from FREEZING to FROZEN lazily if the cgroup was
-</span><span class='line'>&#9; * only partially frozen when we exitted write. */
-</span><span class='line'>&#9;update_freezer_state(cgroup, freezer);
-</span><span class='line'>&#9;state = freezer-&gt;state;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>如果是FREEZING状态，则需要更新状态（因为之前不能frozen的进程可能已经不在了）。我们来看update_freezer_state：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>cgroup_iter_start(cgroup, &it);
-</span><span class='line'>while ((task = cgroup_iter_next(cgroup, &it))) {
-</span><span class='line'>&#9;ntotal++;
-</span><span class='line'>&#9;if (is_task_frozen_enough(task))
-</span><span class='line'>&#9;&#9;nfrozen++;
-</span><span class='line'>}
-</span><span class='line'> 
-</span><span class='line'>/*
-</span><span class='line'> * Transition to FROZEN when no new tasks can be added ensures
-</span><span class='line'> * that we never exist in the FROZEN state while there are unfrozen
-</span><span class='line'> * tasks.
-</span><span class='line'> */
-</span><span class='line'>if (nfrozen == ntotal)
-</span><span class='line'>&#9;freezer-&gt;state = CGROUP_FROZEN;
-</span><span class='line'>else if (nfrozen &gt; 0)
-</span><span class='line'>&#9;freezer-&gt;state = CGROUP_FREEZING;
-</span><span class='line'>else
-</span><span class='line'>&#9;freezer-&gt;state = CGROUP_THAWED;
-</span><span class='line'>cgroup_iter_end(cgroup, &it);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>这里对该cgroup所有的进程迭代了一遍，分别统计进程数和已经frozen的进程数，然后根据统计结果改变状态。</p>
-
-<p>下面我们来看对freezer.state写入的情况，该情况由freezer_write来处理，该函数中从写入值获取目标状态，然后调用freezer_change_state(cgroup, goal_state)来完成操作。在freezer_change_state中，根据goal_state分别调用不同的实现函数：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>switch (goal_state) {
-</span><span class='line'>case CGROUP_THAWED:
-</span><span class='line'>&#9;unfreeze_cgroup(cgroup, freezer);
-</span><span class='line'>&#9;break;
-</span><span class='line'>case CGROUP_FROZEN:
-</span><span class='line'>&#9;retval = try_to_freeze_cgroup(cgroup, freezer);
-</span><span class='line'>&#9;break;
-</span><span class='line'>default:
-</span><span class='line'>&#9;BUG();
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>我们先来看frozen的情况，该情况由try_to_freeze_cgroup来处理，该函数中有：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>freezer-&gt;state = CGROUP_FREEZING;
-</span><span class='line'>cgroup_iter_start(cgroup, &it);
-</span><span class='line'>while ((task = cgroup_iter_next(cgroup, &it))) {
-</span><span class='line'>&#9;if (!freeze_task(task, true))
-</span><span class='line'>&#9;&#9;continue;
-</span><span class='line'>&#9;if (is_task_frozen_enough(task))
-</span><span class='line'>&#9;&#9;continue;
-</span><span class='line'>&#9;if (!freezing(task) && !freezer_should_skip(task))
-</span><span class='line'>&#9;&#9;num_cant_freeze_now++;
-</span><span class='line'>}
-</span><span class='line'>cgroup_iter_end(cgroup, &it);
-</span><span class='line'> 
-</span><span class='line'>return num_cant_freeze_now ? -EBUSY : 0;</span></code></pre></td></tr></table></div></figure>
-
-
-<p>首先将当前状态设成CGROUP_FREEZING，然后对cgroup中的进程进行迭代，while循环中对进程进行freeze操作，如果成功直接进行下一次迭代，如果不成功则进行进一步的判断，如果是进程已经frozen了，那也直接进行下一次迭代，如果不是，则进行计数。最后根据计数结果进行返回，如果所有进程都顺利frozen，则返回0，否则返回-EBUSY表示有进程不能被frozen。</p>
-
-<p>下面我们来看free_task这个函数，在这个函数中对task进行freeze操作。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if (!freezing(p)) {
-</span><span class='line'>&#9;rmb();
-</span><span class='line'>&#9;if (frozen(p))
-</span><span class='line'>&#9;&#9;return false;
-</span><span class='line'> 
-</span><span class='line'>&#9;if (!sig_only || should_send_signal(p))
-</span><span class='line'>&#9;&#9;set_freeze_flag(p);
-</span><span class='line'>&#9;else
-</span><span class='line'>&#9;&#9;return false;
-</span><span class='line'>}
-</span><span class='line'> 
-</span><span class='line'>if (should_send_signal(p)) {
-</span><span class='line'>&#9;if (!signal_pending(p))
-</span><span class='line'>&#9;&#9;fake_signal_wake_up(p);
-</span><span class='line'>} else if (sig_only) {
-</span><span class='line'>&#9;return false;
-</span><span class='line'>} else {
-</span><span class='line'>&#9;wake_up_state(p, TASK_INTERRUPTIBLE);
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>return true;</span></code></pre></td></tr></table></div></figure>
-
-
-<p>首先检查进程是不是已经被标记为正在freezing，如果不是再做判断。如果进程已经被frozen，则返回false。如果进程不是sig_only的或者可以发送信号（即进程无PF_FREEZER_NOSIG 标记），则设置进程的TIF_FREEZE标记。</p>
-
-<p>然后根据进程是否有PF_FREEZER_NOSIG 标记进行进一步处理，如果无这个标记，则给进程发送一个信号，唤醒进程，让进程处理TIF_FREEZE，即进行freeze操作，如果有这个标记，则如果进程是sig_only的，返回false（即不能完成free操作），否则直接唤醒进程去处理TIF_FREEZE。</p>
-
-<p>总结一下，对于我们这个freezer子系统的调用来说，sig_only=true，那么能成功的执行过程就是set_freeze_flag(p)->fake_signal_wake_up(p)。</p>
-
-<p>下面我们来看thaw 进程的情况，该情况由unfreeze_cgroup处理，在unfreeze_cgroup中有</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>cgroup_iter_start(cgroup, &it);
-</span><span class='line'>while ((task = cgroup_iter_next(cgroup, &it))) {
-</span><span class='line'>&#9;thaw_process(task);
-</span><span class='line'>}
-</span><span class='line'>cgroup_iter_end(cgroup, &it);
-</span><span class='line'> 
-</span><span class='line'>freezer-&gt;state = CGROUP_THAWED;</span></code></pre></td></tr></table></div></figure>
-
-
-<p>对该cgroup中所有的进程调用thaw_process，我们来看thaw_process。该函数中有：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if (__thaw_process(p) == 1) {
-</span><span class='line'>&#9;task_unlock(p);
-</span><span class='line'>&#9;wake_up_process(p);
-</span><span class='line'>&#9;return 1;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>其中__thaw_process中</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if (frozen(p)) {
-</span><span class='line'>&#9;p-&gt;flags &= ~PF_FROZEN;
-</span><span class='line'>&#9;return 1;
-</span><span class='line'>}
-</span><span class='line'>clear_freeze_flag(p);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>如果进程已经frozen，则清掉其frozen标记，如果不是的话，说明进程已经设置了TIF_FREEZE，但还没有frozen，所以只需要清掉TIF_FREEZE即可。</p>
-
-<p>回到thaw_process中，清掉了相关标记后，只需要唤醒进程，然后内核会自动处理。</p>
-
-<p>最后，我们再来看看freezer子系统结构体的定义：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct cgroup_subsys freezer_subsys = {
-</span><span class='line'>&#9;.name = "freezer",
-</span><span class='line'>&#9;.create = freezer_create,
-</span><span class='line'>&#9;.destroy = freezer_destroy,
-</span><span class='line'>&#9;.populate = freezer_populate,
-</span><span class='line'>&#9;.subsys_id = freezer_subsys_id,
-</span><span class='line'>&#9;.can_attach = freezer_can_attach,
-</span><span class='line'>&#9;.attach = NULL,
-</span><span class='line'>&#9;.fork = freezer_fork,
-</span><span class='line'>&#9;.exit = NULL,
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
-
-
-<p>这里说一下can_attach，can_attach是在一个进程加入到一个cgroup之前调用的，检查是否可以attach，freezer_can_attach中对cgroup当前的状态做了检查，如果是frozen就返回错误，这说明不能将一个进程加入到一个frozen的cgroup。</p>
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/08/07/cgroup-5/">devices子系统</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-08-07T16:54:00+08:00'><span class='date'>2015-08-07</span> <span class='time'>16:54:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://www.cnblogs.com/lisperl/archive/2012/04/24/2468170.html">http://www.cnblogs.com/lisperl/archive/2012/04/24/2468170.html</a></p>
-
-<p>使用devices 子系统可以允许或者拒绝cgroup中的进程访问设备。devices子系统有三个控制文件：devices.allow,devices.deny,devices.list。devices.allow用于指定cgroup中的进程可以访问的设备,devices.deny用于指定cgroup中的进程不能访问的设备，devices.list用于报告cgroup中的进程访问的设备。devices.allow文件中包含若干条目，每个条目有四个字段：type、major、minor 和 access。type、major 和 minor 字段中使用的值对应 Linux 分配的设备。</p>
-
-<p>type指定设备类型：<br/>
-a - 应用所有设备，可以是字符设备，也可以是块设备<br/>
-b- 指定块设备<br/>
-c - 指定字符设备</p>
-
-<p>major和minor指定设备的主次设备号。</p>
-
-<p>access 则指定相应的权限：<br/>
-r - 允许任务从指定设备中读取<br/>
-w - 允许任务写入指定设备<br/>
-m - 允许任务生成还不存在的设备文件</p>
-
-<p>devices子系统是通过提供device whilelist 来实现的。与其他子系统一样，devices子系统也有一个内嵌了cgroup_subsystem_state的结构来管理资源。在devices子系统中，这个结构是：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct dev_cgroup {
-</span><span class='line'>&#9;struct cgroup_subsys_state css;
-</span><span class='line'>&#9;struct list_head whitelist;
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
-
-
-<p>这个结构体除了通用的cgroup_subsystem_state之外，就只有一个链表指针，而这个链表指针指向了该cgroup中的进程可以访问的devices whilelist。</p>
-
-<p>下面我们来看一下devices子系统如何管理whilelist。在devices子系统中，定义了一个叫dev_whitelist_item的结构来管理可以访问的device，对应于devices.allow中的一个条目。这个结构体的定义如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct dev_whitelist_item {
-</span><span class='line'>&#9;u32 major, minor;
-</span><span class='line'>&#9;short type;
-</span><span class='line'>&#9;short access;
-</span><span class='line'>&#9;struct list_head list;
-</span><span class='line'>&#9;struct rcu_head rcu;
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
-
-
-<p>major，minor用于指定设备的主次设备号，type用于指定设备类型，type取值可以是：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#define DEV_BLOCK 1
-</span><span class='line'>#define DEV_CHAR  2
-</span><span class='line'>#define DEV_ALL   4 </span></code></pre></td></tr></table></div></figure>
-
-
-<p>对应于之前devices.allow文件中三种情况。</p>
-
-<p>access用于相应的访问权限,access取值可以是:</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#define ACC_MKNOD 1
-</span><span class='line'>#define ACC_READ  2
-</span><span class='line'>#define ACC_WRITE 4</span></code></pre></td></tr></table></div></figure>
-
-
-<p>也和之前devices.allow文件中的情况对应。</p>
-
-<p>List字段用于将该结构体连到相应的dev_cgroup中whitelist指向的链表。</p>
-
-<p>通过以上数据结构，devices子系统就能管理一个cgroup的进程可以访问的devices了。 光有数据结构还不行，还要有具体实现才行。devices子系统通过实现两个函数供内核调用来实现控制cgroup中的进程能够访问的devices。首先我们来第一个函数：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>int devcgroup_inode_permission(struct inode *inode, int mask)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct dev_cgroup *dev_cgroup;
-</span><span class='line'>&#9;struct dev_whitelist_item *wh;
-</span><span class='line'> 
-</span><span class='line'>&#9;dev_t device = inode-&gt;i_rdev;
-</span><span class='line'>&#9;if (!device)
-</span><span class='line'>&#9;&#9;return 0;
-</span><span class='line'>&#9;if (!S_ISBLK(inode-&gt;i_mode) && !S_ISCHR(inode-&gt;i_mode))
-</span><span class='line'>&#9;&#9;return 0;
-</span><span class='line'> 
-</span><span class='line'>&#9;rcu_read_lock();
-</span><span class='line'> 
-</span><span class='line'>&#9;dev_cgroup = task_devcgroup(current);
-</span><span class='line'> 
-</span><span class='line'>&#9;list_for_each_entry_rcu(wh, &dev_cgroup-&gt;whitelist, list) {
-</span><span class='line'>&#9;&#9;if (wh-&gt;type & DEV_ALL)
-</span><span class='line'>&#9;&#9;&#9;goto found;
-</span><span class='line'>&#9;&#9;if ((wh-&gt;type & DEV_BLOCK) && !S_ISBLK(inode-&gt;i_mode))
-</span><span class='line'>&#9;&#9;&#9;continue;
-</span><span class='line'>&#9;&#9;if ((wh-&gt;type & DEV_CHAR) && !S_ISCHR(inode-&gt;i_mode))
-</span><span class='line'>&#9;&#9;&#9;continue;
-</span><span class='line'>&#9;&#9;if (wh-&gt;major != ~0 && wh-&gt;major != imajor(inode))
-</span><span class='line'>&#9;&#9;&#9;continue;
-</span><span class='line'>&#9;&#9;if (wh-&gt;minor != ~0 && wh-&gt;minor != iminor(inode))
-</span><span class='line'>&#9;&#9;&#9;continue;
-</span><span class='line'> 
-</span><span class='line'>&#9;&#9;if ((mask & MAY_WRITE) && !(wh-&gt;access & ACC_WRITE))
-</span><span class='line'>&#9;&#9;&#9;continue;
-</span><span class='line'>&#9;&#9;if ((mask & MAY_READ) && !(wh-&gt;access & ACC_READ))
-</span><span class='line'>&#9;&#9;&#9;continue;
-</span><span class='line'>&#9;&#9;found:
-</span><span class='line'>&#9;&#9;&#9;rcu_read_unlock();
-</span><span class='line'>&#9;&#9;return 0;
-</span><span class='line'>&#9;}
-</span><span class='line'> 
-</span><span class='line'>&#9;rcu_read_unlock();
-</span><span class='line'> 
-</span><span class='line'>&#9;return -EPERM;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>我们来简单分析一下这个函数，首先如果该inode对应的不是devices，直接返回0，如果既不是块设备也不是字符设备，也返回0，因为devices只控制块设备和字符设备的访问，其他情况不管。接着获得当前进程的dev_cgroup，然后在dev_cgroup中whitelist指针的链表中查找，如果找到对应设备而且mask指定的权限和设备的权限一致就返回0，如果没有找到就返回错误。</p>
-
-<p>这个函数是针对inode节点存在的情况，通过对比权限来控制cgroup中的进程能够访问的devices。还有一个情况是inode不存在，在这种情况下，一个进程要访问一个设备就必须通过mknod建立相应的设备文件。为了达到对这种情况的控制，devices子系统导出了第二个函数：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>int devcgroup_inode_mknod(int mode, dev_t dev)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct dev_cgroup *dev_cgroup;
-</span><span class='line'>&#9;struct dev_whitelist_item *wh;
-</span><span class='line'> 
-</span><span class='line'>&#9;if (!S_ISBLK(mode) && !S_ISCHR(mode))
-</span><span class='line'>&#9;&#9;return 0;
-</span><span class='line'> 
-</span><span class='line'>&#9;rcu_read_lock();
-</span><span class='line'> 
-</span><span class='line'>&#9;dev_cgroup = task_devcgroup(current);
-</span><span class='line'> 
-</span><span class='line'>&#9;list_for_each_entry_rcu(wh, &dev_cgroup-&gt;whitelist, list) {
-</span><span class='line'>&#9;&#9;if (wh-&gt;type & DEV_ALL)
-</span><span class='line'>&#9;&#9;&#9;goto found;
-</span><span class='line'>&#9;&#9;if ((wh-&gt;type & DEV_BLOCK) && !S_ISBLK(mode))
-</span><span class='line'>&#9;&#9;&#9;continue;
-</span><span class='line'>&#9;&#9;if ((wh-&gt;type & DEV_CHAR) && !S_ISCHR(mode))
-</span><span class='line'>&#9;&#9;&#9;continue;
-</span><span class='line'>&#9;&#9;if (wh-&gt;major != ~0 && wh-&gt;major != MAJOR(dev))
-</span><span class='line'>&#9;&#9;&#9;continue;
-</span><span class='line'>&#9;&#9;if (wh-&gt;minor != ~0 && wh-&gt;minor != MINOR(dev))
-</span><span class='line'>&#9;&#9;&#9;continue;
-</span><span class='line'> 
-</span><span class='line'>&#9;&#9;if (!(wh-&gt;access & ACC_MKNOD))
-</span><span class='line'>&#9;&#9;&#9;continue;
-</span><span class='line'>&#9;&#9;found:
-</span><span class='line'>&#9;&#9;&#9;rcu_read_unlock();
-</span><span class='line'>&#9;&#9;return 0;
-</span><span class='line'>&#9;}
-</span><span class='line'> 
-</span><span class='line'>&#9;rcu_read_unlock();
-</span><span class='line'> 
-</span><span class='line'>&#9;return -EPERM;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>这个函数的实现跟第一个函数类似，这里就不赘述了。</p>
-
-<p>下面我们再来看一下devices子系统本身的一些东西。跟其他子系统一样，devices同样实现了一个cgroup_subsys：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct cgroup_subsys devices_subsys = {
-</span><span class='line'>&#9;.name = "devices",
-</span><span class='line'>&#9;.can_attach = devcgroup_can_attach,
-</span><span class='line'>&#9;.create = devcgroup_create,
-</span><span class='line'>&#9;.destroy = devcgroup_destroy,
-</span><span class='line'>&#9;.populate = devcgroup_populate,
-</span><span class='line'>&#9;.subsys_id = devices_subsys_id,
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
-
-
-<p>devices相应的三个控制文件：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static struct cftype dev_cgroup_files[] = {
-</span><span class='line'>&#9;{
-</span><span class='line'>&#9;&#9;.name = "allow",
-</span><span class='line'>&#9;&#9;.write_string  = devcgroup_access_write,
-</span><span class='line'>&#9;&#9;.private = DEVCG_ALLOW,
-</span><span class='line'>&#9;},
-</span><span class='line'>&#9;{
-</span><span class='line'>&#9;&#9;.name = "deny",
-</span><span class='line'>&#9;&#9;.write_string = devcgroup_access_write,
-</span><span class='line'>&#9;&#9;.private = DEVCG_DENY,
-</span><span class='line'>&#9;},
-</span><span class='line'>&#9;{
-</span><span class='line'>&#9;&#9;.name = "list",
-</span><span class='line'>&#9;&#9;.read_seq_string = devcgroup_seq_read,
-</span><span class='line'>&#9;&#9;.private = DEVCG_LIST,
-</span><span class='line'>&#9;},
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
-
-
-<p>其中allow和deny都是通过devcgroup_access_write实现的，只是通过private字段区分，因为二者的实现逻辑有相同的地方。devcgroup_access_write最终通过调用devcgroup_update_access来实现。在devcgroup_update_access根据写入的内容构造一个dev_whitelist_item ，然后根据文件类型做不同的处理：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>switch (filetype) {
-</span><span class='line'>&#9;case DEVCG_ALLOW:
-</span><span class='line'>&#9;&#9;if (!parent_has_perm(devcgroup, &wh))
-</span><span class='line'>&#9;&#9;&#9;return -EPERM;
-</span><span class='line'>&#9;&#9;return dev_whitelist_add(devcgroup, &wh);
-</span><span class='line'>&#9;case DEVCG_DENY:
-</span><span class='line'>&#9;&#9;dev_whitelist_rm(devcgroup, &wh);
-</span><span class='line'>&#9;&#9;break;
-</span><span class='line'>&#9;default:
-</span><span class='line'>&#9;&#9;return -EINVAL;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>allow的话，就将item加入whitelist，deny的话，就将item从whitelist中删去。</p>
-</div>
-  
-  
-
-
-    </article>
-  
   <div class="pagination">
     
       <a class="prev" href="/posts/187">&larr; Older</a>
@@ -865,7 +775,7 @@ m - 允许任务生成还不存在的设备文件</p>
   
     <section>
 <h1>Categories
-<span class='right_span'>(967)</span>
+<span class='right_span'>(969)</span>
 
 </h1>
 <head>
@@ -956,7 +866,7 @@ if (!document.getElementById('assembly~base')) document.getElementById('aexp_ass
 if (!document.getElementById('assembly')) document.getElementById('aexp_assembly').style.visibility = 'hidden';
 if (!document.getElementById('assembly~win')) document.getElementById('aexp_assembly~win').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(199)</span></li>
+<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(200)</span></li>
 <div id='tools' class='catsub'><li><a href='/blog/cats/tools~apache2/?opendiv=tools'>apache2</a><a href='##' onmousedown=showDiv('tools~apache2') id='aexp_tools~apache2'><span class='exp_style' id='exp_tools~apache2'>[+]</span></a><span class='right_span'>9</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~apache2')) document.getElementById('aexp_tools~apache2').style.visibility = 'hidden';
@@ -997,7 +907,7 @@ if (!document.getElementById('tools~haproxy')) document.getElementById('aexp_too
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~isal')) document.getElementById('aexp_tools~isal').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/tools~mysql/?opendiv=tools'>mysql</a><a href='##' onmousedown=showDiv('tools~mysql') id='aexp_tools~mysql'><span class='exp_style' id='exp_tools~mysql'>[+]</span></a><span class='right_span'>30</span></li>
+<li><a href='/blog/cats/tools~mysql/?opendiv=tools'>mysql</a><a href='##' onmousedown=showDiv('tools~mysql') id='aexp_tools~mysql'><span class='exp_style' id='exp_tools~mysql'>[+]</span></a><span class='right_span'>31</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~mysql')) document.getElementById('aexp_tools~mysql').style.visibility = 'hidden';
 </script>
@@ -1194,8 +1104,8 @@ if (!document.getElementById('kernel~tcp')) document.getElementById('aexp_kernel
 if (!document.getElementById('kernel')) document.getElementById('aexp_kernel').style.visibility = 'hidden';
 if (!document.getElementById('kernel~vpn')) document.getElementById('aexp_kernel~vpn').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/network/'>network</a><a href='##' onmousedown=showDiv('network') id='aexp_network'><span class='exp_style' id='exp_network'>[+]</span></a><span class='right_span'>(8)</span></li>
-<div id='network' class='catsub'><li><a href='/blog/cats/network~base/?opendiv=network'>base</a><a href='##' onmousedown=showDiv('network~base') id='aexp_network~base'><span class='exp_style' id='exp_network~base'>[+]</span></a><span class='right_span'>8</span></li>
+<li class='catclass'><a href='/blog/cats/network/'>network</a><a href='##' onmousedown=showDiv('network') id='aexp_network'><span class='exp_style' id='exp_network'>[+]</span></a><span class='right_span'>(9)</span></li>
+<div id='network' class='catsub'><li><a href='/blog/cats/network~base/?opendiv=network'>base</a><a href='##' onmousedown=showDiv('network~base') id='aexp_network~base'><span class='exp_style' id='exp_network~base'>[+]</span></a><span class='right_span'>9</span></li>
 </div><script language='javascript' type='text/javascript'>
 if (!document.getElementById('network')) document.getElementById('aexp_network').style.visibility = 'hidden';
 if (!document.getElementById('network~base')) document.getElementById('aexp_network~base').style.visibility = 'hidden';
@@ -1307,7 +1217,7 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 
 <section>
 <h1>Date Categories
-<span class='right_span'>(967)</span>
+<span class='right_span'>(969)</span>
 
 </h1>
 <head>
@@ -1315,8 +1225,9 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(87)</span></li>
-<div id='2024' class='catsub'><li><a href='/blog/cats/2024~10/?opendiv=2024'>2024-10</a><span class='right_span'>5</span></li>
+<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(89)</span></li>
+<div id='2024' class='catsub'><li><a href='/blog/cats/2024~12/?opendiv=2024'>2024-12</a><span class='right_span'>2</span></li>
+<li><a href='/blog/cats/2024~10/?opendiv=2024'>2024-10</a><span class='right_span'>5</span></li>
 <li><a href='/blog/cats/2024~09/?opendiv=2024'>2024-09</a><span class='right_span'>15</span></li>
 <li><a href='/blog/cats/2024~08/?opendiv=2024'>2024-08</a><span class='right_span'>18</span></li>
 <li><a href='/blog/cats/2024~07/?opendiv=2024'>2024-07</a><span class='right_span'>26</span></li>
@@ -1488,6 +1399,14 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
   <ul id="recent_posts">
     
       <li class="post">
+        <a href="/blog/2024/12/12/tools-mysql-bin/">删除MySQL下的bin</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2024/12/12/network-sfp/">光模块配置</a>
+      </li>
+    
+      <li class="post">
         <a href="/blog/2024/10/27/network-ap-ac/">无线AP与AC详解</a>
       </li>
     
@@ -1517,14 +1436,6 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
     
       <li class="post">
         <a href="/blog/2024/09/20/sqlserver-_/">`_` 通配符 -- 匹配一个字符</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/09/14/lang-web-ding/">钉钉开放平台API</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/09/14/lang-web-staticmap/">腾讯地图--静态地图API</a>
       </li>
     
   </ul>

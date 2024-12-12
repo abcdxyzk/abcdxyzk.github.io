@@ -131,6 +131,354 @@ var ss360Config = {
       
   <header>
     
+      <h2 class="entry-title"><a href="/blog/2018/01/04/kernel-net-sk-lock/">sk 的锁，spin_lock_bh、lock_sock</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2018-01-04T02:20:00+08:00'><span class='date'>2018-01-04</span> <span class='time'>02:20:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><h4>一、修改sk的锁 sk_lock.slock</h4>
+
+<p>tcp协议栈对struct sock <em>sk有两把锁，第一把是sk_lock.slock，第二把则是sk_lock.owned。sk_lock.slock用于获取struct sock </em>sk对象的成员的修改权限；sk_lock.owned用于区分当前是进程上下文或是软中断上下文，为进程上下文时sk_lock.owned会被置1，中断上下文为0。</p>
+
+<p>如果是要对sk修改，首先是必须拿锁sk_lock.slock，其后是判断当前是软中断或是进程上下文，如果是进程上下文，那么一般也不能修改sk</p>
+
+<p>中断上下文可以用下面的锁，也就是下面的锁只有 spin_lock</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* BH context may only use the following locking interface. */
+</span><span class='line'>#define bh_lock_sock(__sk)      spin_lock(&((__sk)-&gt;sk_lock.slock))
+</span><span class='line'>#define bh_lock_sock_nested(__sk) \
+</span><span class='line'>&#9;&#9;&#9;&#9;spin_lock_nested(&((__sk)-&gt;sk_lock.slock), \
+</span><span class='line'>&#9;&#9;&#9;&#9;SINGLE_DEPTH_NESTING)
+</span><span class='line'>#define bh_unlock_sock(__sk)    spin_unlock(&((__sk)-&gt;sk_lock.slock))</span></code></pre></td></tr></table></div></figure>
+
+
+<p>非中断上下文可以直接用 spin_lock_bh(&amp;((sk)->sk_lock.slock))</p>
+
+<p>获得sk_lock.slock 锁后还要判断 sock_owned_by_user(sk), 如果被进程上下文占用也一般不能操作sk</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define sock_owned_by_user(sk)  ((sk)-&gt;sk_lock.owned)</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>二、进程上下文获取sk</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static inline void lock_sock(struct sock *sk)
+</span><span class='line'>{
+</span><span class='line'>&#9;lock_sock_nested(sk, 0);
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>void lock_sock_nested(struct sock *sk, int subclass)
+</span><span class='line'>{
+</span><span class='line'>&#9;might_sleep();
+</span><span class='line'>
+</span><span class='line'>&#9;// 先获取 sk_lock.slock 锁
+</span><span class='line'>&#9;spin_lock_bh(&sk-&gt;sk_lock.slock);
+</span><span class='line'>&#9;// 如果有进程占用sk，则调__lock_sock等待占用sk的进程结束
+</span><span class='line'>&#9;if (sk-&gt;sk_lock.owned)
+</span><span class='line'>&#9;&#9;__lock_sock(sk);
+</span><span class='line'>
+</span><span class='line'>&#9;// 此时占用sk的进程结束了，但前进程就可以占用sk
+</span><span class='line'>&#9;sk-&gt;sk_lock.owned = 1;
+</span><span class='line'>&#9;// 进程占用sk时不占 sk_lock.slock
+</span><span class='line'>&#9;spin_unlock(&sk-&gt;sk_lock.slock);
+</span><span class='line'>
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * The sk_lock has mutex_lock() semantics here:
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;mutex_acquire(&sk-&gt;sk_lock.dep_map, subclass, 0, _RET_IP_);
+</span><span class='line'>&#9;local_bh_enable();
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>static void __lock_sock(struct sock *sk)
+</span><span class='line'>&#9;__releases(&sk-&gt;sk_lock.slock)
+</span><span class='line'>&#9;__acquires(&sk-&gt;sk_lock.slock)
+</span><span class='line'>{
+</span><span class='line'>&#9;DEFINE_WAIT(wait);
+</span><span class='line'>
+</span><span class='line'>&#9;for (;;) {
+</span><span class='line'>&#9;&#9;prepare_to_wait_exclusive(&sk-&gt;sk_lock.wq, &wait,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;TASK_UNINTERRUPTIBLE);
+</span><span class='line'>&#9;&#9;spin_unlock_bh(&sk-&gt;sk_lock.slock);
+</span><span class='line'>&#9;&#9;schedule();
+</span><span class='line'>&#9;&#9;spin_lock_bh(&sk-&gt;sk_lock.slock);
+</span><span class='line'>&#9;&#9;if (!sock_owned_by_user(sk))
+</span><span class='line'>&#9;&#9;&#9;break;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;finish_wait(&sk-&gt;sk_lock.wq, &wait);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void release_sock(struct sock *sk)
+</span><span class='line'>{
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * The sk_lock has mutex_unlock() semantics:
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;mutex_release(&sk-&gt;sk_lock.dep_map, 1, _RET_IP_);
+</span><span class='line'>
+</span><span class='line'>&#9;spin_lock_bh(&sk-&gt;sk_lock.slock);
+</span><span class='line'>&#9;if (sk-&gt;sk_backlog.tail)
+</span><span class='line'>&#9;&#9;__release_sock(sk); // 处理backlog的包
+</span><span class='line'>
+</span><span class='line'>&#9;/* Warning : release_cb() might need to release sk ownership,
+</span><span class='line'>&#9; * ie call sock_release_ownership(sk) before us.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;if (sk-&gt;sk_prot-&gt;release_cb)
+</span><span class='line'>&#9;&#9;sk-&gt;sk_prot-&gt;release_cb(sk);
+</span><span class='line'>
+</span><span class='line'>&#9;// 获取sk_lock.slock，然后清除 sk_lock.owned
+</span><span class='line'>&#9;sock_release_ownership(sk);
+</span><span class='line'>&#9;if (waitqueue_active(&sk-&gt;sk_lock.wq))
+</span><span class='line'>&#9;&#9;wake_up(&sk-&gt;sk_lock.wq);
+</span><span class='line'>&#9;spin_unlock_bh(&sk-&gt;sk_lock.slock);
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>static inline void sock_release_ownership(struct sock *sk)
+</span><span class='line'>{
+</span><span class='line'>&#9;sk-&gt;sk_lock.owned = 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2018/01/04/kernel-net-df/">本地IP包分片--local_df,ignore_df</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2018-01-04T01:41:00+08:00'><span class='date'>2018-01-04</span> <span class='time'>01:41:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p>local_df 和 ignore_df 是一个意思，在某个版本rename了</p>
+
+<h4>ip_queue_xmit 函数中有：</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (ip_dont_fragment(sk, &rt-&gt;dst) && !skb-&gt;ignore_df)
+</span><span class='line'>&#9;iph-&gt;frag_off = htons(IP_DF);
+</span><span class='line'>else
+</span><span class='line'>&#9;iph-&gt;frag_off = 0;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>ip_dont_fragment</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static inline
+</span><span class='line'>int ip_dont_fragment(struct sock *sk, struct dst_entry *dst)
+</span><span class='line'>{
+</span><span class='line'>&#9;return  inet_sk(sk)-&gt;pmtudisc == IP_PMTUDISC_DO ||
+</span><span class='line'>&#9;&#9;(inet_sk(sk)-&gt;pmtudisc == IP_PMTUDISC_WANT &&
+</span><span class='line'>&#9;&#9; !(dst_metric_locked(dst, RTAX_MTU)));
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>一般情况下都是开启pmtu、skb->ignore_df = 0, 所以 iph->frag_off = htons(IP_DF);</p>
+
+<h4>ip_queue_xmit -> ip_finish_output -> ip_fragment :</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int ip_fragment(struct sock *sk, struct sk_buff *skb,
+</span><span class='line'>&#9;       unsigned int mtu, 
+</span><span class='line'>&#9;       int (*output)(struct sock *, struct sk_buff *))
+</span><span class='line'>{
+</span><span class='line'>&#9;struct iphdr *iph = ip_hdr(skb);
+</span><span class='line'>
+</span><span class='line'>&#9;// 如果需要分片，直接进入分片函数
+</span><span class='line'>&#9;if ((iph-&gt;frag_off & htons(IP_DF)) == 0)
+</span><span class='line'>&#9;&#9;return ip_do_fragment(sk, skb, output);
+</span><span class='line'>
+</span><span class='line'>&#9;// 如果没设置分片，或手动设置的分片过大，则直接丢弃
+</span><span class='line'>&#9;if (unlikely(!skb-&gt;ignore_df ||
+</span><span class='line'>&#9;&#9;     (IPCB(skb)-&gt;frag_max_size &&
+</span><span class='line'>&#9;&#9;      IPCB(skb)-&gt;frag_max_size &gt; mtu))) {
+</span><span class='line'>&#9;&#9;struct rtable *rt = skb_rtable(skb);
+</span><span class='line'>&#9;&#9;struct net_device *dev = rt-&gt;dst.dev;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;IP_INC_STATS(dev_net(dev), IPSTATS_MIB_FRAGFAILS);
+</span><span class='line'>&#9;&#9;icmp_send(skb, ICMP_DEST_UNREACH, ICMP_FRAG_NEEDED,
+</span><span class='line'>&#9;&#9;&#9;  htonl(mtu));
+</span><span class='line'>&#9;&#9;kfree_skb(skb);
+</span><span class='line'>&#9;&#9;return -EMSGSIZE;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;// 所以设置 skb-&gt;ignore_df = 1 且 skb-&gt;len &gt; mtu 则执行到这里
+</span><span class='line'>&#9;return ip_do_fragment(sk, skb, output);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>所以设置 skb->ignore_df = 1 且 skb->len > mtu 则执行 ip_do_fragment 进行IP分片,</p>
+
+<p>分片是按网卡mtu进行，如果mss小于网卡mtu-40，则需要设置 IPCB(skb)->frag_max_size</p>
+
+<h4>iph->frag_off 定义</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define IP_DF           0x4000          /* Flag: "Don't Fragment"       */
+</span><span class='line'>#define IP_MF           0x2000          /* Flag: "More Fragments"       */
+</span><span class='line'>#define IP_OFFSET       0x1FFF          /* "Fragment Offset" part       */</span></code></pre></td></tr></table></div></figure>
+
+
+<p>1) 不分片的包 iph->frag_off = htons(IP_DF)<br/>
+2) 最后一个分片包 ((ntohs(iph->frag_off) &amp; IP_OFFSET) > 0)<br/>
+3) 其余分片包 ((ntohs(iph->frag_off) &amp; IP_OFFSET) > 0 &amp;&amp; (iph->frag_off &amp; htons(IP_MF)) > 0)</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
       <h2 class="entry-title"><a href="/blog/2018/01/03/debug-mark-cong-rmmod/">拥塞控制模块无法卸载</a></h2>
     
     
@@ -187,254 +535,6 @@ var ss360Config = {
 
     </article>
   
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2017/12/03/command-iptables/">iptables</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2017-12-03T13:58:00+08:00'><span class='date'>2017-12-03</span> <span class='time'>13:58:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><h4>一台通过另一台上网</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>find /proc/ -name rp_filter -exec sh -c "echo 0 &gt; {} " \;
-</span><span class='line'>find /proc/ -name rp_filter -exec cat {} \;
-</span><span class='line'>
-</span><span class='line'>echo 1 &gt; /proc/sys/net/ipv4/ip_forward
-</span><span class='line'>cat /proc/sys/net/ipv4/ip_forward
-</span><span class='line'>
-</span><span class='line'>iptables -t nat -A POSTROUTING -s 12.0.0.10/24 -o wlp7s0 -j MASQUERADE
-</span><span class='line'>iptables -t nat -L -vn</span></code></pre></td></tr></table></div></figure>
-
-
-<hr />
-
-<p><a href="http://blog.csdn.net/l241002209/article/details/43987933">http://blog.csdn.net/l241002209/article/details/43987933</a></p>
-
-<h4>1、添加</h4>
-
-<p>添加规则有两个参数：-A和-I。其中<br/>
--A是添加到规则的末尾；<br/>
--I可以插入到指定位置，没有指定位置的话默认插入到规则的首部。</p>
-
-<h4>2、查看</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>iptables -nvL –line-number
-</span><span class='line'>
-</span><span class='line'> -L 查看当前表的所有规则，默认查看的是filter表，如果要查看NAT表，可以加上-t NAT参数
-</span><span class='line'> -n 不对ip地址进行反查，加上这个参数显示速度会快很多
-</span><span class='line'> -v 输出详细信息，包含通过该规则的数据包数量，总字节数及相应的网络接口
-</span><span class='line'> –line-number 显示规则的序列号，这个参数在删除或修改规则时会用到</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>3</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>iptables -nvL
-</span><span class='line'>iptables -F # 清除所有规则，但不改变默认策略
-</span><span class='line'>iptables -P INPUT ACCEPT  # INPUT 默认策略
-</span><span class='line'>iptables -P OUTPUT ACCEPT # OUTPUT 默认策略
-</span><span class='line'>
-</span><span class='line'>iptables -I INPUT -s 192.168.1.5 -j DROP # 头部插入
-</span><span class='line'>iptables -A INPUT -p tcp --dport 22 -j ACCEPT # 尾部追加，规则按顺序匹配的，匹配到就返回
-</span><span class='line'>
-</span><span class='line'>iptables -D INPUT -s 192.168.1.5 -j DROP
-</span><span class='line'>iptables -D INPUT 2
-</span></code></pre></td></tr></table></div></figure>
-
-
-<p>4、修改
-修改使用-R参数</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>iptables -R INPUT 3 -j ACCEPT</span></code></pre></td></tr></table></div></figure>
-
-
-<hr />
-
-<p><a href="https://blog.csdn.net/zqixiao_09/article/details/53401321">https://blog.csdn.net/zqixiao_09/article/details/53401321</a></p>
-
-<h3>NAT地址转换</h3>
-
-<h4>iptables nat 原理</h4>
-
-<p>同filter表一样，nat表也有三条缺省的"链"(chains)：</p>
-
-<h5>PREROUTING:目的DNAT规则</h5>
-
-<p>把从外来的访问重定向到其他的机子上，比如内部SERVER，或者DMZ。</p>
-
-<p>因为路由时只检查数据包的目的ip地址，所以必须在路由之前就进行目的PREROUTING DNAT;
-系统先PREROUTING DNAT翻译——>再过滤（FORWARD）——>最后路由。
-路由和过滤（FORWARD)中match 的目的地址，都是针对被PREROUTING DNAT之后的。</p>
-
-<h5>POSTROUTING:源SNAT规则</h5>
-
-<p>在路由以后在执行该链中的规则。</p>
-
-<p>系统先路由——>再过滤（FORWARD)——>最后才进行POSTROUTING SNAT地址其match 源地址是翻译前的。</p>
-
-<p>OUTPUT:定义对本地产生的数据包的目的NAT规则</p>
-
-<h4>内网访问外网  -J SNAT</h4>
-
-<p>-j SNAT 源网络地址转换，SNAT就是重写包的源IP地址, SNAT 只能用在nat表的POSTROUTING链里</p>
-
-<p>固定public 地址（外网接口地址）的最基本内访外SNAT</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>iptables -t nat -A POSTROUTING -s 192.168.0.0/24 -o eth0 -j SNAT --to 你的eth0地址</span></code></pre></td></tr></table></div></figure>
-
-
-<p>-j MASQUERADE</p>
-
-<p>用于外网口public地址是DHCP动态获取的（如ADSL）</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>iptables -t nat  -A POSTROUTING –o eth1 –s 192.168.1.0/24 –j MASQUERADE
-</span><span class='line'>iptables -t nat  -A POSTROUTING -o ppp0  -j  MASQUERADE</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>外网访问内网 –J DNT</h4>
-
-<p>DNAT：目的网络地址转换，重写包的目的IP地址</p>
-
-<h5>典型的DNAT的例子</h5>
-
-<p>外部接口ip：210.83.2.206 内部接口ip：192.168.1.1</p>
-
-<p>ftp服务器　：　ip 192.168.1.3 web服务器　：　ip 192.168.1.4</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>iptables -t nat -A PREROUTING -d 210.83.2.206 -p tcp --dport 21 -j DNAT --to 192.168.1.3
-</span><span class='line'>iptables -t nat -A PREROUTING -d 210.83.2.206 -p tcp --dport 80 -j DNAT --to 192.168.1.4</span></code></pre></td></tr></table></div></figure>
-
-
-<p>DNAT用于内部SERVER的load-balance（即CISCO的rotery）</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>iptables –t nat –A PREROUTING –d 219.142.217.161 –j DNAT --to-destination 192.168.1.24-192.168.1.25</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>DNAT  带端口映射(改变SERVER的端口)</h5>
-
-<p>一个FTP SERVER从内部192.168.100.125:21映射到216.94.87.37:2121的例子</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>iptables -t nat -A PREROUTING -p tcp -d 216.94.87.37 --dport 2121 -j DNAT --to-destination 192.168.100.125:21</span></code></pre></td></tr></table></div></figure>
-
-
-
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2017/12/03/lang-python/">python</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2017-12-03T13:24:00+08:00'><span class='date'>2017-12-03</span> <span class='time'>13:24:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><h4>python dict 是指针</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>[root@localhost tmp]# cat a.py
-</span><span class='line'>a = b = {}
-</span><span class='line'>a[1] = 2
-</span><span class='line'>print a
-</span><span class='line'>print b
-</span><span class='line'>
-</span><span class='line'>[root@localhost tmp]# python a.py
-</span><span class='line'>{1: 2}
-</span><span class='line'>{1: 2}</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>utf8</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#coding:utf-8</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>时间戳、int互转</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>t = time.mktime(time.strptime("2020-01-01 00:00:00", "%Y-%m-%d %H:%M:%S"))
-</span><span class='line'>ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t))</span></code></pre></td></tr></table></div></figure>
-
-
-
-</div>
-  
-  
-
-
-    </article>
-  
   <div class="pagination">
     
       <a class="prev" href="/posts/161">&larr; Older</a>
@@ -449,7 +549,7 @@ var ss360Config = {
   
     <section>
 <h1>Categories
-<span class='right_span'>(967)</span>
+<span class='right_span'>(969)</span>
 
 </h1>
 <head>
@@ -540,7 +640,7 @@ if (!document.getElementById('assembly~base')) document.getElementById('aexp_ass
 if (!document.getElementById('assembly')) document.getElementById('aexp_assembly').style.visibility = 'hidden';
 if (!document.getElementById('assembly~win')) document.getElementById('aexp_assembly~win').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(199)</span></li>
+<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(200)</span></li>
 <div id='tools' class='catsub'><li><a href='/blog/cats/tools~apache2/?opendiv=tools'>apache2</a><a href='##' onmousedown=showDiv('tools~apache2') id='aexp_tools~apache2'><span class='exp_style' id='exp_tools~apache2'>[+]</span></a><span class='right_span'>9</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~apache2')) document.getElementById('aexp_tools~apache2').style.visibility = 'hidden';
@@ -581,7 +681,7 @@ if (!document.getElementById('tools~haproxy')) document.getElementById('aexp_too
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~isal')) document.getElementById('aexp_tools~isal').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/tools~mysql/?opendiv=tools'>mysql</a><a href='##' onmousedown=showDiv('tools~mysql') id='aexp_tools~mysql'><span class='exp_style' id='exp_tools~mysql'>[+]</span></a><span class='right_span'>30</span></li>
+<li><a href='/blog/cats/tools~mysql/?opendiv=tools'>mysql</a><a href='##' onmousedown=showDiv('tools~mysql') id='aexp_tools~mysql'><span class='exp_style' id='exp_tools~mysql'>[+]</span></a><span class='right_span'>31</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~mysql')) document.getElementById('aexp_tools~mysql').style.visibility = 'hidden';
 </script>
@@ -778,8 +878,8 @@ if (!document.getElementById('kernel~tcp')) document.getElementById('aexp_kernel
 if (!document.getElementById('kernel')) document.getElementById('aexp_kernel').style.visibility = 'hidden';
 if (!document.getElementById('kernel~vpn')) document.getElementById('aexp_kernel~vpn').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/network/'>network</a><a href='##' onmousedown=showDiv('network') id='aexp_network'><span class='exp_style' id='exp_network'>[+]</span></a><span class='right_span'>(8)</span></li>
-<div id='network' class='catsub'><li><a href='/blog/cats/network~base/?opendiv=network'>base</a><a href='##' onmousedown=showDiv('network~base') id='aexp_network~base'><span class='exp_style' id='exp_network~base'>[+]</span></a><span class='right_span'>8</span></li>
+<li class='catclass'><a href='/blog/cats/network/'>network</a><a href='##' onmousedown=showDiv('network') id='aexp_network'><span class='exp_style' id='exp_network'>[+]</span></a><span class='right_span'>(9)</span></li>
+<div id='network' class='catsub'><li><a href='/blog/cats/network~base/?opendiv=network'>base</a><a href='##' onmousedown=showDiv('network~base') id='aexp_network~base'><span class='exp_style' id='exp_network~base'>[+]</span></a><span class='right_span'>9</span></li>
 </div><script language='javascript' type='text/javascript'>
 if (!document.getElementById('network')) document.getElementById('aexp_network').style.visibility = 'hidden';
 if (!document.getElementById('network~base')) document.getElementById('aexp_network~base').style.visibility = 'hidden';
@@ -891,7 +991,7 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 
 <section>
 <h1>Date Categories
-<span class='right_span'>(967)</span>
+<span class='right_span'>(969)</span>
 
 </h1>
 <head>
@@ -899,8 +999,9 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(87)</span></li>
-<div id='2024' class='catsub'><li><a href='/blog/cats/2024~10/?opendiv=2024'>2024-10</a><span class='right_span'>5</span></li>
+<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(89)</span></li>
+<div id='2024' class='catsub'><li><a href='/blog/cats/2024~12/?opendiv=2024'>2024-12</a><span class='right_span'>2</span></li>
+<li><a href='/blog/cats/2024~10/?opendiv=2024'>2024-10</a><span class='right_span'>5</span></li>
 <li><a href='/blog/cats/2024~09/?opendiv=2024'>2024-09</a><span class='right_span'>15</span></li>
 <li><a href='/blog/cats/2024~08/?opendiv=2024'>2024-08</a><span class='right_span'>18</span></li>
 <li><a href='/blog/cats/2024~07/?opendiv=2024'>2024-07</a><span class='right_span'>26</span></li>
@@ -1072,6 +1173,14 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
   <ul id="recent_posts">
     
       <li class="post">
+        <a href="/blog/2024/12/12/tools-mysql-bin/">删除MySQL下的bin</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2024/12/12/network-sfp/">光模块配置</a>
+      </li>
+    
+      <li class="post">
         <a href="/blog/2024/10/27/network-ap-ac/">无线AP与AC详解</a>
       </li>
     
@@ -1101,14 +1210,6 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
     
       <li class="post">
         <a href="/blog/2024/09/20/sqlserver-_/">`_` 通配符 -- 匹配一个字符</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/09/14/lang-web-ding/">钉钉开放平台API</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/09/14/lang-web-staticmap/">腾讯地图--静态地图API</a>
       </li>
     
   </ul>

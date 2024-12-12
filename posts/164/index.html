@@ -131,6 +131,408 @@ var ss360Config = {
       
   <header>
     
+      <h2 class="entry-title"><a href="/blog/2017/07/23/kernel-clock-1/">Linux时间子系统之一：clock source（时钟源）</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2017-07-23T12:54:00+08:00'><span class='date'>2017-07-23</span> <span class='time'>12:54:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://blog.csdn.net/droidphone/article/details/7975694">http://blog.csdn.net/droidphone/article/details/7975694</a></p>
+
+<p>clock source用于为Linux内核提供一个时间基线，如果你用linux的date命令获取当前时间，内核会读取当前的clock source，转换并返回合适的时间单位给用户空间。在硬件层，它通常实现为一个由固定时钟频率驱动的计数器，计数器只能单调地增加，直到溢出为止。时钟源是内核计时的基础，系统启动时，内核通过硬件RTC获得当前时间，在这以后，在大多数情况下，内核通过选定的时钟源更新实时时间信息（墙上时间），而不再读取RTC的时间。本节的内核代码树基于V3.4.10。</p>
+
+<h4>1. struct clocksource结构</h4>
+
+<p>内核用一个clocksource结构对真实的时钟源进行软件抽象，现在我们从clock source的数据结构开始，它的定义如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct clocksource {  
+</span><span class='line'>&#9;/* 
+</span><span class='line'>&#9; * Hotpath data, fits in a single cache line when the 
+</span><span class='line'>&#9; * clocksource itself is cacheline aligned. 
+</span><span class='line'>&#9; */  
+</span><span class='line'>&#9;cycle_t (*read)(struct clocksource *cs);  
+</span><span class='line'>&#9;cycle_t cycle_last;  
+</span><span class='line'>&#9;cycle_t mask;  
+</span><span class='line'>&#9;u32 mult;  
+</span><span class='line'>&#9;u32 shift;  
+</span><span class='line'>&#9;u64 max_idle_ns;  
+</span><span class='line'>&#9;u32 maxadj;  
+</span><span class='line'>#ifdef CONFIG_ARCH_CLOCKSOURCE_DATA  
+</span><span class='line'>&#9;struct arch_clocksource_data archdata;  
+</span><span class='line'>#endif  
+</span><span class='line'>  
+</span><span class='line'>&#9;const char *name;  
+</span><span class='line'>&#9;struct list_head list;  
+</span><span class='line'>&#9;int rating;  
+</span><span class='line'>&#9;int (*enable)(struct clocksource *cs);  
+</span><span class='line'>&#9;void (*disable)(struct clocksource *cs);  
+</span><span class='line'>&#9;unsigned long flags;  
+</span><span class='line'>&#9;void (*suspend)(struct clocksource *cs);  
+</span><span class='line'>&#9;void (*resume)(struct clocksource *cs);  
+</span><span class='line'>  
+</span><span class='line'>&#9;/* private: */  
+</span><span class='line'>#ifdef CONFIG_CLOCKSOURCE_WATCHDOG  
+</span><span class='line'>&#9;/* Watchdog related data, used by the framework */  
+</span><span class='line'>&#9;struct list_head wd_list;  
+</span><span class='line'>&#9;cycle_t cs_last;  
+</span><span class='line'>&#9;cycle_t wd_last;  
+</span><span class='line'>#endif  
+</span><span class='line'>} ____cacheline_aligned;  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>ocksource中的几个重要的字段。</p>
+
+<h5>1.1 rating：时钟源的精度</h5>
+
+<p>同一个设备下，可以有多个时钟源，每个时钟源的精度由驱动它的时钟频率决定，比如一个由10MHz时钟驱动的时钟源，他的精度就是100nS。clocksource结构中有一个rating字段，代表着该时钟源的精度范围，它的取值范围如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>1--99： 不适合于用作实际的时钟源，只用于启动过程或用于测试；
+</span><span class='line'>100--199：基本可用，可用作真实的时钟源，但不推荐；
+</span><span class='line'>200--299：精度较好，可用作真实的时钟源；
+</span><span class='line'>300--399：很好，精确的时钟源；
+</span><span class='line'>400--499：理想的时钟源，如有可能就必须选择它作为时钟源；</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>1.2 read回调函数</h5>
+
+<p>时钟源本身不会产生中断，要获得时钟源的当前计数，只能通过主动调用它的read回调函数来获得当前的计数值，注意这里只能获得计数值，也就是所谓的cycle，要获得相应的时间，必须要借助clocksource的mult和shift字段进行转换计算。</p>
+
+<h5>1.3 mult和shift字段</h5>
+
+<p>因为从clocksource中读到的值是一个cycle计数值，要转换为时间，我们必须要知道驱动clocksource的时钟频率F，一个简单的计算就可以完成：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>t = cycle/F;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>可是clocksource并没有保存时钟的频率F，因为使用上面的公式进行计算，需要使用浮点运算，这在内核中是不允许的，因此，内核使用了另外一个变通的办法，根据时钟的频率和期望的精度，事先计算出两个辅助常数mult和shift，然后使用以下公式进行cycle和t的转换：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>t = (cycle * mult) &gt;&gt; shift;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>只要我们保证：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>F = (1 &lt;&lt; shift) / mult;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>内核内部使用64位进行该转换计算：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static inline s64 clocksource_cyc2ns(cycle_t cycles, u32 mult, u32 shift)  
+</span><span class='line'>{  
+</span><span class='line'>&#9;return ((u64) cycles * mult) &gt;&gt; shift;  
+</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>从转换精度考虑，mult的值是越大越好，但是为了计算过程不发生溢出，mult的值又不能取得过大。为此内核假设cycle计数值被转换后的最大时间值：10分钟（600秒），主要的考虑是CPU进入IDLE状态后，时间信息不会被更新，只要在10分钟内退出IDLE，clocksource的cycle计数值就可以被正确地转换为相应的时间，然后系统的时间信息可以被正确地更新。当然最后的结果不一定是10分钟，它由clocksource_max_deferment进行计算，并保存max_idle_ns字段中，tickless的代码要考虑这个值，以防止在NO_HZ配置环境下，系统保持IDLE状态的时间过长。在这样，由10分钟这个假设的时间值，我们可以推算出合适的mult和shift值。</p>
+
+<h4>2. clocksource的注册和初始化</h4>
+
+<p>通常，clocksource要在初始化阶段通过clocksource_register_hz函数通知内核它的工作时钟的频率，调用的过程如下：</p>
+
+<p><img src="/images/kernel/2017-07-23-1.png" alt="" /></p>
+
+<p>由上图可见，最终大部分工作会转由__clocksource_register_scale完成，该函数首先完成对mult和shift值的计算，然后根据mult和shift值，最终通过clocksource_max_deferment获得该clocksource可接受的最大IDLE时间，并记录在clocksource的max_idle_ns字段中。clocksource_enqueue函数负责按clocksource的rating的大小，把该clocksource按顺序挂在全局链表clocksource_list上，rating值越大，在链表上的位置越靠前。</p>
+
+<p>每次新的clocksource注册进来，都会触发clocksource_select函数被调用，它按照rating值选择最好的clocksource，并记录在全局变量curr_clocksource中，然后通过timekeeping_notify函数通知timekeeping，当前clocksource已经变更，关于timekeeping，我将会在后续的博文中阐述。</p>
+
+<h4>3. clocksource watchdog</h4>
+
+<p>系统中可能同时会注册对个clocksource，各个clocksource的精度和稳定性各不相同，为了筛选这些注册的clocksource，内核启用了一个定时器用于监控这些clocksource的性能，定时器的周期设为0.5秒：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define WATCHDOG_INTERVAL (HZ &gt;&gt; 1)  
+</span><span class='line'>#define WATCHDOG_THRESHOLD (NSEC_PER_SEC &gt;&gt; 4)  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>当有新的clocksource被注册时，除了会挂在全局链表clocksource_list外，还会同时挂在一个watchdog链表上：watchdog_list。定时器周期性地（0.5秒）检查watchdog_list上的clocksource，WATCHDOG_THRESHOLD的值定义为0.0625秒，如果在0.5秒内，clocksource的偏差大于这个值就表示这个clocksource是不稳定的，定时器的回调函数通过clocksource_watchdog_kthread线程标记该clocksource，并把它的rate修改为0，表示精度极差。</p>
+
+<h4>4. 建立clocksource的简要过程</h4>
+
+<p>在系统的启动阶段，内核注册了一个基于jiffies的clocksource，代码位于kernel/time/jiffies.c：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct clocksource clocksource_jiffies = {  
+</span><span class='line'>&#9;.name       = "jiffies",  
+</span><span class='line'>&#9;.rating     = 1, /* lowest valid rating*/  
+</span><span class='line'>&#9;.read       = jiffies_read,  
+</span><span class='line'>&#9;.mask       = 0xffffffff, /*32bits*/  
+</span><span class='line'>&#9;.mult       = NSEC_PER_JIFFY &lt;&lt; JIFFIES_SHIFT, /* details above */  
+</span><span class='line'>&#9;.shift      = JIFFIES_SHIFT,  
+</span><span class='line'>};  
+</span><span class='line'>......  
+</span><span class='line'>  
+</span><span class='line'>static int __init init_jiffies_clocksource(void)  
+</span><span class='line'>{  
+</span><span class='line'>&#9;return clocksource_register(&clocksource_jiffies);  
+</span><span class='line'>}  
+</span><span class='line'>  
+</span><span class='line'>core_initcall(init_jiffies_clocksource);  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>它的精度只有1/HZ秒，rating值为1，如果平台的代码没有提供定制的clocksource_default_clock函数，它将返回该clocksource：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct clocksource * __init __weak clocksource_default_clock(void)  
+</span><span class='line'>{  
+</span><span class='line'>&#9;return &clocksource_jiffies;  
+</span><span class='line'>}  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>然后，在初始化的后段，clocksource的代码会把全局变量curr_clocksource设置为上述的clocksource：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int __init clocksource_done_booting(void)  
+</span><span class='line'>{  
+</span><span class='line'>&#9;&#9;......  
+</span><span class='line'>&#9;curr_clocksource = clocksource_default_clock();  
+</span><span class='line'>&#9;&#9;......  
+</span><span class='line'>&#9;finished_booting = 1;  
+</span><span class='line'>&#9;&#9;......  
+</span><span class='line'>&#9;clocksource_select();  
+</span><span class='line'>&#9;&#9;......  
+</span><span class='line'>&#9;return 0;  
+</span><span class='line'>}  
+</span><span class='line'>fs_initcall(clocksource_done_booting);  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>当然，如果平台级的代码在初始化时也会注册真正的硬件clocksource，所以经过clocksource_select()函数后，curr_clocksource将会被设为最合适的clocksource。如果clocksource_select函数认为需要切换更好的时钟源，它会通过timekeeping_notify通知timekeeping系统，使用新的clocksource进行时间计数和更新操作。</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2016/08/31/command-pssh_pscp/">pssh、pscp命令</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2016-08-31T00:20:00+08:00'><span class='date'>2016-08-31</span> <span class='time'>00:20:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://blog.csdn.net/kumu_linux/article/details/8562320">http://blog.csdn.net/kumu_linux/article/details/8562320</a></p>
+
+<p>pssh是一个python编写可以在多台服务器上执行命令的工具，同时支持拷贝文件，是同类工具中很出色的，类似pdsh，个人认为相对pdsh更为简便，使用必须在各个服务器上配置好密钥认证访问。</p>
+
+<p>项目地址： <a href="https://code.google.com/p/parallel-ssh/">https://code.google.com/p/parallel-ssh/</a></p>
+
+<p>PSSH provides parallel versions of OpenSSH and related tools. Included are pssh, pscp, prsync, pnuke, and pslurp. The project includes psshlib which can be used within custom applications. The source code is written in Python and can be cloned from:</p>
+
+<p>git clone <a href="http://code.google.com/p/parallel-ssh/">http://code.google.com/p/parallel-ssh/</a></p>
+
+<p>PSSH is supported on Python 2.4 and greater (including Python 3.1 and greater). It was originally written and maintained by Brent N. Chun. Due to his busy schedule, Brent handed over maintenance to Andrew McNabb in October 2009.</p>
+
+<h4>下载安装</h4>
+
+<h5>下载</h5>
+
+<p>wget <a href="http://parallel-ssh.googlecode.com/files/pssh-2.3.1.tar.gz">http://parallel-ssh.googlecode.com/files/pssh-2.3.1.tar.gz</a></p>
+
+<p>本地下载 <a href="/download/tools/pssh-2.3.1.tar.gz">pssh-2.3.1.tar.gz</a></p>
+
+<h5>安装</h5>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>tar xf pssh-2.3.1.tar.gz  
+</span><span class='line'>cd pssh-2.3.1/  
+</span><span class='line'>python setup.py install  </span></code></pre></td></tr></table></div></figure>
+
+
+<h5>参数命令介绍</h5>
+
+<p>pssh   在多个主机上并行地运行命令</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>   -h 执行命令的远程主机列表  或者 -H user@ip:port  文件内容格式[user@]host[:port]
+</span><span class='line'>
+</span><span class='line'>   -l 远程机器的用户名
+</span><span class='line'>
+</span><span class='line'>   -P 执行时输出执行信息
+</span><span class='line'>   -p 一次最大允许多少连接
+</span><span class='line'>   -o 输出内容重定向到一个文件
+</span><span class='line'>   -e 执行错误重定向到一个文件
+</span><span class='line'>   -t 设置命令执行的超时时间
+</span><span class='line'>   -A 提示输入密码并且把密码传递给ssh
+</span><span class='line'>   -O 设置ssh参数的具体配置，参照ssh_config配置文件
+</span><span class='line'>   -x 传递多个SSH 命令，多个命令用空格分开，用引号括起来
+</span><span class='line'>   -X 同-x 但是一次只能传递一个命令
+</span><span class='line'>   -i 显示标准输出和标准错误在每台host执行完毕后</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>其他命令</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>pscp     传输文件到多个hosts，类似scp
+</span><span class='line'>
+</span><span class='line'>pslurp   从多台远程机器拷贝文件到本地
+</span><span class='line'>
+</span><span class='line'>pnuke    并行在远程主机杀进程
+</span><span class='line'>
+</span><span class='line'>prsync   使用rsync协议从本地计算机同步到远程主机</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>实例</h4>
+
+<h5>pssh</h5>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>$ pssh -h ip.txt -l root chkconfig --level 2345 snmpd on  
+</span><span class='line'>[1] 10:59:29 [SUCCESS] ... ...  
+</span><span class='line'>[2] 10:59:29 [SUCCESS] ... ...  
+</span><span class='line'>[3] 10:59:29 [SUCCESS] ... ...  
+</span><span class='line'>... ...  </span></code></pre></td></tr></table></div></figure>
+
+
+<h5>pscp</h5>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>$ pscp -h ip.txt -l root /etc/snmp/snmpd.conf /etc/snmp/snmpd.conf  
+</span><span class='line'>[1] 11:00:42 [SUCCESS] ... ...  
+</span><span class='line'>[2] 11:00:42 [SUCCESS] ... ...  
+</span><span class='line'>[3] 11:00:42 [SUCCESS] ... ...  
+</span><span class='line'>... ...  </span></code></pre></td></tr></table></div></figure>
+
+
+
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
       <h2 class="entry-title"><a href="/blog/2016/05/21/kernel-irq-bh/">linux 中断下半部</a></h2>
     
     
@@ -279,621 +681,6 @@ var ss360Config = {
 
     </article>
   
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2016/05/11/debug-gdb-thread/">gdb线程</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2016-05-11T20:10:00+08:00'><span class='date'>2016-05-11</span> <span class='time'>20:10:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p>GDB多线程调试的基本命令。</p>
-
-<p>info threads 显示当前可调试的所有线程，每个线程会有一个GDB为其分配的ID，后面操作线程的时候会用到这个ID。 前面有*的是当前调试的线程。</p>
-
-<p>thread ID 切换当前调试的线程为指定ID的线程。</p>
-
-<p>break thread_test.c:123 thread all 在所有线程中相应的行上设置断点</p>
-
-<p>thread apply ID1 ID2 command 让一个或者多个线程执行GDB命令command。</p>
-
-<p>thread apply all command 让所有被调试线程执行GDB命令command。</p>
-
-<p>set scheduler-locking off|on|step 估计是实际使用过多线程调试的人都可以发现，在使用step或者continue命令调试当前被调试线程的时候，其他线程也是同时执行的，怎么只让被调试程序执行呢？通过这个命令就可以实现这个需求。off 不锁定任何线程，也就是所有线程都执行，这是默认值。 on 只有当前被调试程序会执行。 step 在单步的时候，除了next过一个函数的情况(熟悉情况的人可能知道，这其实是一个设置断点然后continue的行为)以外，只有当前线程会执行。</p>
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2016/03/29/debug-ksplice-detail/">理解Ksplice执行过程</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2016-03-29T16:00:00+08:00'><span class='date'>2016-03-29</span> <span class='time'>16:00:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://m.blog.chinaunix.net/uid-29280350-id-4717510.html">http://m.blog.chinaunix.net/uid-29280350-id-4717510.html</a></p>
-
-<p><a href="http://m.blog.chinaunix.net/uid-29280350-id-4906197.html">http://m.blog.chinaunix.net/uid-29280350-id-4906197.html</a></p>
-
-<hr />
-
-<p>注：在Linux-3.0.0 到 linux-3.8.0上能够正常运行，超过3.8.13就会导致系统桌面崩溃</p>
-
-<h3>1.Ksplice-create</h3>
-
-<p>Ksplice-create用于创建补丁文件，根据用户提供的不同的更新文件，ksplice-create有三种不同的途径：<br/>
-  1）Patch文件<br/>
-  2）Diffext指定新文件的后缀<br/>
-  3）使用git指定新的标记</p>
-
-<p>同时，ksplice-create还需要指定orig_config_dir（指定config的目录），在该目录下要有以下几个文件：<br/>
-  1）当前run内核的System.map<br/>
-  2）当前run内核的.config<br/>
-  3）当前run内核的modules库下的build链接<br/>
-以上三项缺一不可。</p>
-
-<h4>1.1配置</h4>
-
-<p>根据配置变量，组织make命令：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>make -rR</span></code></pre></td></tr></table></div></figure>
-
-
-<p>如果定义了jobs</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>-jn</span></code></pre></td></tr></table></div></figure>
-
-
-<p>如果定义了verbose level</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>V=1 否则 -s</span></code></pre></td></tr></table></div></figure>
-
-
-<p>make_ksplice 变量：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>@make -f $datadir/Makefile.ksplice @kbuild_flags</span></code></pre></td></tr></table></div></figure>
-
-
-<p>如果定义了build_modules</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>KSPLICE_BUILD_MODULES=1</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>1.2 Revert</h4>
-
-<p>配置变量完成后，ksplice-create会查找linux内核代码目录下是否会存在*.KSPLICE_presrc文件，存在该类型的文件则表明在该linux内核目录下曾制作过补丁文件，因此需要先将代码恢复为原始代码。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>my @revert_flags=("KSPLICE_MODE=revert");
-</span><span class='line'>&#9;Revert_orig()
-</span><span class='line'>&#9;&#9;Find出*.KSPLICE_presrc的文件，将之恢复为原始文件
-</span><span class='line'>&#9;&#9;执行命令：make -rR -f Makefile.ksplice KSPLICE_MODE=revert
-</span><span class='line'>
-</span><span class='line'>进入Makefile.ksplice文件：
-</span><span class='line'>&#9;Makefile.ksplice默认目标是__ksplice，
-</span><span class='line'>&#9;__ksplice: $(ksplice-deps) $(ksplice-dirs)
-</span><span class='line'>&#9;&#9;@:
-</span><span class='line'>
-</span><span class='line'>&#9;目标只是依赖两个dirs，没有具体的执行命令，所有的执行命令都是在依赖中执行的。对于ksplice-dirs的命令：
-</span><span class='line'>
-</span><span class='line'>&#9;$(ksplice-dirs):
-</span><span class='line'>&#9;&#9;$(Q) $(MAKE) $(build)=$(@:_ksplice_%=%)
-</span><span class='line'>&#9;&#9;其中
-</span><span class='line'>&#9;&#9;build := -f $(ksplice-makefile) obj
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;所以命令展开就是：
-</span><span class='line'>&#9;&#9;make -f /usr/local/share/ksplice/Makefile.ksplice obj=arch/x86/crypto
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;又再次进入makefile.ksplice，这次传入了obj。</span></code></pre></td></tr></table></div></figure>
-
-
-<p>revert的作用就是把.ksplice_pre的文件执行cmd_ksplice-revert。</p>
-
-<p>最后通过$(call cmd, ksplice-revert)调用</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>cmd_ksplice-revert = touch -r ksplice-revert-stamp $(@:_ksplice-revert_%=%); \
-</span><span class='line'>&#9;mv $(@:_ksplice-revert_%=%) $(@:_ksplice-revert_%.KSPLICE_pre=%)</span></code></pre></td></tr></table></div></figure>
-
-
-<p>在然后根据ksplice-clean-files把ksplice生成的文件clean掉。</p>
-
-<h4>1.3 SNAP</h4>
-
-<p>执行完revert之后，重新回到ksplice-create文件中继续执行</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>@snap_flags = (“KSPLICE_MODE=snap”);
-</span><span class='line'>runval_raw(@make_ksplice,@snap_flags)</span></code></pre></td></tr></table></div></figure>
-
-
-<p>展开即为：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>执行命令：make -rR -f Makefile.ksplice KSPLICE_MODE=snap</span></code></pre></td></tr></table></div></figure>
-
-
-<p>进入Makefile.ksplice文件：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>ifeq ($(KSPLICE_MODE),snap)
-</span><span class='line'>$(obj)/%.o.KSPLICE: $(obj)/%.o FORCE
-</span><span class='line'>&#9;$(if $(strip $(wildcard $&lt;.KSPLICE_pre) $(filter $&lt;, $?)), \
-</span><span class='line'>&#9;&#9;$(call cmd, ksplice-snap))
-</span><span class='line'>&#9;else
-</span><span class='line'>&#9;&#9;$(obj)/%. o.KSPLICE:$(obj)/%.o
-</span><span class='line'>&#9;&#9;$(call cmd, ksplice-diff)
-</span><span class='line'>&#9;endif</span></code></pre></td></tr></table></div></figure>
-
-
-<p>其中</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>cmd_ksplice-snap = $(ksplice-script) snap $@
-</span><span class='line'>cmd_ksplice-diff = $(ksplice-script) diff $@
-</span><span class='line'>ksplice-scrript = $(dir $(ksplice-makefile))ksplice-obj.pl</span></code></pre></td></tr></table></div></figure>
-
-
-<p>进入ksplice-obj.pl文件中:</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>sub do_snap {
-</span><span class='line'>&#9;my ($out) = @_;
-</span><span class='line'>&#9;my ($obj) = $out = ~ /^(.*)\.KSPLICE$/ or die;
-</span><span class='line'>&#9;die if (!-e $obj);
-</span><span class='line'>&#9;unlink "$obj.KSPLICE_pre" if (-e "$obj.KSPLICE_pre");
-</span><span class='line'>&#9;empty_diff($out);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>sub empty_diff {
-</span><span class='line'>&#9;my ($out) = @_;
-</span><span class='line'>&#9;my ($obj) = $out =~ /^(.*)\.KSPLICE$/ or die;
-</span><span class='line'>&#9;unlink "$obj.KSPLICE_new_code" if (-e "$obj.KSPLICE_new_code");
-</span><span class='line'>&#9;unlink "$obj.KSPLICE_old_code" if (-e "$obj.KSPLICE_old_code");
-</span><span class='line'>&#9;open OUT, '&gt;', "$out.tmp";
-</span><span class='line'>&#9;close OUT;
-</span><span class='line'>&#9;rename "$out.tmp", $out;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>snap的工作就是生成一个.o.KSPLICE空文件，函数empty_diff就是用来生成空文件的。.o.KSPLICE文件用来作为一个标志位，只是为了后续diff阶段，如果有不同的.o就会把.o.KSPLICE中写入1，最后遍历所有的.o.KSPLICE，哪些为1就知道哪些有差异了。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>sub do_diff {
-</span><span class='line'>&#9;my ($out) = @_;
-</span><span class='line'>&#9;my ($obj) = $out =~ /^(.*)\.KSPLICE$/ or die;
-</span><span class='line'>&#9;my $obj_pre = "$obj.KSPLICE_pre";
-</span><span class='line'>&#9;die if (!-e $obj);
-</span><span class='line'>&#9;die "Patch creates new object $obj" if (!-e $obj_pre);
-</span><span class='line'>&#9;if (system('cmp', '-s', '--', $obj_pre, $obj) == 0) {
-</span><span class='line'>&#9;&#9;unlink $obj_pre;
-</span><span class='line'>&#9;&#9;return empty_diff($out);
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;runval("$libexecdir/ksplice-objmanip", $obj, "$obj.KSPLICE_new_code", "keep-new-code", "$obj.KSPLICE_pre", $ENV{KSPLICE_KID});
-</span><span class='line'>&#9;return empty_diff($out) if (!-e "$obj.KSPLICE_new_code");
-</span><span class='line'>
-</span><span class='line'>&#9;open OUT, '&gt;', "$out.tmp";
-</span><span class='line'>&#9;print OUT "1\n";
-</span><span class='line'>&#9;close OUT;
-</span><span class='line'>&#9;rename "$out.tmp", $out;
-</span><span class='line'>&#9;runval("$libexecdir/ksplice-objmanip", $obj_pre, "$obj.KSPLICE_old_code", "keep-old-code");
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>无论snap还是diff都是要创建目标.o.KSPLICE, 但是动作不一样，并且snap是FORCE，diff不是强制的，最关键的就是打了patch之后，就会重新生成patch对应的.o，此时依赖条件更新了，就会执行diff命令。</p>
-
-<h4>1.4 创建ksplice模块</h4>
-
-<p>将kmodsrc目录拷贝到tmp目录下，执行命令：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>@make_kmodsrc = (@make, "-C", $kernel_headers_dir, "M=$kmodsrc", "KSPLICE_KID=$kid", "KSPLICE_VERSION=1.0", "map_printk=$map_printk");</span></code></pre></td></tr></table></div></figure>
-
-
-<p>编译内核模块，然后make modules_install，</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>@make_kmodsrc_install = (@make_kmodsrc, qw(modules_install --old-file=_modinst_post --old-file=_emodinst_post), "MAKE=make --old-file=_modinst_post --old-file=_emodinst_post", "INSTALL_MOD_STRIP=1", "MODLIB=$tmpdir/ksplice-modules");</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>1.5 PATCH</h4>
-
-<p>将准备的patch文件更新到内核中：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>runval_infile($patchfile, "patch", @patch_opt, "-bz", ".KSPLICE_presrc")；</span></code></pre></td></tr></table></div></figure>
-
-
-<p>-bz的意思：<br/>
--b 备份原始文件<br/>
--z 是用.KSPLICE_presrc为后缀备份原始文件。</p>
-
-<p>要注意patch文件中各个文件的行号等内容要对齐，不然patch文件无法更新到内核源码中（要每个文件都要检查，并确认patch文件可用）。</p>
-
-<p>打上补丁后，执行：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>make_ksplice KSPLICE_MODE=diff</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>1.6 DIFF</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>my @diff_flags = ("KSPLICE_MODE=diff")
-</span><span class='line'>runval_raw(@make_ksplice, @diff_flags);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>即执行命令：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>make -rR -f Makefile.ksplice KSPLICE_MODE=diff</span></code></pre></td></tr></table></div></figure>
-
-
-<p>进入Makefile.ksplice文件：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>ifeq ($(KSPLICE_MODE),diff)
-</span><span class='line'>&#9;define ksplice-cow-check
-</span><span class='line'>&#9;&#9;$(if $(strip $(1)),$(if $(filter-out %.KSPLICE,$@),$(if $(wildcard $@),$(if $(wildcard $@.KSPLICE_pre),,$(call cmd,ksplice-cow)))))$(1)
-</span><span class='line'>&#9;endef
-</span><span class='line'>
-</span><span class='line'>&#9;define ksplice-add-cow-check
-</span><span class='line'>&#9;&#9;$(v) = $$(call ksplice-cow-check,$(value $(v)))
-</span><span class='line'>&#9;endef
-</span><span class='line'>
-</span><span class='line'>&#9;ksplice-cow-eval += $(foreach v,if_changed if_changed_dep if_changed_rule,$(ksplice-add-cow-check))
-</span><span class='line'>endif   # KSPLICE_MODE</span></code></pre></td></tr></table></div></figure>
-
-
-<p>其中</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>cmd_ksplice-cow = cp -a $@ $@.KSPLICE_pre</span></code></pre></td></tr></table></div></figure>
-
-
-<p>diff比较的是.o.KSPLICE_pre 和 新编译的.o，从do_diff的实现来看，在diff之前，KSPLICE_pre就已经生成了，生成KSPLICE_pre的命令只有cmd-ksplice-cow, 即diff操作的结果。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>$KSPLICE_MODE ?= diff
-</span><span class='line'>ifeq ($(KSPLICE_MODE),snap)
-</span><span class='line'>&#9;$(obj)/%.o.KSPLICE: $(obj)/%.o FORCE
-</span><span class='line'>&#9;&#9;$(if $(strip $(wildcard $&lt;.KSPLICE_pre) $(filter $&lt;, $?)), \
-</span><span class='line'>&#9;&#9;&#9;$(call cmd, ksplice-snap))
-</span><span class='line'>else
-</span><span class='line'>&#9;$(obj)/%. o.KSPLICE:$(obj)/%.o
-</span><span class='line'>&#9;$(call cmd, ksplice-diff)
-</span><span class='line'>endif</span></code></pre></td></tr></table></div></figure>
-
-
-<p>在此处调用</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>cmd_ksplice-diff=$(ksplice-script) diff $@</span></code></pre></td></tr></table></div></figure>
-
-
-<p>进入ksplice-obj.pl中调用函数do_diff</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>sub do_diff {
-</span><span class='line'>&#9;my ($out) = @_;
-</span><span class='line'>&#9;my ($obj) = $out =~ /^(.*)\.KSPLICE$/ or die;
-</span><span class='line'>&#9;my $obj_pre = "$obj.KSPLICE_pre";
-</span><span class='line'>&#9;die if (!-e $obj);
-</span><span class='line'>&#9;die "Patch creates new object $obj" if (!-e $obj_pre);
-</span><span class='line'>&#9;if (system('cmp', '-s', '--', $obj_pre, $obj) == 0) {
-</span><span class='line'>&#9;&#9;unlink $obj_pre;
-</span><span class='line'>&#9;&#9;return empty_diff($out);
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;runval("$libexecdir/ksplice-objmanip", $obj, "$obj.KSPLICE_new_code", "keep-new-code", "$obj.KSPLICE_pre", $ENV{KSPLICE_KID});
-</span><span class='line'>&#9;return empty_diff($out) if (!-e "$obj.KSPLICE_new_code");
-</span><span class='line'>
-</span><span class='line'>&#9;open OUT, '&gt;', "$out.tmp";
-</span><span class='line'>&#9;print OUT "1\n";
-</span><span class='line'>&#9;close OUT;
-</span><span class='line'>&#9;rename "$out.tmp", $out;
-</span><span class='line'>
-</span><span class='line'>&#9;runval("$libexecdir/ksplice-objmanip", $obj_pre, "$obj.KSPLICE_old_code", "keep-old-code");
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>此处有三个关键点，第一system系统调用cmp，比较$(obj)和$obj_pre之间的不同，第二通过调用ksplice-objmanip（即objmanip）生成new_code，并且在.o.KSPLICE_pre中写入标志位1，第三步调用ksplice-objmanip（即objmanip）将未打patch之前的代码生成old_code。第二步和第三步进入到C文件objmanip.c的main()函数中，根据传入的参数的不同，调用不同的函数，最后生成new和old。</p>
-
-<h4>1.7 模块编译</h4>
-
-<p>命令：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>runstr（qw(find -name *.KSPLCE* !  ( - name *.KSPLICE -empty ) ! -name .*.KSPLICE.cmd -print0)）</span></code></pre></td></tr></table></div></figure>
-
-
-<p>找出所有<em>.KSPLICE</em>非空的文件，将读入的内容保存到@modules中。对MOD的处理是在KSPLICE_KMODSRC中生成的。</p>
-
-<p>命令：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>runval(@make_ksplice, "KSPLICE_MODE=modinst", "MODLIB=$tmpdir/modules", "INSTALL_MOD_STRIP=1", "modules=@modulepaths");</span></code></pre></td></tr></table></div></figure>
-
-
-<p>在Makefile.ksplice中，对modinst的处理是：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>ifeq ($(KSPLICE_MODE),modinst)
-</span><span class='line'>ksplice-deps += ksplice_modinst
-</span><span class='line'>PHONY += ksplice_modinst
-</span><span class='line'>ksplice_modinst:
-</span><span class='line'>&#9;$(Q) $(MAKE) –f $(srctree)/scripts/Makefile.modinst
-</span><span class='line'>endif</span></code></pre></td></tr></table></div></figure>
-
-
-<p>这里的Makefile.modinst和Makefile.modpost都是内核script中的Makefile。</p>
-
-<p>在ksplice-create中分别调用了两次make_kmodsrc， 第一次编译出ksplice.ko模块，第二次传入参数KSPLICE_MODULES=@modules 生成new.ko 和 old.ko文件。在kmodsrc目录中的Makefile中，第一次编译的是KSPLICE_CORE:</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>KSPLICE_CORE = ksplice-$(KSPLICE_KID)
-</span><span class='line'>obj-m += $(KSPLICE_CORE).o</span></code></pre></td></tr></table></div></figure>
-
-
-<p>实际上最终编译生成ksplice-kid.ko 还是依靠的obj-m的方法编译的。</p>
-
-<p>第二次编译的时候传入的modules，同时KSPLICE_SKIP_CORE=1，表示不编译ksplice.ko</p>
-
-<p>在ksplice-create中，执行命令：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>runval(@make_kmodsrc, "KSPLICE_MODULES=@modules", "KSPLICE_SKIP_CORE=1");
-</span><span class='line'>runval(@make_kmodsrc_install, "KSPLICE_MODULES=@modules", "KSPLICE_SKIP_CORE=1");</span></code></pre></td></tr></table></div></figure>
-
-
-<p>在kmodsrc/Makefile中：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>ifneq ($(KSPLICE_MODULES),)
-</span><span class='line'>&#9;$(foreach mod,$(KSPLICE_MODULES),$(obj)/new-code-$(target).o): $(obj)/%.o: $ (src)/new_code_loader.c FORCE
-</span><span class='line'>&#9;$(call if_changed_rule,cc_o_c)
-</span><span class='line'>&#9;$(foreach mod,$(KSPLICE_MODULES),$(obj)/old-code-$(target).o): $(obj)/%.o: $ (src)/old_code_loader.c FORCE
-</span><span class='line'>&#9;$(call if_changed_rule,cc_o_c)
-</span><span class='line'>endif</span></code></pre></td></tr></table></div></figure>
-
-
-<p>以new为例：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>$(KSPLICE)-n-objs = $(ksplice-new-code-objs)
-</span><span class='line'>ksplice-new-code-objs = new-code-$(target).o collect-new-code-$(mod).o</span></code></pre></td></tr></table></div></figure>
-
-
-<p>new.ko由new-code-mod.o 和 collect-new-code-$(mod).o 组成。</p>
-
-<p>new-code-mod.o的命令：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>$(foreach mod,$(KSPLICE_MODULES),$(obj)/new-code-$(target).o): $(obj)/%.o: \
-</span><span class='line'>&#9;$ (src)/new_code_loader.c FORCE
-</span><span class='line'>$(call if_changed_rule,cc_o_c)</span></code></pre></td></tr></table></div></figure>
-
-
-<p>collect-new-code-$(mod).o的命令：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>$(obj)/collect-new-code-%.o: $(obj)/%.o.KSPLICE_new_code $(obj)/ksplice.lds     FORCE
-</span><span class='line'>$(call if_changed,ksplice-collect)
-</span><span class='line'>cmd_ksplice-collect = \
-</span><span class='line'>&#9;$(ksplice-script) finalize $&lt; $&lt;.final $* && \
-</span><span class='line'>&#9;$(LD) --script=$(obj)/ksplice.lds -r -o $@ $&lt;.final</span></code></pre></td></tr></table></div></figure>
-
-
-<p>collect的命令最后调用do_finalize生成mod.final，再结合ksplice.lds 生成collect-new-code-mod.o</p>
-
-<h3>2.ksplice-apply</h3>
-
-<h4>2.1 校验补丁文件</h4>
-
-<p>第一，执行命令：chdir(unpack_update($file))</p>
-
-<p>其中 unpack_update()在文件Ksplice.pm中，首先检测使用的补丁文件是否是目录，如果是则返回到ksplice-apply文件中；如果是压缩文件则将其解压到/tmp/临时目录下，然后将路径返回到ksplice-apply文件中。</p>
-
-<p>第二，检测目标路径中是否存在contents文件，不存在就退出ksplice-apply程序。</p>
-
-<p>第三，检测当前系统/sys/moudle下面是否已经加载了该补丁文件。</p>
-
-<p>在上述操作中，如果有不满足要求的，通过设置apply_errors来输出错误信息。</p>
-
-<h4>2.2 加载补丁文件</h4>
-
-<p>执行命令load_module($change->{new_code_file})</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>sub load_module {
-</span><span class='line'>&#9;my ($module, @params) = @_;
-</span><span class='line'>&#9;push @modules_loaded, ($module =~ m/^(.)\.ko$/);
-</span><span class='line'>&#9;if (runval_raw("insmod", $module, @params) != 0){
-</span><span class='line'>&#9;&#9;pop @modules_loaded;
-</span><span class='line'>&#9;&#9;child_error();
-</span><span class='line'>&#9;&#9;return 0;
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;return 1;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>在函数load_module()中调用系统函数insmod来加载ko文件。如果在加载过程中出现错误，由insmod返回错误信息。</p>
-</div>
-  
-  
-
-
-    </article>
-  
   <div class="pagination">
     
       <a class="prev" href="/posts/165">&larr; Older</a>
@@ -908,7 +695,7 @@ var ss360Config = {
   
     <section>
 <h1>Categories
-<span class='right_span'>(967)</span>
+<span class='right_span'>(969)</span>
 
 </h1>
 <head>
@@ -999,7 +786,7 @@ if (!document.getElementById('assembly~base')) document.getElementById('aexp_ass
 if (!document.getElementById('assembly')) document.getElementById('aexp_assembly').style.visibility = 'hidden';
 if (!document.getElementById('assembly~win')) document.getElementById('aexp_assembly~win').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(199)</span></li>
+<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(200)</span></li>
 <div id='tools' class='catsub'><li><a href='/blog/cats/tools~apache2/?opendiv=tools'>apache2</a><a href='##' onmousedown=showDiv('tools~apache2') id='aexp_tools~apache2'><span class='exp_style' id='exp_tools~apache2'>[+]</span></a><span class='right_span'>9</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~apache2')) document.getElementById('aexp_tools~apache2').style.visibility = 'hidden';
@@ -1040,7 +827,7 @@ if (!document.getElementById('tools~haproxy')) document.getElementById('aexp_too
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~isal')) document.getElementById('aexp_tools~isal').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/tools~mysql/?opendiv=tools'>mysql</a><a href='##' onmousedown=showDiv('tools~mysql') id='aexp_tools~mysql'><span class='exp_style' id='exp_tools~mysql'>[+]</span></a><span class='right_span'>30</span></li>
+<li><a href='/blog/cats/tools~mysql/?opendiv=tools'>mysql</a><a href='##' onmousedown=showDiv('tools~mysql') id='aexp_tools~mysql'><span class='exp_style' id='exp_tools~mysql'>[+]</span></a><span class='right_span'>31</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~mysql')) document.getElementById('aexp_tools~mysql').style.visibility = 'hidden';
 </script>
@@ -1237,8 +1024,8 @@ if (!document.getElementById('kernel~tcp')) document.getElementById('aexp_kernel
 if (!document.getElementById('kernel')) document.getElementById('aexp_kernel').style.visibility = 'hidden';
 if (!document.getElementById('kernel~vpn')) document.getElementById('aexp_kernel~vpn').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/network/'>network</a><a href='##' onmousedown=showDiv('network') id='aexp_network'><span class='exp_style' id='exp_network'>[+]</span></a><span class='right_span'>(8)</span></li>
-<div id='network' class='catsub'><li><a href='/blog/cats/network~base/?opendiv=network'>base</a><a href='##' onmousedown=showDiv('network~base') id='aexp_network~base'><span class='exp_style' id='exp_network~base'>[+]</span></a><span class='right_span'>8</span></li>
+<li class='catclass'><a href='/blog/cats/network/'>network</a><a href='##' onmousedown=showDiv('network') id='aexp_network'><span class='exp_style' id='exp_network'>[+]</span></a><span class='right_span'>(9)</span></li>
+<div id='network' class='catsub'><li><a href='/blog/cats/network~base/?opendiv=network'>base</a><a href='##' onmousedown=showDiv('network~base') id='aexp_network~base'><span class='exp_style' id='exp_network~base'>[+]</span></a><span class='right_span'>9</span></li>
 </div><script language='javascript' type='text/javascript'>
 if (!document.getElementById('network')) document.getElementById('aexp_network').style.visibility = 'hidden';
 if (!document.getElementById('network~base')) document.getElementById('aexp_network~base').style.visibility = 'hidden';
@@ -1350,7 +1137,7 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 
 <section>
 <h1>Date Categories
-<span class='right_span'>(967)</span>
+<span class='right_span'>(969)</span>
 
 </h1>
 <head>
@@ -1358,8 +1145,9 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(87)</span></li>
-<div id='2024' class='catsub'><li><a href='/blog/cats/2024~10/?opendiv=2024'>2024-10</a><span class='right_span'>5</span></li>
+<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(89)</span></li>
+<div id='2024' class='catsub'><li><a href='/blog/cats/2024~12/?opendiv=2024'>2024-12</a><span class='right_span'>2</span></li>
+<li><a href='/blog/cats/2024~10/?opendiv=2024'>2024-10</a><span class='right_span'>5</span></li>
 <li><a href='/blog/cats/2024~09/?opendiv=2024'>2024-09</a><span class='right_span'>15</span></li>
 <li><a href='/blog/cats/2024~08/?opendiv=2024'>2024-08</a><span class='right_span'>18</span></li>
 <li><a href='/blog/cats/2024~07/?opendiv=2024'>2024-07</a><span class='right_span'>26</span></li>
@@ -1531,6 +1319,14 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
   <ul id="recent_posts">
     
       <li class="post">
+        <a href="/blog/2024/12/12/tools-mysql-bin/">删除MySQL下的bin</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2024/12/12/network-sfp/">光模块配置</a>
+      </li>
+    
+      <li class="post">
         <a href="/blog/2024/10/27/network-ap-ac/">无线AP与AC详解</a>
       </li>
     
@@ -1560,14 +1356,6 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
     
       <li class="post">
         <a href="/blog/2024/09/20/sqlserver-_/">`_` 通配符 -- 匹配一个字符</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/09/14/lang-web-ding/">钉钉开放平台API</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/09/14/lang-web-staticmap/">腾讯地图--静态地图API</a>
       </li>
     
   </ul>

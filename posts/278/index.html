@@ -131,6 +131,568 @@ var ss360Config = {
       
   <header>
     
+      <h2 class="entry-title"><a href="/blog/2013/12/25/debug-kprobe-doc/">kprobes Documentation</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2013-12-25T14:04:00+08:00'><span class='date'>2013-12-25</span> <span class='time'>14:04:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="https://www.kernel.org/doc/Documentation/kprobes.txt">https://www.kernel.org/doc/Documentation/kprobes.txt</a></p>
+
+<p>Documentation/kprobes.txt</p>
+
+<h4>1.4 How Does Jump Optimization Work?</h4>
+
+<p>If your kernel is built with CONFIG_OPTPROBES=y (currently this flag<br/>
+is automatically set &lsquo;y&rsquo; on x86/x86-64, non-preemptive kernel) and<br/>
+the &ldquo;debug.kprobes_optimization&rdquo; kernel parameter is set to 1 (see<br/>
+sysctl(8)), Kprobes tries to reduce probe-hit overhead by using a jump<br/>
+instruction instead of a breakpoint instruction at each probepoint.</p>
+
+<h5>1.4.1 Init a Kprobe</h5>
+
+<p>When a probe is registered, before attempting this optimization,<br/>
+Kprobes inserts an ordinary, breakpoint-based kprobe at the specified<br/>
+address. So, even if it&rsquo;s not possible to optimize this particular<br/>
+probepoint, there&rsquo;ll be a probe there.</p>
+
+<h5>1.4.2 Safety Check</h5>
+
+<p>Before optimizing a probe, Kprobes performs the following safety checks:</p>
+
+<ul>
+<li><p>Kprobes verifies that the region that will be replaced by the jump<br/>
+instruction (the &ldquo;optimized region&rdquo;) lies entirely within one function.<br/>
+(A jump instruction is multiple bytes, and so may overlay multiple<br/>
+instructions.)</p></li>
+<li><p>Kprobes analyzes the entire function and verifies that there is no<br/>
+jump into the optimized region.  Specifically:</p>
+
+<ul>
+<li>the function contains no indirect jump;</li>
+<li>the function contains no instruction that causes an exception (since<br/>
+the fixup code triggered by the exception could jump back into the<br/>
+optimized region &ndash; Kprobes checks the exception tables to verify this);<br/>
+and</li>
+<li>there is no near jump to the optimized region (other than to the first<br/>
+byte).</li>
+</ul>
+</li>
+<li><p>For each instruction in the optimized region, Kprobes verifies that<br/>
+the instruction can be executed out of line.</p></li>
+</ul>
+
+
+<h5>1.4.3 Preparing Detour Buffer</h5>
+
+<p>Next, Kprobes prepares a &ldquo;detour&rdquo; buffer, which contains the following<br/>
+instruction sequence:<br/>
+- <span style="color:red">code to push the CPU&rsquo;s registers (emulating a breakpoint trap)</span><br/>
+- <span style="color:red">a call to the trampoline code which calls user&rsquo;s probe handlers.</span><br/>
+- <span style="color:red">code to restore registers</span><br/>
+- <span style="color:red">the instructions from the optimized region</span><br/>
+- <span style="color:red">a jump back to the original execution path.</span></p>
+
+<h5>1.4.4 Pre-optimization</h5>
+
+<p>After preparing the detour buffer, Kprobes verifies that none of the<br/>
+following situations exist:<br/>
+- <span style="color:red">The probe has either a break_handler (i.e., it&rsquo;s a jprobe) or a post_handler.</span><br/>
+- <span style="color:red">Other instructions in the optimized region are probed.</span><br/>
+- <span style="color:red">The probe is disabled.</span></p>
+
+<p>In any of the above cases, Kprobes won&rsquo;t start optimizing the probe.<br/>
+Since these are temporary situations, Kprobes tries to start<br/>
+optimizing it again if the situation is changed.</p>
+
+<p>If the kprobe can be optimized, Kprobes enqueues the kprobe to an<br/>
+optimizing list, and kicks the kprobe-optimizer workqueue to optimize<br/>
+it.  If the to-be-optimized probepoint is hit before being optimized,<br/>
+Kprobes returns control to the original instruction path by setting<br/>
+the CPU&rsquo;s instruction pointer to the copied code in the detour buffer<br/>
+&ndash; thus at least avoiding the single-step.</p>
+
+<h5>1.4.5 Optimization</h5>
+
+<p>The Kprobe-optimizer doesn&rsquo;t insert the jump instruction immediately;<br/>
+rather, it calls synchronize_sched() for safety first, because it&rsquo;s<br/>
+possible for a CPU to be interrupted in the middle of executing the<br/>
+optimized region(*).  As you know, synchronize_sched() can ensure<br/>
+that all interruptions that were active when synchronize_sched()<br/>
+was called are done, but only if CONFIG_PREEMPT=n.  So, this version<br/>
+of kprobe optimization supports only kernels with CONFIG_PREEMPT=n.(**)</p>
+
+<p>After that, the Kprobe-optimizer calls stop_machine() to replace<br/>
+the optimized region with a jump instruction to the detour buffer,<br/>
+using text_poke_smp().</p>
+
+<h5>1.4.6 Unoptimization</h5>
+
+<p>When an optimized kprobe is unregistered, disabled, or blocked by<br/>
+another kprobe, it will be unoptimized.  If this happens before<br/>
+the optimization is complete, the kprobe is just dequeued from the<br/>
+optimized list.  If the optimization has been done, the jump is<br/>
+replaced with the original code (except for an int3 breakpoint in<br/>
+the first byte) by using text_poke_smp().</p>
+
+<p>(<em>)Please imagine that the 2nd instruction is interrupted and then<br/>
+the optimizer replaces the 2nd instruction with the jump </em>address*<br/>
+while the interrupt handler is running. When the interrupt<br/>
+returns to original address, there is no valid instruction,<br/>
+and it causes an unexpected result.</p>
+
+<p>(**)This optimization-safety checking may be replaced with the<br/>
+stop-machine method that ksplice uses for supporting a CONFIG_PREEMPT=y<br/>
+kernel.</p>
+
+<p>NOTE for geeks:<br/>
+<span style="color:red">The jump optimization changes the kprobe&rsquo;s pre_handler behavior.</span><br/>
+<span style="color:red">Without optimization, the pre_handler can change the kernel&rsquo;s execution</span><br/>
+<span style="color:red">path by changing regs->ip and returning 1.  However, when the probe</span><br/>
+<span style="color:red">is optimized, that modification is ignored.  Thus, if you want to</span><br/>
+<span style="color:red">tweak the kernel&rsquo;s execution path, you need to suppress optimization,</span><br/>
+<span style="color:red">using one of the following techniques:</span><br/>
+- <span style="color:blue">Specify an empty function for the kprobe&rsquo;s post_handler or break_handler.</span><br/>
+ or<br/>
+- <span style="color:blue">Execute &lsquo;sysctl -w debug.kprobes_optimization=n&rsquo;</span></p>
+
+<p>&hellip;&hellip;&hellip;&hellip;&hellip;&hellip;..</p>
+
+<h4>5. Kprobes Features and Limitations</h4>
+
+<p>Kprobes allows multiple probes at the same address.  Currently,<br/>
+however, there cannot be multiple jprobes on the same function at<br/>
+the same time.  Also, a probepoint for which there is a jprobe or<br/>
+a post_handler cannot be optimized.  So if you install a jprobe,<br/>
+or a kprobe with a post_handler, at an optimized probepoint, the<br/>
+probepoint will be unoptimized automatically.</p>
+
+<p>In general, you can install a probe anywhere in the kernel.<br/>
+In particular, you can probe interrupt handlers.  Known exceptions<br/>
+are discussed in this section.</p>
+
+<p>The register_<em>probe functions will return -EINVAL if you attempt<br/>
+to install a probe in the code that implements Kprobes (mostly<br/>
+kernel/kprobes.c and arch/</em>/kernel/kprobes.c, but also functions such<br/>
+as do_page_fault and notifier_call_chain).</p>
+
+<p>If you install a probe in an inline-able function, Kprobes makes<br/>
+no attempt to chase down all inline instances of the function and<br/>
+install probes there.  gcc may inline a function without being asked,<br/>
+so keep this in mind if you&rsquo;re not seeing the probe hits you expect.</p>
+
+<p>A probe handler can modify the environment of the probed function<br/>
+&ndash; e.g., by modifying kernel data structures, or by modifying the<br/>
+contents of the pt_regs struct (which are restored to the registers<br/>
+upon return from the breakpoint).  So Kprobes can be used, for example,<br/>
+to install a bug fix or to inject faults for testing.  Kprobes, of<br/>
+course, has no way to distinguish the deliberately injected faults<br/>
+from the accidental ones.  Don&rsquo;t drink and probe.</p>
+
+<p>Kprobes makes no attempt to prevent probe handlers from stepping on<br/>
+each other &ndash; e.g., probing printk() and then calling printk() from a<br/>
+probe handler.  If a probe handler hits a probe, that second probe&rsquo;s<br/>
+handlers won&rsquo;t be run in that instance, and the kprobe.nmissed member<br/>
+of the second probe will be incremented.</p>
+
+<p>As of Linux v2.6.15-rc1, multiple handlers (or multiple instances of<br/>
+the same handler) may run concurrently on different CPUs.</p>
+
+<p>Kprobes does not use mutexes or allocate memory except during<br/>
+registration and unregistration.</p>
+
+<p>Probe handlers are run with preemption disabled.  Depending on the<br/>
+architecture and optimization state, handlers may also run with<br/>
+interrupts disabled (e.g., kretprobe handlers and optimized kprobe<br/>
+handlers run without interrupt disabled on x86/x86-64).  In any case,<br/>
+your handler should not yield the CPU (e.g., by attempting to acquire<br/>
+a semaphore).</p>
+
+<p>Since a return probe is implemented by replacing the return<br/>
+address with the trampoline&rsquo;s address, stack backtraces and calls<br/>
+to <code>__builtin_return_address()</code> will typically yield the trampoline&rsquo;s<br/>
+address instead of the real return address for kretprobed functions.<br/>
+(As far as we can tell, <code>__builtin_return_address()</code> is used only<br/>
+for instrumentation and error reporting.)</p>
+
+<p>If the number of times a function is called does not match the number<br/>
+of times it returns, registering a return probe on that function may<br/>
+produce undesirable results. In such a case, a line:<br/>
+kretprobe BUG!: Processing kretprobe d000000000041aa8 @ c00000000004f48c<br/>
+gets printed. With this information, one will be able to correlate the<br/>
+exact instance of the kretprobe that caused the problem. We have the<br/>
+do_exit() case covered. do_execve() and do_fork() are not an issue.<br/>
+We&rsquo;re unaware of other specific cases where this could be a problem.</p>
+
+<p>If, upon entry to or exit from a function, the CPU is running on<br/>
+a stack other than that of the current task, registering a return<br/>
+probe on that function may produce undesirable results.  For this<br/>
+reason, Kprobes doesn&rsquo;t support return probes (or kprobes or jprobes)<br/>
+on the x86_64 version of <code>__switch_to()</code>; the registration functions<br/>
+return -EINVAL.</p>
+
+<p><kk style="color:red">
+On x86/x86-64, since the Jump Optimization of Kprobes modifies<br/>
+instructions widely, there are some limitations to optimization. To<br/>
+explain it, we introduce some terminology. Imagine a 3-instruction<br/>
+sequence consisting of a two 2-byte instructions and one 3-byte<br/>
+instruction.<br/>
+</kk></p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>        IA  
+</span><span class='line'>         |  
+</span><span class='line'>[-2][-1][0][1][2][3][4][5][6][7]  
+</span><span class='line'>        [ins1][ins2][  ins3 ]  
+</span><span class='line'>        [&lt;-     DCR       -&gt;]  
+</span><span class='line'>           [&lt;- JTPR -&gt;]  </span></code></pre></td></tr></table></div></figure>
+
+
+<p>
+<kk style="color:red">
+ins1: 1st Instruction<br/>
+ins2: 2nd Instruction<br/>
+ins3: 3rd Instruction<br/>
+IA:  Insertion Address<br/>
+JTPR: Jump Target Prohibition Region<br/>
+DCR: Detoured Code Region<br/>
+</kk></p>
+
+<p><kk style="color:red">
+The instructions in DCR are copied to the out-of-line buffer<br/>
+of the kprobe, because the bytes in DCR are replaced by<br/>
+a 5-byte jump instruction. So there are several limitations.<br/>
+</kk></p>
+
+<p><kk style="color:red">
+a) The instructions in DCR must be relocatable.<br/>
+b) The instructions in DCR must not include a call instruction.<br/>
+c) JTPR must not be targeted by any jump or call instruction.<br/>
+d) DCR must not straddle the border between functions.<br/>
+</kk></p>
+
+<p><kk style="color:red">
+Anyway, these limitations are checked by the in-kernel instruction<br/>
+decoder, so you don&rsquo;t need to worry about that.<br/>
+</kk></p>
+
+<h4>6. Probe Overhead</h4>
+
+<p>On a typical CPU in use in 2005, a kprobe hit takes 0.5 to 1.0<br/>
+microseconds to process.  Specifically, a benchmark that hits the same<br/>
+probepoint repeatedly, firing a simple handler each time, reports 1-2<br/>
+million hits per second, depending on the architecture.  A jprobe or<br/>
+return-probe hit typically takes 50-75% longer than a kprobe hit.<br/>
+When you have a return probe set on a function, adding a kprobe at<br/>
+the entry to that function adds essentially no overhead.</p>
+
+<p>Here are sample overhead figures (in usec) for different architectures.<br/>
+k = kprobe; j = jprobe; r = return probe; kr = kprobe + return probe<br/>
+on same function; jr = jprobe + return probe on same function</p>
+
+<p>i386: Intel Pentium M, 1495 MHz, 2957.31 bogomips<br/>
+k = 0.57 usec; j = 1.00; r = 0.92; kr = 0.99; jr = 1.40</p>
+
+<p>x86_64: AMD Opteron 246, 1994 MHz, 3971.48 bogomips<br/>
+k = 0.49 usec; j = 0.76; r = 0.80; kr = 0.82; jr = 1.07</p>
+
+<p>ppc64: POWER5 (gr), 1656 MHz (SMT disabled, 1 virtual CPU per physical CPU)<br/>
+k = 0.77 usec; j = 1.31; r = 1.26; kr = 1.45; jr = 1.99</p>
+
+<h5>6.1 Optimized Probe Overhead</h5>
+
+<p>Typically, an optimized kprobe hit takes 0.07 to 0.1 microseconds to<br/>
+process. Here are sample overhead figures (in usec) for x86 architectures.<br/>
+k = unoptimized kprobe, b = boosted (single-step skipped), o = optimized kprobe,<br/>
+r = unoptimized kretprobe, rb = boosted kretprobe, ro = optimized kretprobe.</p>
+
+<p>i386: Intel&reg; Xeon&reg; E5410, 2.33GHz, 4656.90 bogomips<br/>
+k = 0.80 usec; b = 0.33; o = 0.05; r = 1.10; rb = 0.61; ro = 0.33</p>
+
+<p>x86-64: Intel&reg; Xeon&reg; E5410, 2.33GHz, 4656.90 bogomips<br/>
+<span style="color:red">k = 0.99 usec; b = 0.43; o = 0.06; r = 1.24; rb = 0.68; ro = 0.30</span></p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2013/12/23/assembly-opcode/">深入浅出指令编码之三：64位计算</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2013-12-23T17:55:00+08:00'><span class='date'>2013-12-23</span> <span class='time'>17:55:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://www.pediy.com/kssd/pediy10/77824.html">http://www.pediy.com/kssd/pediy10/77824.html</a></p>
+
+<p>  AMD 在x86体系的32位计算扩展为64位计算，这是通过什么来实现的？它是怎样设计的？具体细节是什么？这就是这一节要讲解的。</p>
+
+<h4>一、硬件编程资源</h4>
+
+<p>　　了解现在processor提供编程资源是很重要的，对要进一步学习提供材料，下面分别讲解x86的编程资源和x64的编程资源。</p>
+
+<h5>1、x86的32位编程资源</h5>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>●  8个32位通用寄存器：EAX、ECX、EDX、EBX、ESP、EBP、ESI、EDI
+</span><span class='line'>　　　这些寄存器还可分解为8个8位寄存器：AL、CL、DL、BL、AH、CH、DH、BH
+</span><span class='line'>　　　和8个16位寄存器：AX、CX、DX、BX、SP、BP、SI、DI
+</span><span class='line'>●  6个段寄存器：ES、CS、SS、DS、FS、GS
+</span><span class='line'>●  32位的EFLAGS 标志位寄存器
+</span><span class='line'>●  32位的指令指针寄存器EIP
+</span><span class='line'>●  8个64位MMX寄存器
+</span><span class='line'>●  8个128位XMM寄存器
+</span><span class='line'>●  还有就是32位的寻址空间（Virtual Address Space）</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>2、x64的64位编程资源</h5>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>●  32位通用寄存器被扩展至64位，除了原有的8个寄存器，新增8个寄存器，共16个通用寄存器：RAX、RCX、RDX、RBX、RSP、RBP、RSI、RDI、R8、R9、R10、R11、R12、R13、R14、R15
+</span><span class='line'>●  保留了原有的6个寄存器，但是作用被限制
+</span><span class='line'>●  32位的标志寄存器被扩展为64位的标志寄存器RELAGS
+</span><span class='line'>●  8个64位MMX寄存器不变
+</span><span class='line'>●  新增8个XMM寄存器，共16个XMM寄存器
+</span><span class='line'>●  还有就是64位的寻址空间（Virtaul Address Space）</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>二、寄存器编码（或者说ID值）</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>●  16个64位通用寄存器是： 0000 ~ 1111，也就是：0 ~ 15
+</span><span class='line'>　　　　8个32位通用寄存器是：　000 ~ 111 也就是：0 ~ 7
+</span><span class='line'>●  6个段寄存器的编码是：000 ~ 101　也就是：0 ~ 5
+</span><span class='line'>●  MMX寄存器编码是： 000 ~ 111　也就是：0 ~ 7
+</span><span class='line'>●  16个XMM寄存器编码是： 0000 ~ 1111 也就是：0 ~ 15
+</span><span class='line'>　　　　8个XMM寄存器编码是：000 ~ 111 也就是：0 ~ 7</span></code></pre></td></tr></table></div></figure>
+
+
+<p>所谓寄存器编码是寄存器对应的二进制编码，按顺序来定义，看下面的表格：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>RAX/ES/MMX0/XMM0　-&gt;  0000
+</span><span class='line'>RCX/CS/MMX1/XMM1  -&gt;  0001
+</span><span class='line'>RDX/SS/MMX2/XMM2  -&gt;  0010
+</span><span class='line'>RBX/DS/MMX3/XMM3  -&gt;  0011
+</span><span class='line'>RSP/FS/MMX4/XMM4   -&gt;  0100
+</span><span class='line'>RBP/GS/MMX5/XMM5  -&gt;  0101
+</span><span class='line'>RSI/MMX6/XMM6      -&gt;  0110
+</span><span class='line'>RDI/MMX7/XMM7     -&gt;  0111
+</span><span class='line'>R8/XMM8 　 -&gt;  1000
+</span><span class='line'>R9/XMM9 　 -&gt;  1001
+</span><span class='line'>R10/XMM10  -&gt;  1010
+</span><span class='line'>R11/XMM11  -&gt;  1011
+</span><span class='line'>R12/XMM12  -&gt;  1100
+</span><span class='line'>R13/XMM13  -&gt;  1101
+</span><span class='line'>R14/XMM14  -&gt;  1110
+</span><span class='line'>R15/XMM15  -&gt;  1111</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  RAX ~ RDI　与　EAX ~ EDI　的编码是相同的，这里有一个情况是，EAX ~ EDI的编码是3位，为什么RAX~RDI的编码却是4位呢？这就是下面要讲到的REX prefix会将寄存器编码进行扩展。</p>
+
+<h4>三、  开启64位计算的基石（REX prefix）</h4>
+
+<p>　　AMD64体系的64位计算是这样设计：操作数的Default Operand-Size是32位，而Address-Size是固定为64位的，这里就引发3个问题要解决的：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>●  问题1：当要访问是64位的寄存器时，那么必须要有一种机制去开启或者说确认访问的寄存器是64位的。
+</span><span class='line'>●  问题2：而要访问的内存操作数寄存器寻址的话，那么也必须要去开启或确认寄存器是64位的以及访问新增寄存的问题。
+</span><span class='line'>●  问题3：如何去访问新增加的几个寄存器呢？那么也必须要有方法去访问增加的寄存器？</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  那么在64位Long模式下，为什么不将操作数的Default Operand-Size设计为64位呢？那是由于体系限制，本来AMD64就是在 x86的基础上扩展为64位的。x86体系当初设计时就没想到有会被扩展到64位的时候。所以在Segment-Descriptor（段描述符）里就没 有可以扩展为64位的标志位。DS.D位只有置1时是32位，清0时为16位，这两种情况。</p>
+
+<p>  AMD在保持兼容的大提前下，只好令谋计策，AMD的解决方案是：增加一个64位模式下特有Prefix，以起到扩展访问64位的能力。这就是 REX prefix。</p>
+
+<h5>1、REX prefix 的具体格式及含义</h5>
+
+<p>  REX prefix的取值范围是：40 ~ 4F（0100 0000 ~ 0100 1111），来看下原来opcode取值范围的40 ~ 4F的是什么指令：<br/>
+  Opcode为40 ~ 47在x86下是inc eax ~ inc edi　指令，48 ~ 4F在x86下是dec eax ~ dec edi　指令。<br/>
+  在64位模式下，40 ~ 4F 就已经不是指令而变身为 prefix了。</p>
+
+<h6>1.1  REX prefix字节的组成部分：</h6>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>●  bit0：REX.B
+</span><span class='line'>●  bit1：REX.X
+</span><span class='line'>●  bit2：REX.R
+</span><span class='line'>●  bit3：REX.W
+</span><span class='line'>●  bit4 ~ bit7：此域固定为0100，也就是高半字节为4。</span></code></pre></td></tr></table></div></figure>
+
+
+<p>★  REX.W域是设定操作数的大小（Operand-Size），当REX.W为1时，操作数是64位，为0时，操作数的大小是缺省大小（Default Opeand-Size）。这就解决了访问64位寄存器的问题。</p>
+
+<p>★  REX.R域是用于扩展ModRM字节中的R（Reg）域，ModRM中的Reg域除了对Opcode的补充外，是用来定义寄存器的编码，即寄存器 值。REX.R将原来3位的寄存器ID（000 ~ 111）扩展为4位（0000 ~ 1111），这就解决了访新增寄存器的问题。</p>
+
+<p>★  REX.X域是用于扩展SIB字节中的Index域，SIB中的Index域是指明Index 寄存器的编码，即ID值。这就解决了寄存器寻址内存中使用新增寄存器的问题。</p>
+
+<p>★  REX.B域是用于扩展ModRM字节中的r/m域和SIB中的Base域，SIB中的Base域指明Base寄存器编码即ID值。这就解决了寄存器寻址内存中使用新增寄存器的问题。</p>
+
+<p>★  REX.B域的另一个作用是：若指令中没有ModRM和SIB，也就是在Opcode中直接给出寄存器ID值，REX.B起到扩展寄存器的作用。</p>
+
+<h6>1.2、下面使用几个例子来说明问题：</h6>
+
+<p>例1：指令 mov eax, 1　　
+这条指令的Default Operand-Size是32位，在32位下它的机器编码是：b8 01 00 00 00（其5个字节）若改成64位编码时，变成 mov rax, 1。<br/>
+　　此时，它的机器编码是 48 b8 01 00 00 00 00 00 00 00 （共10个字节）<br/>
+  在这里48 就是 REX prefix字节，即：0100 1000　它的各个域值是：REX.W = 1，定义操作数是64位的，REX.R = 0、REX.X = 0、 REX.B = 0　这条指令不需要ModRM和SIB字节，所以RXB域都为0。<br/>
+　　这里有个值得思考的地方，若 REX.W域为0时，这条指令的操作数是32位的，也就是说，机器编码：40 b8 01 00 00 00（其6个字节）是与 b8 01 00 00 00结果一样的，都是mov eax, 1</p>
+
+<p>例2：指令：mov rax, r14<br/>
+　　这是一条常见64位指令，源寄存器是r14，目标寄存器是rax 它的机器编码是：<br/>
+　　　4c 89 f0（共3个字节）<br/>
+在这个编码里4c是REX prefix，89是opcode，f0是ModRM。<br/>
+REX Prefix的值是4c （0100 1100），其中REX.W = 1，REX.R = 1，XB都为0。<br/>
+ModRM的值是F0（11-110-000），Mod=11，Reg=110, R/M = 000，在这里先不讲ModRM的含义，在后面的章节再详述。在这条指令里，Reg表示源操作数r14的ID值。<br/>
+r14是新增加寄存器，所以需要REX.R进行扩展，得出最终寄存器的ID值，1+110 = 1110，这是r14寄存器的ID值，从而得出正确的编码。</p>
+
+<p>例3：回到序言里的例子：mov word ptr es:[eax + ecx * 8 + 0x11223344], 0x12345678<br/>
+作为例子，我将它改为64位指令，如下：<br/>
+mov qword ptr [rax + rcx * 8 + 0x11223344], 0x12345678<br/>
+操作数大小变为64位，而base 寄存器和index寄存器都改为64位，disp（offset）和imme（值不变），为啥不变？在以后的章节会有详述。</p>
+
+<p>好，现在来看看指令怎么译：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>(1)  REX.W：　要置为 1 以扩展64位大小。
+</span><span class='line'>(2)  REX.B：  由于base不是新增的寄存器，所以置为 0
+</span><span class='line'>(3)  REX.X：　由于index 也不是新增的寄存器，所以置为 0
+</span><span class='line'>(4)  REX.R：　源操作数和目标作数不是寄存器，所以置为 0</span></code></pre></td></tr></table></div></figure>
+
+
+<p>所以，REX prefix就等于 48（0100 1000）<br/>
+故，整条指令编码是：48 c7 84 c8 44 33 22 11 78 56 34 12（共12个字节）</p>
+
+<p>例4：我将上面的例子再改一改，变为：mov qword ptr [r8 + r9 * 8 + 0x11223344], 0x12345678<br/>
+那么，看看这指令怎么译：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>（1）  REX.W：置1，使用64位大小
+</span><span class='line'>（2）  REX.B：base寄存器是r8，是新增寄存器，所以置为1
+</span><span class='line'>（3）  REX.X：index寄存器是r9，是新增寄存器，所以置为1
+</span><span class='line'>（4）  REX.R：操作数中没有寄存器，所在置为0</span></code></pre></td></tr></table></div></figure>
+
+
+<p>所以，REX　prefix就等于（0100 1011）4b<br/>
+故，整条指令编码是：4b c7 84 c8 44 33 22 11 78 56 34 12（共12个字节）</p>
+
+<p>例5：看看这条指令 mov r8, 1</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>（1）  REX.W：置1
+</span><span class='line'>（2）  REX.B：访问Opcode中的寄存器ID值，它是新增寄存器，所为置1
+</span><span class='line'>（3）  REX.X：置0
+</span><span class='line'>（4）  REX.R：置0</span></code></pre></td></tr></table></div></figure>
+
+
+<p>所以，REX是 49（0100 1001）<br/>
+故整条指令编码是：49 b8 01 00 00 00 00 00 00 00</p>
+
+<h5>2、REX prefix补充说明</h5>
+
+<p>（1）关于顺序：REX一定是在x86 prefix之后，而在Opcode之前。<br/>
+（2）关于冲突：当x86 prefix和 REX prefix同时出现，而又出现冲突时，REX的优先权要优于 x86 prefix，<br/>
+  举个例子：指令 mov r8, 1<br/>
+  若出现以下编码怎么办：66 49 b8 01 00 00 00 00 00 00 00　既有66 又有49，那么结果66会被忽略，也就等于：49 b8 01 00 00 00 00 00 00 00。<br/>
+  而对于 66 b8 01 00 00 00 00 00 00 00　这个编码来说：会被解析为：mov ax, 1<br/>
+  去掉了49这个REX prefix操作数被调整为 16　位。<br/>
+（3）关于原来Opcode码，由于40 ~ 4F被作为 REX prefix，那么原指令inc reg/dec reg，只能使用 FF/0　和 FF/1　这两个Opcode了。<br/>
+（4）缺省操作数大小（Default Operand-Size）<br/>
+  64位绝大部分缺省操作数是32位的，但有一部分是64位的，依赖于rsp的寻址和短跳转（near jmp/near call）是64位的。<br/>
+  如下指令：push r8<br/>
+  REX值是41（0100 0001），即REX.W为0，使用default opearnd-size<br/>
+  它的编码是 41 ff f0</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
       <h2 class="entry-title"><a href="/blog/2013/12/04/debug-source-debug/">How source debuggers work?</a></h2>
     
     
@@ -811,76 +1373,6 @@ var ss360Config = {
 
     </article>
   
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2013/12/02/debug-articles/">debug articles</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2013-12-02T17:44:00+08:00'><span class='date'>2013-12-02</span> <span class='time'>17:44:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p>debug article <a href="http://blog.csdn.net/u011279649/article/category/1491593">http://blog.csdn.net/u011279649/article/category/1491593</a></p>
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2013/11/29/debug-dwarf-article/">BFD or dwarf? article</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2013-11-29T17:54:00+08:00'><span class='date'>2013-11-29</span> <span class='time'>17:54:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://blog.techveda.org/howsourcedebuggerswork/">http://blog.techveda.org/howsourcedebuggerswork/</a></p>
-
-<p><a href="http://bbs.sjtu.edu.cn/bbscon,board,Security,file,M.1134227822.A.html">http://bbs.sjtu.edu.cn/bbscon,board,Security,file,M.1134227822.A.html</a></p>
-
-<p><a href="http://blog.csdn.net/warriorpaw/article/details/8660704">http://blog.csdn.net/warriorpaw/article/details/8660704</a></p>
-
-<p><a href="http://blog.csdn.net/rrerre/article/details/6843539">http://blog.csdn.net/rrerre/article/details/6843539</a></p>
-
-<p><a href="http://blog.csdn.net/rrerre/article/details/6639484">http://blog.csdn.net/rrerre/article/details/6639484</a></p>
-
-<p><a href="http://dwarfstd.org/doc/Dwarf3.pdf">http://dwarfstd.org/doc/Dwarf3.pdf</a></p>
-
-<p>dwarf2解析 <a href="http://hi.baidu.com/tag/dwarf2%E8%A7%A3%E6%9E%90/feeds">http://hi.baidu.com/tag/dwarf2%E8%A7%A3%E6%9E%90/feeds</a></p>
-</div>
-  
-  
-
-
-    </article>
-  
   <div class="pagination">
     
       <a class="prev" href="/posts/279">&larr; Older</a>
@@ -895,7 +1387,7 @@ var ss360Config = {
   
     <section>
 <h1>Categories
-<span class='right_span'>(967)</span>
+<span class='right_span'>(969)</span>
 
 </h1>
 <head>
@@ -986,7 +1478,7 @@ if (!document.getElementById('assembly~base')) document.getElementById('aexp_ass
 if (!document.getElementById('assembly')) document.getElementById('aexp_assembly').style.visibility = 'hidden';
 if (!document.getElementById('assembly~win')) document.getElementById('aexp_assembly~win').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(199)</span></li>
+<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(200)</span></li>
 <div id='tools' class='catsub'><li><a href='/blog/cats/tools~apache2/?opendiv=tools'>apache2</a><a href='##' onmousedown=showDiv('tools~apache2') id='aexp_tools~apache2'><span class='exp_style' id='exp_tools~apache2'>[+]</span></a><span class='right_span'>9</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~apache2')) document.getElementById('aexp_tools~apache2').style.visibility = 'hidden';
@@ -1027,7 +1519,7 @@ if (!document.getElementById('tools~haproxy')) document.getElementById('aexp_too
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~isal')) document.getElementById('aexp_tools~isal').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/tools~mysql/?opendiv=tools'>mysql</a><a href='##' onmousedown=showDiv('tools~mysql') id='aexp_tools~mysql'><span class='exp_style' id='exp_tools~mysql'>[+]</span></a><span class='right_span'>30</span></li>
+<li><a href='/blog/cats/tools~mysql/?opendiv=tools'>mysql</a><a href='##' onmousedown=showDiv('tools~mysql') id='aexp_tools~mysql'><span class='exp_style' id='exp_tools~mysql'>[+]</span></a><span class='right_span'>31</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~mysql')) document.getElementById('aexp_tools~mysql').style.visibility = 'hidden';
 </script>
@@ -1224,8 +1716,8 @@ if (!document.getElementById('kernel~tcp')) document.getElementById('aexp_kernel
 if (!document.getElementById('kernel')) document.getElementById('aexp_kernel').style.visibility = 'hidden';
 if (!document.getElementById('kernel~vpn')) document.getElementById('aexp_kernel~vpn').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/network/'>network</a><a href='##' onmousedown=showDiv('network') id='aexp_network'><span class='exp_style' id='exp_network'>[+]</span></a><span class='right_span'>(8)</span></li>
-<div id='network' class='catsub'><li><a href='/blog/cats/network~base/?opendiv=network'>base</a><a href='##' onmousedown=showDiv('network~base') id='aexp_network~base'><span class='exp_style' id='exp_network~base'>[+]</span></a><span class='right_span'>8</span></li>
+<li class='catclass'><a href='/blog/cats/network/'>network</a><a href='##' onmousedown=showDiv('network') id='aexp_network'><span class='exp_style' id='exp_network'>[+]</span></a><span class='right_span'>(9)</span></li>
+<div id='network' class='catsub'><li><a href='/blog/cats/network~base/?opendiv=network'>base</a><a href='##' onmousedown=showDiv('network~base') id='aexp_network~base'><span class='exp_style' id='exp_network~base'>[+]</span></a><span class='right_span'>9</span></li>
 </div><script language='javascript' type='text/javascript'>
 if (!document.getElementById('network')) document.getElementById('aexp_network').style.visibility = 'hidden';
 if (!document.getElementById('network~base')) document.getElementById('aexp_network~base').style.visibility = 'hidden';
@@ -1337,7 +1829,7 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 
 <section>
 <h1>Date Categories
-<span class='right_span'>(967)</span>
+<span class='right_span'>(969)</span>
 
 </h1>
 <head>
@@ -1345,8 +1837,9 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(87)</span></li>
-<div id='2024' class='catsub'><li><a href='/blog/cats/2024~10/?opendiv=2024'>2024-10</a><span class='right_span'>5</span></li>
+<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(89)</span></li>
+<div id='2024' class='catsub'><li><a href='/blog/cats/2024~12/?opendiv=2024'>2024-12</a><span class='right_span'>2</span></li>
+<li><a href='/blog/cats/2024~10/?opendiv=2024'>2024-10</a><span class='right_span'>5</span></li>
 <li><a href='/blog/cats/2024~09/?opendiv=2024'>2024-09</a><span class='right_span'>15</span></li>
 <li><a href='/blog/cats/2024~08/?opendiv=2024'>2024-08</a><span class='right_span'>18</span></li>
 <li><a href='/blog/cats/2024~07/?opendiv=2024'>2024-07</a><span class='right_span'>26</span></li>
@@ -1518,6 +2011,14 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
   <ul id="recent_posts">
     
       <li class="post">
+        <a href="/blog/2024/12/12/tools-mysql-bin/">删除MySQL下的bin</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2024/12/12/network-sfp/">光模块配置</a>
+      </li>
+    
+      <li class="post">
         <a href="/blog/2024/10/27/network-ap-ac/">无线AP与AC详解</a>
       </li>
     
@@ -1547,14 +2048,6 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
     
       <li class="post">
         <a href="/blog/2024/09/20/sqlserver-_/">`_` 通配符 -- 匹配一个字符</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/09/14/lang-web-ding/">钉钉开放平台API</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/09/14/lang-web-staticmap/">腾讯地图--静态地图API</a>
       </li>
     
   </ul>

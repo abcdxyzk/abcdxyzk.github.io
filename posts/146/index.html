@@ -131,6 +131,440 @@ var ss360Config = {
       
   <header>
     
+      <h2 class="entry-title"><a href="/blog/2018/09/28/kernel-sk_lookup/">nulls_hlist原理 和 tcp连接查找</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2018-09-28T01:33:00+08:00'><span class='date'>2018-09-28</span> <span class='time'>01:33:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct proto tcp_prot = {
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;.slab_flags             = SLAB_DESTROY_BY_RCU,
+</span><span class='line'>&#9;...
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>sk 的slab初始化的时候带上 SLAB_DESTROY_BY_RCU ，所以free(sk)只会把sk加入到slab的freelist，并不会释放内存。</p>
+
+<p>这也就是为什么<code>__inet_lookup_established</code>里需要两次INET_MATCH。因为第一次INET_MATCH到atomic_inc_not_zero之间有可能在另一个cpu上将sk放到freelist，然后sk又被其他连接alloc拿去用了</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>__inet_lookup_established() {
+</span><span class='line'>&#9;...
+</span><span class='line'>begin:
+</span><span class='line'>&#9;sk_nulls_for_each_rcu(sk, node, &head-&gt;chain) {
+</span><span class='line'>&#9;&#9;if (likely(INET_MATCH(sk, net, acookie, saddr, daddr, ports, dif))) {
+</span><span class='line'>&#9;&#9;&#9;if (unlikely(!atomic_inc_not_zero(&sk-&gt;sk_refcnt)))
+</span><span class='line'>&#9;&#9;&#9;&#9;goto out;
+</span><span class='line'>&#9;&#9;&#9;if (unlikely(!INET_MATCH(sk, net, acookie, saddr, daddr, ports, dif))) {
+</span><span class='line'>&#9;&#9;&#9;&#9;sock_gen_put(sk);
+</span><span class='line'>&#9;&#9;&#9;&#9;goto begin;
+</span><span class='line'>&#9;&#9;&#9;}
+</span><span class='line'>&#9;&#9;&#9;goto found;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;...
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<hr />
+
+<p><a href="https://blog.csdn.net/dog250/article/details/73013732">https://blog.csdn.net/dog250/article/details/73013732</a></p>
+
+<h3>Linux 4.7之前TCP连接处理问题</h3>
+
+<p>我们已经知道，在TCP的接收主函数tcp_v4_rcv中，基于skb的元数据查找socket的过程是无锁的，查找完毕之后，会针对找到的socket结果上锁或者无锁处理，逻辑非常清晰：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>tcp_v4_rcv(skb)
+</span><span class='line'>{
+</span><span class='line'>&#9;sk = lockless_lookup(skb);
+</span><span class='line'>&#9;if (sk.is_listener) {
+</span><span class='line'>// Lockless begin
+</span><span class='line'>&#9;&#9;process_handshake(sk, skb);
+</span><span class='line'>&#9;&#9;new_sk = build_synack_sk(skb);
+</span><span class='line'>&#9;&#9;new_sk.listener = sk;
+</span><span class='line'>&#9;} else if (sk.is_synrecv) {
+</span><span class='line'>&#9;&#9;listener = sk.lister;
+</span><span class='line'>&#9;&#9;child_sk = build_child_sk(skb, sk);
+</span><span class='line'>&#9;&#9;add_sk_into_acceptq(listener, child_sk);
+</span><span class='line'>// Lockless end
+</span><span class='line'>&#9;&#9;goto data;
+</span><span class='line'>&#9;} else {
+</span><span class='line'>data:
+</span><span class='line'>&#9;&#9;lock(sk);
+</span><span class='line'>&#9;&#9;process(sk, skb);
+</span><span class='line'>&#9;&#9;unlock(sk);
+</span><span class='line'>&#9;}
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这个逻辑已经臻于完美了，至少在表面上看来确实如此！</p>
+
+<p>当我知道了4.7内核针对syncookie的优化之后，我便内窥了lockless_lookup内部，突破性的改进在于，4.7内核用真正的RCU callback替换了一个仅有的Atomic操作，做到了真正的无锁化查找！</p>
+
+<p>看来我们都被骗了，其实所谓的lockless_lookup并不是真正的lockless，为了应景和应题，本文只讨论Listener socket，我们来看下它的逻辑：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>lockless_lookup(skb)
+</span><span class='line'>{
+</span><span class='line'>&#9;hash = hashfn(skb);
+</span><span class='line'>&#9;hlist = listener_list[hash];
+</span><span class='line'>// 第一部分：#1-查找socket
+</span><span class='line'>begin:
+</span><span class='line'>&#9;sk_nulls_for_each_rcu(sk, node, hlist) {
+</span><span class='line'>&#9;&#9;if (match(skb, sk)) {
+</span><span class='line'>&#9;&#9;&#9;ret = sk;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;}
+</span><span class='line'>// 第二部分：#2-与socket重新hash并插入hlist进行互斥    
+</span><span class='line'>&#9;if (get_nulls_value(node) != hash) {
+</span><span class='line'>&#9;&#9;goto begin;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>// 第三部分：#3-与socket被释放进行互斥   
+</span><span class='line'>&#9;if (ret) {
+</span><span class='line'>&#9;&#9;if (!atomic_inc_not_zero(ret))
+</span><span class='line'>&#9;&#9;&#9;ret = NULL;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;return ret;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这个逻辑可以分为3个部分，我在注释中已经标明，可以看到，虽然在调用者tcp_v4_rcv看来，查找socket的操作是无锁的，然而内窥其实现逻辑之后便会发现，它其实还是在内部进行了两个轻量级的互斥操作。下面我来一个一个说。</p>
+
+<h4>nulls hlist互斥</h4>
+
+<p>由于在lockless_lookup被调用时是无锁的，所以在sk_nulls_for_each_rcu遍历过程中会出现以下情况造成遍历混乱：</p>
+
+<p><img src="/images/kernel/2018-09-28.png" alt="" /></p>
+
+<p>这种情况下，常规的hlist是无法发现的，因为这种hlist以next为NULL视为链表的结束。不管一个node被重新hash到哪个链表，在结束的时候都会碰到NULL，此时你根本区别不出来这个NULL是不是一开始遍历开始时那个hlist冲突链表的NULL。怎么解决这个问题呢？上锁肯定是不妥的，幸亏Linux内核有一个精妙的数据结构，即nulls hlist！下面我先来简单地介绍一下这个精妙的hlist数据结构和标准的hlist有何不同。</p>
+
+<h4>差异：</h4>
+
+<p>1.nulls hlist不再以NULL结尾，而以一个大到2<sup>31</sup>空间的任意值结尾</p>
+
+<p>2.nulls hlist以node最低位是不是1标识是不是链表的结束</p>
+
+<p>于是nulls hlist的结尾节点的next字段可以编码为高31位和低1位，如果低1位为1，那么高31位便可以取出当初存进去的任意值，是不是很精妙呢？！之所以可以这么做，原因很简单，在计算机中，Linux内核数据结构的所有的地址都是对齐存放的，因此最低1位的数据位是空闲的，当然可以借为它用了。</p>
+
+<p>现在我们考虑这个nulls node的高31位存什么数据好呢？答案很明确，当然是存该hlist的hash值了，这样以下的操作一目了然：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>init:
+</span><span class='line'>for (i = 0; i &lt; INET_LHTABLE_SIZE; i++) {
+</span><span class='line'>&#9;// 低1位和高31位的拼接：
+</span><span class='line'>&#9;// 低1位保存1，代表结束，新节点会插入到其前面
+</span><span class='line'>&#9;// 高31位保存该list的hash值
+</span><span class='line'>&#9;listener_list[i].next = (1UL | (((long)i) &lt;&lt; 1)) 
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>lookup:
+</span><span class='line'>hash1 = hashfn(skb);
+</span><span class='line'>hlist = listener_list[hash1];
+</span><span class='line'>sk_nulls_for_each_rcu...{
+</span><span class='line'>&#9;...
+</span><span class='line'>}
+</span><span class='line'>hash2 = get_nulls_value(node);
+</span><span class='line'>if (hash1 != hash2) {
+</span><span class='line'>&#9;// 发现结束的时候已经不在开始遍历的链表上了
+</span><span class='line'>&#9;goto begin;
+</span><span class='line'>}
+</span><span class='line'>//.....</span></code></pre></td></tr></table></div></figure>
+
+
+<p>是不是很精妙呢？其实在Linux中，很多地方都用到了这个nulls hlist数据结构，我第一次看到它是在当年搞nf conntrack的时候。
+  以上的叙述大致解释了这个nulls hlist的精妙之处，说完了优点再看看它的问题，这个nulls hlist带啦的不断retry是一种消极尝试，非常类似顺序锁读操作，只要读冲突便一直重复，直到某次没有冲突，关于顺序锁，可以看一下read_seqbegin/read_seqretry以及write_seqlock这对夫妻和小三。
+  为什么需要这样？答案是，在无锁化的lookup中，必须这样！因为你取出一个node和从该node取出下一个node之间是有时间差的，你没有对这个时间差强制没有任何保护措施，这就是根本原因，所以，消极的尝试也未尝不是一个好办法。
+  总结下根本原因，取出node和取出下一个node之间存在race！</p>
+
+<h4>原子变量互斥</h4>
+
+<p>刚刚说完了lockless_lookup的第二部分，下面看看第三部分，atomic_inc_not_zero带来的互斥。</p>
+
+<p>我们知道，在sk_nulls_for_each_rcu找到一个匹配的socket并且nulls node检查通过之后，在实际使用它之前，由于无锁化调用，会存在race，此期间可能会有别的线程将该socket释放到虚空，如何避免使用一个已经被释放的socket呢？这个很简单，操作原子计数器即可：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>free：
+</span><span class='line'>if (atomic_dec_and_test(sk)) {
+</span><span class='line'>&#9;// 此往后，由于已经将ref减为0，别处的inc_not_zero将失败，因此可以放心释放socket了。
+</span><span class='line'>&#9;free(sk);
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>lookup：
+</span><span class='line'>if (ret && !atomic_inc_not_zero(ret)) {
+</span><span class='line'>&#9;ret = NULL;
+</span><span class='line'>&#9;goto done;
+</span><span class='line'>}
+</span><span class='line'>// 此处后，由于已经增加了ref，引用的数据将是有效数据
+</span><span class='line'>//...</span></code></pre></td></tr></table></div></figure>
+
+
+<p>虽然这个Atomic变量不是什么锁，但是在微观上，操作它是要锁总线的，即便在代码层面没有看到任何lock字眼，但这是指令集的逻辑。当面对ddos攻击的时候，试想同时会有多少的线程争抢这个Atomic底下的总线资源！！这是一笔昂贵的开销！</p>
+
+<p>为什么非要有这么一个操作呢？答案很明确，怕取到一个被释放的socket从而导致内核数据混乱，简单点说就是怕panic。所以必然要有个原子变量来保护一下，事实证明，这么做还真不错呢。然而把问题更上一层来谈，为什么内核数据会混乱导致panic？因为取出node和使用node之间存在race，在这两个操作之间，node可能会被释放掉。这一点和上面的“取出node和取出下一个node之间存在race”是不同的。</p>
+
+<h4>现在发现了2个race：</h4>
+
+<p>1.取出node和取出下一个node之间；</p>
+
+<p>2.取出node和使用node之间。</p>
+
+<p>但归根结底，这两个race是同一个问题导致，那就是socket被释放(重新hash也有个先被释放的过程)！如果一个socket在被lookup期间，不允许被释放是否可以呢(你可以调用释放操作，但在此期间，你要保证数据有效)？当然可以，如何做到就是一个简单的事情了。如果能做到这一点并且真的做了，上述针对两个race的两个互斥就可以去掉了，TCP的新建连接数性能指标必然会有大幅度提升。</p>
+
+<h3>Linux 4.7的优化</h3>
+
+<p>Linux 4.7内核通过SOCK_RCU_FREE标识重构了sk_destruct的实现：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void sk_destruct(struct sock *sk)
+</span><span class='line'>{
+</span><span class='line'>&#9;if (sock_flag(sk, SOCK_RCU_FREE))
+</span><span class='line'>&#9;&#9;call_rcu(&sk-&gt;sk_rcu, __sk_destruct);
+</span><span class='line'>&#9;else
+</span><span class='line'>&#9;&#9;__sk_destruct(&sk-&gt;sk_rcu);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>如果携带有SOCK_RCU_FREE标识，便通过RCU callback进行释放，我们知道，RCU callback的调用时机是必须经过一个grace period，而这个period通过rcu lock/unlock可以严格控制。</p>
+
+<p>一切显得简单明了。Linux 4.7内核仅为Listener socket设置了SOCK_RCU_FREE标识：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>// 创建socket
+</span><span class='line'>__inet_hash(...)
+</span><span class='line'>{
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;sock_set_flag(sk, SOCK_RCU_FREE);
+</span><span class='line'>&#9;...
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>// 从一个Listener socket派生子socket
+</span><span class='line'>inet_csk_clone_lock(...)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct sock *newsk = sk_clone_lock(sk, priority);
+</span><span class='line'>&#9;if (newsk) {
+</span><span class='line'>&#9;&#9;...
+</span><span class='line'>&#9;&#9;/* listeners have SOCK_RCU_FREE, not the children */
+</span><span class='line'>&#9;&#9;sock_reset_flag(newsk, SOCK_RCU_FREE);
+</span><span class='line'>&#9;&#9;...
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;...
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这保证了在lockless_lookup调用中不必再担心取到错误的数据和无效的数据，前提是lockless_lookup的调用必须有rcu锁的保护。这很容易：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>&#9;rcu_read_lock();
+</span><span class='line'>&#9;sk = lockless_lookup(skb);
+</span><span class='line'>&#9;...
+</span><span class='line'>done:
+</span><span class='line'>&#9;rcu_read_unlock();12345</span></code></pre></td></tr></table></div></figure>
+
+
+<p>当然，这个lock/unlock没有体现在tcp_v4_rcv函数里，而是体现在了ip_local_deliver_finish里。</p>
+
+<h4>社区patch</h4>
+
+<p>以下是一个社区的patch：</p>
+
+<p>[PATCH v2 net-next 06/11] tcp/dccp: do not touch listener sk_refcnt under synflood</p>
+
+<p><a href="http://www.spinics.net/lists/netdev/msg371229.html">http://www.spinics.net/lists/netdev/msg371229.html</a></p>
+
+<p>本地下载 <a href="/download/kernel/do-not-touch-listener-sk_refcnt-under-synflood.patch">do-not-touch-listener-sk_refcnt-under-synflood.patch</a></p>
+
+<p>作者详细说明了取消原子变量操作后带来的收益并且携带测试结果，我想这算是令人信服的，最重要的是，它已经被合入内核了。</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2018/08/05/debug-crash_shell/">crash执行shell脚本</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2018-08-05T23:39:00+08:00'><span class='date'>2018-08-05</span> <span class='time'>23:39:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p>crash执行shell脚本</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>crash&gt; kmem -S TCP &gt; /tmp/slabinfo
+</span><span class='line'>
+</span><span class='line'>[root@vm1 ~]# cat /tmp/slabinfo | grep '\[fff' | awk -F[ '{print $2}' | awk -F] '{print "sock "$1" | grep skc_portpair &gt;&gt; /tmp/sock"}' &gt; /tmp/sock.sh
+</span><span class='line'>
+</span><span class='line'>crash&gt; &lt; /tmp/sock.sh
+</span></code></pre></td></tr></table></div></figure>
+
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
       <h2 class="entry-title"><a href="/blog/2018/07/30/kernel-tcp_metric/">ip tcp_metric, 链路状态历史</a></h2>
     
     
@@ -525,754 +959,6 @@ var ss360Config = {
 
     </article>
   
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2018/07/23/kernel-ip_tunnel/">IPIP实现IP隧道</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2018-07-23T02:32:00+08:00'><span class='date'>2018-07-23</span> <span class='time'>02:32:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="https://blog.csdn.net/kkdelta/article/details/39611061">https://blog.csdn.net/kkdelta/article/details/39611061</a></p>
-
-<p>IPIP实现IP隧道的简单示例</p>
-
-<p>两台主机，A和B，每台主机由两块网卡，其中eth0在同一个网段，能够互相连通。</p>
-
-<p>A的eth1和B的eth1分别在两个不同的网段。</p>
-
-<p>A: eth0:192.168.9.5 eth1:192.168.8.5</p>
-
-<p>B: eth0:192.168.9.6 eth1:192.168.10.6</p>
-
-<p>A:</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>ip tun add lxT mode ipip remote 192.168.9.6 local 192.168.9.5
-</span><span class='line'>ip link set lxT up
-</span><span class='line'>ip add add 192.168.200.1 brd 255.255.255.255 peer 192.168.200.2 dev lxT
-</span><span class='line'>ip ro add 192.168.200.0/24 via 192.168.200.1</span></code></pre></td></tr></table></div></figure>
-
-
-<p>B：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>ip tun add lxT mode ipip remote 192.168.9.5 local 192.168.9.6
-</span><span class='line'>ip link set lxT up
-</span><span class='line'>ip add add 192.168.200.2 brd 255.255.255.255 peer 192.168.200.1 dev lxT
-</span><span class='line'>ip ro add 192.168.200.0/24 via 192.168.200.2</span></code></pre></td></tr></table></div></figure>
-
-
-<p>在A机器添加路由信息，指定到192.168.10.6通过lxT</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>ip ro add 192.168.10.6/32 dev lxT</span></code></pre></td></tr></table></div></figure>
-
-
-<p>在B机器添加路由信息，指定到192.168.8.5通过lxT</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>ip ro add 192.168.8.5/32 dev lxT</span></code></pre></td></tr></table></div></figure>
-
-
-<p>这样 192.168.8.5 和 192.168.10.6 就可以相互ping通了</p>
-
-<h4>部分参数</h4>
-
-<p>ttl N   设置进入通道数据包的TTL为N。N是一个1—255之间的数字。0是一个特殊的值，表示这个数据包的TTL值是继承(inherit)的。ttl参数的缺省值是：inherit。</p>
-
-<p>tos T或者dsfield T    设置进入通道数据包的TOS域，缺省是inherit。</p>
-
-<p>mode MODE   设置通道模式。有效的模式包括：ipip、sit和gre。</p>
-
-<p>nopmtudisc  在这个通道上禁止路径最大传输单元发现( Path MTU Discovery)。默认情况下，这个功能是打开的。注意：这个选项和固定的ttl是不兼容的，如果使用了固定的ttl参数，系统会打开路径最大传输单元发现( Path MTU Discovery)功能。</p>
-
-<h3>ip tunnel gw</h3>
-
-<h4>CLIENT:</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>ifconfig eth1 11.0.0.20/24
-</span><span class='line'>route add -net 14.0.0.0/24 gw 11.0.0.1 dev eth1</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>RS:</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>ifconfig eth0 192.168.1.191/24
-</span><span class='line'>modprobe ipip # ip tun add tunl0 mode ipip remote any local any
-</span><span class='line'>ip link set tunl0 mtu 1480 up
-</span><span class='line'>ifconfig tunl0:0 14.0.0.1/24
-</span><span class='line'>
-</span><span class='line'>ip tun add tunl1 mode ipip remote 12.0.0.1 local 12.0.0.102 dev eth1          # better
-</span><span class='line'>#ip tun add tunl1 mode ipip remote 192.168.1.102 local 192.168.1.191 dev eth0  # upload err
-</span><span class='line'>ip link set tunl1 mtu 1480 up
-</span><span class='line'>
-</span><span class='line'>ip rule add from 14.0.0.1 table 1
-</span><span class='line'>ip route add table 1 default dev tunl1
-</span><span class='line'>
-</span><span class='line'>find /proc/ -name rp_filter -exec cat {} \;
-</span><span class='line'>find /proc/ -name rp_filter -exec sh -c "echo 0 &gt; {}" \;</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>GW:</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>find /proc/ -name rp_filter -exec cat {} \;
-</span><span class='line'>find /proc/ -name rp_filter -exec sh -c "echo 0 &gt; {}" \;
-</span><span class='line'>
-</span><span class='line'>echo 1 &gt; /proc/sys/net/ipv4/ip_forward
-</span><span class='line'>
-</span><span class='line'>modprobe ipip # ip tun add tunl0 mode ipip remote any local any
-</span><span class='line'>ip link set tunl0 mtu 1480 up
-</span><span class='line'>
-</span><span class='line'>ip tun add tunl1 mode ipip remote 192.168.1.191 local 192.168.1.102 dev enp3s0     # better
-</span><span class='line'>#ip tun add tunl1 mode ipip remote 12.0.0.102 local 12.0.0.1 dev enx00e04b367c0c    # upload err?
-</span><span class='line'>ip link set tunl1 mtu 1480 up
-</span><span class='line'>
-</span><span class='line'>ip rule add from 11.0.0.20 table 1
-</span><span class='line'>ip route add table 1 default dev tunl1</span></code></pre></td></tr></table></div></figure>
-
-
-
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2018/07/23/kernel-ip_rule/">linux策略路由</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2018-07-23T02:02:00+08:00'><span class='date'>2018-07-23</span> <span class='time'>02:02:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><h2><a href="https://blog.csdn.net/guodong1010/article/category/6149064">https://blog.csdn.net/guodong1010/article/category/6149064</a></h2>
-
-<p><a href="https://www.cnblogs.com/iceocean/articles/1594488.html">https://www.cnblogs.com/iceocean/articles/1594488.html</a></p>
-
-<h3>1.策略路由介绍</h3>
-
-<p>策略性是指对于IP包的路由是以网络管理员根据需要定下的一些策略为主要依据进行路由的。例如我们可以有这样的策略：“所有来直自网A的包，选择X路径；其他选择Y路径”，或者是“所有TOS为A的包选择路径F；其他选者路径K”。</p>
-
-<p>Cisco 的网络操作系统 (Cisco IOS) 从11.0开始就采用新的策略性路由机制。而Linux是在内核2.1开始采用策略性路由机制的。策略性路由机制与传统的路由算法相比主要是引入了多路由表以及规则的概念。</p>
-
-<h3>2.linux方式</h3>
-
-<h4>2.1 多路由表（multiple Routing Tables)</h4>
-
-<p>传统的路由算法是仅使用一张路由表的。但是在有些情形底下，我们是需要使用多路由表的。例如一个子网通过一个路由器与外界相连，路由器与外界有两条线路相连，其中一条的速度比较快，一条的速度比较慢。对于子网内的大多数用户来说对速度并没有特殊的要求，所以可以让他们用比较慢的路由；但是子网内有一些特殊的用户却是对速度的要求比较苛刻，所以他们需要使用速度比较快的路由。如果使用一张路由表上述要求是无法实现的，而如果根据源地址或其它参数，对不同的用户使用不同的路由表，这样就可以大大提高路由器的性能。</p>
-
-<h4>2.2 规则（rule)</h4>
-
-<p>规则是策略性的关键性的新的概念。我们可以用自然语言这样描述规则，例如我门可以指定这样的规则：</p>
-
-<p>规则一：“所有来自192.16.152.24的IP包，使用路由表10，本规则的优先级别是1500”</p>
-
-<p>规则二：“所有的包，使用路由表253，本规则的优先级别是32767”</p>
-
-<p>我们可以看到，规则包含3个要素：</p>
-
-<p>什么样的包，将应用本规则（所谓的SELECTOR，可能是filter更能反映其作用）；</p>
-
-<p>符合本规则的包将对其采取什么动作（ACTION），例如用那个表；</p>
-
-<p>本规则的优先级别。优先级别越高的规则越先匹配（数值越小优先级别越高）。</p>
-
-<h3>3. linux策略路由配置方式</h3>
-
-<p>传统的linux下配置路由的工具是route，而实现策略性路由配置的工具是iproute2工具包。</p>
-
-<h4>3.1 接口地址的配置 IP Addr</h4>
-
-<p>对于接口的配置可以用下面的命令进行：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>Usage: ip addr [ add | del ] IFADDR dev STRING</span></code></pre></td></tr></table></div></figure>
-
-
-<p>例如：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>router&gt;# ip addr add 192.168.0.1/24 broadcast 192.168.0.255 label eth0 dev eth0</span></code></pre></td></tr></table></div></figure>
-
-
-<p>上面表示，给接口eth0赋予地址192.168.0.1 掩码是255.255.255.0(24代表掩码中1的个数)，广播地址是192.168.0.255</p>
-
-<h4>3.2 路由的配置 IP Route</h4>
-
-<p>Linux最多可以支持255张路由表，其中有3张表是内置的：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>　　表255 本地路由表（Local table）本地接口地址，广播地址，已及NAT地址都放在这个表。该路由表由系统自动维护，管理员不能直接修改。
-</span><span class='line'>
-</span><span class='line'>　　表254 主路由表（Main table）如果没有指明路由所属的表，所有的路由都默认都放在这个表里，一般来说，旧的路由工具（如route）所添加的路由都会加到这个表。一般是普通的路由。
-</span><span class='line'>
-</span><span class='line'>　　表253 默认路由表（Default table）一般来说默认的路由都放在这张表，但是如果特别指明放的也可以是所有的网关路由。
-</span><span class='line'>
-</span><span class='line'>　　表 0 保留</span></code></pre></td></tr></table></div></figure>
-
-
-<p>路由配置命令的格式如下：</p>
-
-<h5>Usage: ip route list SELECTOR</h5>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>ip route { change | del | add | append | replace | monitor } ROUTE</span></code></pre></td></tr></table></div></figure>
-
-
-<p>如果想查看路由表的内容，可以通过命令：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>ip route list table table_number</span></code></pre></td></tr></table></div></figure>
-
-
-<p>对于路由的操作包括change、del、add 、append 、replace 、 monitor这些。例如添加路由可以用：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>router&gt;# ip route add 0/0 via 192.168.0.4 table main
-</span><span class='line'>router&gt;# ip route add 192.168.3.0/24 via 192.168.0.3 table 1</span></code></pre></td></tr></table></div></figure>
-
-
-<p>第一条命令是向主路由表（main table）即表254添加一条路由，路由的内容是设置192.168.0.4成为网关。</p>
-
-<p>第二条命令代表向路由表1添加一条路由，子网192.168.3.0（子网掩码是255.255.255.0）的网关是192.168.0.3。</p>
-
-<p>在多路由表的路由体系里，所有的路由的操作，例如网路由表添加路由，或者在路由表里寻找特定的路由，需要指明要操作的路由表，所有没有指明路由表，默认是对主路由表（表254）进行操作。而在单表体系里，路由的操作是不用指明路由表的。</p>
-
-<h4>3.3 规则的配置 IP Rule</h4>
-
-<p>在Linux里，总共可以定义232个优先级的规则，一个优先级别只能有一条规则，即理论上总共可以有条规则。其中有3个规则是默认的。命令用法如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>Usage: ip rule [ list | add | del ] SELECTOR ACTION
-</span><span class='line'>
-</span><span class='line'>SELECTOR := [ from PREFIX ] [ to PREFIX ] [ tos TOS ]
-</span><span class='line'>&#9;[ dev STRING ] [ pref NUMBER ]
-</span><span class='line'>
-</span><span class='line'>ACTION := [ table TABLE_ID ] [ nat ADDRESS ]
-</span><span class='line'>&#9;[ prohibit | reject | unreachable ]
-</span><span class='line'>&#9;[ flowid CLASSID ]
-</span><span class='line'>
-</span><span class='line'>TABLE_ID := [ local | main | default | new | NUMBER</span></code></pre></td></tr></table></div></figure>
-
-
-<p>首先我们可以看看路由表默认的所有规则：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>root@netmonster# ip rule list
-</span><span class='line'>0: from all lookup local
-</span><span class='line'>32766: from all lookup main
-</span><span class='line'>32767: from all lookup default</span></code></pre></td></tr></table></div></figure>
-
-
-<p>规则0，它是优先级别最高的规则，规则规定，所有的包，都必须首先使用local表（254）进行路由。本规则不能被更改和删除。</p>
-
-<p>规则32766，规定所有的包，使用表main进行路由。本规则可以被更改和删除。</p>
-
-<p>规则32767，规定所有的包，使用表default进行路由。本规则可以被更改和删除。</p>
-
-<p>在默认情况下进行路由时，首先会根据规则0在本地路由表里寻找路由，如果目的地址是本网络，或是广播地址的话，在这里就可以找到合适的路由；如果路由失败，就会匹配下一个不空的规则，在这里只有32766规则，在这里将会在主路由表里寻找路由;如果失败，就会匹配32767规则，即寻找默认路由表。如果失败，路由将失败。重这里可以看出，策略性路由是往前兼容的。</p>
-
-<p>还可以添加规则：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>router&gt;# ip rule add [from 0/0] table 1 pref 32800
-</span><span class='line'>router &gt;#ip rule add from 192.168.3.112/32 [tos 0x10] table ２ pref 1500prohibit</span></code></pre></td></tr></table></div></figure>
-
-
-<p>第一条命令将向规则链增加一条规则，规则匹配的对象是所有的数据包，动作是选用路由表1的路由，这条规则的优先级是32800。</p>
-
-<p>第二条命令将向规则链增加一条规则，规则匹配的对象是IP为192.168.3.112，tos等于0x10的包，使用路由表2，这条规则的优先级是1500，动作是。添加以后，我们可以看看系统规则的变化。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>router&gt;# ip rule
-</span><span class='line'>0: from all lookup local
-</span><span class='line'>1500 from 192.168.3.112/32 [tos 0x10] lookup 2
-</span><span class='line'>32766: from all lookup main
-</span><span class='line'>32767: from all lookup default
-</span><span class='line'>32800: from all lookup 1</span></code></pre></td></tr></table></div></figure>
-
-
-<p>上面的规则是以源地址为关键字，作为是否匹配的依据的。除了源地址外，还可以用以下的信息：</p>
-
-<p>From &ndash; 源地址</p>
-
-<p>To &ndash; 目的地址（这里是选择规则时使用，查找路由表时也使用）</p>
-
-<p>Tos &ndash; IP包头的TOS（type of sevice）域</p>
-
-<p>Dev &ndash; 物理接口</p>
-
-<p>Fwmark &ndash; 防火墙参数</p>
-
-<p>采取的动作除了指定表，还可以指定下面的动作：</p>
-
-<p>Table 指明所使用的表</p>
-
-<p>Nat 透明网关</p>
-
-<p>Action prohibit 丢弃该包，并发送 COMM.ADM.PROHIITED的ICMP信息</p>
-
-<p>Reject 单纯丢弃该包</p>
-
-<p>Unreachable丢弃该包，并发送 NET UNREACHABLE的ICMP信息</p>
-
-<h3>4.策略路由的应用</h3>
-
-<h4>4.1 基于源地址选路（ Source-Sensitive Routing）</h4>
-
-<p>如果一个网络通过两条线路接入互联网，一条是比较快的ADSL，另外一条是比较慢的普通的调制解调器。这样的话，网络管理员既可以提供无差别的路由服务，也可以根据源地址的不同，使一些特定的地址使用较快的线路，而普通用户则使用较慢的线路，即基于源址的选路。</p>
-
-<h4>4.2 根据服务级别选路（ Quality of Service）</h4>
-
-<p>网络管理员可以根据IP报头的服务级别域，对于不同的服务要求可以分别对待对于传送速率、吞吐量以及可靠性的有不同要求的数据报根据网络的状况进行不同的路由。</p>
-
-<h4>4.3 节省费用的应用</h4>
-
-<p>网络管理员可以根据通信的状况，让一些比较大的阵发性通信使用一些带宽比较高但是比较贵的路径一段短的时间，然后让基本的通信继续使用原来比较便宜的基本线路。例如，管理员知道，某一台主机与一个特定的地址通信通常是伴随着大量的阵发性通信的，那么网络管理员可以安排一些策略，使得这些主机使用特别的路由，这些路由是按需拨号，带宽比较高的线路，通信完成以后就停止使用，而普通的通信则不受影响。这样既提高网络的性能，又能节省费用。</p>
-
-<h4>4.4 负载平衡（Load Sharing）</h4>
-
-<p>根据网络交通的特征，网络管理员可以在不同的路径之间分配负荷实现负载平衡。</p>
-
-<h3>5 linux下策略路由的实现</h3>
-
-<p>在Linux下，策略性路由是由RPDB实现的。对于RPDB的内部机制的理解，可以加深对于策略性路由使用的理解。文件主要包含：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>fib_hash.c
-</span><span class='line'>fib_rules.c
-</span><span class='line'>fib_sematic
-</span><span class='line'>fib_frontend.c
-</span><span class='line'>route.c</span></code></pre></td></tr></table></div></figure>
-
-
-<p>RDPB主要由多路由表和规则组成。路由表以及对其的操作和其对外的接口是整个RPDB的核心部分。路由表主要由table，zone，node这些主要的数据结构构成。对路由表的操作主要包含物理的操作以及语义的操作。路由表除了向IP层提供路由寻找的接口以外还必须与几个元素提供接口：与用户的接口（即更改路由）、proc的接口、IP层控制接口、以及和硬件的接口（网络接口的改变会导致路由表内容的改变）。处在RDPB的中心的规则，由规则选取表。IP层并不直接使用路由表，而是通过一个路由适配层,路由适配层提供为IP层提供高性能的路由服务。</p>
-
-<h3>5.1 路由表（Fib Table）</h3>
-
-<p>数据结构：</p>
-
-<p>在整个策略性路由的框架里，路由表是最重要的的数据结构，我们在上面以及对路由表的概念和结构进行了清楚的说明。Linux里通过下面这些主要的数据结构进行实现的。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>主要数据结构       作用          位置
-</span><span class='line'>struct fib_table  路由表           ip_fib.h 116
-</span><span class='line'>struct fn_hash        路由表的哈希数据    fib_hash.c 104
-</span><span class='line'>struct fn_zone        zone域         fib_hash.c 85
-</span><span class='line'>struct fib_node       路由节点        fib_hash.c 68
-</span><span class='line'>struct fib_info       路由信息        ip_fib.h 57
-</span><span class='line'>struct fib_result 路由结果        ip_fib.h 86</span></code></pre></td></tr></table></div></figure>
-
-
-<p>数据结构之间的主要关系如下。路由表由路由表号以及路由表的操作函数指针还有表数据组成。这里需要注意的是，路由表结构里并不直接定义zone域，而是通过一个数据指针指向fn_hash。只有当zone里有数据才会连接到fn_zone_list里。</p>
-
-<p>系统的所有的路由表由数组变量<code>*fib_tables[RT_TABLE_MAX+1]</code>维护，其中系统定义RT_TABLE_MAX为254，也就是说系统最大的路由表为255张，所有的路由表的操作都是对这个数组进行的。。同时系统还定义了三长路由表<code>*local_table</code>; <code>*main_table</code>。</p>
-
-<h4>路由表的操作：</h4>
-
-<p>Linux策略路由代码的主要部分是对路由表的操作。对于路由表的操作，物理操作是直观的和易于理解的。对于表的操作不外乎就是添加、删除、更新等的操作。还有一种操作，是所谓的语义操作，语义操作主要是指诸如计算下一条的地址，把节点转换为路由项，寻找指定信息的路由等。</p>
-
-<h5>1、物理操作(operation)：</h5>
-
-<p>路由表的物理操作主要包括如下这些函数：</p>
-
-<p>路由标操作实现函数 位置</p>
-
-<p>新建路由表</p>
-
-<p>删除路由表</p>
-
-<p>搜索路由 fn_hash_lookup fib_hash.c 269</p>
-
-<p>插入路由到路由表 fn_hash_insert fib_hash.c 341</p>
-
-<p>删除路由表的路由 fn_hash_delete</p>
-
-<p>fn_hash_dump</p>
-
-<p>fib_hash.c 433</p>
-
-<p>fib_hash.c 614</p>
-
-<p>更新路由表的路由 fn_hash_flush fib_hash.c 729</p>
-
-<p>显示路由表的路由信息 fn_hash_get_info fib_hash.c 750</p>
-
-<p>选择默认路由 fn_hash_select_default fib_hash.c 842</p>
-
-<h5>2、语义操作(semantics operation)：</h5>
-
-<p>语义操作并不涉及路由表整体框架的理解，而且，函数名也是不言自明的，所以请大家参考fib_semantics.c。</p>
-
-<h5>3、接口(front end)</h5>
-
-<p>对于路由表接口的理解，关键在于理解那里有</p>
-
-<p>IP</p>
-
-<p>首先是路由表于IP层的接口。路由在目前linux的意义上来说，最主要的还是IP层的路由，所以和IP层的的接口是最主要的接口。和ip层的衔接主要是向IP层提供寻找路由、路由控制、寻找指定ip的接口。</p>
-
-<p>Fil_lookup</p>
-
-<p>ip_rt_ioctl fib_frontend.c 286;&ldquo; f</p>
-
-<p>ip_dev_find 145</p>
-
-<p>Inet</p>
-
-<p>路由表还必须提供配置接口，即用户直接操作路由的接口，例如增加和删除一条路由。当然在策略性路由里，还有规则的添加和删除。</p>
-
-<p>inet_rtm_delroute 351</p>
-
-<p>inet_rtm_newroute 366</p>
-
-<p>inet_check_attr 335</p>
-
-<p>proc</p>
-
-<p>在 /proc/net/route 里显示路由信息。</p>
-
-<p>fib_get_procinfo</p>
-
-<h5>4、网络设备（net dev event）</h5>
-
-<p>路由是和硬件关联的，当网络设备启动或关闭的时候，必须通知路由表的管理程序，更新路由表的信息。</p>
-
-<p>fib_disable_ip 567</p>
-
-<p>fib_inetaddr_event 575</p>
-
-<p>fib_netdev_event</p>
-
-<h5>5、内部维护（ magic）</h5>
-
-<p>上面我们提到，本地路由表（local table）的维护是由系统自动进行的。也就是说当用户为硬件设置IP地址等的时候，系统自动在本地路由表里添加本地接口地址以及广播地址。</p>
-
-<p>fib_magic 417</p>
-
-<p>fib_add_ifaddr 459</p>
-
-<p>fib_del_ifaddr 498</p>
-
-<h3>Rule</h3>
-
-<h4>1、数据结构</h4>
-
-<p>规则在fib_rules.c的52行里定义为 struct fib_rule。而RPDB里所有的路由是保存在101行的变量fib_rules里的，注意这个变量很关键，它掌管着所有的规则，规则的添加和删除都是对这个变量进行的。</p>
-
-<h4>2、系统定义规则：</h4>
-
-<p>fib_rules被定义以后被赋予了三条默认的规则：默认规则，本地规则以及主规则。</p>
-
-<p>u 本地规则local_rule</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static struct fib_rule local_rule = {
-</span><span class='line'>&#9;r_next: &main_rule, /*下一条规则是主规则*/
-</span><span class='line'>&#9;r_clntref: ATOMIC_INIT(2),
-</span><span class='line'>&#9;r_table: RT_TABLE_LOCAL, /*指向本地路由表*/
-</span><span class='line'>&#9;r_action: RTN_UNICAST, /*动作是返回路由*/
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
-
-
-<p>u 主规则main_rule</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static struct fib_rule main_rule = {
-</span><span class='line'>&#9;r_next: &default_rule,/*下一条规则是默认规则*/
-</span><span class='line'>&#9;r_clntref: ATOMIC_INIT(2),
-</span><span class='line'>&#9;r_preference: 0x7FFE, /*默认规则的优先级32766*/
-</span><span class='line'>&#9;r_table: RT_TABLE_MAIN, /*指向主路由表*/
-</span><span class='line'>&#9;r_action: RTN_UNICAST, /*动作是返回路由*/
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
-
-
-<p>u 默认规则default rule</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static struct fib_rule default_rule = {
-</span><span class='line'>&#9;r_clntref: ATOMIC_INIT(2),
-</span><span class='line'>&#9;r_preference: 0x7FFF,/*默认规则的优先级32767*/
-</span><span class='line'>&#9;r_table: RT_TABLE_DEFAULT,/*指默认路由表*/
-</span><span class='line'>&#9;r_action: RTN_UNICAST,/*动作是返回路由*/
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
-
-
-<p>规则链的链头指向本地规则。</p>
-
-<h4>RPDB的中心函数fib_lookup</h4>
-
-<p>现在到了讨论RPDB的实现的的中心函数fib_lookup了。RPDB通过提供接口函数fib_lookup，作为寻找路由的入口点，在这里有必要详细讨论这个函数，下面是源代码：，</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>310 int fib_lookup(const struct rt_key *key, struct fib_result *res)
-</span><span class='line'>311 {
-</span><span class='line'>312   int err;
-</span><span class='line'>313   struct fib_rule *r, *policy;
-</span><span class='line'>314   struct fib_table *tb;
-</span><span class='line'>315
-</span><span class='line'>316   u32 daddr = key-&gt;dst;
-</span><span class='line'>317   u32 saddr = key-&gt;src;
-</span><span class='line'>318
-</span><span class='line'>321   read_lock(&fib_rules_lock);
-</span><span class='line'>322   for (r = fib_rules; r; r=r-&gt;r_next) {/*扫描规则链fib_rules里的每一条规则直到匹配为止*/
-</span><span class='line'>323       if (((saddr^r-&gt;r_src) & r-&gt;r_srcmask) ||
-</span><span class='line'>324           ((daddr^r-&gt;r_dst) & r-&gt;r_dstmask) ||
-</span><span class='line'>325 #ifdef CONFIG_IP_ROUTE_TOS
-</span><span class='line'>326           (r-&gt;r_tos && r-&gt;r_tos != key-&gt;tos) ||
-</span><span class='line'>327 #endif
-</span><span class='line'>328 #ifdef CONFIG_IP_ROUTE_FWMARK
-</span><span class='line'>329           (r-&gt;r_fwmark && r-&gt;r_fwmark != key-&gt;fwmark) ||
-</span><span class='line'>330 #endif
-</span><span class='line'>331           (r-&gt;r_ifindex && r-&gt;r_ifindex != key-&gt;iif))
-</span><span class='line'>332       continue;/*以上为判断规则是否匹配，如果不匹配则扫描下一条规则，否则继续*/
-</span><span class='line'>335       switch (r-&gt;r_action) {/*好了，开始处理动作了*/
-</span><span class='line'>336       case RTN_UNICAST:/*没有设置动作*/
-</span><span class='line'>337       case RTN_NAT: /*动作nat ADDRESS*/
-</span><span class='line'>338           policy = r;
-</span><span class='line'>339           break;
-</span><span class='line'>340       case RTN_UNREACHABLE: /*动作unreachable*/
-</span><span class='line'>341           read_unlock(&fib_rules_lock);
-</span><span class='line'>342           return -ENETUNREACH;
-</span><span class='line'>343       default:
-</span><span class='line'>344           case RTN_BLACKHOLE:/* 动作reject */
-</span><span class='line'>345           read_unlock(&fib_rules_lock);
-</span><span class='line'>346           return -EINVAL;
-</span><span class='line'>347       case RTN_PROHIBIT:/* 动作prohibit */
-</span><span class='line'>348           read_unlock(&fib_rules_lock);
-</span><span class='line'>349           return -EACCES;
-</span><span class='line'>350       }
-</span><span class='line'>351       /*选择路由表*/
-</span><span class='line'>352       if ((tb = fib_get_table(r-&gt;r_table)) == NULL)
-</span><span class='line'>353           continue;
-</span><span class='line'>&#9;&#9;/*在路由表里寻找指定的路由*/
-</span><span class='line'>354       err = tb-&gt;tb_lookup(tb, key, res);
-</span><span class='line'>355       if (err == 0) {/*命中目标*/
-</span><span class='line'>356           res-&gt;r = policy;
-</span><span class='line'>357           if (policy)
-</span><span class='line'>358               atomic_inc(&policy-&gt;r_clntref);
-</span><span class='line'>359           read_unlock(&fib_rules_lock);
-</span><span class='line'>360           return 0;
-</span><span class='line'>361       }
-</span><span class='line'>362       if (err &lt; 0 && err != -EAGAIN) {/*路由失败*/
-</span><span class='line'>363           read_unlock(&fib_rules_lock);
-</span><span class='line'>364           return err;
-</span><span class='line'>365       }
-</span><span class='line'>366   }
-</span><span class='line'>368   read_unlock(&fib_rules_lock);
-</span><span class='line'>369   return -ENETUNREACH;
-</span><span class='line'>370 }</span></code></pre></td></tr></table></div></figure>
-
-
-<p>上面的这段代码的思路是非常的清晰的。首先程序从优先级高到低扫描所有的规则，如果规则匹配，处理该规则的动作。如果是普通的路由寻址或者是nat地址转换的换，首先从规则得到路由表，然后对该路由表进行操作。这样RPDB终于清晰的显现出来了。</p>
-
-<h4>5.2 IP层路由适配（IP route）</h4>
-
-<p>路由表以及规则组成的系统，可以完成路由的管理以及查找的工作，但是为了使得IP层的路由工作更加的高效，linux的路由体系里，route.c里完成大多数IP层与RPDB的适配工作，以及路由缓冲（route cache）的功能。</p>
-
-<h5>调用接口</h5>
-
-<p>IP层的路由接口分为发送路由接口以及接收路由接口：</p>
-
-<h5>发送路由接口</h5>
-
-<p>IP层在发送数据时如果需要进行路由工作的时候，就会调用ip_route_out函数。这个函数在完成一些键值的简单转换以后，就会调用ip_route_output_key函数，这个函数首先在缓存里寻找路由，如果失败就会调用ip_route_output_slow，ip_route_output_slow里调用fib_lookup在路由表里寻找路由，如果命中，首先在缓存里添加这个路由，然后返回结果。</p>
-
-<p>ip_route_out route.h</p>
-
-<p>ip_route_output_key route.c 1984;</p>
-
-<p>ip_route_output_slow route.c 1690;"</p>
-
-<h5>接收路由接口</h5>
-
-<p>IP层接到一个数据包以后，如果需要进行路由，就调用函数ip_route_input，ip_route_input现在缓存里寻找，如果失败则ip_route_inpu调用ip_route_input_slow， ip_route_input_slow里调用fib_lookup在路由表里寻找路由，如果命中，首先在缓存里添加这个路由，然后返回结果。</p>
-
-<p>ip_route_input_slow route.c 1312;&ldquo; f</p>
-
-<p>ip_route_input route.c 1622;&ldquo; f</p>
-
-<h3>cache</h3>
-
-<p>路由缓存保存的是最近使用的路由。当IP在路由表进行路由以后，如果命中就会在路由缓存里增加该路由。同时系统还会定时检查路由缓存里的项目是否失效，如果失效则清除。</p>
-</div>
-  
-  
-
-
-    </article>
-  
   <div class="pagination">
     
       <a class="prev" href="/posts/147">&larr; Older</a>
@@ -1287,7 +973,7 @@ var ss360Config = {
   
     <section>
 <h1>Categories
-<span class='right_span'>(967)</span>
+<span class='right_span'>(969)</span>
 
 </h1>
 <head>
@@ -1378,7 +1064,7 @@ if (!document.getElementById('assembly~base')) document.getElementById('aexp_ass
 if (!document.getElementById('assembly')) document.getElementById('aexp_assembly').style.visibility = 'hidden';
 if (!document.getElementById('assembly~win')) document.getElementById('aexp_assembly~win').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(199)</span></li>
+<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(200)</span></li>
 <div id='tools' class='catsub'><li><a href='/blog/cats/tools~apache2/?opendiv=tools'>apache2</a><a href='##' onmousedown=showDiv('tools~apache2') id='aexp_tools~apache2'><span class='exp_style' id='exp_tools~apache2'>[+]</span></a><span class='right_span'>9</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~apache2')) document.getElementById('aexp_tools~apache2').style.visibility = 'hidden';
@@ -1419,7 +1105,7 @@ if (!document.getElementById('tools~haproxy')) document.getElementById('aexp_too
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~isal')) document.getElementById('aexp_tools~isal').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/tools~mysql/?opendiv=tools'>mysql</a><a href='##' onmousedown=showDiv('tools~mysql') id='aexp_tools~mysql'><span class='exp_style' id='exp_tools~mysql'>[+]</span></a><span class='right_span'>30</span></li>
+<li><a href='/blog/cats/tools~mysql/?opendiv=tools'>mysql</a><a href='##' onmousedown=showDiv('tools~mysql') id='aexp_tools~mysql'><span class='exp_style' id='exp_tools~mysql'>[+]</span></a><span class='right_span'>31</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~mysql')) document.getElementById('aexp_tools~mysql').style.visibility = 'hidden';
 </script>
@@ -1616,8 +1302,8 @@ if (!document.getElementById('kernel~tcp')) document.getElementById('aexp_kernel
 if (!document.getElementById('kernel')) document.getElementById('aexp_kernel').style.visibility = 'hidden';
 if (!document.getElementById('kernel~vpn')) document.getElementById('aexp_kernel~vpn').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/network/'>network</a><a href='##' onmousedown=showDiv('network') id='aexp_network'><span class='exp_style' id='exp_network'>[+]</span></a><span class='right_span'>(8)</span></li>
-<div id='network' class='catsub'><li><a href='/blog/cats/network~base/?opendiv=network'>base</a><a href='##' onmousedown=showDiv('network~base') id='aexp_network~base'><span class='exp_style' id='exp_network~base'>[+]</span></a><span class='right_span'>8</span></li>
+<li class='catclass'><a href='/blog/cats/network/'>network</a><a href='##' onmousedown=showDiv('network') id='aexp_network'><span class='exp_style' id='exp_network'>[+]</span></a><span class='right_span'>(9)</span></li>
+<div id='network' class='catsub'><li><a href='/blog/cats/network~base/?opendiv=network'>base</a><a href='##' onmousedown=showDiv('network~base') id='aexp_network~base'><span class='exp_style' id='exp_network~base'>[+]</span></a><span class='right_span'>9</span></li>
 </div><script language='javascript' type='text/javascript'>
 if (!document.getElementById('network')) document.getElementById('aexp_network').style.visibility = 'hidden';
 if (!document.getElementById('network~base')) document.getElementById('aexp_network~base').style.visibility = 'hidden';
@@ -1729,7 +1415,7 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 
 <section>
 <h1>Date Categories
-<span class='right_span'>(967)</span>
+<span class='right_span'>(969)</span>
 
 </h1>
 <head>
@@ -1737,8 +1423,9 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(87)</span></li>
-<div id='2024' class='catsub'><li><a href='/blog/cats/2024~10/?opendiv=2024'>2024-10</a><span class='right_span'>5</span></li>
+<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(89)</span></li>
+<div id='2024' class='catsub'><li><a href='/blog/cats/2024~12/?opendiv=2024'>2024-12</a><span class='right_span'>2</span></li>
+<li><a href='/blog/cats/2024~10/?opendiv=2024'>2024-10</a><span class='right_span'>5</span></li>
 <li><a href='/blog/cats/2024~09/?opendiv=2024'>2024-09</a><span class='right_span'>15</span></li>
 <li><a href='/blog/cats/2024~08/?opendiv=2024'>2024-08</a><span class='right_span'>18</span></li>
 <li><a href='/blog/cats/2024~07/?opendiv=2024'>2024-07</a><span class='right_span'>26</span></li>
@@ -1910,6 +1597,14 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
   <ul id="recent_posts">
     
       <li class="post">
+        <a href="/blog/2024/12/12/tools-mysql-bin/">删除MySQL下的bin</a>
+      </li>
+    
+      <li class="post">
+        <a href="/blog/2024/12/12/network-sfp/">光模块配置</a>
+      </li>
+    
+      <li class="post">
         <a href="/blog/2024/10/27/network-ap-ac/">无线AP与AC详解</a>
       </li>
     
@@ -1939,14 +1634,6 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
     
       <li class="post">
         <a href="/blog/2024/09/20/sqlserver-_/">`_` 通配符 -- 匹配一个字符</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/09/14/lang-web-ding/">钉钉开放平台API</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/09/14/lang-web-staticmap/">腾讯地图--静态地图API</a>
       </li>
     
   </ul>
