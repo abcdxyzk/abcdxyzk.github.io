@@ -131,6 +131,226 @@ var ss360Config = {
       
   <header>
     
+      <h2 class="entry-title"><a href="/blog/2020/05/25/kernel-reuseport-history/">reuseport使用</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2020-05-25T17:07:00+08:00'><span class='date'>2020-05-25</span> <span class='time'>17:07:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://www.it165.net/os/html/201605/17066.html">http://www.it165.net/os/html/201605/17066.html</a></p>
+
+<h3>Q&amp;A</h3>
+
+<h4>Q1：什么是reuseport？</h4>
+
+<p>A1：reuseport是一种套接字复用机制，它允许你将多个套接字bind在同一个IP地址/端口对上，这样一来，就可以建立多个服务来接受到同一个端口的连接。</p>
+
+<h4>Q2：当来了一个连接时，系统怎么决定到底是哪个套接字来处理它？</h4>
+
+<p>A2：对于不同的内核，处理机制是不一样的，总的说来，reuseport分为两种模式，即热备份模式和负载均衡模式，在早期的内核版本中，即便是加入对reuseport选项的支持，也仅仅为热备份模式，而在3.9内核之后，则全部改为了负载均衡模式，两种模式没有共存</p>
+
+<h4>Q3：什么是热备份模式和负载均衡模式呢？</h4>
+
+<p>A3：
+热备份模式：即你创建了N个reuseport的套接字，然而工作的只有一个，其它的作为备份，只有当前一个套接字不再可用的时候，才会由后一个来取代，其投入工作的顺序取决于实现。</p>
+
+<p>负载均衡模式：即你创建的所有N个reuseport的套接字均可以同时工作，当连接到来的时候，系统会取一个套接字来处理它。这样就可以达到负载均衡的目的，降低某一个服务的压力。</p>
+
+<h4>Q4：到底怎么取套接字呢？</h4>
+
+<p>A4：这个对于热备份模式和负载均衡模式是不同的。</p>
+
+<p>热备份模式：一般而言，会将所有的reuseport同一个IP地址/端口的套接字挂在一个链表上，取第一个即可，如果该套接字挂了，它会被从链表删除，然后第二个便会成为第一个。</p>
+
+<p>负载均衡模式：和热备份模式一样，所有reuseport同一个IP地址/端口的套接字会挂在一个链表上，你也可以认为是一个数组，这样会更加方便，当有连接到来时，用数据包的源IP/源端口作为一个HASH函数的输入，将结果对reuseport套接字数量取模，得到一个索引，该索引指示的数组位置对应的套接字便是工作套接字。</p>
+
+<h3>关于REUSEPORT的实现</h3>
+
+<p>Linux 4.5/4.6所谓的对reuseport的优化主要体现在查询速度上，在优化前，在HASH冲突链表上遍历所有的套接字之后才能知道到底取哪个(基于一种冒泡的score打分机制，不完成一轮冒泡遍历，不能确定谁的score最高)，之所以如此低效是因为内核将reuseport的所有套接字和其它套接字混合在了一起，查找是平坦的，正常的做法应该是将它们分为一个组，进行分层查找，先找到这个组(这个很容易)，然后再在组中找具体的套接字。Linux 4.5针对UDP做了上述优化，而Linux 4.6则将这个优化引入到了TCP。</p>
+
+<p>设想系统中一共有10000个套接字被HASH到同一个冲突链表，其中9950个是reuseport的同一组套接字，如果按照老的算法，需要遍历10000个套接字，如果使用基于分组的算法，最多只需要遍历51个套接字即可，找到那个组之后，一步HASH就可以找到目标套接字的索引！</p>
+
+<h4>Linux 4.5之前的reuseport查找实现(4.3内核)</h4>
+
+<p>以下是未优化前的Linux 4.3内核的实现，可见是多么地不直观。它采用了遍历HASH冲突链表的方式进行reuseport套接字的精确定位：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>result = NULL;
+</span><span class='line'>badness = 0;
+</span><span class='line'>udp_portaddr_for_each_entry_rcu(sk, node, &hslot2-&gt;head) {
+</span><span class='line'>&#9;score = compute_score2(sk, net, saddr, sport, daddr, hnum, dif);
+</span><span class='line'>&#9;if (score &gt; badness) { // 冒泡排序
+</span><span class='line'>&#9;&#9;// 找到了更加合适的socket，需要重新hash
+</span><span class='line'>&#9;&#9;result = sk;
+</span><span class='line'>&#9;&#9;badness = score;
+</span><span class='line'>&#9;&#9;reuseport = sk-&gt;sk_reuseport;
+</span><span class='line'>&#9;&#9;if (reuseport) {
+</span><span class='line'>&#9;&#9;&#9;hash = udp_ehashfn(net, daddr, hnum, saddr, sport);
+</span><span class='line'>&#9;&#9;&#9;matches = 1;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;} else if (score == badness && reuseport) { // reuseport套接字散列定位
+</span><span class='line'>&#9;&#9;// 找到了同样reuseport的socket，进行定位
+</span><span class='line'>&#9;&#9;matches++;
+</span><span class='line'>&#9;&#9;if (reciprocal_scale(hash, matches) == 0)
+</span><span class='line'>&#9;&#9;&#9;result = sk;
+</span><span class='line'>&#9;&#9;hash = next_pseudo_random32(hash);
+</span><span class='line'>&#9;}
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>之所以要遍历是因为所有的reuseport套接字和其它的套接字都被平坦地插入到同一个表中，事先并不知道有多少组reuseport套接字以及每一组中有多少个套接字</p>
+
+<h4>Linux 4.5(针对UDP)/4.6(针对TCP)的reuseport查找实现</h4>
+
+<p>我们来看看在4.5和4.6内核中对于reuseport的查找增加了一些什么神奇的新东西：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>result = NULL;
+</span><span class='line'>badness = 0;
+</span><span class='line'>udp_portaddr_for_each_entry_rcu(sk, node, &hslot2-&gt;head) {
+</span><span class='line'>&#9;score = compute_score2(sk, net, saddr, sport, daddr, hnum, dif);
+</span><span class='line'>&#9;if (score &gt; badness) {
+</span><span class='line'>&#9;&#9;// 在reuseport情形下，意味着找到了更加合适的socket组，需要重新hash
+</span><span class='line'>&#9;&#9;result = sk;
+</span><span class='line'>&#9;&#9;badness = score;
+</span><span class='line'>&#9;&#9;reuseport = sk-&gt;sk_reuseport;
+</span><span class='line'>&#9;&#9;if (reuseport) {
+</span><span class='line'>&#9;&#9;&#9;hash = udp_ehashfn(net, daddr, hnum, saddr, sport);
+</span><span class='line'>&#9;&#9;&#9;if (select_ok) {
+</span><span class='line'>&#9;&#9;&#9;&#9;struct sock *sk2;
+</span><span class='line'>&#9;&#9;&#9;&#9;// 找到了一个组，接着进行组内hash。
+</span><span class='line'>&#9;&#9;&#9;&#9;sk2 = reuseport_select_sock(sk, hash, skb, sizeof(struct udphdr));
+</span><span class='line'>&#9;&#9;&#9;&#9;if (sk2) {
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;result = sk2;
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;select_ok = false;
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;goto found;
+</span><span class='line'>&#9;&#9;&#9;&#9;}
+</span><span class='line'>&#9;&#9;&#9;}
+</span><span class='line'>&#9;&#9;&#9;matches = 1;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;} else if (score == badness && reuseport) {
+</span><span class='line'>&#9;&#9;// 这个else if分支的期待是，在分层查找不适用的时候，寻找更加匹配的reuseport组，注意4.5/4.6以后直接寻找的是一个reuseport组。
+</span><span class='line'>&#9;&#9;// 在某种意义上，这回退到了4.5之前的算法。
+</span><span class='line'>&#9;&#9;matches++;
+</span><span class='line'>&#9;&#9;if (reciprocal_scale(hash, matches) == 0)
+</span><span class='line'>&#9;&#9;&#9;result = sk;
+</span><span class='line'>&#9;&#9;hash = next_pseudo_random32(hash);
+</span><span class='line'>&#9;}
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>我们着重看一下reuseport_select_sock，这个函数是第二层组内查找的关键，其实不应该叫做查找，而应该叫做定位更加合适：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct sock *reuseport_select_sock(struct sock *sk, u32 hash, struct sk_buff *skb, int hdr_len)
+</span><span class='line'>{
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;prog = rcu_dereference(reuse-&gt;prog);
+</span><span class='line'>&#9;socks = READ_ONCE(reuse-&gt;num_socks);
+</span><span class='line'>&#9;if (likely(socks)) {
+</span><span class='line'>&#9;&#9;/* paired with smp_wmb() in reuseport_add_sock() */
+</span><span class='line'>&#9;&#9;smp_rmb();
+</span><span class='line'> 
+</span><span class='line'>&#9;&#9;if (prog && skb) // 可以用BPF来从用户态注入自己的定位逻辑，更好实现基于策略的负载均衡
+</span><span class='line'>&#9;&#9;&#9;sk2 = run_bpf(reuse, socks, prog, skb, hdr_len);
+</span><span class='line'>&#9;&#9;else
+</span><span class='line'>&#9;&#9;&#9;// reciprocal_scale简单地将结果限制在了[0,socks)这个区间内
+</span><span class='line'>&#9;&#9;&#9;sk2 = reuse-&gt;socks[reciprocal_scale(hash, socks)];
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;...
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
       <h2 class="entry-title"><a href="/blog/2020/05/25/kernel-reuseport/">reuseport使用</a></h2>
     
     
@@ -636,293 +856,6 @@ var ss360Config = {
 
     </article>
   
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2020/05/22/kernel-qdisc-init/">qdisc 的创建过程</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2020-05-22T11:12:00+08:00'><span class='date'>2020-05-22</span> <span class='time'>11:12:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://blog.chinaunix.net/uid-26902809-id-4106161.html">http://blog.chinaunix.net/uid-26902809-id-4106161.html</a></p>
-
-<p>register_netdevice会初始化netdev的Tx调度discipline, 缺省使用noop_qdisc</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>register_netdevice
-</span><span class='line'>---&gt;dev_init_scheduler
-</span><span class='line'>
-</span><span class='line'>
-</span><span class='line'>void dev_init_scheduler(struct net_device *dev)
-</span><span class='line'>{
-</span><span class='line'>&#9;dev-&gt;qdisc = &noop_qdisc; //缺省为设备配置noop_qdisc
-</span><span class='line'>&#9;netdev_for_each_tx_queue(dev, dev_init_scheduler_queue, &noop_qdisc); //缺省为每个队列配置noop_qdisc
-</span><span class='line'>&#9;if (dev_ingress_queue(dev))
-</span><span class='line'>&#9;&#9;dev_init_scheduler_queue(dev, dev_ingress_queue(dev), &noop_qdisc);
-</span><span class='line'>
-</span><span class='line'>&#9;setup_timer(&dev-&gt;watchdog_timer, dev_watchdog, (unsigned long)dev);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>dev_open
-</span><span class='line'>---&gt;__dev_open
-</span><span class='line'>----&gt;dev_activate
-</span><span class='line'>----&gt;attach_default_qdiscs
-</span><span class='line'>----&gt;attach_one_default_qdisc
-</span><span class='line'>为单队列的设备创建pfifo_fast的qdisc
-</span><span class='line'>
-</span><span class='line'>static void attach_one_default_qdisc(struct net_device *dev,
-</span><span class='line'>&#9;&#9;&#9;&#9;struct netdev_queue *dev_queue,
-</span><span class='line'>&#9;&#9;&#9;&#9;void *_unused)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct Qdisc *qdisc = &noqueue_qdisc;
-</span><span class='line'>
-</span><span class='line'>&#9;if (dev-&gt;tx_queue_len) {
-</span><span class='line'>&#9;&#9;qdisc = qdisc_create_dflt(dev_queue,
-</span><span class='line'>&#9;&#9;&#9;&#9;&pfifo_fast_ops, TC_H_ROOT);
-</span><span class='line'>&#9;&#9;if (!qdisc) {
-</span><span class='line'>&#9;&#9;&#9;netdev_info(dev, "activation failed\n");
-</span><span class='line'>&#9;&#9;&#9;return;
-</span><span class='line'>&#9;&#9;}
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;dev_queue-&gt;qdisc_sleeping = qdisc;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>dev_open
-</span><span class='line'>---&gt;__dev_open
-</span><span class='line'>----&gt;dev_activate
-</span><span class='line'>----&gt;attach_default_qdiscs
-</span><span class='line'>----&gt;qdisc_create_dflt
-</span><span class='line'>为多队列的设备创建mq_qdisc, 创建完mq_qdisc， 接着调用mq_qdisc_ops-&gt;mq_init函数为每个队列创建pfifo_fast_ops的qdisc
-</span><span class='line'>
-</span><span class='line'>struct Qdisc *qdisc_create_dflt(struct netdev_queue *dev_queue,
-</span><span class='line'>&#9;&#9;&#9;struct Qdisc_ops *ops, unsigned int parentid)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct Qdisc *sch;
-</span><span class='line'>
-</span><span class='line'>&#9;sch = qdisc_alloc(dev_queue, ops);
-</span><span class='line'>&#9;if (IS_ERR(sch))
-</span><span class='line'>&#9;&#9;goto errout;
-</span><span class='line'>&#9;sch-&gt;parent = parentid;
-</span><span class='line'>
-</span><span class='line'>&#9;if (!ops-&gt;init || ops-&gt;init(sch, NULL) == 0)
-</span><span class='line'>&#9;&#9;return sch;
-</span><span class='line'>
-</span><span class='line'>&#9;qdisc_destroy(sch);
-</span><span class='line'>errout:
-</span><span class='line'>&#9;return NULL;
-</span><span class='line'>}
-</span><span class='line'>EXPORT_SYMBOL(qdisc_create_dflt);</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>dev_open
-</span><span class='line'>---&gt;__dev_open
-</span><span class='line'>----&gt;dev_activate
-</span><span class='line'>----&gt;attach_default_qdiscs
-</span><span class='line'>static void attach_default_qdiscs(struct net_device *dev)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct netdev_queue *txq;
-</span><span class='line'>&#9;struct Qdisc *qdisc;
-</span><span class='line'>
-</span><span class='line'>&#9;txq = netdev_get_tx_queue(dev, 0);
-</span><span class='line'>
-</span><span class='line'>&#9;if (!netif_is_multiqueue(dev) || dev-&gt;tx_queue_len == 0) {
-</span><span class='line'>&#9;&#9;netdev_for_each_tx_queue(dev, attach_one_default_qdisc, NULL);
-</span><span class='line'>&#9;&#9;dev-&gt;qdisc = txq-&gt;qdisc_sleeping;
-</span><span class='line'>&#9;&#9;atomic_inc(&dev-&gt;qdisc-&gt;refcnt);
-</span><span class='line'>&#9;} else {
-</span><span class='line'>&#9;&#9;qdisc = qdisc_create_dflt(txq, &mq_qdisc_ops, TC_H_ROOT);
-</span><span class='line'>&#9;&#9;if (qdisc) {
-</span><span class='line'>&#9;&#9;&#9;qdisc-&gt;ops-&gt;attach(qdisc);
-</span><span class='line'>&#9;&#9;&#9;dev-&gt;qdisc = qdisc;
-</span><span class='line'>&#9;&#9;}
-</span><span class='line'>&#9;}
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>dev_open函数会调用dev_activate：
-</span><span class='line'>a. 为单队列的设备创建pfifo_fast的qdisc
-</span><span class='line'>b. 为多队列的设备创建mq_qdisc, 创建完mq_qdisc， 接着调用mq_qdisc_ops-&gt;mq_init函数为每个队列创建pfifo_fast_ops的qdisc
-</span><span class='line'>dev_open
-</span><span class='line'>---&gt;__dev_open
-</span><span class='line'>----&gt;dev_activate
-</span><span class='line'>
-</span><span class='line'>void dev_activate(struct net_device *dev)
-</span><span class='line'>{
-</span><span class='line'>&#9;int need_watchdog;
-</span><span class='line'>
-</span><span class='line'>&#9;/* No queueing discipline is attached to device;
-</span><span class='line'>&#9;   create default one i.e. pfifo_fast for devices,
-</span><span class='line'>&#9;   which need queueing and noqueue_qdisc for
-</span><span class='line'>&#9;   virtual interfaces
-</span><span class='line'>&#9;*/
-</span><span class='line'>
-</span><span class='line'>&#9;if (dev-&gt;qdisc == &noop_qdisc)
-</span><span class='line'>&#9;&#9;attach_default_qdiscs(dev);
-</span><span class='line'>
-</span><span class='line'>&#9;if (!netif_carrier_ok(dev))
-</span><span class='line'>&#9;/* Delay activation until next carrier-on event */
-</span><span class='line'>&#9;&#9;return;
-</span><span class='line'>
-</span><span class='line'>&#9;need_watchdog = 0;
-</span><span class='line'>&#9;netdev_for_each_tx_queue(dev, transition_one_qdisc, &need_watchdog);
-</span><span class='line'>&#9;if (dev_ingress_queue(dev))
-</span><span class='line'>&#9;&#9;transition_one_qdisc(dev, dev_ingress_queue(dev), NULL);
-</span><span class='line'>
-</span><span class='line'>&#9;if (need_watchdog) {
-</span><span class='line'>&#9;&#9;dev-&gt;trans_start = jiffies;
-</span><span class='line'>&#9;&#9;dev_watchdog_up(dev);
-</span><span class='line'>&#9;}
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-
-</div>
-  
-  
-
-
-    </article>
-  
   <div class="pagination">
     
       <a class="prev" href="/posts/130">&larr; Older</a>
@@ -937,7 +870,7 @@ var ss360Config = {
   
     <section>
 <h1>Categories
-<span class='right_span'>(969)</span>
+<span class='right_span'>(970)</span>
 
 </h1>
 <head>
@@ -1266,8 +1199,8 @@ if (!document.getElementById('kernel~tcp')) document.getElementById('aexp_kernel
 if (!document.getElementById('kernel')) document.getElementById('aexp_kernel').style.visibility = 'hidden';
 if (!document.getElementById('kernel~vpn')) document.getElementById('aexp_kernel~vpn').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/network/'>network</a><a href='##' onmousedown=showDiv('network') id='aexp_network'><span class='exp_style' id='exp_network'>[+]</span></a><span class='right_span'>(9)</span></li>
-<div id='network' class='catsub'><li><a href='/blog/cats/network~base/?opendiv=network'>base</a><a href='##' onmousedown=showDiv('network~base') id='aexp_network~base'><span class='exp_style' id='exp_network~base'>[+]</span></a><span class='right_span'>9</span></li>
+<li class='catclass'><a href='/blog/cats/network/'>network</a><a href='##' onmousedown=showDiv('network') id='aexp_network'><span class='exp_style' id='exp_network'>[+]</span></a><span class='right_span'>(10)</span></li>
+<div id='network' class='catsub'><li><a href='/blog/cats/network~base/?opendiv=network'>base</a><a href='##' onmousedown=showDiv('network~base') id='aexp_network~base'><span class='exp_style' id='exp_network~base'>[+]</span></a><span class='right_span'>10</span></li>
 </div><script language='javascript' type='text/javascript'>
 if (!document.getElementById('network')) document.getElementById('aexp_network').style.visibility = 'hidden';
 if (!document.getElementById('network~base')) document.getElementById('aexp_network~base').style.visibility = 'hidden';
@@ -1379,7 +1312,7 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 
 <section>
 <h1>Date Categories
-<span class='right_span'>(969)</span>
+<span class='right_span'>(970)</span>
 
 </h1>
 <head>
@@ -1387,7 +1320,9 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(89)</span></li>
+<li class='catclass'><a href='/blog/cats/2025/'>2025</a><a href='##' onmousedown=showDiv('2025')><span class='exp_style' id='exp_2025'>[+]</span></a><span class='right_span'>(1)</span></li>
+<div id='2025' class='catsub'><li><a href='/blog/cats/2025~01/?opendiv=2025'>2025-01</a><span class='right_span'>1</span></li>
+</div><li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(89)</span></li>
 <div id='2024' class='catsub'><li><a href='/blog/cats/2024~12/?opendiv=2024'>2024-12</a><span class='right_span'>2</span></li>
 <li><a href='/blog/cats/2024~10/?opendiv=2024'>2024-10</a><span class='right_span'>5</span></li>
 <li><a href='/blog/cats/2024~09/?opendiv=2024'>2024-09</a><span class='right_span'>15</span></li>
@@ -1561,6 +1496,10 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
   <ul id="recent_posts">
     
       <li class="post">
+        <a href="/blog/2025/01/16/network-ac-ap/">如何在ac上telnet到ap</a>
+      </li>
+    
+      <li class="post">
         <a href="/blog/2024/12/12/tools-mysql-bin/">删除MySQL下的bin</a>
       </li>
     
@@ -1594,10 +1533,6 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
     
       <li class="post">
         <a href="/blog/2024/09/20/ffmpeg-mp3/">ffmpeg分离MP3文件报错</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/09/20/sqlserver-_/">`_` 通配符 -- 匹配一个字符</a>
       </li>
     
   </ul>
@@ -1697,7 +1632,7 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 
     </div>
   </div>
-  <footer role="contentinfo">  Copyright &copy; 2024 - kk -
+  <footer role="contentinfo">  Copyright &copy; 2025 - kk -
   <span class="credit">Powered by <a href="http://octopress.org">Octopress</a></span>
   <a title="Top" href="#" id="scroll2top" style="position: fixed; height: 50px; bottom: 30px; right: 25px; cursor: pointer; z-index: 9999; display: block; opacity: 1;"><img src="/images/scrollup.png"></a>
   <script src="/javascripts/scroll2top.js"></script>

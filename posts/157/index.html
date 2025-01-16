@@ -131,6 +131,645 @@ var ss360Config = {
       
   <header>
     
+      <h2 class="entry-title"><a href="/blog/2018/02/09/kernel-keyring/">内核模块签名--密匙</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2018-02-09T01:37:00+08:00'><span class='date'>2018-02-09</span> <span class='time'>01:37:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="https://www.ibm.com/developerworks/cn/linux/l-key-retention.html">https://www.ibm.com/developerworks/cn/linux/l-key-retention.html</a></p>
+
+<p>Linux 密钥保留服务（Linux key retention service）是在 Linux 2.6 中引入的，它的主要意图是在 Linux 内核中缓存身份验证数据。远程文件系统和其他内核服务可以使用这个服务来管理密码学、身份验证标记、跨域用户映射和其他安全问题。它还使 Linux 内核能够快速访问所需的密钥，并可以用来将密钥操作（比如添加、更新和删除）委托给用户空间。</p>
+
+<p>本文将概述 Linux 密钥保留服务，定义它的术语，帮助您快速掌握 Linux 密钥的使用方法。您将通过示例代码了解如何在内核模块中使用 Linux 密钥保留服务。在编写本文时使用的内核版本是 2.6.20。</p>
+
+<h4>什么是密钥？</h4>
+
+<p>密钥（key）是一组密码学数据、身份验证标记或某些相似的元素，它在内核中由 struct key 表示。在 Linux 内核源代码中，struct key 是在 include/linux/key.h 下定义的。</p>
+
+<p>清单 1 给出 struct key 中一些重要的字段。注意，为了支持密钥，已经修改了 task_struct、user_struct 和 signal_struct。
+清单 1. struct key 中的重要字段</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct key {
+</span><span class='line'>&#9;atomic_t             usage;         /* number of references */
+</span><span class='line'>&#9;key_serial_t         serial;        /* key serial number */
+</span><span class='line'>&#9;struct key_type      *type;         /* type of key */
+</span><span class='line'>&#9;time_t               expiry;        /* time at which key expires (or 0) */
+</span><span class='line'>&#9;uid_t                uid;           /* UID */
+</span><span class='line'>&#9;gid_t                gid;           /* GID */
+</span><span class='line'>&#9;key_perm_t           perm;          /* access permissions */
+</span><span class='line'>&#9;unsigned short       quotalen;      /* length added to quota */
+</span><span class='line'>&#9;unsigned short       datalen;       /* payload data length
+</span><span class='line'>&#9;char                 *description;
+</span><span class='line'>&#9;union {
+</span><span class='line'>&#9;&#9;unsigned long       value;
+</span><span class='line'>&#9;&#9;void                *data;
+</span><span class='line'>&#9;&#9;struct keyring_list *subscriptions;
+</span><span class='line'>&#9;} payload;                          /* Actual security data */
+</span><span class='line'>&#9;....
+</span><span class='line'>&#9;....
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>密钥的属性</h4>
+
+<p>密钥具有以下属性：</p>
+
+<p>  序号（Serial number）：一个惟一的 32 位非零正数。</p>
+
+<p>  类型（Type）：Linux 密钥保留服务定义两个标准密钥类型：user 和 keyring。要添加新的密钥类型，必须由一个内核服务注册它。用户空间程序不允许创建新的密钥类型。密钥类型在内核中由 struct key_type 表示，这是在 include/linux/key.h 中定义的。key_type 结构的一些重要字段见清单 2。</p>
+
+<p>  清单 2. key_type 的重要字段</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct key_type {
+</span><span class='line'>&#9;const char *name;
+</span><span class='line'>&#9;size_t def_datalen;
+</span><span class='line'>     
+</span><span class='line'>&#9;/* Operations that can be defined for a key_type */
+</span><span class='line'>&#9;int (*instantiate)(struct key *key, const void *data, size_t datalen);
+</span><span class='line'>&#9;int (*update)(struct key *key, const void *data, size_t datalen);
+</span><span class='line'>&#9;int (*match)(const struct key *key, const void *desc);
+</span><span class='line'>&#9;void (*revoke)(struct key *key);
+</span><span class='line'>&#9;void (*destroy)(struct key *key);
+</span><span class='line'>&#9;void (*describe)(const struct key *key, struct seq_file *p);
+</span><span class='line'>&#9;long (*read)(const struct key *key, char __user *buffer, size_t buflen);
+</span><span class='line'>&#9;....
+</span><span class='line'>&#9;....
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  还可以将一组操作与一个密钥类型相关联。key_type 可以定义以下操作：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>    instantiate 创建指定类型的一个新密钥。
+</span><span class='line'>    describe 输出描述这个密钥的文本。
+</span><span class='line'>    match 根据描述搜索密钥。
+</span><span class='line'>    destroy 清除与一个密钥相关的所有数据。
+</span><span class='line'>    request_key 搜索密钥。
+</span><span class='line'>    revoke 清除密钥数据并将密钥的状态改为 REVOKED。
+</span><span class='line'>    read 读取密钥数据。
+</span><span class='line'>    update 修改密钥。
+</span><span class='line'>  描述（Description）：一个描述密钥的可输出字符串。这个属性还可以用来执行搜索操作。
+</span><span class='line'>  访问控制信息（Access control information）：每个密钥有一个所有者 ID、一个 GID 和一个权限掩码，权限掩码表示如何响应用户级或内核级程序。权限掩码给四个可能的密钥访问者类型各分配 8 位：所有者、用户、组和其他。在这 8 位中，只定义了 6 位。可能的权限如下：
+</span><span class='line'>    View 允许权限持有者查看密钥属性。
+</span><span class='line'>    Read 允许权限持有者读取密钥并列出 keyring 的密钥。
+</span><span class='line'>    Write 允许权限持有者修改密钥或 keyring 的有效内容和修改链接的密钥。
+</span><span class='line'>    Search 允许权限持有者搜索 keyring 和寻找密钥。
+</span><span class='line'>    Link 允许权限持有者将特定的密钥或 keyring 链接到 keyring。
+</span><span class='line'>    Set Attribute 允许权限持有者设置密钥的 UID、GID 和权限掩码。 
+</span><span class='line'>过期时间（Expiry Time）：密钥的生存期。密钥也可以是永久的。
+</span><span class='line'>有效内容（Payload）：实际的安全内容。可以通过 struct key_type 定义的操作用数据对有效内容进行实例化，还可以读取数据或修改数据。对于内核来说，有效内容仅仅是一组数据。
+</span><span class='line'>状态（State）：密钥可以处于以下状态：
+</span><span class='line'>    UNINSTANTIATED：已经创建了密钥，但是还没有附加任何数据。
+</span><span class='line'>    INSTANTIATED：密钥已经实例化并附加了数据；这是一个完整的 状态。
+</span><span class='line'>    NEGATIVE：这是一个临时状态，表示前面对用户空间的调用失败了。
+</span><span class='line'>    EXPIRED：表示密钥已经超过了预定义的生存期。
+</span><span class='line'>    REVOKED：一个用户空间操作将密钥转移到这个状态。
+</span><span class='line'>    DEAD：key_type 取消了注册。</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>密钥类型</h4>
+
+<p>有两种预定义的密钥类型：keyring 和 user。</p>
+
+<p>keyring 包含一组到其他密钥或 keyring 的链接。有六种标准的 keyring：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>线程特有的
+</span><span class='line'>进程特有的
+</span><span class='line'>会话特有的
+</span><span class='line'>用户特有的会话
+</span><span class='line'>用户默认的会话
+</span><span class='line'>组特有的（还未实现）</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>限额</h5>
+
+<p>对于一个用户可以拥有的密钥和 keyring 的数量有限制（密钥数量限额），对于在密钥描述和有效内容中使用的信息量也有限制（密钥大小限额）。进程特有的和线程特有的 keyring 不在用户限额的范围内。</p>
+
+<p>只有前三个 keyring 被自动搜索，自动搜索会按照次序进行。第四种类型（用户特有的会话 keyring）不被直接搜索，但是，它通常会链接到一个会话特有的 keyring。登录进程（比如 PAM）将绑定到用户默认的会话 keyring，直到创建另一个会话为止。</p>
+
+<p>用户密钥由用户空间程序操作。</p>
+
+<h3>三个新的系统调用</h3>
+
+<p>Linux 密钥保留服务提供三个新的系统调用，用来在用户空间中操作密钥。第一个是 add_key：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>key_serial_t add_key(const char *type, const char *desc,
+</span><span class='line'>&#9;&#9;     const void *payload, size_t plen,
+</span><span class='line'>&#9;&#9;     key_serial_t ring);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>add_key 系统调用用来创建类型为 type、长度为 plen 的密钥。密钥描述由 desc 定义，它的有效内容由 payload 指定。密钥链接到 keyring ring。密钥类型可以是 user 或 keyring。其他任何密钥类型必须已经通过内核服务向内核注册，然后才能使用。如果密钥是 keyring 类型的，有效内容就应该是 NULL，plen 应该是零。</p>
+
+<p>下一个新的系统调用是 request_key：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>key_serial_t request_key(const char *type, const char *desc,
+</span><span class='line'>&#9;&#9;&#9; const char *callout_info, 
+</span><span class='line'>&#9;&#9;&#9; key_serial_t dest_keyring);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>request_key 系统调用搜索一个进程 keyring，寻找一个密钥。搜索密钥的基本算法见清单 3。
+清单 3. request_key 算法</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>search_into_each_subscribed_keyrings {
+</span><span class='line'>&#9;if (key is found) {
+</span><span class='line'>&#9;&#9;return(found key);
+</span><span class='line'>&#9;} else {
+</span><span class='line'>&#9;&#9;if (callout_info is NULL) {
+</span><span class='line'>&#9;&#9;&#9;return(ERROR);
+</span><span class='line'>&#9;&#9;} else {
+</span><span class='line'>&#9;&#9;&#9;Execute /sbin/request-key and pass callout_info as argument;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;}
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>关于 request_key 算法的工作原理的详细信息，请参考 Documentation/keys-request-key.txt（参见 参考资料 中的链接）。</p>
+
+<p>最后，系统调用 keyctl 提供许多用来管理密钥的函数。可以根据传递给 keyctl 的第一个参数在密钥上执行各种操作。下面列出 keyctl 的一部分操作：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>KEYCTL_DESCRIBE 描述一个密钥。
+</span><span class='line'>KEYCTL_READ 从一个密钥读取有效内容数据。
+</span><span class='line'>KEYCTL_UPDATE 更新指定的密钥。
+</span><span class='line'>KEYCTL_LINK 将一个密钥链接到一个 keyring。
+</span><span class='line'>KEYCTL_UNLINK 将密钥或 keyring 与另一个 keyring 的链接取消。
+</span><span class='line'>KEYCTL_JOIN_SESSION_KEYRING 将一个会话 keyring 替换为新的会话 keyring。
+</span><span class='line'>KEYCTL_REVOKE 取消一个密钥。
+</span><span class='line'>KEYCTL_CHOWN 修改密钥的所有者。
+</span><span class='line'>KEYCTL_SETPERM 修改密钥的权限掩码。
+</span><span class='line'>KEYCTL_CLEAR 清除一个 keyring。
+</span><span class='line'>KEYCTL_SEARCH 在一个 keyring 树中搜索密钥。
+</span><span class='line'>KEYCTL_INSTANTIATE 对部分构造好的密钥进行实例化。
+</span><span class='line'>KEYCTL_NEGATE 取消对部分构造好的密钥的实例化。</span></code></pre></td></tr></table></div></figure>
+
+
+<p>关于 keyctl 的原型和 keyctl 可以执行的其他操作的更多信息，请参考 Linux 手册页。</p>
+
+<h4>管理密钥的内核 API</h4>
+
+<p>下面是几个用来管理密钥的最重要的 Linux 内核 API。要想了解更全面的信息，请下载并参考 Linux 密钥实现源代码文件（参见下面的 下载）。</p>
+
+<p>register_key_type 用来定义新的密钥类型。</p>
+
+<p>如果已经存在名称相同的密钥类型，那么 int register_key_type(struct key_type *type) 返回 EEXIT。</p>
+
+<p>unregister_key_type 用来取消密钥类型的注册：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void unregister_key_type(struct key_type *type);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>key_put 发布一个密钥：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void key_put(struct key *key);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>request_key 搜索与给定的描述匹配的密钥：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct key *request_key(const struct key_type *type,
+</span><span class='line'>                        const char *description,
+</span><span class='line'>                        const char *callout_string);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>key_alloc 分配指定类型的密钥：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct key *key_alloc(struct key_type *type, const char *desc, 
+</span><span class='line'>                      uid_t uid, gid_t gid, struct task_struct *ctx,
+</span><span class='line'>                      key_perm_t perm, unsigned long flags);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>key_instantiate_and_link 对密钥进行实例化并将它链接到目标 keyring：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int key_instantiate_and_link(struct key *key,  const void *data,
+</span><span class='line'>                             size_t datalen, struct key *keyring,
+</span><span class='line'>                             struct key *instkey);</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>启用密钥服务</h4>
+
+<p>因为 Linux 密钥保留服务仍然非常新，在默认情况下 Linux 内核中关闭了这个服务。要想启用密钥服务，必须使用 CONFIG_KEYS=y 选项对内核进行配置。可以在内核编译的 make *config 步骤中 Security options 下面找到这个选项。</p>
+
+<p>清单 4 给出在 Linux 内核中启用密钥服务的配置。
+清单 4. 在 Linux 内核中启用密钥服务</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>".config" file ...
+</span><span class='line'>#
+</span><span class='line'># Security options
+</span><span class='line'>#
+</span><span class='line'>CONFIG_KEYS=y
+</span><span class='line'>CONFIG_KEYS_DEBUG_PROC_KEYS=y
+</span><span class='line'>CONFIG_SECURITY=y
+</span><span class='line'>CONFIG_SECURITY_NETWORK=y
+</span><span class='line'>CONFIG_SECURITY_CAPABILITIES=y</span></code></pre></td></tr></table></div></figure>
+
+
+<p>密钥的源代码被组织在目录 linux-2.6.x/security/keys 中。</p>
+
+<p>接下来，需要 下载并安装 keyutils 包。keyutils 包含 keyctl 命令，可以使用这个命令在密钥上执行各种操作。前面已经列出了 keyctl 的一部分操作。更多信息参见 Linux 手册页。</p>
+
+<h4>创建新的密钥类型</h4>
+
+<p>学习 Linux 密钥保留服务最容易的方式就是进行实践。下面的示例使用 Linux 密钥保留服务创建一个新类型的密钥。如果还没有 下载示例程序， 现在就执行这个步骤。执行 make 来构建内核模块和用户级程序的二进制代码。这些代码已经在 Linux 内核版本 2.6.20 上测试过了。</p>
+
+<p>示例程序有两个组件：一个内核模块和一个用户空间程序。这个内核模块注册一个新的密钥类型。这个用户空间程序在预定义的 proc-entries 上执行 ioctl，这会导致对内核模块的调用。这个调用会产生一个新的密钥。然后，一个 “bash” shell 返回给用户，它带有新的会话 keyring 和链接到这个 keyring 的新类型的密钥。</p>
+
+<p>因为这个用户空间程序将执行 ioctl，内核模块必须注册 proc_ioctl() 函数来处理 ioctl 请求。所有 ioctl 通信都使用 /proc 接口来进行。清单 5 给出在内核模块中声明的一个新的密钥类型。
+清单 5. 声明新的密钥类型</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>truct key_type new_key_type = {
+</span><span class='line'>&#9;.name = "mykey",
+</span><span class='line'>&#9;.instantiate = instantiate_key,
+</span><span class='line'>&#9;.describe = key_desc,
+</span><span class='line'>&#9;.destroy = key_destroy,
+</span><span class='line'>&#9;.match = key_match,
+</span><span class='line'>;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>然后，模块在它的 init 函数中调用 register_key_type() 来注册这个新密钥类型（名为 mykey）。当内核模块收到 ioctl 请求时，它首先调用 key_alloc() 来分配一个新的密钥，从而创建一个会话 keyring。在成功调用 key_alloc() 之后，调用 key_instantiate_and_link() 对密钥进行实例化。在创建并实例化会话 keyring 之后，为用户的会话创建密钥。同样，依次调用 key_alloc() 和 key_instantiate_and_link()。成功完成这些调用之后，用户空间会话就有了一个新密钥。</p>
+
+<p>示例程序中演示了所有这些步骤。</p>
+
+<h4>使用模块</h4>
+
+<p>创建了新的密钥类型之后，我们来试用一下这个内核模块。模块中的一个基本操作是查看一个进程与哪些 keyring 相关联，以及这些 keyring 包含哪些密钥和其他 keyring。调用 keyctl show 就可以在树结构中显示密钥。清单 6 显示在运行程序之前密钥的状态。
+清单 6. 查看进程的 keyring</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>root@phoenix set.5]# keyctl show
+</span><span class='line'>ession Keyring
+</span><span class='line'>      -3 --alswrv      0     0  keyring: _ses.1976
+</span><span class='line'>       2 --alswrv      0     0   \_ keyring: _uid.0</span></code></pre></td></tr></table></div></figure>
+
+
+<p>清单 7 显示插入模块或者卸载模块或用户级程序的命令的输出。这些消息会放在一个系统日志文件中（通常是 /var/log/messages）。
+清单 7. 插入内核模块</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>root@phoenix set.5]# insmod ./kernel.land/newkey.ko
+</span><span class='line'>oading the module ...
+</span><span class='line'>egistered "learning_key"</span></code></pre></td></tr></table></div></figure>
+
+
+<p>接下来，执行用户级程序。
+清单 8. 执行用户级程序</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>root@phoenix set.5]# ./user.land/session
+</span><span class='line'>  
+</span><span class='line'>n /var/log/message, you will see similar output
+</span><span class='line'>nstalling session keyring:
+</span><span class='line'>eyring allocated successfully.
+</span><span class='line'>eyring instantiated and linked successfully.
+</span><span class='line'>ew session keyring installed successfully.
+</span><span class='line'>ey of new type allocated successfully.
+</span><span class='line'>ew key type linked to current session.</span></code></pre></td></tr></table></div></figure>
+
+
+<p>再看一下密钥的状态，见清单 9。
+清单 9. 运行用户级程序之后的密钥状态</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>root@phoenix set.5]# keyctl show
+</span><span class='line'>ession Keyring
+</span><span class='line'>      -3 --alswrv      0     0  keyring: session.2621
+</span><span class='line'>39044642 --alswrv      0     0   \_ mykey: New key type
+</span><span class='line'>  
+</span><span class='line'>root@phoenix set.5]# cat /proc/keys
+</span><span class='line'>0000001 I-----     1 perm 1f3f0000     0     0 keyring   _uid_ses.0: 1/4
+</span><span class='line'>0000002 I-----     5 perm 1f3f0000     0     0 keyring   _uid.0: empty
+</span><span class='line'>253c622 I--Q--     1 perm 3f3f0000     0     0 mykey   New key type: 0
+</span><span class='line'>1a490da I--Q--     2 perm 3f3f0000     0     0 keyring   session.2621: 1/4
+</span><span class='line'>3670439 I--Q--     2 perm 1f3f0000     0     0 keyring   _ses.1977: 1/4
+</span><span class='line'>59d39b8 I--Q--     5 perm 1f3f0000     0     0 keyring   _ses.1976: 1/4
+</span><span class='line'>a14f259 I--Q--     3 perm 1f3f0000     0     0 keyring   _ses.1978: 1/4
+</span><span class='line'>root@phoenix set.5]# cat /proc/key-users
+</span><span class='line'>   0:     8 7/7 5/100 136/10000
+</span><span class='line'>  43:     2 2/2 2/100 56/10000
+</span><span class='line'>  48:     2 2/2 2/100 56/10000
+</span><span class='line'>  81:     2 2/2 2/100 56/10000
+</span><span class='line'>  786:     4 4/4 4/100 113/10000
+</span><span class='line'>
+</span><span class='line'>"keyctl describe &lt;Key&gt;" command gives the description of key.
+</span><span class='line'>  
+</span><span class='line'>[root@phoenix set.5]# keyctl describe -3
+</span><span class='line'>       -3: alswrvalswrv------------     0     0 keyring: session.2621
+</span><span class='line'>[root@phoenix set.5]# keyctl describe 39044642
+</span><span class='line'> 39044642: alswrvalswrv------------     0     0 mykey: New key type
+</span><span class='line'>[avinesh@phoenix set.5]$ keyctl search -3 mykey "New key type"
+</span><span class='line'>39044642
+</span><span class='line'>[root@phoenix set.5]# exit
+</span><span class='line'>exit
+</span><span class='line'>Now back to our previous state  
+</span><span class='line'>[root@phoenix set.5]# keyctl show
+</span><span class='line'>Session Keyring
+</span><span class='line'>       -3 --alswrv      0     0  keyring: _ses.1976
+</span><span class='line'>        2 --alswrv      0     0   \_ keyring: _uid.0
+</span><span class='line'>[root@phoenix set.5]# rmmod ./kernel.land/newkey.ko 
+</span><span class='line'>Unloading the module.
+</span><span class='line'>Unregistered "learning_key"</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>与密钥相关的 proc 文件</h4>
+
+<p>/proc 中添加了两个文件来管理密钥：/proc/keys 和 /proc/key-users。我们来仔细看看这些文件。</p>
+
+<h5>/proc/keys</h5>
+
+<p>如果一个进程希望了解它可以查看哪些密钥，它可以通过读取 /proc/keys 获得这些信息。在配置内核时，必须启用这个文件，因为它允许任何用户列出密钥数据库。
+清单 10. /proc/keys 文件</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>[root@phoenix set.5]# cat /proc/keys
+</span><span class='line'>00000001 I-----  1     perm    1f3f0000      0    0    keyring    _uid_ses.0 : 1/4
+</span><span class='line'>00000002 I-----  5     perm    1f3f0000      0    0    keyring    _uid.0     : empty
+</span><span class='line'>13670439 I--Q--  2     perm    1f3f0000      0    0    keyring    _ses.1977  : 1/4
+</span><span class='line'>159d39b8 I--Q--  6     perm    1f3f0000      0    0    keyring    _ses.1976  : 1/4
+</span><span class='line'>3a14f259 I--Q--  3     perm    1f3f0000      0    0    keyring    _ses.1978  : 1/4
+</span><span class='line'>[Serial][Flags][Usage][Expiry][Permissions][UID][GID][TypeName][Description] :[Summary]</span></code></pre></td></tr></table></div></figure>
+
+
+<p>*Source: linux_kernel_source/security/keys/proc.c:proc_keys_show()</p>
+
+<p>在以上文件中看到的大多数字段来自 include/linux/key.h 中定义的 struct key。可能的标志值见清单 11。
+清单 11. struct key 字段可能的标志值</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>I        Instantiated
+</span><span class='line'>R        Revoked
+</span><span class='line'>D        Dead
+</span><span class='line'>Q        Contributes to user's quota
+</span><span class='line'>U        Under construction by callback to user-space
+</span><span class='line'>N        Negative key</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>/proc/key-users</h5>
+
+<p>清单 12 显示 /proc/key-users 文件。
+清单 12. /proc/key-users 文件</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>[root@phoenix set.5]# cat /proc/key-users
+</span><span class='line'>    0:     6 5/5 3/100 90/10000
+</span><span class='line'>   43:     2 2/2 2/100 56/10000
+</span><span class='line'>   48:     2 2/2 2/100 56/10000
+</span><span class='line'>   81:     2 2/2 2/100 56/10000
+</span><span class='line'>  786:     4 4/4 4/100 113/10000</span></code></pre></td></tr></table></div></figure>
+
+
+<p>清单 13 给出每个字段的含义。
+清单 13. /proc/key-users 文件的字段</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>&lt;UID&gt;            User ID
+</span><span class='line'>&lt;usage&gt;          Usage count
+</span><span class='line'>&lt;inst&gt;/&lt;keys&gt;    Total number of keys and number instantiated
+</span><span class='line'>&lt;keys&gt;/&lt;max&gt;     Key count quota
+</span><span class='line'>&lt;bytes&gt;&lt;max&gt;     Key size quota</span></code></pre></td></tr></table></div></figure>
+
+
+<p>*Source: linux_kernel_source/security/keys/proc.c:proc_key_users_show()</p>
+
+<p>大多数字段是 security/keys/internal.h 中定义的 struct key_user 的字段。</p>
+
+<h4>结束语</h4>
+
+<p>Linux 密钥保留服务是一种新的机制，其用途是保存与安全相关的信息，让 Linux 内核可以快速地访问这些信息。这个服务仍然处于初级阶段，刚刚开始获得认可。OpenAFS 使用 Linux 密钥保留服务来实现进程身份验证组（PAG），NFSv4 和 MIT Kerberos 也使用它。Linux 密钥保留服务仍然在进行开发，以后可能会修改或改进。</p>
+
+<h4>下载资源</h4>
+
+<p>  使用 Linux 密钥保留服务的示例应用程序 (key.retention.services.zip | 4KB)</p>
+
+<h4>相关主题</h4>
+
+<ul>
+    <li>您可以参阅本文在 developerWorks 全球站点上的 <a href="http://www.ibm.com/developerworks/linux/library/l-key-retention.html?S_TACT=105AGX52&amp;S_CMP=cn-a-l" target="_blank">英文原文</a> 。</li>
+    <li>“<a href="http://www.ibm.com/developerworks/cn/linux/l-seclnx1.html">让 Linux 更安全</a>”（developerWorks，2004 年 7 月）是分三部分的文章，介绍了 Linux 安全性。</li>
+    <li>“<a href="http://www.ibm.com/developerworks/cn/linux/l-system-calls/">使用 Linux 系统调用的内核命令</a>”（developerWorks，2007 年 3 月）介绍了 Linux 系统调用，并解释了如何将系统调用从用户空间传递到内核。</li>
+    <li>阅读 <a href="http://lxr.linux.no/source/Documentation/keys.txt">Documentation/keys.txt</a>和
+        <a href="http://lxr.linux.no/source/Documentation/keys-request-key.txt">Documentation/keys-request-key.txt</a>，进一步了解 Linux 2.6 内核中密钥的概念和创建密钥的过程。</li>
+    <li><a href="http://lxr.linux.no/source/security/keys/">Linux key implementation sources</a> 是用来管理密钥的 Linux 内核 API。</li>
+    <li>David Howells 是 Linux 密钥保留服务的创建者。请参阅他在 2006 年渥太华 Linux 研讨会上 <a href="http://people.redhat.com/~dhowells/keys/keyrings-bof-ols2006.odp">讲话的幻灯片</a>。</li>
+    <li>“<a href="http://lwn.net/Articles/210502/">Kernel key management</a>” 提供了用来管理密钥的 Linux 内核 API 的更多信息。</li>
+    <li><a href="http://www.openafs.org/">OpenAFS</a> 使用 Linux 密钥保留服务实现它的进程身份验证组（PAG）。请查看 <a href="http://openafs.org/cgi-bin/cvsweb.cgi/openafs/src/afs/LINUX/osi_groups.c">源代码</a>。</li>
+    <li>下载 <a href="http://people.redhat.com/~dhowells/keyutils/">keyutils 包</a>，开始试用 Linux 密钥保留服务。</li>
+    <li>在 <a href="http://www.ibm.com/developerworks/cn/linux/">developerWorks Linux 专区</a> 中可以找到为 Linux 开发人员准备的更多参考资料。 </li>
+    <li>使用 <a href="http://www.ibm.com/developerworks/downloads/?S_TACT=105AGX52&amp;S_CMP=cn-a-l">IBM 试用软件</a> 构建您的下一个 Linux 开发项目，这些软件可以从 developerWorks 直接下载。 </li>
+</ul>
+
+
+
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
       <h2 class="entry-title"><a href="/blog/2018/02/09/tools-openssl/">openssl常用命令，签名、非对称加解密</a></h2>
     
     
@@ -1159,664 +1798,6 @@ var ss360Config = {
 
     </article>
   
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2018/02/03/kernel-net-synack/">SYN-ACK 重传</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2018-02-03T23:01:00+08:00'><span class='date'>2018-02-03</span> <span class='time'>23:01:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><h3>fastopen synack 重传</h3>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>int tcp_conn_request(struct request_sock_ops *rsk_ops,
-</span><span class='line'>&#9;&#9;&#9;const struct tcp_request_sock_ops *af_ops,
-</span><span class='line'>&#9;&#9;&#9;struct sock *sk, struct sk_buff *skb)
-</span><span class='line'>{
-</span><span class='line'>&#9;...
-</span><span class='line'>&#9;fastopen = !want_cookie &&
-</span><span class='line'>&#9;&#9;&#9;tcp_try_fastopen(sk, skb, req, &foc, dst);
-</span><span class='line'>&#9;...</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>bool tcp_try_fastopen(struct sock *sk, struct sk_buff *skb,
-</span><span class='line'>&#9;&#9;&#9;struct request_sock *req,
-</span><span class='line'>&#9;&#9;&#9;struct tcp_fastopen_cookie *foc,
-</span><span class='line'>&#9;&#9;&#9;struct dst_entry *dst)
-</span><span class='line'>{
-</span><span class='line'>&#9;...
-</span><span class='line'>&#9;if (tcp_fastopen_create_child(sk, skb, dst, req)) {
-</span><span class='line'>&#9;...
-</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static bool tcp_fastopen_create_child(struct sock *sk,
-</span><span class='line'>&#9;&#9;&#9;&#9;struct sk_buff *skb,
-</span><span class='line'>&#9;&#9;&#9;&#9;struct dst_entry *dst,
-</span><span class='line'>&#9;&#9;&#9;&#9;struct request_sock *req)
-</span><span class='line'>{
-</span><span class='line'>&#9;...
-</span><span class='line'>&#9;child = inet_csk(sk)-&gt;icsk_af_ops-&gt;syn_recv_sock(sk, skb, req, NULL);
-</span><span class='line'>&#9;...
-</span><span class='line'>&#9;inet_csk_reset_xmit_timer(child, ICSK_TIME_RETRANS,
-</span><span class='line'>&#9;&#9;&#9;&#9;TCP_TIMEOUT_INIT, TCP_RTO_MAX);
-</span><span class='line'>&#9;...
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>void tcp_retransmit_timer(struct sock *sk)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
-</span><span class='line'>&#9;struct inet_connection_sock *icsk = inet_csk(sk);
-</span><span class='line'>
-</span><span class='line'>&#9;if (tp-&gt;fastopen_rsk) {
-</span><span class='line'>&#9;&#9;WARN_ON_ONCE(sk-&gt;sk_state != TCP_SYN_RECV &&
-</span><span class='line'>&#9;&#9;&#9;sk-&gt;sk_state != TCP_FIN_WAIT1);
-</span><span class='line'>&#9;&#9;tcp_fastopen_synack_timer(sk);
-</span><span class='line'>&#9;&#9;/* Before we receive ACK to our SYN-ACK don't retransmit
-</span><span class='line'>&#9;&#9; * anything else (e.g., data or FIN segments).
-</span><span class='line'>&#9;&#9; */
-</span><span class='line'>&#9;&#9;return;
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;...</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/*
-</span><span class='line'> *      Timer for Fast Open socket to retransmit SYNACK. Note that the
-</span><span class='line'> *      sk here is the child socket, not the parent (listener) socket.
-</span><span class='line'> */
-</span><span class='line'>static void tcp_fastopen_synack_timer(struct sock *sk)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct inet_connection_sock *icsk = inet_csk(sk);
-</span><span class='line'>&#9;int max_retries = icsk-&gt;icsk_syn_retries ? :
-</span><span class='line'>&#9;&#9;sysctl_tcp_synack_retries + 1; /* add one more retry for fastopen */
-</span><span class='line'>&#9;struct request_sock *req;
-</span><span class='line'>
-</span><span class='line'>&#9;req = tcp_sk(sk)-&gt;fastopen_rsk;
-</span><span class='line'>&#9;req-&gt;rsk_ops-&gt;syn_ack_timeout(sk, req);
-</span><span class='line'>
-</span><span class='line'>&#9;if (req-&gt;num_timeout &gt;= max_retries) {
-</span><span class='line'>&#9;&#9;tcp_write_err(sk);
-</span><span class='line'>&#9;&#9;return;
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;/* XXX (TFO) - Unlike regular SYN-ACK retransmit, we ignore error
-</span><span class='line'>&#9; * returned from rtx_syn_ack() to make it more persistent like
-</span><span class='line'>&#9; * regular retransmit because if the child socket has been accepted
-</span><span class='line'>&#9; * it's not good to give up too easily.
-</span><span class='line'>&#9; */
-</span><span class='line'>&#9;inet_rtx_syn_ack(sk, req);
-</span><span class='line'>&#9;req-&gt;num_timeout++;
-</span><span class='line'>&#9;inet_csk_reset_xmit_timer(sk, ICSK_TIME_RETRANS,
-</span><span class='line'>&#9;&#9;TCP_TIMEOUT_INIT &lt;&lt; req-&gt;num_timeout, TCP_RTO_MAX);
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<hr />
-
-<p><a href="http://blog.csdn.net/u011130578/article/details/44954891">http://blog.csdn.net/u011130578/article/details/44954891</a></p>
-
-<h4>1 Why</h4>
-
-<p>TCP服务器在收到SYN请求后发送SYN|ACK响应，然后等待对端的ACK到来以完成三次握手。如果没有收到ACK，TCP应该重传SYN|ACK，这个功能由SYN-ACK定时器完成。由于SYN|ACK发送后并没有放入发送队列中，故重传时必须重新构建SYN|ACK报文。</p>
-
-<h4>2 When</h4>
-
-<p>TCP在发送SYN|ACK响应后设置SYN-ACK定时器：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>1465 int tcp_v4_conn_request(struct sock *sk, struct sk_buff *skb)
-</span><span class='line'>1466 {
-</span><span class='line'>...
-</span><span class='line'>1598     skb_synack = tcp_make_synack(sk, dst, req,
-</span><span class='line'>1599         fastopen_cookie_present(&valid_foc) ? &valid_foc : NULL);　//构建SYN|ACK
-</span><span class='line'>1600
-</span><span class='line'>1601     if (skb_synack) {
-</span><span class='line'>1602         __tcp_v4_send_check(skb_synack, ireq-&gt;loc_addr, ireq-&gt;rmt_addr);
-</span><span class='line'>1603         skb_set_queue_mapping(skb_synack, skb_get_queue_mapping(skb));
-</span><span class='line'>1604     } else
-</span><span class='line'>1605         goto drop_and_free;
-</span><span class='line'>1606
-</span><span class='line'>1607     if (likely(!do_fastopen)) {
-</span><span class='line'>1608         int err;
-</span><span class='line'>1609         err = ip_build_and_send_pkt(skb_synack, sk, ireq-&gt;loc_addr,
-</span><span class='line'>1610              ireq-&gt;rmt_addr, ireq-&gt;opt);　//发送SYN|ACK
-</span><span class='line'>...
-</span><span class='line'>1617         /* Add the request_sock to the SYN table */
-</span><span class='line'>1618         inet_csk_reqsk_queue_hash_add(sk, req, TCP_TIMEOUT_INIT);　//将requese sock加入到SYN表中，并设置SYN-ACK定时器
-</span><span class='line'>...</span></code></pre></td></tr></table></div></figure>
-
-
-<p>inet_csk_reqsk_queue_hash_add函数：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>521 void inet_csk_reqsk_queue_hash_add(struct sock *sk, struct request_sock *req,
-</span><span class='line'>522                    unsigned long timeout)
-</span><span class='line'>523 {
-</span><span class='line'>524     struct inet_connection_sock *icsk = inet_csk(sk);
-</span><span class='line'>525     struct listen_sock *lopt = icsk-&gt;icsk_accept_queue.listen_opt;
-</span><span class='line'>526     const u32 h = inet_synq_hash(inet_rsk(req)-&gt;rmt_addr, inet_rsk(req)-&gt;rmt_port,
-</span><span class='line'>527                      lopt-&gt;hash_rnd, lopt-&gt;nr_table_entries);
-</span><span class='line'>528
-</span><span class='line'>529     reqsk_queue_hash_req(&icsk-&gt;icsk_accept_queue, h, req, timeout);　//将request_sock放入syn_table中并记录超时时间
-</span><span class='line'>530     inet_csk_reqsk_queue_added(sk, timeout);　//设置SYN-ACK定时器
-</span><span class='line'>531 }</span></code></pre></td></tr></table></div></figure>
-
-
-<p>reqsk_queue_hash_req函数会记录request_sock的超时时间：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>262 static inline void reqsk_queue_hash_req(struct request_sock_queue *queue,
-</span><span class='line'>263                     u32 hash, struct request_sock *req,
-</span><span class='line'>264                     unsigned long timeout)
-</span><span class='line'>265 {
-</span><span class='line'>266     struct listen_sock *lopt = queue-&gt;listen_opt;
-</span><span class='line'>267
-</span><span class='line'>268     req-&gt;expires = jiffies + timeout;　//超时时间
-</span><span class='line'>269     req-&gt;num_retrans = 0;
-</span><span class='line'>270     req-&gt;num_timeout = 0;
-</span><span class='line'>271     req-&gt;sk = NULL;
-</span><span class='line'>272     req-&gt;dl_next = lopt-&gt;syn_table[hash];
-</span><span class='line'>273
-</span><span class='line'>274     write_lock(&queue-&gt;syn_wait_lock);
-</span><span class='line'>275     lopt-&gt;syn_table[hash] = req;
-</span><span class='line'>276     write_unlock(&queue-&gt;syn_wait_lock);
-</span><span class='line'>277 }</span></code></pre></td></tr></table></div></figure>
-
-
-<p>inet_csk_reqsk_queue_added函数为整个syn_table设置一个SYN-ACK定时器：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>280 static inline void inet_csk_reqsk_queue_added(struct sock *sk,
-</span><span class='line'>281                           const unsigned long timeout)
-</span><span class='line'>282 {
-</span><span class='line'>283     if (reqsk_queue_added(&inet_csk(sk)-&gt;icsk_accept_queue) == 0) //如果添加request sock之前syn_table为空
-</span><span class='line'>284         inet_csk_reset_keepalive_timer(sk, timeout);//设置SYN-ACK定时器
-</span><span class='line'>285 }</span></code></pre></td></tr></table></div></figure>
-
-
-<p>inet_csk_reset_keepalive_timer函数真正设置定时器：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>404 void inet_csk_reset_keepalive_timer(struct sock *sk, unsigned long len)
-</span><span class='line'>405 {
-</span><span class='line'>406     sk_reset_timer(sk, &sk-&gt;sk_timer, jiffies + len);
-</span><span class='line'>407 }</span></code></pre></td></tr></table></div></figure>
-
-
-<p>SYN-ACK定时器的超时时间为TCP_TIMEOUT_INIT（1秒）。</p>
-
-<h4>3 What</h4>
-
-<p>SYN-ACK定时器的结构为sk->sk_timer，其超时函数为tcp_keepalive_timer：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>558 static void tcp_keepalive_timer (unsigned long data)
-</span><span class='line'>559 {
-</span><span class='line'>560     struct sock *sk = (struct sock *) data;
-</span><span class='line'>561     struct inet_connection_sock *icsk = inet_csk(sk);
-</span><span class='line'>562     struct tcp_sock *tp = tcp_sk(sk);
-</span><span class='line'>563     u32 elapsed;
-</span><span class='line'>564
-</span><span class='line'>565     /* Only process if socket is not in use. */
-</span><span class='line'>566     bh_lock_sock(sk);
-</span><span class='line'>567     if (sock_owned_by_user(sk)) {
-</span><span class='line'>568         /* Try again later. */
-</span><span class='line'>569         inet_csk_reset_keepalive_timer (sk, HZ/20);
-</span><span class='line'>570         goto out;
-</span><span class='line'>571     }
-</span><span class='line'>572
-</span><span class='line'>573     if (sk-&gt;sk_state == TCP_LISTEN) {　//如果是SYN-ACK定时器超时则判断为真
-</span><span class='line'>574         tcp_synack_timer(sk);　//SYN-ACK定时器超时函数
-</span><span class='line'>575         goto out;
-</span><span class='line'>576     }
-</span><span class='line'>...</span></code></pre></td></tr></table></div></figure>
-
-
-<p>tcp_synack_timer函数：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>534 static void tcp_synack_timer(struct sock *sk)
-</span><span class='line'>535 {
-</span><span class='line'>536     inet_csk_reqsk_queue_prune(sk, TCP_SYNQ_INTERVAL,
-</span><span class='line'>537                    TCP_TIMEOUT_INIT, TCP_RTO_MAX);
-</span><span class='line'>538 }</span></code></pre></td></tr></table></div></figure>
-
-
-<p>inet_csk_reqsk_queue_prune函数：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-<span class='line-number'>36</span>
-<span class='line-number'>37</span>
-<span class='line-number'>38</span>
-<span class='line-number'>39</span>
-<span class='line-number'>40</span>
-<span class='line-number'>41</span>
-<span class='line-number'>42</span>
-<span class='line-number'>43</span>
-<span class='line-number'>44</span>
-<span class='line-number'>45</span>
-<span class='line-number'>46</span>
-<span class='line-number'>47</span>
-<span class='line-number'>48</span>
-<span class='line-number'>49</span>
-<span class='line-number'>50</span>
-<span class='line-number'>51</span>
-<span class='line-number'>52</span>
-<span class='line-number'>53</span>
-<span class='line-number'>54</span>
-<span class='line-number'>55</span>
-<span class='line-number'>56</span>
-<span class='line-number'>57</span>
-<span class='line-number'>58</span>
-<span class='line-number'>59</span>
-<span class='line-number'>60</span>
-<span class='line-number'>61</span>
-<span class='line-number'>62</span>
-<span class='line-number'>63</span>
-<span class='line-number'>64</span>
-<span class='line-number'>65</span>
-<span class='line-number'>66</span>
-<span class='line-number'>67</span>
-<span class='line-number'>68</span>
-<span class='line-number'>69</span>
-<span class='line-number'>70</span>
-<span class='line-number'>71</span>
-<span class='line-number'>72</span>
-<span class='line-number'>73</span>
-<span class='line-number'>74</span>
-<span class='line-number'>75</span>
-<span class='line-number'>76</span>
-<span class='line-number'>77</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>570 void inet_csk_reqsk_queue_prune(struct sock *parent,
-</span><span class='line'>571                 const unsigned long interval,
-</span><span class='line'>572                 const unsigned long timeout,
-</span><span class='line'>573                 const unsigned long max_rto)
-</span><span class='line'>574 {
-</span><span class='line'>575     struct inet_connection_sock *icsk = inet_csk(parent);
-</span><span class='line'>576     struct request_sock_queue *queue = &icsk-&gt;icsk_accept_queue;
-</span><span class='line'>577     struct listen_sock *lopt = queue-&gt;listen_opt;
-</span><span class='line'>578     int max_retries = icsk-&gt;icsk_syn_retries ? : sysctl_tcp_synack_retries;
-</span><span class='line'>579     int thresh = max_retries;
-</span><span class='line'>580     unsigned long now = jiffies;
-</span><span class='line'>581     struct request_sock **reqp, *req;
-</span><span class='line'>582     int i, budget;
-</span><span class='line'>583
-</span><span class='line'>584     if (lopt == NULL || lopt-&gt;qlen == 0)
-</span><span class='line'>585         return;
-</span><span class='line'>...
-</span><span class='line'>604     if (lopt-&gt;qlen&gt;&gt;(lopt-&gt;max_qlen_log-1)) {
-</span><span class='line'>605         int young = (lopt-&gt;qlen_young&lt;&lt;1);
-</span><span class='line'>606
-</span><span class='line'>607         while (thresh &gt; 2) {
-</span><span class='line'>608             if (lopt-&gt;qlen &lt; young)
-</span><span class='line'>609                 break;
-</span><span class='line'>610             thresh--;
-</span><span class='line'>611             young &lt;&lt;= 1;
-</span><span class='line'>612         }
-</span><span class='line'>613     }
-</span><span class='line'>614
-</span><span class='line'>615     if (queue-&gt;rskq_defer_accept)    //需要等待数据到来再唤醒应用进程
-</span><span class='line'>616         max_retries = queue-&gt;rskq_defer_accept;
-</span><span class='line'>617
-</span><span class='line'>618     budget = 2 * (lopt-&gt;nr_table_entries / (timeout / interval));
-</span><span class='line'>619     i = lopt-&gt;clock_hand;
-</span><span class='line'>620
-</span><span class='line'>621     do {　　//遍历SYN table
-</span><span class='line'>622         reqp=&lopt-&gt;syn_table[i];
-</span><span class='line'>623         while ((req = *reqp) != NULL) {
-</span><span class='line'>624             if (time_after_eq(now, req-&gt;expires)) {　//超时
-</span><span class='line'>625                 int expire = 0, resend = 0;
-</span><span class='line'>626
-</span><span class='line'>627                 syn_ack_recalc(req, thresh, max_retries,
-</span><span class='line'>628                            queue-&gt;rskq_defer_accept,
-</span><span class='line'>629                            &expire, &resend);     //计算request sock是否过期以及是否需要重发SYN|ACK
-</span><span class='line'>630                 req-&gt;rsk_ops-&gt;syn_ack_timeout(parent, req);　//调用tcp_syn_ack_timeout更新信息数据库
-</span><span class='line'>631                 if (!expire &&  //request socket没有超时
-</span><span class='line'>632                     (!resend ||
-</span><span class='line'>633                      !inet_rtx_syn_ack(parent, req) || 　//重传SYN-ACK
-</span><span class='line'>634                      inet_rsk(req)-&gt;acked)) {
-</span><span class='line'>635                     unsigned long timeo;
-</span><span class='line'>636
-</span><span class='line'>637                     if (req-&gt;num_timeout++ == 0)
-</span><span class='line'>638                         lopt-&gt;qlen_young--;
-</span><span class='line'>639                     timeo = min(timeout &lt;&lt; req-&gt;num_timeout,
-</span><span class='line'>640                             max_rto);
-</span><span class='line'>641                     req-&gt;expires = now + timeo;  //更新request_sock超时时间
-</span><span class='line'>642                     reqp = &req-&gt;dl_next;
-</span><span class='line'>643                     continue;
-</span><span class='line'>644                 }
-</span><span class='line'>645
-</span><span class='line'>646                 /* Drop this request */
-</span><span class='line'>647                 inet_csk_reqsk_queue_unlink(parent, req, reqp);　
-</span><span class='line'>648                 reqsk_queue_removed(queue, req);
-</span><span class='line'>649                 reqsk_free(req);
-</span><span class='line'>650                 continue;
-</span><span class='line'>651             }
-</span><span class='line'>652             reqp = &req-&gt;dl_next;
-</span><span class='line'>653         }
-</span><span class='line'>654
-</span><span class='line'>655         i = (i + 1) & (lopt-&gt;nr_table_entries - 1);
-</span><span class='line'>656
-</span><span class='line'>657     } while (--budget &gt; 0);
-</span><span class='line'>658
-</span><span class='line'>659     lopt-&gt;clock_hand = i;
-</span><span class='line'>660
-</span><span class='line'>661     if (lopt-&gt;qlen)　//syn_table中还有成员
-</span><span class='line'>662         inet_csk_reset_keepalive_timer(parent, interval);　//继续设置定时器，超时
-</span><span class='line'>663 }</span></code></pre></td></tr></table></div></figure>
-
-
-<p>604-611：当syn_table中剩余空间比较小时，需要减小最大重试次数，以便使旧的request_sock能够更快消亡，从而新的request_sock能够更多的被接受</p>
-
-<p>647-649：将超时的request_sock移出syn_table并释放，即丢弃其对应的连接</p>
-
-<p>631-642：全部满足下列条件就不删除request_sock而只是更新超时时间：<br/>
-（1）request_sock没有超时<br/>
-（2）下列3个条件之一成立<br/>
-     1）不需要重传SYN|ACK<br/>
-     2）重传SYN|ACK成功<br/>
-     3）应用进程使用TCP_DEFER_ACCEPT socket选项意图使数据到来时listen socket再唤醒进程，当ACK到来但没有数据时</p>
-
-<p>syn_ack_recalc函数来确定request_sock是否超时以及是否需要重传SYN|ACK：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>539 static inline void syn_ack_recalc(struct request_sock *req, const int thresh,
-</span><span class='line'>540                   const int max_retries,
-</span><span class='line'>541                   const u8 rskq_defer_accept,
-</span><span class='line'>542                   int *expire, int *resend)
-</span><span class='line'>543 {
-</span><span class='line'>544     if (!rskq_defer_accept) {    //不需要等待数据到来再调用accept系统调用
-</span><span class='line'>545         *expire = req-&gt;num_timeout &gt;= thresh;    //超时次数达到限制则超时
-</span><span class='line'>546         *resend = 1;    //重传SYN|ACK
-</span><span class='line'>547         return;
-</span><span class='line'>548     }
-</span><span class='line'>549     *expire = req-&gt;num_timeout &gt;= thresh &&    //超时次数达到限制
-</span><span class='line'>550           (!inet_rsk(req)-&gt;acked || req-&gt;num_timeout &gt;= max_retries);    //ACK没有到来或超时次数达到最高上限
-</span><span class='line'>551     /*
-</span><span class='line'>552      * Do not resend while waiting for data after ACK,
-</span><span class='line'>553      * start to resend on end of deferring period to give
-</span><span class='line'>554      * last chance for data or ACK to create established socket.
-</span><span class='line'>555      */
-</span><span class='line'>556     *resend = !inet_rsk(req)-&gt;acked || //ACK没有到来
-</span><span class='line'>557           req-&gt;num_timeout &gt;= rskq_defer_accept - 1;    //超时次数超过或即将达到应用进程的限制，赶快重传SYN|ACK以便给对端最后一个机会建立连接
-</span><span class='line'>558 }</span></code></pre></td></tr></table></div></figure>
-
-
-<p>综上，SYN|ACK定时器超时时重传SYN|ACK的条件是下列条件全部成立：<br/>
-（1）request_sock超时<br/>
-（2）request_sock的超时次数达到限制<br/>
-（3）下列条件之一成立：<br/>
-    1）应用进程没有使用TCP_DEFER_ACCEPT socket选项来延迟accept request_sock的时间<br/>
-    2）应用进程使用TCP_DEFER_ACCEPT socket选项设置了超时次数限制，但ACK没有到来或，超时次数达到最高限制且超时次数超过或即将达到应用进程的限制</p>
-
-<p>SYN|ACK的重传是由inet_rtx_syn_ack函数完成的：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>560 int inet_rtx_syn_ack(struct sock *parent, struct request_sock *req)
-</span><span class='line'>561 {
-</span><span class='line'>562     int err = req-&gt;rsk_ops-&gt;rtx_syn_ack(parent, req);    //指向tcp_v4_rtx_synack或tcp_v6_rtx_synack
-</span><span class='line'>563
-</span><span class='line'>564     if (!err)
-</span><span class='line'>565         req-&gt;num_retrans++;
-</span><span class='line'>566     return err;
-</span><span class='line'>567 }</span></code></pre></td></tr></table></div></figure>
-
-
-<p>tcp_v4_rtx_synack函数：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>870 static int tcp_v4_rtx_synack(struct sock *sk, struct request_sock *req)
-</span><span class='line'>871 {
-</span><span class='line'>872     int res = tcp_v4_send_synack(sk, NULL, req, 0, false); //构建并发送SYN-ACK
-</span><span class='line'>873
-</span><span class='line'>874     if (!res)
-</span><span class='line'>875         TCP_INC_STATS_BH(sock_net(sk), TCP_MIB_RETRANSSEGS);
-</span><span class='line'>876     return res;
-</span><span class='line'>877 }</span></code></pre></td></tr></table></div></figure>
-
-
-
-</div>
-  
-  
-
-
-    </article>
-  
   <div class="pagination">
     
       <a class="prev" href="/posts/158">&larr; Older</a>
@@ -1831,7 +1812,7 @@ var ss360Config = {
   
     <section>
 <h1>Categories
-<span class='right_span'>(969)</span>
+<span class='right_span'>(970)</span>
 
 </h1>
 <head>
@@ -2160,8 +2141,8 @@ if (!document.getElementById('kernel~tcp')) document.getElementById('aexp_kernel
 if (!document.getElementById('kernel')) document.getElementById('aexp_kernel').style.visibility = 'hidden';
 if (!document.getElementById('kernel~vpn')) document.getElementById('aexp_kernel~vpn').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/network/'>network</a><a href='##' onmousedown=showDiv('network') id='aexp_network'><span class='exp_style' id='exp_network'>[+]</span></a><span class='right_span'>(9)</span></li>
-<div id='network' class='catsub'><li><a href='/blog/cats/network~base/?opendiv=network'>base</a><a href='##' onmousedown=showDiv('network~base') id='aexp_network~base'><span class='exp_style' id='exp_network~base'>[+]</span></a><span class='right_span'>9</span></li>
+<li class='catclass'><a href='/blog/cats/network/'>network</a><a href='##' onmousedown=showDiv('network') id='aexp_network'><span class='exp_style' id='exp_network'>[+]</span></a><span class='right_span'>(10)</span></li>
+<div id='network' class='catsub'><li><a href='/blog/cats/network~base/?opendiv=network'>base</a><a href='##' onmousedown=showDiv('network~base') id='aexp_network~base'><span class='exp_style' id='exp_network~base'>[+]</span></a><span class='right_span'>10</span></li>
 </div><script language='javascript' type='text/javascript'>
 if (!document.getElementById('network')) document.getElementById('aexp_network').style.visibility = 'hidden';
 if (!document.getElementById('network~base')) document.getElementById('aexp_network~base').style.visibility = 'hidden';
@@ -2273,7 +2254,7 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 
 <section>
 <h1>Date Categories
-<span class='right_span'>(969)</span>
+<span class='right_span'>(970)</span>
 
 </h1>
 <head>
@@ -2281,7 +2262,9 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(89)</span></li>
+<li class='catclass'><a href='/blog/cats/2025/'>2025</a><a href='##' onmousedown=showDiv('2025')><span class='exp_style' id='exp_2025'>[+]</span></a><span class='right_span'>(1)</span></li>
+<div id='2025' class='catsub'><li><a href='/blog/cats/2025~01/?opendiv=2025'>2025-01</a><span class='right_span'>1</span></li>
+</div><li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(89)</span></li>
 <div id='2024' class='catsub'><li><a href='/blog/cats/2024~12/?opendiv=2024'>2024-12</a><span class='right_span'>2</span></li>
 <li><a href='/blog/cats/2024~10/?opendiv=2024'>2024-10</a><span class='right_span'>5</span></li>
 <li><a href='/blog/cats/2024~09/?opendiv=2024'>2024-09</a><span class='right_span'>15</span></li>
@@ -2455,6 +2438,10 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
   <ul id="recent_posts">
     
       <li class="post">
+        <a href="/blog/2025/01/16/network-ac-ap/">如何在ac上telnet到ap</a>
+      </li>
+    
+      <li class="post">
         <a href="/blog/2024/12/12/tools-mysql-bin/">删除MySQL下的bin</a>
       </li>
     
@@ -2488,10 +2475,6 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
     
       <li class="post">
         <a href="/blog/2024/09/20/ffmpeg-mp3/">ffmpeg分离MP3文件报错</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/09/20/sqlserver-_/">`_` 通配符 -- 匹配一个字符</a>
       </li>
     
   </ul>
@@ -2591,7 +2574,7 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 
     </div>
   </div>
-  <footer role="contentinfo">  Copyright &copy; 2024 - kk -
+  <footer role="contentinfo">  Copyright &copy; 2025 - kk -
   <span class="credit">Powered by <a href="http://octopress.org">Octopress</a></span>
   <a title="Top" href="#" id="scroll2top" style="position: fixed; height: 50px; bottom: 30px; right: 25px; cursor: pointer; z-index: 9999; display: block; opacity: 1;"><img src="/images/scrollup.png"></a>
   <script src="/javascripts/scroll2top.js"></script>

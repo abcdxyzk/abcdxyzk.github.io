@@ -131,6 +131,409 @@ var ss360Config = {
       
   <header>
     
+      <h2 class="entry-title"><a href="/blog/2015/07/29/tools-haproxy_src5/">HAProxy 研究笔记 -- HTTP请求处理-2-解析</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-07-29T16:07:00+08:00'><span class='date'>2015-07-29</span> <span class='time'>16:07:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://blog.chinaunix.net/uid-10167808-id-3819702.html">http://blog.chinaunix.net/uid-10167808-id-3819702.html</a></p>
+
+<p> 本文继续分析 1.5-dev17 中接收到 client 数据之后的处理。</p>
+
+<p>haproxy-1.5-dev17 中接收 client 发送的请求数据流程见文档： HTTP请求处理-1-接收</p>
+
+<h4>1. haproxy 主循环的处理流程</h4>
+
+<p>主循环处理流程见文档 主循环简介</p>
+
+<p>请求数据的解析工作在主循环 process_runnable_tasks() 中执行。</p>
+
+<h4>2. 执行 run queue 中的任务</h4>
+
+<p> HTTP请求处理-1-接收 中分析到 session 建立之后，一来会将 session 的 task 放入 runqueue，该 task 会 在下一轮遍历可以运行的 task 中出现，并得到执行。二是立即调用 conn_fd_handler 去 接收 client 发送的数据。</p>
+
+<p>数据接收流程结束后（注意，这并不代表接收到了完整的 client 请求，因为也可能暂时 读取不到 client 的数据退出接收），haproxy 调度执行下一轮循环，调用 process_runnable_tasks() 处理所有在 runqueue 中的 task：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void process_runnable_tasks(int *next)
+</span><span class='line'>{
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;eb = eb32_lookup_ge(&rqueue, rqueue_ticks - TIMER_LOOK_BACK);
+</span><span class='line'>&#9;while (max_processed--) {
+</span><span class='line'>&#9;&#9;...
+</span><span class='line'>&#9;&#9;t = eb32_entry(eb, struct task, rq);
+</span><span class='line'>&#9;&#9;eb = eb32_next(eb);
+</span><span class='line'>&#9;&#9;__task_unlink_rq(t);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;t-&gt;state |= TASK_RUNNING;
+</span><span class='line'>&#9;&#9;/* This is an optimisation to help the processor's branch
+</span><span class='line'>&#9;&#9; * predictor take this most common call.
+</span><span class='line'>&#9;&#9; */
+</span><span class='line'>&#9;&#9;t-&gt;calls++;
+</span><span class='line'>&#9;&#9;if (likely(t-&gt;process == process_session))
+</span><span class='line'>&#9;&#9;&#9;t = process_session(t);
+</span><span class='line'>&#9;&#9;else
+</span><span class='line'>&#9;&#9;&#9;t = t-&gt;process(t);
+</span><span class='line'>&#9;&#9;...
+</span><span class='line'>&#9;}
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>大多数情况下，task 的 proecss 都指向 process_session() 函数。该函数就是负责解析 已接收到的数据，选择 backend server，以及 session 状态的变化等等。</p>
+
+<h4>3. session 的处理：process_session()</h4>
+
+<p>下面介绍 process_session() 函数的实现。该函数代码比较庞大，超过一千行，这里仅 介绍与 HTTP 请求处理的逻辑，采用代码块的逻辑介绍。</p>
+
+<p>处理 HTTP 请求的逻辑代码集中在 label resync_request 处。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct task *process_session(struct task *t)
+</span><span class='line'>{
+</span><span class='line'>&#9;...
+</span><span class='line'> resync_request:
+</span><span class='line'>&#9;/* Analyse request */
+</span><span class='line'>&#9;if (((s-&gt;req-&gt;flags & ~rqf_last) & CF_MASK_ANALYSER) ||
+</span><span class='line'>&#9;&#9;((s-&gt;req-&gt;flags ^ rqf_last) & CF_MASK_STATIC) ||
+</span><span class='line'>&#9;&#9;s-&gt;si[0].state != rq_prod_last ||
+</span><span class='line'>&#9;&#9;s-&gt;si[1].state != rq_cons_last) {
+</span><span class='line'>&#9;&#9;unsigned int flags = s-&gt;req-&gt;flags;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (s-&gt;req-&gt;prod-&gt;state &gt;= SI_ST_EST) {
+</span><span class='line'>&#9;&#9;&#9;ana_list = ana_back = s-&gt;req-&gt;analysers;
+</span><span class='line'>&#9;&#9;&#9;while (ana_list && max_loops--) {
+</span><span class='line'>&#9;&#9;&#9;&#9;/* 这段代码中逐一的列举出了所有的 analysers 对应的处理函数
+</span><span class='line'>&#9;&#9;&#9;&#9; * 这里不一一列出，等待下文具体分析
+</span><span class='line'>&#9;&#9;&#9;&#9; */
+</span><span class='line'>&#9;&#9;&#9;&#9;...
+</span><span class='line'>&#9;&#9;&#9;}
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;rq_prod_last = s-&gt;si[0].state;
+</span><span class='line'>&#9;&#9;rq_cons_last = s-&gt;si[1].state;
+</span><span class='line'>&#9;&#9;s-&gt;req-&gt;flags &= ~CF_WAKE_ONCE;
+</span><span class='line'>&#9;&#9;rqf_last = s-&gt;req-&gt;flags;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if ((s-&gt;req-&gt;flags ^ flags) & CF_MASK_STATIC)
+</span><span class='line'>&#9;&#9;&#9;goto resync_request;
+</span><span class='line'>&#9;}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>首先要判断 s->req->prod->state 的状态是否已经完成建连，根据之前的初始化动作， se->req->prod 指向 s->si[0]，即标识与 client 端连接的相关信息。正确建连成功之 后，会更改 si 的状态的，具体代码在 session_complete() 中：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>s-&gt;si[0].state     = s-&gt;si[0].prev_state = SI_ST_EST;
+</span><span class='line'>...
+</span><span class='line'>s-&gt;req-&gt;prod = &s-&gt;si[0];
+</span><span class='line'>s-&gt;req-&gt;cons = &s-&gt;si[1];</span></code></pre></td></tr></table></div></figure>
+
+
+<p>只有 frontend 连接建立成功，才具备处理 client 发送请求数据的基础。上一篇文章中 已经接收到了 client 发送的数据。这里就是需要根据 s->req->analysers 的值，确定 while 循环中哪些函数处理当前的数据。</p>
+
+<p>补充介绍一下 s->req->analysers 的赋值。 同样是在 session_complete 中初始化的</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* activate default analysers enabled for this listener */
+</span><span class='line'>s-&gt;req-&gt;analysers = l-&gt;analysers;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>可见，其直接使用 session 所在的 listener 的 analyser。 listener 中该数值的初始化 是在 check_config_validity() 中完成的：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>&#9;&#9;listener-&gt;analysers |= curproxy-&gt;fe_req_ana;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>而归根结蒂还是来源于 listener 所在的 proxy 上的 fe_req_ana， proxy 上的 fe_req_ana 的初始化同样是在 check_config_validity()，且是在给 listener->analysers 赋值之前</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>&#9;if (curproxy-&gt;cap & PR_CAP_FE) {
+</span><span class='line'>&#9;&#9;if (!curproxy-&gt;accept)
+</span><span class='line'>&#9;&#9;&#9;curproxy-&gt;accept = frontend_accept;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (curproxy-&gt;tcp_req.inspect_delay ||
+</span><span class='line'>&#9;&#9;&#9;!LIST_ISEMPTY(&curproxy-&gt;tcp_req.inspect_rules))
+</span><span class='line'>&#9;&#9;&#9;curproxy-&gt;fe_req_ana |= AN_REQ_INSPECT_FE;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (curproxy-&gt;mode == PR_MODE_HTTP) {
+</span><span class='line'>&#9;&#9;&#9;curproxy-&gt;fe_req_ana |= AN_REQ_WAIT_HTTP | AN_REQ_HTTP_PROCESS_FE;
+</span><span class='line'>&#9;&#9;&#9;curproxy-&gt;fe_rsp_ana |= AN_RES_WAIT_HTTP | AN_RES_HTTP_PROCESS_FE;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;/* both TCP and HTTP must check switching rules */
+</span><span class='line'>&#9;&#9;curproxy-&gt;fe_req_ana |= AN_REQ_SWITCHING_RULES;
+</span><span class='line'>&#9;}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>从上面代码可以看出，一个 HTTP 模式的 proxy，至少有三个标记位会被置位： AN_REQ_WAIT_HTTP, AN_REQ_HTTP_PROCESS_FE, AN_REQ_SWITCHING_RULES。也就是说， s->req->analysers 由以上三个标记置位。那么随后处理 HTTP REQ 的循环中，就要经过 这三个标记位对应的 analyser 的处理。</p>
+
+<p>接着回到 resync_request 标签下的那个 while 循环，就是逐个判断 analysers 的设置， 并调用对应的函数处理。需要启用那些 analysers，是和 haproxy 的配置相对应的。本文 使用最简单的配置，下面仅列出配置所用到的几个处理函数：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>&#9;&#9;while (ana_list && max_loops--) {
+</span><span class='line'>&#9;&#9;&#9;/* Warning! ensure that analysers are always placed in ascending order! */
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;if (ana_list & AN_REQ_INSPECT_FE) {
+</span><span class='line'>&#9;&#9;&#9;&#9;if (!tcp_inspect_request(s, s-&gt;req, AN_REQ_INSPECT_FE))
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;break;
+</span><span class='line'>&#9;&#9;&#9;&#9;UPDATE_ANALYSERS(s-&gt;req-&gt;analysers, ana_list, ana_back, AN_REQ_INSPECT_FE);
+</span><span class='line'>&#9;&#9;&#9;}
+</span><span class='line'>&#9;&#9;
+</span><span class='line'>&#9;&#9;&#9;if (ana_list & AN_REQ_WAIT_HTTP) {
+</span><span class='line'>&#9;&#9;&#9;&#9;if (!http_wait_for_request(s, s-&gt;req, AN_REQ_WAIT_HTTP))
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;break;
+</span><span class='line'>&#9;&#9;&#9;&#9;UPDATE_ANALYSERS(s-&gt;req-&gt;analysers, ana_list, ana_back, AN_REQ_WAIT_HTTP);
+</span><span class='line'>&#9;&#9;&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;if (ana_list & AN_REQ_HTTP_PROCESS_FE) {
+</span><span class='line'>&#9;&#9;&#9;&#9;if (!http_process_req_common(s, s-&gt;req, AN_REQ_HTTP_PROCESS_FE, s-&gt;fe))
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;break;
+</span><span class='line'>&#9;&#9;&#9;&#9;UPDATE_ANALYSERS(s-&gt;req-&gt;analysers, ana_list, ana_back, AN_REQ_HTTP_PROCESS_FE);
+</span><span class='line'>&#9;&#9;&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;if (ana_list & AN_REQ_SWITCHING_RULES) {
+</span><span class='line'>&#9;&#9;&#9;&#9;if (!process_switching_rules(s, s-&gt;req, AN_REQ_SWITCHING_RULES))
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;break;
+</span><span class='line'>&#9;&#9;&#9;&#9;UPDATE_ANALYSERS(s-&gt;req-&gt;analysers, ana_list, ana_back, AN_REQ_SWITCHING_RULES);
+</span><span class='line'>&#9;&#9;&#9;}
+</span><span class='line'>&#9;&#9;&#9;...
+</span><span class='line'>&#9;&#9;}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>analysers 的处理也是有顺序的。其中处理请求的第一个函数是 tcp_inspect_request()。 该函数主要是在于如果配置了这里先介绍 http_wait_for_request() 函数的实现。 顾名思义，该函数主要是配置中启用 inspect_rules 时，会调用到该函数。否则的话， 处理 HTTP Req 的第一个函数就是 http_wait_for_request().</p>
+
+<p>顾名思义，http_wait_for_request() 该函数分析所解析的 HTTP Requset 不一定是一个 完整的请求。上篇文章分析读取 client 请求数据的实现中，已经提到，只要不能从 socket 读到更多的数据，就会结束数据的接收。一个请求完全完全有可能因为一些异常原因，或者 请求长度本身就比较大而被拆分到不同的 IP 报文中，一次 read 系统调用可能只读取到其 中的一部分内容。因此，该函数会同时分析已经接收到的数据，并确认是否已经接收到了 完整的 HTTP 请求。只有接收到了完整的 HTTP 请求，该函数处理完，才会交给下一个 analyser 处理，否则只能结束请求的处理，等待接收跟多的数据，解析出一个完成的 HTTP 请求才行。</p>
+
+<h4>4. 解析接收到的 http 请求数据： http_wait_for_request()</h4>
+
+<p>以下是 http_wait_for_request() 的简要分析：</p>
+
+<p>1.调用 http_msg_analyzer，解析 s->req->buf 中新读取到的数据。该函数会按照 HTTP 协议， 解析 HTTP request 和 response 的头部数据，并记录到数据结构 struct http_msg 中。</p>
+
+<p>2.如果开启了 debug，并且已经完整的解析了 header，则 header 内容打印出来</p>
+
+<p>3.尚未读取到完整的 request 的处理，分作以下几种情形处理：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (unlikely(msg-&gt;msg_state &lt; HTTP_MSG_BODY)) {
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * First, let's catch bad requests.
+</span><span class='line'>&#9; */
+</span><span class='line'>
+</span><span class='line'>解析到 header 内容中有不符合 HTTP 协议的情形 HTTP_MSG_ERROR，应答 400 bad request 处理
+</span><span class='line'>req-&gt;buf 满了，甚至加入 maxrewrite 的空间仍然不够用，应答 400 bad request
+</span><span class='line'>读取错误 CF_READ_ERROR 发生，比如 client 发送 RST 断开连接， 应答 400 bad request
+</span><span class='line'>读取超时，client 超时未发送完整的请求，应答 408 Request Timeout
+</span><span class='line'>client 主动关闭，发送 FIN 包，实际上是所谓的 half-close，同样应答 400 bad request
+</span><span class='line'>如果以上情况都不满足，则意味着还可以继续尝试读取新数据，设置一下超时
+</span><span class='line'>
+</span><span class='line'>&#9;/* just set the request timeout once at the beginning of the request */
+</span><span class='line'>&#9;if (!tick_isset(req-&gt;analyse_exp)) {
+</span><span class='line'>&#9;&#9;if ((msg-&gt;msg_state == HTTP_MSG_RQBEFORE) &&
+</span><span class='line'>&#9;&#9;&#9;(txn-&gt;flags & TX_WAIT_NEXT_RQ) &&
+</span><span class='line'>&#9;&#9;&#9;tick_isset(s-&gt;be-&gt;timeout.httpka))
+</span><span class='line'>&#9;&#9;&#9;req-&gt;analyse_exp = tick_add(now_ms, s-&gt;be-&gt;timeout.httpka);
+</span><span class='line'>&#9;&#9;else
+</span><span class='line'>&#9;&#9;&#9;req-&gt;analyse_exp = tick_add_ifset(now_ms, s-&gt;be-&gt;timeout.httpreq);
+</span><span class='line'>&#9;}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>根据以上代码，在等待 http request 期间，有两种 timeout 可以设置： 当是http 连接 Keep-Alive 时，并且处理完了头一个请求之后，等待第二个请求期间，设置 httpka 的超 时，超过设定时间不发送新的请求，将会超时；否则，将设置 http 的 request timeout。</p>
+
+<p>因此，在不启用 http ka timeout 时，http request 同时承担起 http ka timeout 的 功能。在有 http ka timeout 时，这两者各自作用的时间段没有重叠。</p>
+
+<p>满足该环节的请求都终止处理，不再继续了。</p>
+
+<h5>4.2. 处理完整的 http request</h5>
+
+<p>这里处理的都是已经解析到完整 http request header 的情况，并且所有 header 都被 索引化了，便于快速查找。根据已经得到的 header 的信息，设置 session 和 txn 的 相关成员，相当于汇总一下 header 的摘要信息，便于随后处理之用。流程如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>更新 session 和 proxy 的统计计数
+</span><span class='line'>删除 http ka timeout 的超时处理。可能在上一个请求处理完之后，设置了 http ka 的 timeout，因为这里已经得到完整的请求，因此需要停止该 timeout 的处理逻辑
+</span><span class='line'>确认 METHOD，并设置 session 的标记位 s-&gt;flags |= SN_REDIRECTABLE，只有 GET 和 HEAD 请求可以被重定向
+</span><span class='line'>检测 URI 是否是配置的要做 monitor 的 URI，是的话，则执行对应 ACL，并设置应答
+</span><span class='line'>检测如果开启 log 功能的话，要给 txn-&gt;uri 分配内存，用于记录 URI
+</span><span class='line'>检测 HTTP version
+</span><span class='line'>&#9;将 0.9 版本的升级为 1.0
+</span><span class='line'>&#9;1.1 及其以上的版本都当做 1.1 处理
+</span><span class='line'>初始化用于标识 Connection header 的标记位
+</span><span class='line'>如果启用了 capture header 配置，调用 capture_headers() 记录下对应的 header
+</span><span class='line'>处理 Transfer-Encoding/Content-Length 等 header
+</span><span class='line'>最后一步，清理 req-&gt;analysers 的标记位 AN_REQ_WAIT_HTTP，因为本函数已经成功处理完毕，可以进行下一个 analyser 的处理了。</span></code></pre></td></tr></table></div></figure>
+
+
+<p>至此，http_wait_for_request() 的处理已经结束。</p>
+
+<h4>5. 其他对 HTTP 请求的处理逻辑</h4>
+
+<p>按照我们前面分析的，随后应该还有两个 analyser 要处理，简单介绍一下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>AN_REQ_HTTP_PROCESS_FE 对应的 http_process_req_common()
+</span><span class='line'>&#9;对 frontend 中 req 配置的常见处理，比如 block ACLs, filter, reqadd 等
+</span><span class='line'>&#9;设置 Connection mode， 主要是 haproxy 到 server 采用什么连接方式，tunnel 或者 按照 transcation 处理的短连接
+</span><span class='line'>AN_REQ_SWITCHING_RULES 对应的 process_switching_rules()
+</span><span class='line'>&#9;如果配置了选择 backend 的 rules，比如用 use_backend，则查询规则为 session 分配一个 backend
+</span><span class='line'>&#9;处理 persist_rules，一旦设置了 force-persist, 则不管 server 是否 down，都要保证 session 分配给 persistence 中记录的 server。</span></code></pre></td></tr></table></div></figure>
+
+
+<p>以上两个函数，不再具体分析。待以后需要时再完善。</p>
+
+<p>至此，client 端 http 请求已经完成解析和相关设置，并且给 session 指定了将来选择 server 所属的 backend。</p>
+
+<p>下一篇文章就分析选择 server 的流程。</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
       <h2 class="entry-title"><a href="/blog/2015/07/29/tools-haproxy_src4/">HAProxy 研究笔记 -- 主循环处理流程</a></h2>
     
     
@@ -584,321 +987,6 @@ var ss360Config = {
 
     </article>
   
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/07/29/tools-haproxy_src2/">HAProxy 研究笔记 -- rules 实现</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-07-29T16:00:00+08:00'><span class='date'>2015-07-29</span> <span class='time'>16:00:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://blog.chinaunix.net/uid-10167808-id-3775567.html">http://blog.chinaunix.net/uid-10167808-id-3775567.html</a></p>
-
-<p>本文研究 haproxy-1.5-dev17 中 rules 的相关实现。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>1. ACL
-</span><span class='line'>2. rule 的组成
-</span><span class='line'>3. rule 的执行
-</span><span class='line'>4. rule 的种类</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>1. ACL</h4>
-
-<p>如果要实现功能丰富的 rules，需要有配套的 ACL 机制。</p>
-
-<p>ACL 的格式如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>acl [flags] [operator] ... </span></code></pre></td></tr></table></div></figure>
-
-
-<p>haproxy 中 ACL 数据结构的定义：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/* The acl will be linked to from the proxy where it is declared */
-</span><span class='line'>struct acl {
-</span><span class='line'>&#9;struct list list;           /* chaining */
-</span><span class='line'>&#9;char *name;           /* acl name */
-</span><span class='line'>&#9;struct list expr;     /* list of acl_exprs */
-</span><span class='line'>&#9;int cache_idx;              /* ACL index in cache */
-</span><span class='line'>&#9;unsigned int requires;      /* or'ed bit mask of all acl_expr's ACL_USE_* */
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
-
-
-<p>其中：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>name: ACL 的名字
-</span><span class='line'>expr: ACL 定义的表达式。就是定义的 ACL 名字后面的表达式。这是一个链表结构。因此，可以定义多条表达式不同但是名字相同的 ACL。这样，多个表达式都属于同一个 ACL。
-</span><span class='line'>requires: 所有表达式中关键字对应的作用域（该关键字可以用在什么场合）的集合
-</span><span class='line'>
-</span><span class='line'>函数 parse_acl() 负责解析定义好的 ACL:
-</span><span class='line'>
-</span><span class='line'>查找 ACL 的名字，如果不存在的话，则 alloc 一个新的 acl 结构
-</span><span class='line'>通过调用 parse_acl_expr() 对表达式进行解析，并返回 struct acl_expr 结构
-</span><span class='line'>&#9;ACL 中的表达式应该只有一个 kw
-</span><span class='line'>&#9;查找该关键字，必须是已经注册好的。并返回该关键字注册时的数据结构 struct acl_expr
-</span><span class='line'>&#9;alloc 一个 struct acl_expr 结构体，记录下返回的 kw 的数据结构，并作成员的初始化
-</span><span class='line'>&#9;调用对应 kw 的 parse 方法，将解析的结果保存在 struct acl_pattern 结构体中，并将该结构体加入到 expr-&gt;patterns 的链表中
-</span><span class='line'>将解析到的表达式插入到 acl 中的 expr 链表中</span></code></pre></td></tr></table></div></figure>
-
-
-<p>总结： 一个 ACL 包含一到多个表达式。每个表达式包含一个 kw及一到多个 pattern。</p>
-
-<h4>2. rule 的组成</h4>
-
-<p>这里简要描述 rule 与 acl 之间的逻辑关系：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>rule 应该是 action + condition 组成
-</span><span class='line'>&#9;有些动作自身可能也需要记录一些信息。不同的 rule 对应动作的信息可能不同，比如 reqirep 等
-</span><span class='line'>&#9;block rules 的动作比较单一， condition 满足之后处理结果均相同
-</span><span class='line'>condition，完成 rule 检测的判断条件 对应数据结构： struct acl_cond
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;struct acl_cond {
-</span><span class='line'>&#9;&#9;&#9;struct list list;           /* Some specific tests may use multiple conditions */
-</span><span class='line'>&#9;&#9;&#9;struct list suites;         /* list of acl_term_suites */
-</span><span class='line'>&#9;&#9;&#9;int pol;                    /* polarity: ACL_COND_IF / ACL_COND_UNLESS */
-</span><span class='line'>&#9;&#9;&#9;unsigned int requires;      /* or'ed bit mask of all acl's ACL_USE_* */
-</span><span class='line'>&#9;&#9;&#9;const char *file;           /* config file where the condition is declared */
-</span><span class='line'>&#9;&#9;&#9;int line;                   /* line in the config file where the condition is declared */
-</span><span class='line'>&#9;&#9;};
-</span><span class='line'>&#9;&#9;
-</span><span class='line'>
-</span><span class='line'>condition 包含多个 ACL 组。组的分割逻辑是逻辑或（|| 或者 or），即 struct list suites 的成员，组的数据结构 struct acl_term_suite
-</span><span class='line'>
-</span><span class='line'>&#9;struct acl_term_suite {
-</span><span class='line'>&#9;&#9;struct list list;           /* chaining of term suites */
-</span><span class='line'>&#9;&#9;struct list terms;          /* list of acl_terms */
-</span><span class='line'>&#9;};
-</span><span class='line'>
-</span><span class='line'>&#9;该数据结构可以包含多个 ACL，以及每个 ACL 可能的一个取反标识 '!'
-</span><span class='line'>&#9;所有表达式中相邻的 ACL 且其逻辑关系为逻辑与(&&) 的构成一个 ACL 组
-</span><span class='line'>&#9;&#9;比如 if acl1 !acl2 or acl3 acl4，则构成两个 acl_term_suite，分别是 acl1 !acl2 和 acl3 acl4
-</span><span class='line'>&#9;&#9;每个 ACL 及其可能的取反标记对应的数据结构： struct acl_term
-</span><span class='line'>
-</span><span class='line'>&#9;&#9;&#9;struct acl_term {
-</span><span class='line'>&#9;&#9;&#9;&#9;struct list list;           /* chaining */
-</span><span class='line'>&#9;&#9;&#9;&#9;struct acl *acl;            /* acl pointed to by this term */
-</span><span class='line'>&#9;&#9;&#9;&#9;int neg;                    /* 1 if the ACL result must be negated */
-</span><span class='line'>&#9;&#9;&#9;};
-</span><span class='line'>
-</span><span class='line'>&#9;一个 ACL 包含多个 expr</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>3. rule 的执行</h4>
-
-<p>概括起来很简单，执行判断条件。符合条件，然后执行对应动作。</p>
-
-<p>下面是 rspadd 的示例代码：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/* add response headers from the rule sets in the same order */
-</span><span class='line'>list_for_each_entry(wl, &rule_set-&gt;rsp_add, list) {
-</span><span class='line'>&#9;if (txn-&gt;status &lt; 200)
-</span><span class='line'>&#9;&#9;break;
-</span><span class='line'>&#9;if (wl-&gt;cond) {
-</span><span class='line'>&#9;&#9;int ret = acl_exec_cond(wl-&gt;cond, px, t, txn, SMP_OPT_DIR_RES|SMP_OPT_FINAL);
-</span><span class='line'>&#9;&#9;ret = acl_pass(ret);
-</span><span class='line'>&#9;&#9;if (((struct acl_cond *)wl-&gt;cond)-&gt;pol == ACL_COND_UNLESS)
-</span><span class='line'>&#9;&#9;&#9;ret = !ret;
-</span><span class='line'>&#9;&#9;if (!ret)
-</span><span class='line'>&#9;&#9;&#9;continue;
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;if (unlikely(http_header_add_tail(&txn-&gt;rsp, &txn-&gt;hdr_idx, wl-&gt;s) &lt; 0))
-</span><span class='line'>&#9;&#9;goto return_bad_resp;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>对于同一个种类的 rules，执行逻辑如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>主要遍历 rule，调用 acl_exec_cond 执行该 rule 的检测条件。该检测结果只给出匹配与否。
-</span><span class='line'>&#9;逐个遍历 cond 上的 ACL 组，即cond-&gt;suites。任一 suite 匹配成功，则认为匹配成功
-</span><span class='line'>&#9;同一个 ACL 组上，遍历所有 suite-&gt;terms （ACL + 取反逻辑）。任意一个 ACL 匹配失败，则跳到下一个 ACL 组继续匹配。同一组全部 ACL 匹配成功，则认为该 ACL 组匹配
-</span><span class='line'>&#9;&#9;同一个 ACL 上的匹配，则是逐一遍历 ACL 的 expr。只要任意一个 expr 匹配成功，则认为该 ACL 匹配成功
-</span><span class='line'>结合 condition 中的条件 if/unless，确定最终匹配结果
-</span><span class='line'>如果匹配则执行对应的 action，否则检测下一条规则。</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>4. rule 的种类</h4>
-
-<p>从 proxy 结构体可以看出 rule 的种类</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct proxy {
-</span><span class='line'>&#9;...
-</span><span class='line'>&#9;struct list acl;                        /* ACL declared on this proxy */
-</span><span class='line'>&#9;struct list http_req_rules;       /* HTTP request rules: allow/deny/http-auth */
-</span><span class='line'>&#9;struct list block_cond;                 /* early blocking conditions (chained) */
-</span><span class='line'>&#9;struct list redirect_rules;             /* content redirecting rules (chained) */
-</span><span class='line'>&#9;struct list switching_rules;            /* content switching rules (chained) */
-</span><span class='line'>&#9;struct list persist_rules;        /* 'force-persist' and 'ignore-persist' rules (chained) */
-</span><span class='line'>&#9;struct list sticking_rules;             /* content sticking rules (chained) */
-</span><span class='line'>&#9;struct list storersp_rules;             /* content store response rules (chained) */
-</span><span class='line'>&#9;struct list server_rules;               /* server switching rules (chained) */
-</span><span class='line'>&#9;struct {                                /* TCP request processing */
-</span><span class='line'>&#9;&#9;unsigned int inspect_delay;     /* inspection delay */
-</span><span class='line'>&#9;&#9;struct list inspect_rules;      /* inspection rules */
-</span><span class='line'>&#9;&#9;struct list l4_rules;           /* layer4 rules */
-</span><span class='line'>&#9;} tcp_req;
-</span><span class='line'>&#9;struct {                                /* TCP request processing */
-</span><span class='line'>&#9;&#9;unsigned int inspect_delay;     /* inspection delay */
-</span><span class='line'>&#9;&#9;struct list inspect_rules;      /* inspection rules */
-</span><span class='line'>&#9;} tcp_rep;
-</span><span class='line'>&#9;...
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>其中， 函数 http_process_req_common 中处理的规则如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>http_process_req_common
-</span><span class='line'>{
-</span><span class='line'>&#9;... 
-</span><span class='line'>&#9;1. process block rules
-</span><span class='line'>&#9;...
-</span><span class='line'>&#9;2. process http req rules
-</span><span class='line'>&#9;...
-</span><span class='line'>&#9;3. execute regular exp if any
-</span><span class='line'>&#9;...
-</span><span class='line'>&#9;4. req add
-</span><span class='line'>&#9;...
-</span><span class='line'>&#9;5. process redirect rules
-</span><span class='line'>&#9;...
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>这里没有详细的介绍各种具体用途的 rules。随后具体分析代码的时候总结一下再加上。</p>
-</div>
-  
-  
-
-
-    </article>
-  
   <div class="pagination">
     
       <a class="prev" href="/posts/193">&larr; Older</a>
@@ -913,7 +1001,7 @@ var ss360Config = {
   
     <section>
 <h1>Categories
-<span class='right_span'>(969)</span>
+<span class='right_span'>(970)</span>
 
 </h1>
 <head>
@@ -1242,8 +1330,8 @@ if (!document.getElementById('kernel~tcp')) document.getElementById('aexp_kernel
 if (!document.getElementById('kernel')) document.getElementById('aexp_kernel').style.visibility = 'hidden';
 if (!document.getElementById('kernel~vpn')) document.getElementById('aexp_kernel~vpn').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/network/'>network</a><a href='##' onmousedown=showDiv('network') id='aexp_network'><span class='exp_style' id='exp_network'>[+]</span></a><span class='right_span'>(9)</span></li>
-<div id='network' class='catsub'><li><a href='/blog/cats/network~base/?opendiv=network'>base</a><a href='##' onmousedown=showDiv('network~base') id='aexp_network~base'><span class='exp_style' id='exp_network~base'>[+]</span></a><span class='right_span'>9</span></li>
+<li class='catclass'><a href='/blog/cats/network/'>network</a><a href='##' onmousedown=showDiv('network') id='aexp_network'><span class='exp_style' id='exp_network'>[+]</span></a><span class='right_span'>(10)</span></li>
+<div id='network' class='catsub'><li><a href='/blog/cats/network~base/?opendiv=network'>base</a><a href='##' onmousedown=showDiv('network~base') id='aexp_network~base'><span class='exp_style' id='exp_network~base'>[+]</span></a><span class='right_span'>10</span></li>
 </div><script language='javascript' type='text/javascript'>
 if (!document.getElementById('network')) document.getElementById('aexp_network').style.visibility = 'hidden';
 if (!document.getElementById('network~base')) document.getElementById('aexp_network~base').style.visibility = 'hidden';
@@ -1355,7 +1443,7 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 
 <section>
 <h1>Date Categories
-<span class='right_span'>(969)</span>
+<span class='right_span'>(970)</span>
 
 </h1>
 <head>
@@ -1363,7 +1451,9 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(89)</span></li>
+<li class='catclass'><a href='/blog/cats/2025/'>2025</a><a href='##' onmousedown=showDiv('2025')><span class='exp_style' id='exp_2025'>[+]</span></a><span class='right_span'>(1)</span></li>
+<div id='2025' class='catsub'><li><a href='/blog/cats/2025~01/?opendiv=2025'>2025-01</a><span class='right_span'>1</span></li>
+</div><li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(89)</span></li>
 <div id='2024' class='catsub'><li><a href='/blog/cats/2024~12/?opendiv=2024'>2024-12</a><span class='right_span'>2</span></li>
 <li><a href='/blog/cats/2024~10/?opendiv=2024'>2024-10</a><span class='right_span'>5</span></li>
 <li><a href='/blog/cats/2024~09/?opendiv=2024'>2024-09</a><span class='right_span'>15</span></li>
@@ -1537,6 +1627,10 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
   <ul id="recent_posts">
     
       <li class="post">
+        <a href="/blog/2025/01/16/network-ac-ap/">如何在ac上telnet到ap</a>
+      </li>
+    
+      <li class="post">
         <a href="/blog/2024/12/12/tools-mysql-bin/">删除MySQL下的bin</a>
       </li>
     
@@ -1570,10 +1664,6 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
     
       <li class="post">
         <a href="/blog/2024/09/20/ffmpeg-mp3/">ffmpeg分离MP3文件报错</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/09/20/sqlserver-_/">`_` 通配符 -- 匹配一个字符</a>
       </li>
     
   </ul>
@@ -1673,7 +1763,7 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 
     </div>
   </div>
-  <footer role="contentinfo">  Copyright &copy; 2024 - kk -
+  <footer role="contentinfo">  Copyright &copy; 2025 - kk -
   <span class="credit">Powered by <a href="http://octopress.org">Octopress</a></span>
   <a title="Top" href="#" id="scroll2top" style="position: fixed; height: 50px; bottom: 30px; right: 25px; cursor: pointer; z-index: 9999; display: block; opacity: 1;"><img src="/images/scrollup.png"></a>
   <script src="/javascripts/scroll2top.js"></script>

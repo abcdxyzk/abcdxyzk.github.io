@@ -131,6 +131,861 @@ var ss360Config = {
       
   <header>
     
+      <h2 class="entry-title"><a href="/blog/2021/06/08/base-spin-lock/">Linux内核的自旋锁</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2021-06-08T15:42:00+08:00'><span class='date'>2021-06-08</span> <span class='time'>15:42:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://www.wowotech.net/kernel_synchronization/460.html">http://www.wowotech.net/kernel_synchronization/460.html</a></p>
+
+<p> 自旋锁用于处理器之间的互斥，适合保护很短的临界区，并且不允许在临界区睡眠。申请自旋锁的时候，如果自旋锁被其他处理器占有，本处理器自旋等待（也称为忙等待）。</p>
+
+<p>进程、软中断和硬中断都可以使用自旋锁。</p>
+
+<h4>自旋锁的实现经历了3个阶段：</h4>
+
+<p>(1) 最早的自旋锁是无序竞争的，不保证先申请的进程先获得锁。</p>
+
+<p>(2) 第2个阶段是入场券自旋锁，进程按照申请锁的顺序排队，先申请的进程先获得锁。</p>
+
+<p>(3) 第3个阶段是MCS自旋锁。入场券自旋锁存在性能问题：所有申请锁的处理器在同一个变量上自旋等待，缓存同步的开销大，不适合处理器很多的系统。MCS自旋锁的策略是为每个处理器创建一个变量副本，每个处理器在自己的本地变量上自旋等待，解决了性能问题。</p>
+
+<p>入场券自旋锁和MCS自旋锁都属于排队自旋锁（queued spinlock），进程按照申请锁的顺序排队，先申请的进程先获得锁。</p>
+
+<h2>1. 数据结构</h2>
+
+<p>自旋锁的定义如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>include/linux/spinlock_types.h
+</span><span class='line'>typedef struct spinlock {
+</span><span class='line'>&#9;union {
+</span><span class='line'>&#9;&#9;struct raw_spinlock rlock;
+</span><span class='line'>&#9;&#9;...
+</span><span class='line'>&#9;};
+</span><span class='line'>} spinlock_t;
+</span><span class='line'>
+</span><span class='line'>typedef struct raw_spinlock {
+</span><span class='line'>&#9;arch_spinlock_t raw_lock;
+</span><span class='line'>&#9;...
+</span><span class='line'>} raw_spinlock_t;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>可以看到，数据类型spinlock对raw_spinlock做了封装，然后数据类型raw_spinlock对arch_spinlock_t做了封装，各种处理器架构需要自定义数据类型arch_spinlock_t。</p>
+
+<h4>spinlock和raw_spinlock（原始自旋锁）有什么关系？</h4>
+
+<p>Linux内核有一个实时内核分支（开启配置宏CONFIG_PREEMPT_RT）来支持硬实时特性，内核主线只支持软实时。</p>
+
+<p>对于没有打上实时内核补丁的内核，spinlock只是封装raw_spinlock，它们完全一样。如果打上实时内核补丁，那么spinlock使用实时互斥锁保护临界区，在临界区内可以被抢占和睡眠，但raw_spinlock还是自旋锁。</p>
+
+<p>目前主线版本还没有合并实时内核补丁，说不定哪天就会合并进来，为了使代码可以兼容实时内核，最好坚持3个原则：</p>
+
+<p>（1）尽可能使用spinlock。</p>
+
+<p>（2）绝对不允许被抢占和睡眠的地方，使用raw_spinlock，否则使用spinlock。</p>
+
+<p>（3）如果临界区足够小，使用raw_spinlock。</p>
+
+<h2>2. 使用方法</h2>
+
+<h4>定义并且初始化静态自旋锁的方法是：</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>DEFINE_SPINLOCK(x);</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>在运行时动态初始化自旋锁的方法是：</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>spin_lock_init(x);</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>申请自旋锁的函数是：</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>（1）void spin_lock(spinlock_t *lock); 申请自旋锁，如果锁被其他处理器占有，当前处理器自旋等待。
+</span><span class='line'>（2）`void spin_lock_bh(spinlock_t *lock);` 申请自旋锁，并且禁止当前处理器的软中断。
+</span><span class='line'>（3）`void spin_lock_irq(spinlock_t *lock);` 申请自旋锁，并且禁止当前处理器的硬中断。
+</span><span class='line'>（4）`spin_lock_irqsave(lock, flags);` 申请自旋锁，保存当前处理器的硬中断状态，并且禁止当前处理器的硬中断。
+</span><span class='line'>（5）`int spin_trylock(spinlock_t *lock);` 申请自旋锁，如果申请成功，返回1；如果锁被其他处理器占有，当前处理器不等待，立即返回0。</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>释放自旋锁的函数是：</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>（1）void spin_unlock(spinlock_t *lock);
+</span><span class='line'>（2）void spin_unlock_bh(spinlock_t *lock); 释放自旋锁，并且开启当前处理器的软中断。
+</span><span class='line'>（3）void spin_unlock_irq(spinlock_t *lock); 释放自旋锁，并且开启当前处理器的硬中断。
+</span><span class='line'>（4）void spin_unlock_irqrestore(spinlock_t *lock, unsigned long flags); 释放自旋锁，并且恢复当前处理器的硬中断状态。</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>定义并且初始化静态原始自旋锁的方法是：</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>DEFINE_RAW_SPINLOCK(x);</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>在运行时动态初始化原始自旋锁的方法是：</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>raw_spin_lock_init (x);</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>申请原始自旋锁的函数是：</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>（1）raw_spin_lock(lock) 申请原始自旋锁，如果锁被其他处理器占有，当前处理器自旋等待。
+</span><span class='line'>（2）raw_spin_lock_bh(lock) 申请原始自旋锁，并且禁止当前处理器的软中断。
+</span><span class='line'>（3）raw_spin_lock_irq(lock) 申请原始自旋锁，并且禁止当前处理器的硬中断。
+</span><span class='line'>（4）raw_spin_lock_irqsave(lock, flags) 申请原始自旋锁，保存当前处理器的硬中断状态，并且禁止当前处理器的硬中断。
+</span><span class='line'>（5）raw_spin_trylock(lock) 申请原始自旋锁，如果申请成功，返回1；如果锁被其他处理器占有，当前处理器不等待，立即返回0。</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>释放原始自旋锁的函数是：</h4>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>（1）raw_spin_unlock(lock)
+</span><span class='line'>（2）raw_spin_unlock_bh(lock) 释放原始自旋锁，并且开启当前处理器的软中断。
+</span><span class='line'>（3）raw_spin_unlock_irq(lock) 释放原始自旋锁，并且开启当前处理器的硬中断。
+</span><span class='line'>（4）raw_spin_unlock_irqrestore(lock, flags) 释放原始自旋锁，并且恢复当前处理器的硬中断状态。</span></code></pre></td></tr></table></div></figure>
+
+
+<h2>3. 入场券自旋锁</h2>
+
+<p>入场券自旋锁（ticket spinlock）的算法类似于银行柜台的排队叫号：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>（1）锁拥有排队号和服务号，服务号是当前占有锁的进程的排队号。
+</span><span class='line'>（2）每个进程申请锁的时候，首先申请一个排队号，然后轮询锁的服务号是否等于自己的排队号，如果等于，表示自己占有锁，可以进入临界区，否则继续轮询。
+</span><span class='line'>（3）当进程释放锁时，把服务号加一，下一个进程看到服务号等于自己的排队号，退出自旋，进入临界区。</span></code></pre></td></tr></table></div></figure>
+
+
+<p>ARM64架构定义的数据类型arch_spinlock_t如下所示：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>arch/arm64/include/asm/spinlock_types.h
+</span><span class='line'>typedef struct {
+</span><span class='line'>#ifdef __AARCH64EB__     /* 大端字节序（高位存放在低地址） */
+</span><span class='line'>&#9;u16 next;
+</span><span class='line'>&#9;u16 owner;
+</span><span class='line'>#else                    /* 小端字节序（低位存放在低地址） */
+</span><span class='line'>&#9;u16 owner;
+</span><span class='line'>&#9;u16 next;
+</span><span class='line'>#endif
+</span><span class='line'>} __aligned(4) arch_spinlock_t;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>成员next是排队号，成员owner是服务号。</p>
+
+<p>在多处理器系统中，函数spin_lock()负责申请自旋锁，ARM64架构的代码如下所示：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>spin_lock() -&gt; raw_spin_lock() -&gt; _raw_spin_lock() -&gt; __raw_spin_lock()  -&gt; do_raw_spin_lock() -&gt; arch_spin_lock()
+</span><span class='line'>
+</span><span class='line'>arch/arm64/include/asm/spinlock.h
+</span><span class='line'>static inline void arch_spin_lock(arch_spinlock_t *lock)
+</span><span class='line'>{
+</span><span class='line'>&#9;unsigned int tmp;
+</span><span class='line'>&#9;arch_spinlock_t lockval, newval;
+</span><span class='line'>
+</span><span class='line'>&#9;asm volatile (
+</span><span class='line'>&#9;ARM64_LSE_ATOMIC_INSN (
+</span><span class='line'>&#9;&#9;/* LL/SC */
+</span><span class='line'>&#9;&#9;"   prfm    pstl1strm, %3\n"
+</span><span class='line'>&#9;&#9;"1:   ldaxr   %w0, %3\n"
+</span><span class='line'>&#9;&#9;"   add   %w1, %w0, %w5\n"
+</span><span class='line'>&#9;&#9;"   stxr   %w2, %w1, %3\n"
+</span><span class='line'>&#9;&#9;"   cbnz   %w2, 1b\n",
+</span><span class='line'>&#9;&#9;/* 大系统扩展的原子指令 */
+</span><span class='line'>&#9;&#9;"   mov   %w2, %w5\n"
+</span><span class='line'>&#9;&#9;"   ldadda   %w2, %w0, %3\n"
+</span><span class='line'>&#9;&#9;__nops(3)
+</span><span class='line'>&#9;)
+</span><span class='line'>
+</span><span class='line'>&#9;/* 我们得到锁了吗？*/
+</span><span class='line'>&#9;eor   %w1, %w0, %w0, ror #16\n"
+</span><span class='line'>&#9;cbz   %w1, 3f\n"
+</span><span class='line'>&#9;sevl\n"
+</span><span class='line'>&#9;2:   wfe\n"
+</span><span class='line'>&#9;ldaxrh   %w2, %4\n"
+</span><span class='line'>&#9;eor   %w1, %w2, %w0, lsr #16\n"
+</span><span class='line'>&#9;cbnz   %w1, 2b\n"
+</span><span class='line'>&#9;/* 得到锁，临界区从这里开始*/
+</span><span class='line'>&#9;3:"
+</span><span class='line'>&#9;: "=&r" (lockval), "=&r" (newval), "=&r" (tmp), "+Q" (*lock)
+</span><span class='line'>&#9;: "Q" (lock-&gt;owner), "I" (1 &lt;&lt; TICKET_SHIFT)
+</span><span class='line'>&#9;: "memory");</span></code></pre></td></tr></table></div></figure>
+
+
+<p>第6～18行代码，申请排队号，然后把自旋锁的排队号加1，这是一个原子操作，有两种实现方法：</p>
+
+<p>1）第9～13行代码，使用指令ldaxr（带有获取语义的独占加载）和stxr（独占存储）实现，指令ldaxr带有获取语义，后面的加载/存储指令必须在指令ldaxr完成之后开始执行。</p>
+
+<p>2）第15～16行代码，如果处理器支持大系统扩展，那么使用带有获取语义的原子加法指令ldadda实现，指令ldadda带有获取语义，后面的加载/存储指令必须在指令ldadda完成之后开始执行。</p>
+
+<p>第21～22行代码，如果服务号等于当前进程的排队号，进入临界区。</p>
+
+<p>第24～27行代码，如果服务号不等于当前进程的排队号，那么自旋等待。使用指令ldaxrh（带有获取语义的独占加载，h表示halfword，即2字节）读取服务号，指令ldaxrh带有获取语义，后面的加载/存储指令必须在指令ldaxrh完成之后开始执行。</p>
+
+<p>第23行代码，sevl（send event local）指令的功能是发送一个本地事件，避免错过其他处理器释放自旋锁时发送的事件。</p>
+
+<p>第24行代码，wfe（wait for event）指令的功能是使处理器进入低功耗状态，等待事件。</p>
+
+<p>函数spin_unlock()负责释放自旋锁，ARM64架构的代码如下所示：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>spin_unlock() -&gt; raw_spin_unlock() -&gt; _raw_spin_unlock() -&gt; __raw_spin_unlock()  -&gt; do_raw_spin_unlock() -&gt; arch_spin_unlock()
+</span><span class='line'>
+</span><span class='line'>arch/arm64/include/asm/spinlock.h
+</span><span class='line'>static inline void arch_spin_unlock(arch_spinlock_t *lock)
+</span><span class='line'>{
+</span><span class='line'>&#9;unsigned long tmp;
+</span><span class='line'>
+</span><span class='line'>&#9;asm volatile(ARM64_LSE_ATOMIC_INSN(
+</span><span class='line'>&#9;/* LL/SC */
+</span><span class='line'>&#9;"    ldrh   %w1, %0\n"
+</span><span class='line'>&#9;"    add   %w1, %w1, #1\n"
+</span><span class='line'>&#9;"    stlrh   %w1, %0",
+</span><span class='line'>&#9;/* 大多统扩展的原子指令 */
+</span><span class='line'>&#9;"    mov   %w1, #1\n"
+</span><span class='line'>&#9;"    staddlh   %w1, %0\n"
+</span><span class='line'>&#9;__nops(1))
+</span><span class='line'>&#9;: "=Q" (lock-&gt;owner), "=&r" (tmp)
+</span><span class='line'>&#9;:
+</span><span class='line'>&#9;: "memory");
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>把自旋锁的服务号加1，有两种实现方法：</p>
+
+<p>（1）第7～9行代码，使用指令ldrh（加载，h表示halfword，即2字节）和stlrh（带有释放语义的存储）实现，指令stlrh带有释放语义，前面的加载/存储指令必须在指令stlrh开始执行之前执行完。因为一次只能有一个进程进入临界区，所以只有一个进程把自旋锁的服务号加1，不需要是原子操作。</p>
+
+<p>（2）第11～12行代码，如果处理器支持大系统扩展，那么使用带有释放语义的原子加法指令staddlh实现，指令staddlh带有释放语义，前面的加载/存储指令必须在指令staddlh开始执行之前执行完。</p>
+
+<p>在单处理器系统中，自旋锁是空的。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>include/linux/spinlock_types_up.h
+</span><span class='line'>typedef struct { } arch_spinlock_t;
+</span><span class='line'>函数spin_lock()只是禁止内核抢占。
+</span><span class='line'>spin_lock() -&gt; raw_spin_lock() -&gt; _raw_spin_lock()
+</span><span class='line'>include/linux/spinlock_api_up.h
+</span><span class='line'>#define _raw_spin_lock(lock)             __LOCK(lock)
+</span><span class='line'>#define __LOCK(lock) \
+</span><span class='line'>  do { preempt_disable(); ___LOCK(lock); } while (0)
+</span><span class='line'>#define ___LOCK(lock) \
+</span><span class='line'>  do { __acquire(lock); (void)(lock); } while (0)</span></code></pre></td></tr></table></div></figure>
+
+
+<h2>4. MCS自旋锁</h2>
+
+<p>入场券自旋锁存在性能问题：所有等待同一个自旋锁的处理器在同一个变量上自旋等待，申请或者释放锁的时候会修改锁，导致其他处理器存放自旋锁的缓存行失效，在拥有几百甚至几千个处理器的大型系统中，处理器申请自旋锁时竞争可能很激烈，缓存同步的开销很大，导致系统性能大幅度下降。</p>
+
+<p>MCS（MCS是“Mellor-Crummey”和“Scott”这两个发明人的名字的首字母缩写）自旋锁解决了这个缺点，它的策略是为每个处理器创建一个变量副本，每个处理器在申请自旋锁的时候在自己的本地变量上自旋等待，避免缓存同步的开销。</p>
+
+<h4>4.1.   传统的MCS自旋锁</h4>
+
+<p>传统的MCS自旋锁包含：</p>
+
+<p>（1）一个指针tail指向队列的尾部。</p>
+
+<p>（2）每个处理器对应一个队列节点，即mcs_lock_node结构体，其中成员next指向队列的下一个节点，成员locked指示锁是否被其他处理器占有，如果成员locked的值为1，表示锁被其他处理器占有。</p>
+
+<p>结构体的定义如下所示：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>typedef struct __mcs_lock_node {
+</span><span class='line'>&#9;struct __mcs_lock_node *next;
+</span><span class='line'>&#9;int locked;
+</span><span class='line'>} ____cacheline_aligned_in_smp mcs_lock_node;
+</span><span class='line'>
+</span><span class='line'>typedef struct {
+</span><span class='line'>&#9;mcs_lock_node *tail;
+</span><span class='line'>&#9;mcs_lock_node nodes[NR_CPUS];/* NR_CPUS是处理器的数量 */
+</span><span class='line'>} spinlock_t;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>其中<code>____cacheline_aligned_in_smp</code> 的作用是：在多处理器系统中，结构体的起始地址和长度都是一级缓存行长度的整数倍。</p>
+
+<p>当没有处理器占有或者等待自旋锁的时候，队列是空的，tail是空指针。</p>
+
+<p><img src="/images/kernel/20210608-1.png" alt="" /></p>
+
+<p>图 4.1 处理器0申请MCS自旋锁</p>
+
+<p>如图 4.1所示，当处理器0申请自旋锁的时候，执行原子交换操作，使tail指向处理器0的mcs_lock_node结构体，并且返回tail的旧值。tail的旧值是空指针，说明自旋锁处于空闲状态，那么处理器0获得自旋锁。</p>
+
+<p><img src="/images/kernel/20210608-2.png" alt="" /></p>
+
+<p>图 4.2 处理器1申请MCS自旋锁</p>
+
+<p>如图 4.2所示，当处理器0占有自旋锁的时候，处理器1申请自旋锁，执行原子交换操作，使tail指向处理器1的mcs_lock_node结构体，并且返回tail的旧值。tail的旧值是处理器0的mcs_lock_node结构体的地址，说明自旋锁被其他处理器占有，那么使处理器0的mcs_lock_node结构体的成员next指向处理器1的mcs_lock_node结构体，把处理器1的mcs_lock_node结构体的成员locked设置为1，然后处理器1在自己的mcs_lock_node结构体的成员locked上面自旋等待，等待成员locked的值变成0。</p>
+
+<p><img src="/images/kernel/20210608-3.png" alt="" /></p>
+
+<p>图 4.3 处理器0释放MCS自旋锁</p>
+
+<p>如图 4.3所示，处理器0释放自旋锁，发现自己的mcs_lock_node结构体的成员next不是空指针，说明有申请者正在等待锁，于是把下一个节点的成员locked设置为0，处理器1获得自旋锁。</p>
+
+<p>处理器1释放自旋锁，发现自己的mcs_lock_node结构体的成员next是空指针，说明自己是最后一个申请者，于是执行原子比较交换操作：如果tail指向自己的mcs_lock_node结构体，那么把tail设置为空指针。</p>
+
+<h4>4.2.   小巧的MCS自旋锁</h4>
+
+<p>传统的MCS自旋锁存在的缺陷是：结构体的长度太大，因为mcs_lock_node结构体的起始地址和长度都必须是一级缓存行长度的整数倍，所以MCS自旋锁的长度是（一级缓存行长度 + 处理器数量 * 一级缓存行长度），而入场券自旋锁的长度只有4字节。自旋锁被嵌入到内核的很多结构体中，如果自旋锁的长度增加，会导致这些结构体的长度增加。</p>
+
+<p>经过内核社区技术专家的努力，成功地把MCS自旋锁放进4个字节，实现了小巧的MCS自旋锁。自旋锁的定义如下所示：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>include/asm-generic/qspinlock_types.h
+</span><span class='line'>
+</span><span class='line'>typedef struct qspinlock {
+</span><span class='line'>&#9;atomic_t  val;
+</span><span class='line'>} arch_spinlock_t;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>另外，为每个处理器定义1个队列节点数组，如下所示：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>kernel/locking/qspinlock.c
+</span><span class='line'>#ifdef CONFIG_PARAVIRT_SPINLOCKS
+</span><span class='line'>#define MAX_NODES  8
+</span><span class='line'>#else
+</span><span class='line'>#define MAX_NODES  4
+</span><span class='line'>#endif
+</span><span class='line'>static DEFINE_PER_CPU_ALIGNED(struct mcs_spinlock, mcs_nodes[MAX_NODES]);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>配置宏CONFIG_PARAVIRT_SPINLOCKS用来启用半虚拟化的自旋锁，给虚拟机使用，本文不考虑这种使用场景。每个处理器需要4个队列节点，原因如下：</p>
+
+<p>(1)       申请自旋锁的函数禁止内核抢占，所以进程在等待自旋锁的过程中不会被其他进程抢占。</p>
+
+<p>(2)       进程在等待自旋锁的过程中可能被软中断抢占，然后软中断等待另一个自旋锁。</p>
+
+<p>(3)       软中断在等待自旋锁的过程中可能被硬中断抢占，然后硬中断等待另一个自旋锁。</p>
+
+<p>(4)       硬中断在等待自旋锁的过程中可能被不可屏蔽中断抢占，然后不可屏蔽中断等待另一个自旋锁。</p>
+
+<p>综上所述，一个处理器最多同时等待4个自旋锁。</p>
+
+<p>和入场券自旋锁相比，MCS自旋锁增加的内存开销是数组mcs_nodes。</p>
+
+<p>队列节点的定义如下所示：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>kernel/locking/mcs_spinlock.h
+</span><span class='line'>
+</span><span class='line'>struct mcs_spinlock {
+</span><span class='line'>&#9;struct mcs_spinlock *next;
+</span><span class='line'>&#9;int locked;
+</span><span class='line'>&#9;int count;
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>其中成员next指向队列的下一个节点；成员locked指示锁是否被前一个等待者占有，如果值为1，表示锁被前一个等待者占有；成员count是嵌套层数，也就是数组mcs_nodes已分配的数组项的数量。</p>
+
+<p>自旋锁的32个二进制位被划分成4个字段：</p>
+
+<p>(1)       locked字段，指示锁已经被占有，长度是一个字节，占用第0~7位。</p>
+
+<p>(2)       一个pending位，占用第8位，第1个等待自旋锁的处理器设置pending位。</p>
+
+<p>(3)       index字段，是数组索引，指示队列的尾部节点使用数组mcs_nodes的哪一项。</p>
+
+<p>(4)       cpu字段，存放队列的尾部节点的处理器编号，实际存储的值是处理器编号加上1，cpu字段减去1才是真实的处理器编号。</p>
+
+<p>index字段和cpu字段合起来称为tail字段，存放队列的尾部节点的信息，布局分两种情况：</p>
+
+<p>(1)       如果处理器的数量小于2的14次方，那么第9~15位没有使用，第16~17位是index字段，第18~31位是cpu字段。</p>
+
+<p>(2)       如果处理器的数量大于或等于2的14次方，那么第9~10位是index字段，第11~31位是cpu字段。</p>
+
+<p>把MCS自旋锁放进4个字节的关键是：存储处理器编号和数组索引，而不是存储尾部节点的地址。</p>
+
+<p>内核对MCS自旋锁做了优化：第1个等待自旋锁的处理器直接在锁自身上面自旋等待，不是在自己的mcs_spinlock结构体上自旋等待。这个优化带来的好处是：当锁被释放的时候，不需要访问mcs_spinlock结构体的缓存行，相当于减少了一次缓存没命中。后续的处理器在自己的mcs_spinlock结构体上面自旋等待，直到它们移动到队列的首部为止。</p>
+
+<p>自旋锁的pending位进一步扩展这个优化策略。第1个等待自旋锁的处理器简单地设置pending位，不需要使用自己的mcs_spinlock结构体。第2个处理器看到pending被设置，开始创建等待队列，在自己的mcs_spinlock结构体的locked字段上自旋等待。这种做法消除了两个等待者之间的缓存同步，而且第1个等待者没使用自己的mcs_spinlock结构体，减少了一次缓存行没命中。</p>
+
+<p>在多处理器系统中，申请MCS自旋锁的代码如下所示：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>spin_lock() -&gt; raw_spin_lock() -&gt; _raw_spin_lock() -&gt; __raw_spin_lock()  -&gt; do_raw_spin_lock() -&gt; arch_spin_lock()
+</span><span class='line'>
+</span><span class='line'>include/asm-generic/qspinlock.h
+</span><span class='line'>
+</span><span class='line'>#define arch_spin_lock(l)         queued_spin_lock(l)
+</span><span class='line'>
+</span><span class='line'>static __always_inline void queued_spin_lock(struct qspinlock *lock)
+</span><span class='line'>{
+</span><span class='line'>&#9;u32 val;
+</span><span class='line'>
+</span><span class='line'>&#9;val = atomic_cmpxchg_acquire(&lock-&gt;val, 0, _Q_LOCKED_VAL);
+</span><span class='line'>&#9;if (likely(val == 0))
+</span><span class='line'>&#9;&#9;return;
+</span><span class='line'>&#9;ueued_spin_lock_slowpath(lock, val);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>第7行代码，执行带有获取语义的原子比较交换操作，如果锁的值是0，那么把锁的locked字段设置为1。获取语义保证后面的加载/存储指令必须在函数atomic_cmpxchg_acquire()完成之后开始执行。函数atomic_cmpxchg_acquire()返回锁的旧值。</p>
+
+<p>第8~9行代码，如果锁的旧值是0，说明申请锁的时候锁处于空闲状态，那么成功地获得锁。</p>
+
+<p>第10行代码，如果锁的旧值不是0，说明锁不是处于空闲状态，那么执行申请自旋锁的慢速路径。</p>
+
+<p>申请MCS自旋锁的慢速路径如下所示：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+<span class='line-number'>82</span>
+<span class='line-number'>83</span>
+<span class='line-number'>84</span>
+<span class='line-number'>85</span>
+<span class='line-number'>86</span>
+<span class='line-number'>87</span>
+<span class='line-number'>88</span>
+<span class='line-number'>89</span>
+<span class='line-number'>90</span>
+<span class='line-number'>91</span>
+<span class='line-number'>92</span>
+<span class='line-number'>93</span>
+<span class='line-number'>94</span>
+<span class='line-number'>95</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>kernel/locking/qspinlock.c
+</span><span class='line'>
+</span><span class='line'>void queued_spin_lock_slowpath(struct qspinlock *lock, u32 val)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct mcs_spinlock *prev, *next, *node;
+</span><span class='line'>&#9;u32 new, old, tail;
+</span><span class='line'>&#9;int idx;
+</span><span class='line'>
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;if (val == _Q_PENDING_VAL) {
+</span><span class='line'>&#9;&#9;while ((val = atomic_read(&lock-&gt;val)) == _Q_PENDING_VAL)
+</span><span class='line'>&#9;&#9;cpu_relax();
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;for (;;) {
+</span><span class='line'>&#9;&#9;if (val & ~_Q_LOCKED_MASK)
+</span><span class='line'>&#9;&#9;&#9;goto queue;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;new = _Q_LOCKED_VAL;
+</span><span class='line'>&#9;&#9;if (val == new)
+</span><span class='line'>&#9;&#9;&#9;new |= _Q_PENDING_VAL;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;old = atomic_cmpxchg_acquire(&lock-&gt;val, val, new);
+</span><span class='line'>&#9;&#9;if (old == val)
+</span><span class='line'>&#9;&#9;&#9;break;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;val = old;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;if (new == _Q_LOCKED_VAL)
+</span><span class='line'>&#9;&#9;return;
+</span><span class='line'>
+</span><span class='line'>&#9;smp_cond_load_acquire(&lock-&gt;val.counter, !(VAL & _Q_LOCKED_MASK));
+</span><span class='line'>
+</span><span class='line'>&#9;clear_pending_set_locked(lock);
+</span><span class='line'>&#9;return;
+</span><span class='line'>
+</span><span class='line'>queue:
+</span><span class='line'>&#9;node = this_cpu_ptr(&mcs_nodes[0]);
+</span><span class='line'>&#9;idx = node-&gt;count++;
+</span><span class='line'>&#9;tail = encode_tail(smp_processor_id(), idx);
+</span><span class='line'>
+</span><span class='line'>&#9;node += idx;
+</span><span class='line'>&#9;node-&gt;locked = 0;
+</span><span class='line'>&#9;node-&gt;next = NULL;
+</span><span class='line'>&#9;...
+</span><span class='line'>
+</span><span class='line'>&#9;if (queued_spin_trylock(lock))
+</span><span class='line'>&#9;&#9;goto release;
+</span><span class='line'>
+</span><span class='line'>&#9;old = xchg_tail(lock, tail);
+</span><span class='line'>&#9;next = NULL;
+</span><span class='line'>
+</span><span class='line'>&#9;if (old & _Q_TAIL_MASK) {
+</span><span class='line'>&#9;&#9;prev = decode_tail(old);
+</span><span class='line'>&#9;&#9;smp_read_barrier_depends();
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;WRITE_ONCE(prev-&gt;next, node);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;...
+</span><span class='line'>&#9;&#9;arch_mcs_spin_lock_contended(&node-&gt;locked);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;next = READ_ONCE(node-&gt;next);
+</span><span class='line'>&#9;&#9;if (next)
+</span><span class='line'>&#9;&#9;&#9;prefetchw(next);
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;val = smp_cond_load_acquire(&lock-&gt;val.counter, !(VAL & _Q_LOCKED_PENDING_MASK));
+</span><span class='line'>
+</span><span class='line'>locked:
+</span><span class='line'>&#9;for (;;) {
+</span><span class='line'>&#9;&#9;if ((val & _Q_TAIL_MASK) != tail) {
+</span><span class='line'>&#9;&#9;&#9;set_locked(lock);
+</span><span class='line'>&#9;&#9;&#9;break;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;old = atomic_cmpxchg_relaxed(&lock-&gt;val, val, _Q_LOCKED_VAL);
+</span><span class='line'>&#9;&#9;if (old == val)
+</span><span class='line'>&#9;&#9;&#9;goto release;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;val = old;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;if (!next) {
+</span><span class='line'>&#9;&#9;while (!(next = READ_ONCE(node-&gt;next)))
+</span><span class='line'>&#9;&#9;&#9;cpu_relax();
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;arch_mcs_spin_unlock_contended(&next-&gt;locked);
+</span><span class='line'>&#9;...
+</span><span class='line'>
+</span><span class='line'>release:
+</span><span class='line'>&#9;__this_cpu_dec(mcs_nodes[0].count);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>第8~11行代码，如果锁的状态是pending，即{tail=0，pending=1，locked=0}，那么等待锁的状态变成locked，即{tail=0，pending=0，locked=1}。</p>
+
+<p>第14~15行代码，如果锁的tail字段不是0或者pending位是1，说明已经有处理器在等待自旋锁，那么跳转到标号queue，本处理器加入等待队列。</p>
+
+<p>第17~21行代码，如果锁处于locked状态，那么把锁的状态设置为locked &amp; pending，即{tail=0，pending=1，locked=1}；如果锁处于空闲状态（占有锁的处理器刚刚释放自旋锁），那么把锁的状态设置为locked。</p>
+
+<p>第28~29行代码，如果上一步锁的状态从空闲变成locked，那么成功地获得锁。</p>
+
+<p>第31行代码，等待占有锁的处理器释放自旋锁，即锁的locked字段变成0。</p>
+
+<p>第32行代码，成功地获得锁，把锁的状态从pending改成locked，即清除pending位，把locked字段设置为1。</p>
+
+<h5>从第2个等待自旋锁的处理器开始，需要加入等待队列，处理如下：</h5>
+
+<p>(1)       第37~43行代码，从本处理器的数组mcs_nodes分配一个数组项，然后初始化。</p>
+
+<p>(2)       第46~47行代码，如果锁处于空闲状态，那么获得锁。</p>
+
+<p>(3)       第49行代码，把自旋锁的tail字段设置为本处理器的队列节点的信息，并且返回前一个队列节点的信息。</p>
+
+<p>(4)       第52行代码，如果本处理器的队列节点不是队列首部，那么处理如下：</p>
+
+<p>1）第56行代码，把前一个队列节点的next字段设置为本处理器的队列节点的地址。</p>
+
+<p>2）第59行代码，本处理器在自己的队列节点的locked字段上面自旋等待，等待locked字段从0变成1，也就是等待本处理器的队列节点移动到队列首部。</p>
+
+<p>(5)       第67行代码，本处理器的队列节点移动到队列首部以后，在锁自身上面自旋等待，等待自旋锁的pending位和locked字段都变成0，也就是等待锁的状态变成空闲。</p>
+
+<p>(6)       锁的状态变成空闲以后，本处理器把锁的状态设置为locked，分两种情况：</p>
+
+<p>1）第71行代码，如果队列还有其他节点，即还有其他处理器在等待锁，那么处理如下：</p>
+
+<p>q第72行代码，把锁的locked字段设置为1。</p>
+
+<p>q第83~86行代码，等待下一个等待者设置本处理器的队列节点的next字段。</p>
+
+<p>q第88行代码，把下一个队列节点的locked字段设置为1。</p>
+
+<p>2）第76行代码，如果队列只有一个节点，即本处理器是唯一的等待者，那么把锁的tail字段设置为0，把locked字段设置为1。</p>
+
+<p>(7)       第92行代码，释放本处理器的队列节点。</p>
+
+<p>释放MCS自旋锁的代码如下所示：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>spin_unlock() -&gt; raw_spin_unlock() -&gt; _raw_spin_unlock() -&gt; __raw_spin_unlock()  -&gt; do_raw_spin_unlock() -&gt; arch_spin_unlock()
+</span><span class='line'>
+</span><span class='line'>include/asm-generic/qspinlock.h
+</span><span class='line'>#define arch_spin_unlock(l)       queued_spin_unlock(l)
+</span><span class='line'>
+</span><span class='line'>static __always_inline void queued_spin_unlock(struct qspinlock *lock)
+</span><span class='line'>{
+</span><span class='line'>&#9;(void)atomic_sub_return_release(_Q_LOCKED_VAL, &lock-&gt;val);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>第5行代码，执行带释放语义的原子减法操作，把锁的locked字段设置为0，释放语义保证前面的加载/存储指令在函数atomic_sub_return_release()开始执行之前执行完。</p>
+
+<p>MCS自旋锁的配置宏是CONFIG_ARCH_USE_QUEUED_SPINLOCKS 和CONFIG_QUEUED_SPINLOCKS，目前只有x86处理器架构使用MCS自旋锁，默认开启MCS自旋锁的配置宏，如下所示：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>arch/x86/kconfig
+</span><span class='line'>
+</span><span class='line'>config X86
+</span><span class='line'>&#9;def_bool y
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;select ARCH_USE_QUEUED_SPINLOCKS
+</span><span class='line'>&#9;...
+</span><span class='line'>
+</span><span class='line'>
+</span><span class='line'>kernel/kconfig.locks
+</span><span class='line'>
+</span><span class='line'>config ARCH_USE_QUEUED_SPINLOCKS
+</span><span class='line'>&#9;bool
+</span><span class='line'>config QUEUED_SPINLOCKS
+</span><span class='line'>&#9;def_bool y if ARCH_USE_QUEUED_SPINLOCKS
+</span><span class='line'>&#9;depends on SMP</span></code></pre></td></tr></table></div></figure>
+
+
+
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
       <h2 class="entry-title"><a href="/blog/2021/06/08/tools-git-submodule/">git submodule管理项目子模块</a></h2>
     
     
@@ -597,218 +1452,6 @@ var ss360Config = {
 
     </article>
   
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2021/06/06/tools-log/">linux下logrotate 配置和理解</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2021-06-06T22:59:00+08:00'><span class='date'>2021-06-06</span> <span class='time'>22:59:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>systemctl restart rsyslog</span></code></pre></td></tr></table></div></figure>
-
-
-<hr />
-
-<p><a href="https://blog.csdn.net/cjwid/article/details/1690101">https://blog.csdn.net/cjwid/article/details/1690101</a></p>
-
-<h4>一、logrotate 配置</h4>
-
-<p>logrotate 程序是一个日志文件管理工具。用来把旧的日志文件删除，并创建新的日志文件，我们把它叫做"转储"。我们可以根据日志文件的大小，也可以根据其天数来转储，这个过程一般通过 cron 程序来执行。
-logrotate 程序还可以用于压缩日志文件，以及发送日志到指定的E-mail 。</p>
-
-<p>logrotate 的配置文件是 /etc/logrotate.conf。主要参数如下表：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>参数 功能
-</span><span class='line'>compress 通过gzip 压缩转储以后的日志
-</span><span class='line'>nocompress 不需要压缩时，用这个参数
-</span><span class='line'>copytruncate 用于还在打开中的日志文件，把当前日志备份并截断
-</span><span class='line'>nocopytruncate 备份日志文件但是不截断
-</span><span class='line'>create mode owner group 转储文件，使用指定的文件模式创建新的日志文件
-</span><span class='line'>nocreate 不建立新的日志文件
-</span><span class='line'>delaycompress 和 compress 一起使用时，转储的日志文件到下一次转储时才压缩
-</span><span class='line'>nodelaycompress 覆盖 delaycompress 选项，转储同时压缩。
-</span><span class='line'>errors address 专储时的错误信息发送到指定的Email 地址
-</span><span class='line'>ifempty 即使是空文件也转储，这个是 logrotate 的缺省选项。
-</span><span class='line'>notifempty 如果是空文件的话，不转储
-</span><span class='line'>mail address 把转储的日志文件发送到指定的E-mail 地址
-</span><span class='line'>nomail 转储时不发送日志文件
-</span><span class='line'>olddir directory 转储后的日志文件放入指定的目录，必须和当前日志文件在同一个文件系统
-</span><span class='line'>noolddir 转储后的日志文件和当前日志文件放在同一个目录下
-</span><span class='line'>prerotate/endscript 在转储以前需要执行的命令可以放入这个对，这两个关键字必须单独成行
-</span><span class='line'>postrotate/endscript 在转储以后需要执行的命令可以放入这个对，这两个关键字必须单独成行
-</span><span class='line'>daily 指定转储周期为每天
-</span><span class='line'>weekly 指定转储周期为每周
-</span><span class='line'>monthly 指定转储周期为每月
-</span><span class='line'>rotate count 指定日志文件删除之前转储的次数，0 指没有备份，5 指保留5 个备份
-</span><span class='line'>tabootext [+] list 让logrotate 不转储指定扩展名的文件，缺省的扩展名是：.rpm-orig, .rpmsave, v, 和 ~
-</span><span class='line'>size size 当日志文件到达指定的大小时才转储，Size 可以指定 bytes (缺省)以及KB (sizek)或者MB (sizem).</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>二、缺省配置 logrotate</h4>
-
-<p>logrotate 缺省的配置 /etc/logrotate.conf。
-Red Hat Linux 缺省安装的文件内容是：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'># see "man logrotate" for details
-</span><span class='line'># rotate log files weekly
-</span><span class='line'>weekly
-</span><span class='line'>
-</span><span class='line'># keep 4 weeks worth of backlogs
-</span><span class='line'>rotate 4
-</span><span class='line'>
-</span><span class='line'># send errors to root
-</span><span class='line'>errors root
-</span><span class='line'># create new (empty) log files after rotating old ones
-</span><span class='line'>create
-</span><span class='line'>
-</span><span class='line'># uncomment this if you want your log files compressed
-</span><span class='line'>#compress # 指定不压缩转储文件，如果需要压缩，去掉注释就可以了。
-</span><span class='line'>
-</span><span class='line'># RPM packages drop log rotation information into this directory
-</span><span class='line'>include /etc/logrotate.d
-</span><span class='line'>
-</span><span class='line'># no packages own lastlog or wtmp --we'll rotate them here
-</span><span class='line'>/var/log/wtmp {
-</span><span class='line'>&#9;monthly
-</span><span class='line'>&#9;create 0664 root utmp
-</span><span class='line'>&#9;rotate 1
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'>/var/log/lastlog {
-</span><span class='line'>&#9;monthly
-</span><span class='line'>&#9;rotate 1
-</span><span class='line'>}
-</span><span class='line'>
-</span><span class='line'># system-specific logs may be configured here</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>三、使用include 选项读取其他配置文件</h4>
-
-<p>include 选项允许系统管理员把分散到几个文件的转储信息，集中到一个
-主要的配置文件。当 logrotate 从logrotate.conf 读到include 选项时，会从指定文件读入配置信息，就好像他们已经在/etc/logrotate.conf 中一样。</p>
-
-<p>第13行 include /etc/logrotate.d 告诉 logrotate 读入存放在/etc/logrotate.d 目录中的日志转储参数，当系统中安装了RPM 软件包时，使用include 选项十分有用。RPM 软件包的日志转储参数一般存放在/etc/logrotate.d 目录。</p>
-
-<p>include 选项十分重要，一些应用把日志转储参数存放在 /etc/logrotate.d 。</p>
-
-<p>典型的应用有：apache, linuxconf, samba, cron 以及syslog。</p>
-
-<p>这样，系统管理员只要管理一个 /etc/logrotate.conf 文件就可以了。</p>
-
-<h4>使用 prerotate 和 postrotate 选项</h4>
-
-<p>下面的例子是典型的脚本 /etc/logrotate.d/syslog，这个脚本只是对 /var/log/messages 有效。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/var/log/messages
-</span><span class='line'>{
-</span><span class='line'>&#9;prerotate
-</span><span class='line'>&#9;&#9;/usr/bin/chattr -a /var/log/messages
-</span><span class='line'>&#9;endscript
-</span><span class='line'>&#9;postrotate
-</span><span class='line'>&#9;&#9;/usr/bin/kill -HUP syslogd
-</span><span class='line'>&#9;&#9;/usr/bin/chattr +a /var/log/messages
-</span><span class='line'>&#9;endscript
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>prerotate 命令指定转储以前的动作/usr/bin/chattr -a 去掉/var/log/messages文件的"只追加"属性 endscript 结束 prerotate 部分的脚本postrotate 指定转储后的动作</p>
-
-<p>/usr/bin/killall -HUP syslogd</p>
-
-<p>用来重新初始化系统日志守护程序 syslogd</p>
-
-<p>/usr/bin/chattr +a /var/log/messages</p>
-
-<p>重新为 /var/log/messages 文件指定"只追加"属性，这样防治程序员或用户覆盖此文件。</p>
-
-<p>最后的 endscript 用于结束 postrotate 部分的脚本</p>
-</div>
-  
-  
-
-
-    </article>
-  
   <div class="pagination">
     
       <a class="prev" href="/posts/100">&larr; Older</a>
@@ -823,7 +1466,7 @@ Red Hat Linux 缺省安装的文件内容是：</p>
   
     <section>
 <h1>Categories
-<span class='right_span'>(969)</span>
+<span class='right_span'>(970)</span>
 
 </h1>
 <head>
@@ -1152,8 +1795,8 @@ if (!document.getElementById('kernel~tcp')) document.getElementById('aexp_kernel
 if (!document.getElementById('kernel')) document.getElementById('aexp_kernel').style.visibility = 'hidden';
 if (!document.getElementById('kernel~vpn')) document.getElementById('aexp_kernel~vpn').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/network/'>network</a><a href='##' onmousedown=showDiv('network') id='aexp_network'><span class='exp_style' id='exp_network'>[+]</span></a><span class='right_span'>(9)</span></li>
-<div id='network' class='catsub'><li><a href='/blog/cats/network~base/?opendiv=network'>base</a><a href='##' onmousedown=showDiv('network~base') id='aexp_network~base'><span class='exp_style' id='exp_network~base'>[+]</span></a><span class='right_span'>9</span></li>
+<li class='catclass'><a href='/blog/cats/network/'>network</a><a href='##' onmousedown=showDiv('network') id='aexp_network'><span class='exp_style' id='exp_network'>[+]</span></a><span class='right_span'>(10)</span></li>
+<div id='network' class='catsub'><li><a href='/blog/cats/network~base/?opendiv=network'>base</a><a href='##' onmousedown=showDiv('network~base') id='aexp_network~base'><span class='exp_style' id='exp_network~base'>[+]</span></a><span class='right_span'>10</span></li>
 </div><script language='javascript' type='text/javascript'>
 if (!document.getElementById('network')) document.getElementById('aexp_network').style.visibility = 'hidden';
 if (!document.getElementById('network~base')) document.getElementById('aexp_network~base').style.visibility = 'hidden';
@@ -1265,7 +1908,7 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 
 <section>
 <h1>Date Categories
-<span class='right_span'>(969)</span>
+<span class='right_span'>(970)</span>
 
 </h1>
 <head>
@@ -1273,7 +1916,9 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(89)</span></li>
+<li class='catclass'><a href='/blog/cats/2025/'>2025</a><a href='##' onmousedown=showDiv('2025')><span class='exp_style' id='exp_2025'>[+]</span></a><span class='right_span'>(1)</span></li>
+<div id='2025' class='catsub'><li><a href='/blog/cats/2025~01/?opendiv=2025'>2025-01</a><span class='right_span'>1</span></li>
+</div><li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(89)</span></li>
 <div id='2024' class='catsub'><li><a href='/blog/cats/2024~12/?opendiv=2024'>2024-12</a><span class='right_span'>2</span></li>
 <li><a href='/blog/cats/2024~10/?opendiv=2024'>2024-10</a><span class='right_span'>5</span></li>
 <li><a href='/blog/cats/2024~09/?opendiv=2024'>2024-09</a><span class='right_span'>15</span></li>
@@ -1447,6 +2092,10 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
   <ul id="recent_posts">
     
       <li class="post">
+        <a href="/blog/2025/01/16/network-ac-ap/">如何在ac上telnet到ap</a>
+      </li>
+    
+      <li class="post">
         <a href="/blog/2024/12/12/tools-mysql-bin/">删除MySQL下的bin</a>
       </li>
     
@@ -1480,10 +2129,6 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
     
       <li class="post">
         <a href="/blog/2024/09/20/ffmpeg-mp3/">ffmpeg分离MP3文件报错</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/09/20/sqlserver-_/">`_` 通配符 -- 匹配一个字符</a>
       </li>
     
   </ul>
@@ -1583,7 +2228,7 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 
     </div>
   </div>
-  <footer role="contentinfo">  Copyright &copy; 2024 - kk -
+  <footer role="contentinfo">  Copyright &copy; 2025 - kk -
   <span class="credit">Powered by <a href="http://octopress.org">Octopress</a></span>
   <a title="Top" href="#" id="scroll2top" style="position: fixed; height: 50px; bottom: 30px; right: 25px; cursor: pointer; z-index: 9999; display: block; opacity: 1;"><img src="/images/scrollup.png"></a>
   <script src="/javascripts/scroll2top.js"></script>

@@ -131,6 +131,321 @@ var ss360Config = {
       
   <header>
     
+      <h2 class="entry-title"><a href="/blog/2015/07/29/tools-haproxy_src2/">HAProxy 研究笔记 -- rules 实现</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-07-29T16:00:00+08:00'><span class='date'>2015-07-29</span> <span class='time'>16:00:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://blog.chinaunix.net/uid-10167808-id-3775567.html">http://blog.chinaunix.net/uid-10167808-id-3775567.html</a></p>
+
+<p>本文研究 haproxy-1.5-dev17 中 rules 的相关实现。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>1. ACL
+</span><span class='line'>2. rule 的组成
+</span><span class='line'>3. rule 的执行
+</span><span class='line'>4. rule 的种类</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>1. ACL</h4>
+
+<p>如果要实现功能丰富的 rules，需要有配套的 ACL 机制。</p>
+
+<p>ACL 的格式如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>acl [flags] [operator] ... </span></code></pre></td></tr></table></div></figure>
+
+
+<p>haproxy 中 ACL 数据结构的定义：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* The acl will be linked to from the proxy where it is declared */
+</span><span class='line'>struct acl {
+</span><span class='line'>&#9;struct list list;           /* chaining */
+</span><span class='line'>&#9;char *name;           /* acl name */
+</span><span class='line'>&#9;struct list expr;     /* list of acl_exprs */
+</span><span class='line'>&#9;int cache_idx;              /* ACL index in cache */
+</span><span class='line'>&#9;unsigned int requires;      /* or'ed bit mask of all acl_expr's ACL_USE_* */
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>其中：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>name: ACL 的名字
+</span><span class='line'>expr: ACL 定义的表达式。就是定义的 ACL 名字后面的表达式。这是一个链表结构。因此，可以定义多条表达式不同但是名字相同的 ACL。这样，多个表达式都属于同一个 ACL。
+</span><span class='line'>requires: 所有表达式中关键字对应的作用域（该关键字可以用在什么场合）的集合
+</span><span class='line'>
+</span><span class='line'>函数 parse_acl() 负责解析定义好的 ACL:
+</span><span class='line'>
+</span><span class='line'>查找 ACL 的名字，如果不存在的话，则 alloc 一个新的 acl 结构
+</span><span class='line'>通过调用 parse_acl_expr() 对表达式进行解析，并返回 struct acl_expr 结构
+</span><span class='line'>&#9;ACL 中的表达式应该只有一个 kw
+</span><span class='line'>&#9;查找该关键字，必须是已经注册好的。并返回该关键字注册时的数据结构 struct acl_expr
+</span><span class='line'>&#9;alloc 一个 struct acl_expr 结构体，记录下返回的 kw 的数据结构，并作成员的初始化
+</span><span class='line'>&#9;调用对应 kw 的 parse 方法，将解析的结果保存在 struct acl_pattern 结构体中，并将该结构体加入到 expr-&gt;patterns 的链表中
+</span><span class='line'>将解析到的表达式插入到 acl 中的 expr 链表中</span></code></pre></td></tr></table></div></figure>
+
+
+<p>总结： 一个 ACL 包含一到多个表达式。每个表达式包含一个 kw及一到多个 pattern。</p>
+
+<h4>2. rule 的组成</h4>
+
+<p>这里简要描述 rule 与 acl 之间的逻辑关系：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>rule 应该是 action + condition 组成
+</span><span class='line'>&#9;有些动作自身可能也需要记录一些信息。不同的 rule 对应动作的信息可能不同，比如 reqirep 等
+</span><span class='line'>&#9;block rules 的动作比较单一， condition 满足之后处理结果均相同
+</span><span class='line'>condition，完成 rule 检测的判断条件 对应数据结构： struct acl_cond
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;struct acl_cond {
+</span><span class='line'>&#9;&#9;&#9;struct list list;           /* Some specific tests may use multiple conditions */
+</span><span class='line'>&#9;&#9;&#9;struct list suites;         /* list of acl_term_suites */
+</span><span class='line'>&#9;&#9;&#9;int pol;                    /* polarity: ACL_COND_IF / ACL_COND_UNLESS */
+</span><span class='line'>&#9;&#9;&#9;unsigned int requires;      /* or'ed bit mask of all acl's ACL_USE_* */
+</span><span class='line'>&#9;&#9;&#9;const char *file;           /* config file where the condition is declared */
+</span><span class='line'>&#9;&#9;&#9;int line;                   /* line in the config file where the condition is declared */
+</span><span class='line'>&#9;&#9;};
+</span><span class='line'>&#9;&#9;
+</span><span class='line'>
+</span><span class='line'>condition 包含多个 ACL 组。组的分割逻辑是逻辑或（|| 或者 or），即 struct list suites 的成员，组的数据结构 struct acl_term_suite
+</span><span class='line'>
+</span><span class='line'>&#9;struct acl_term_suite {
+</span><span class='line'>&#9;&#9;struct list list;           /* chaining of term suites */
+</span><span class='line'>&#9;&#9;struct list terms;          /* list of acl_terms */
+</span><span class='line'>&#9;};
+</span><span class='line'>
+</span><span class='line'>&#9;该数据结构可以包含多个 ACL，以及每个 ACL 可能的一个取反标识 '!'
+</span><span class='line'>&#9;所有表达式中相邻的 ACL 且其逻辑关系为逻辑与(&&) 的构成一个 ACL 组
+</span><span class='line'>&#9;&#9;比如 if acl1 !acl2 or acl3 acl4，则构成两个 acl_term_suite，分别是 acl1 !acl2 和 acl3 acl4
+</span><span class='line'>&#9;&#9;每个 ACL 及其可能的取反标记对应的数据结构： struct acl_term
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;struct acl_term {
+</span><span class='line'>&#9;&#9;&#9;&#9;struct list list;           /* chaining */
+</span><span class='line'>&#9;&#9;&#9;&#9;struct acl *acl;            /* acl pointed to by this term */
+</span><span class='line'>&#9;&#9;&#9;&#9;int neg;                    /* 1 if the ACL result must be negated */
+</span><span class='line'>&#9;&#9;&#9;};
+</span><span class='line'>
+</span><span class='line'>&#9;一个 ACL 包含多个 expr</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>3. rule 的执行</h4>
+
+<p>概括起来很简单，执行判断条件。符合条件，然后执行对应动作。</p>
+
+<p>下面是 rspadd 的示例代码：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* add response headers from the rule sets in the same order */
+</span><span class='line'>list_for_each_entry(wl, &rule_set-&gt;rsp_add, list) {
+</span><span class='line'>&#9;if (txn-&gt;status &lt; 200)
+</span><span class='line'>&#9;&#9;break;
+</span><span class='line'>&#9;if (wl-&gt;cond) {
+</span><span class='line'>&#9;&#9;int ret = acl_exec_cond(wl-&gt;cond, px, t, txn, SMP_OPT_DIR_RES|SMP_OPT_FINAL);
+</span><span class='line'>&#9;&#9;ret = acl_pass(ret);
+</span><span class='line'>&#9;&#9;if (((struct acl_cond *)wl-&gt;cond)-&gt;pol == ACL_COND_UNLESS)
+</span><span class='line'>&#9;&#9;&#9;ret = !ret;
+</span><span class='line'>&#9;&#9;if (!ret)
+</span><span class='line'>&#9;&#9;&#9;continue;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;if (unlikely(http_header_add_tail(&txn-&gt;rsp, &txn-&gt;hdr_idx, wl-&gt;s) &lt; 0))
+</span><span class='line'>&#9;&#9;goto return_bad_resp;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>对于同一个种类的 rules，执行逻辑如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>主要遍历 rule，调用 acl_exec_cond 执行该 rule 的检测条件。该检测结果只给出匹配与否。
+</span><span class='line'>&#9;逐个遍历 cond 上的 ACL 组，即cond-&gt;suites。任一 suite 匹配成功，则认为匹配成功
+</span><span class='line'>&#9;同一个 ACL 组上，遍历所有 suite-&gt;terms （ACL + 取反逻辑）。任意一个 ACL 匹配失败，则跳到下一个 ACL 组继续匹配。同一组全部 ACL 匹配成功，则认为该 ACL 组匹配
+</span><span class='line'>&#9;&#9;同一个 ACL 上的匹配，则是逐一遍历 ACL 的 expr。只要任意一个 expr 匹配成功，则认为该 ACL 匹配成功
+</span><span class='line'>结合 condition 中的条件 if/unless，确定最终匹配结果
+</span><span class='line'>如果匹配则执行对应的 action，否则检测下一条规则。</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>4. rule 的种类</h4>
+
+<p>从 proxy 结构体可以看出 rule 的种类</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct proxy {
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;struct list acl;                        /* ACL declared on this proxy */
+</span><span class='line'>&#9;struct list http_req_rules;       /* HTTP request rules: allow/deny/http-auth */
+</span><span class='line'>&#9;struct list block_cond;                 /* early blocking conditions (chained) */
+</span><span class='line'>&#9;struct list redirect_rules;             /* content redirecting rules (chained) */
+</span><span class='line'>&#9;struct list switching_rules;            /* content switching rules (chained) */
+</span><span class='line'>&#9;struct list persist_rules;        /* 'force-persist' and 'ignore-persist' rules (chained) */
+</span><span class='line'>&#9;struct list sticking_rules;             /* content sticking rules (chained) */
+</span><span class='line'>&#9;struct list storersp_rules;             /* content store response rules (chained) */
+</span><span class='line'>&#9;struct list server_rules;               /* server switching rules (chained) */
+</span><span class='line'>&#9;struct {                                /* TCP request processing */
+</span><span class='line'>&#9;&#9;unsigned int inspect_delay;     /* inspection delay */
+</span><span class='line'>&#9;&#9;struct list inspect_rules;      /* inspection rules */
+</span><span class='line'>&#9;&#9;struct list l4_rules;           /* layer4 rules */
+</span><span class='line'>&#9;} tcp_req;
+</span><span class='line'>&#9;struct {                                /* TCP request processing */
+</span><span class='line'>&#9;&#9;unsigned int inspect_delay;     /* inspection delay */
+</span><span class='line'>&#9;&#9;struct list inspect_rules;      /* inspection rules */
+</span><span class='line'>&#9;} tcp_rep;
+</span><span class='line'>&#9;...
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>其中， 函数 http_process_req_common 中处理的规则如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>http_process_req_common
+</span><span class='line'>{
+</span><span class='line'>&#9;... 
+</span><span class='line'>&#9;1. process block rules
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;2. process http req rules
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;3. execute regular exp if any
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;4. req add
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;5. process redirect rules
+</span><span class='line'>&#9;...
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这里没有详细的介绍各种具体用途的 rules。随后具体分析代码的时候总结一下再加上。</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
       <h2 class="entry-title"><a href="/blog/2015/07/29/tools-haproxy_src1/">HAProxy 研究笔记 -- TCP 连接处理流程</a></h2>
     
     
@@ -544,292 +859,6 @@ var ss360Config = {
 
     </article>
   
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/07/29/kvm-qemu/">编译qemu-kvm和安装qemu-kvm</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-07-29T15:22:00+08:00'><span class='date'>2015-07-29</span> <span class='time'>15:22:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://smilejay.com/2012/06/qemu-kvm_compilation_installation/">http://smilejay.com/2012/06/qemu-kvm_compilation_installation/</a></p>
-
-<h4>3.4 编译和安装qemu-kvm</h4>
-
-<p>除了在内核空间的KVM模块之外，在用户空间需要QEMU[注6]来模拟所需要CPU和设备模型以及用于启动客户机进程，这样才有了一个完整的KVM运行环境。而qemu-kvm是为了针对KVM专门做了修改和优化的QEMU分支[注7]，在本书写作的2012年，qemu-kvm分支里面的小部分特性还没有完全合并进入到qemu的主干代码之中，所以本书中采用qemu-kvm来讲解。</p>
-
-<p>在编译和安装了KVM并且启动到编译的内核之后，下面来看一下qemu-kvm的编译和安装。</p>
-
-<h5>3.4.1 下载qemu-kvm源代码</h5>
-
-<p>目前的QEMU项目针对KVM的代码分支qemu-kvm也是由Redhat公司的Gleb Natapov和Marcelo Tosatti作维护者（Maintainer），代码也是托管在kernel.org上。</p>
-
-<p>qemu-kvm开发代码仓库的网页连接为：<a href="http://git.kernel.org/?p=virt/kvm/qemu-kvm.git">http://git.kernel.org/?p=virt/kvm/qemu-kvm.git</a></p>
-
-<p>其中，可以看到有如下3个URL连接可供下载开发中的最新qemu-kvm的代码仓库。
-git://git.kernel.org/pub/scm/virt/kvm/qemu-kvm.git<br/>
-<a href="http://git.kernel.org/pub/scm/virt/kvm/qemu-kvm.git">http://git.kernel.org/pub/scm/virt/kvm/qemu-kvm.git</a><br/>
-<a href="https://git.kernel.org/pub/scm/virt/kvm/qemu-kvm.git">https://git.kernel.org/pub/scm/virt/kvm/qemu-kvm.git</a></p>
-
-<p>可以根据自己实际需要选择3个中任一个用git clone命令下载即可，它们是完全一样的。</p>
-
-<p>另外，可以到sourceforge.net的如下链接中根据需要下载qemu-kvm各个发布版本的代码压缩包（作者建议使用最新的正式发布版本，因为它的功能更多，同时也比较稳定）。</p>
-
-<p><a href="http://sourceforge.net/projects/kvm/files/qemu-kvm/">http://sourceforge.net/projects/kvm/files/qemu-kvm/</a></p>
-
-<p>在本节讲解编译时，以下载开发中的最新的qemu-kvm.git为例，获取其代码仓库过程如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>[root@jay-linux kvm_demo]# git clone\ git://git.kernel.org/pub/scm/virt/kvm/qemu-kvm.git qemu-kvm.git
-</span><span class='line'>Initialized empty Git repository in /root/kvm_demo/qemu-kvm.git/.git/
-</span><span class='line'>remote: Counting objects: 145222, done.
-</span><span class='line'>remote: Compressing objects: 100% (35825/35825), done.
-</span><span class='line'>remote: Total 145222 (delta 114656), reused 137663 (delta 107444)
-</span><span class='line'>Receiving objects: 100% (145222/145222), 40.83 MiB | 10.33 MiB/s, done.
-</span><span class='line'>Resolving deltas: 100% (114656/114656), done.
-</span><span class='line'>[root@jay-linux kvm_demo]# cd qemu-kvm.git
-</span><span class='line'>[root@jay-linux kvm.git]# pwd
-</span><span class='line'>/root/kvm_demo/qemu-kvm.git</span></code></pre></td></tr></table></div></figure>
-
-
-<h5>3.4.2 配置和编译qemu-kvm</h5>
-
-<p>qemu-kvm的配置并不复杂，通常情况下，可以直接运行代码仓库中configure文件进行配置即可。当然，如果对其配置并不熟悉，可以运行“./configure –help”命令查看配置的一些选项及其帮助信息。</p>
-
-<p>显示配置的帮助手册信息如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>[root@jay-linux qemu-kvm.git]# ./configure --help
-</span><span class='line'>Usage: configure [options]
-</span><span class='line'>Options: [defaults in brackets after descriptions]
-</span><span class='line'> 
-</span><span class='line'>Standard options:
-</span><span class='line'>--help                   print this message
-</span><span class='line'>--prefix=PREFIX          install in PREFIX [/usr/local]
-</span><span class='line'>--interp-prefix=PREFIX   where to find shared libraries, etc.
-</span><span class='line'>use %M for cpu name [/usr/gnemul/qemu-%M]
-</span><span class='line'>--target-list=LIST       set target list (default: build everything)
-</span><span class='line'>Available targets: i386-softmmu x86_64-softmmu
-</span><span class='line'>&lt;!- 此处省略百余行帮助信息的输出 -&gt;
-</span><span class='line'>--disable-guest-agent    disable building of the QEMU Guest Agent
-</span><span class='line'>--enable-guest-agent     enable building of the QEMU Guest Agent
-</span><span class='line'>--with-coroutine=BACKEND coroutine backend. Supported options:
-</span><span class='line'>gthread, ucontext, sigaltstack, windows
-</span><span class='line'>
-</span><span class='line'>NOTE: The object files are built at the place where configure is launched</span></code></pre></td></tr></table></div></figure>
-
-
-<p>执行configure文件进行配置的过程如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>[root@jay-linux qemu-kvm.git]# ./configure
-</span><span class='line'>Install prefix    /usr/local
-</span><span class='line'>BIOS directory    /usr/local/share/qemu
-</span><span class='line'>binary directory  /usr/local/bin
-</span><span class='line'>library directory /usr/local/lib
-</span><span class='line'>include directory /usr/local/include
-</span><span class='line'>config directory  /usr/local/etc
-</span><span class='line'>Manual directory  /usr/local/share/man
-</span><span class='line'>ELF interp prefix /usr/gnemul/qemu-%M
-</span><span class='line'>Source path       /root/kvm_demo/qemu-kvm.git
-</span><span class='line'>C compiler        gcc
-</span><span class='line'>Host C compiler   gcc
-</span><span class='line'>&lt;!– 此处省略数十行 –&gt;
-</span><span class='line'>VNC support       yes     #通常需要通过VNC连接到客户机中
-</span><span class='line'>&lt;!– 此处省略十余行 –&gt;
-</span><span class='line'>KVM support       yes     #这是对KVM的支持
-</span><span class='line'>TCG interpreter   no
-</span><span class='line'>KVM device assig. yes    #这是对KVM中VT-d功能的支持
-</span><span class='line'>&lt;!– 此处省略十余行 –&gt;
-</span><span class='line'>OpenGL support    yes
-</span><span class='line'>libiscsi support  no
-</span><span class='line'>build guest agent yes
-</span><span class='line'>coroutine backend ucontext</span></code></pre></td></tr></table></div></figure>
-
-
-<p>需要注意的是，上面命令行输出的KVM相关的选项需要是配置为yes，另外，一般VNC的支持也是配置为yes的（因为通常需要用VNC连接到客户机中）。</p>
-
-<p>【2013.05.13 updated】 在configure时，可能遇到“glib-2.12 required to compile QEMU”的错误，是需要安装glib2和glib2-dev软件包，在RHEL上的安装命令为“yum install glib2 glib2-devel”，在Ubuntu上安装的过程为“apt-get install libglib2.0 libglib2.0-dev”。</p>
-
-<p>经过配置之后，进行编译就很简单了，直接执行make即可进行编译，如下所示：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>[root@jay-linux qemu-kvm.git]# make -j 20
-</span><span class='line'>GEN   config-host.h
-</span><span class='line'>GEN   trace.h
-</span><span class='line'>GEN   qemu-options.def
-</span><span class='line'>GEN   qmp-commands.h
-</span><span class='line'>GEN   qapi-types.h
-</span><span class='line'>GEN   qapi-visit.h
-</span><span class='line'>GEN   tests/test-qapi-types.h
-</span><span class='line'>GEN   tests/test-qapi-visit.h
-</span><span class='line'>GEN   tests/test-qmp-commands.h
-</span><span class='line'>CC    libcacard/cac.o
-</span><span class='line'>CC    libcacard/event.o
-</span><span class='line'>&lt;!– 此处省略数百行的编译时输出信息 –&gt;
-</span><span class='line'>CC    x86_64-softmmu/target-i386/cpu.o
-</span><span class='line'>CC    x86_64-softmmu/target-i386/machine.o
-</span><span class='line'>CC    x86_64-softmmu/target-i386/arch_memory_mapping.o
-</span><span class='line'>CC    x86_64-softmmu/target-i386/arch_dump.o
-</span><span class='line'>CC    x86_64-softmmu/target-i386/kvm.o
-</span><span class='line'>CC    x86_64-softmmu/target-i386/hyperv.o
-</span><span class='line'>LINK  x86_64-softmmu/qemu-system-x86_64</span></code></pre></td></tr></table></div></figure>
-
-
-<p>可以看到，最后有编译生成qemu-system-x86_64文件，它就是我们常用的qemu-kvm的命令行工具（在多数Linux发行版中自带的qemu-kvm软件包的命令行是qemu-kvm，只是名字不同而已）。</p>
-
-<h5>3.4.2 安装qemu-kvm</h5>
-
-<p>编译完成之后，运行“make install”命令即可安装qemu-kvm，其过程如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>[root@jay-linux qemu-kvm.git]# make install | tee make-install.log
-</span><span class='line'>install -d -m 0755 “/usr/local/share/qemu”
-</span><span class='line'>install -d -m 0755 “/usr/local/etc/qemu”
-</span><span class='line'>install -c -m 0644 /root/kvm_demo/qemu-kvm.git/sysconfigs/target/target-x86_64.conf “/usr/local/etc/qemu”
-</span><span class='line'>install -c -m 0644 /root/kvm_demo/qemu-kvm.git/sysconfigs/target/cpus-x86_64.conf “/usr/local/share/qemu”
-</span><span class='line'>install -d -m 0755 “/usr/local/bin”
-</span><span class='line'>install -c -m 0755  vscclient qemu-ga qemu-nbd qemu-img qemu-io  “/usr/local/bin”
-</span><span class='line'>install -d -m 0755 “/usr/local/libexec”
-</span><span class='line'>&lt;!– 此处省略数行的安装时输出信息 –&gt;
-</span><span class='line'>make[1]: Entering directory `/root/kvm_demo/qemu-kvm.git/x86_64-softmmu’
-</span><span class='line'>install -m 755 qemu-system-x86_64 “/usr/local/bin”
-</span><span class='line'>strip “/usr/local/bin/qemu-system-x86_64″
-</span><span class='line'>make[1]: Leaving directory `/root/kvm_demo/qemu-kvm.git/x86_64-softmmu’</span></code></pre></td></tr></table></div></figure>
-
-
-<p>qemu-kvm的安装过程的主要任务有这几个：创建qemu的一些目录，拷贝一些配置文件到相应的目录下，拷贝一些firmware文件(如：sgabios.bin, kvmvapic.bin)到目录下以便qemu-kvm的命令行启动时可以找到对应的固件提供给客户机使用，拷贝keymaps到相应的目录下以便在客户机中支持各种所需键盘类型，拷贝qemu-system-x86_64、qemu-img等可执行程序到对应的目录下。下面的一些命令行检查了qemu-kvm被安装了之后的系统状态。</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>[root@jay-linux qemu-kvm.git]# which qemu-system-x86_64
-</span><span class='line'>/usr/local/bin/qemu-system-x86_64
-</span><span class='line'>[root@jay-linux qemu-kvm.git]# which qemu-img
-</span><span class='line'>/usr/local/bin/qemu-img
-</span><span class='line'>[root@jay-linux qemu-kvm.git]# ls /usr/local/share/qemu/
-</span><span class='line'>bamboo.dtb        mpc8544ds.dtb     petalogix-ml605.dtb       pxe-pcnet.rom    slof.bin            vgabios-vmware.bin
-</span><span class='line'>bios.bin          multiboot.bin     petalogix-s3adsp1800.dtb  pxe-rtl8139.rom  spapr-rtas.bin
-</span><span class='line'>cpus-x86_64.conf  openbios-ppc      ppc_rom.bin               pxe-virtio.rom   vgabios.bin
-</span><span class='line'>keymaps           openbios-sparc32  pxe-e1000.rom             qemu-icon.bmp    vgabios-cirrus.bin
-</span><span class='line'>kvmvapic.bin      openbios-sparc64  pxe-eepro100.rom          s390-zipl.rom    vgabios-qxl.bin
-</span><span class='line'>linuxboot.bin     palcode-clipper   pxe-ne2k_pci.rom          sgabios.bin      vgabios-stdvga.bin
-</span><span class='line'>[root@jay-linux qemu-kvm.git]# ls /usr/local/share/qemu/keymaps/
-</span><span class='line'>ar    common  de     en-gb  es  fi  fr     fr-ca  hr  is  ja  lv  modifiers  nl-be  pl  pt-br  sl  th
-</span><span class='line'>bepo  da      de-ch  en-us  et  fo  fr-be  fr-ch  hu  it  lt  mk  nl         no     pt  ru     sv  tr</span></code></pre></td></tr></table></div></figure>
-
-
-<p>由于qemu-kvm是用户空间的程序，安装之后不用重启系统，直接用qemu-system-x86_64、qemu-img这样的命令行工具即可使用qemu-kvm了。</p>
-</div>
-  
-  
-
-
-    </article>
-  
   <div class="pagination">
     
       <a class="prev" href="/posts/194">&larr; Older</a>
@@ -844,7 +873,7 @@ git://git.kernel.org/pub/scm/virt/kvm/qemu-kvm.git<br/>
   
     <section>
 <h1>Categories
-<span class='right_span'>(969)</span>
+<span class='right_span'>(970)</span>
 
 </h1>
 <head>
@@ -1173,8 +1202,8 @@ if (!document.getElementById('kernel~tcp')) document.getElementById('aexp_kernel
 if (!document.getElementById('kernel')) document.getElementById('aexp_kernel').style.visibility = 'hidden';
 if (!document.getElementById('kernel~vpn')) document.getElementById('aexp_kernel~vpn').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/network/'>network</a><a href='##' onmousedown=showDiv('network') id='aexp_network'><span class='exp_style' id='exp_network'>[+]</span></a><span class='right_span'>(9)</span></li>
-<div id='network' class='catsub'><li><a href='/blog/cats/network~base/?opendiv=network'>base</a><a href='##' onmousedown=showDiv('network~base') id='aexp_network~base'><span class='exp_style' id='exp_network~base'>[+]</span></a><span class='right_span'>9</span></li>
+<li class='catclass'><a href='/blog/cats/network/'>network</a><a href='##' onmousedown=showDiv('network') id='aexp_network'><span class='exp_style' id='exp_network'>[+]</span></a><span class='right_span'>(10)</span></li>
+<div id='network' class='catsub'><li><a href='/blog/cats/network~base/?opendiv=network'>base</a><a href='##' onmousedown=showDiv('network~base') id='aexp_network~base'><span class='exp_style' id='exp_network~base'>[+]</span></a><span class='right_span'>10</span></li>
 </div><script language='javascript' type='text/javascript'>
 if (!document.getElementById('network')) document.getElementById('aexp_network').style.visibility = 'hidden';
 if (!document.getElementById('network~base')) document.getElementById('aexp_network~base').style.visibility = 'hidden';
@@ -1286,7 +1315,7 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 
 <section>
 <h1>Date Categories
-<span class='right_span'>(969)</span>
+<span class='right_span'>(970)</span>
 
 </h1>
 <head>
@@ -1294,7 +1323,9 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(89)</span></li>
+<li class='catclass'><a href='/blog/cats/2025/'>2025</a><a href='##' onmousedown=showDiv('2025')><span class='exp_style' id='exp_2025'>[+]</span></a><span class='right_span'>(1)</span></li>
+<div id='2025' class='catsub'><li><a href='/blog/cats/2025~01/?opendiv=2025'>2025-01</a><span class='right_span'>1</span></li>
+</div><li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(89)</span></li>
 <div id='2024' class='catsub'><li><a href='/blog/cats/2024~12/?opendiv=2024'>2024-12</a><span class='right_span'>2</span></li>
 <li><a href='/blog/cats/2024~10/?opendiv=2024'>2024-10</a><span class='right_span'>5</span></li>
 <li><a href='/blog/cats/2024~09/?opendiv=2024'>2024-09</a><span class='right_span'>15</span></li>
@@ -1468,6 +1499,10 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
   <ul id="recent_posts">
     
       <li class="post">
+        <a href="/blog/2025/01/16/network-ac-ap/">如何在ac上telnet到ap</a>
+      </li>
+    
+      <li class="post">
         <a href="/blog/2024/12/12/tools-mysql-bin/">删除MySQL下的bin</a>
       </li>
     
@@ -1501,10 +1536,6 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
     
       <li class="post">
         <a href="/blog/2024/09/20/ffmpeg-mp3/">ffmpeg分离MP3文件报错</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/09/20/sqlserver-_/">`_` 通配符 -- 匹配一个字符</a>
       </li>
     
   </ul>
@@ -1604,7 +1635,7 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 
     </div>
   </div>
-  <footer role="contentinfo">  Copyright &copy; 2024 - kk -
+  <footer role="contentinfo">  Copyright &copy; 2025 - kk -
   <span class="credit">Powered by <a href="http://octopress.org">Octopress</a></span>
   <a title="Top" href="#" id="scroll2top" style="position: fixed; height: 50px; bottom: 30px; right: 25px; cursor: pointer; z-index: 9999; display: block; opacity: 1;"><img src="/images/scrollup.png"></a>
   <script src="/javascripts/scroll2top.js"></script>

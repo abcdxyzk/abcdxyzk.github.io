@@ -131,6 +131,214 @@ var ss360Config = {
       
   <header>
     
+      <h2 class="entry-title"><a href="/blog/2019/12/09/10Gb-send/">X520-T1 Linux内核发包14Mpps</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2019-12-09T10:46:00+08:00'><span class='date'>2019-12-09</span> <span class='time'>10:46:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><h3>目的</h3>
+
+<p>测试并优化Linux内核发包</p>
+
+<h3>环境</h3>
+
+<p>ga-b250m-d3h
+I7-7700k, 4核8线程，no_trubo=1即最高4.2GHz
+X520-T1
+ubuntu 18.04, linux-image-4.15.0-XX</p>
+
+<h3>netmap</h3>
+
+<p>netmap是一种网卡旁路方法，用netmap测试，发包在 14.3Mpps, 单cpu 60%。测试命令</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>./build-apps/pkt-gen/pkt-gen -i enp3s0 -f tx -c 1 -p 1 -z -d 12.0.0.100:80</span></code></pre></td></tr></table></div></figure>
+
+
+<h3>Linux多线程发包</h3>
+
+<p>在模块中用kthread创建多线程，每个线程构造skb，然后调dev_queue_xmit(skb)。测试发现cpu全部100%，发包大多在12Mpps</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>&#9;&#9;tcp      udp
+</span><span class='line'>fq_codel  12.0Mpps/100%   12.8Mpps/100%
+</span><span class='line'>pfifo_fast    12.7Mpps/100%   14.0Mpps/100%
+</span><span class='line'>noqueue       12.0Mpps/100%   12.8Mpps/100%</span></code></pre></td></tr></table></div></figure>
+
+
+<h3>猜测可能优化点</h3>
+
+<ol>
+<li>qdisc流控</li>
+<li>skb的申请、释放</li>
+</ol>
+
+
+<h3>优化qdisc流控</h3>
+
+<p>qdisc流控可以简单看作把包存下，然后再发送出去。取消qdisc应该能减少一层消耗。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>dev_queue_xmit() -&gt; dev_hard_start_xmit() -&gt; xmit_one() -&gt; netdev_start_xmit() -&gt; __netdev_start_xmit()</span></code></pre></td></tr></table></div></figure>
+
+
+<p>将上面的代码copy到模块，就跳过了qdisc。其实noqueue也是这个流程，但为什么noqueue的pps、cpu都没提升呢？</p>
+
+<p>测试发现skb->xmit_more是关键，ixgbe中关于xmit_more的代码：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>    if (netif_xmit_stopped(txring_txq(tx_ring)) || !skb-&gt;xmit_more) {
+</span><span class='line'>            writel(i, tx_ring-&gt;tail);
+</span><span class='line'>
+</span><span class='line'>            /* we need this if more than one processor can write to our tail
+</span><span class='line'>             * at a time, it synchronizes IO on IA64/Altix systems
+</span><span class='line'>             */
+</span><span class='line'>            mmiowb();
+</span><span class='line'>    }</span></code></pre></td></tr></table></div></figure>
+
+
+<p>noqueue中没有设置xmit_more，但fq_codel,pfifo_fast等用到qdisc框架的都会设置xmit_more，qdisc是用skb->next将skb串起来，当skb->next != NULL时在dev_hard_start_xmit就会设置xmit_more=1。</p>
+
+<p>照此优化，在我们的模块中每次申请多个包，将他们用skb->next串起来再发送。优化后发包在14.2Mpps,每个cpu都60%。</p>
+
+<h3>优化skb的申请、释放</h3>
+
+<p>每秒申请、释放14M的skb有点多。。。</p>
+
+<p>我们可以创建percpu的skb池，申请的时候从池子里拿，释放的时候放回池子。</p>
+
+<ol>
+<li>怎么做到释放时放回池子？用skb->destructor指向我们的回调函数即可</li>
+<li>怎么做到不让Linux内核释放skb以及skb->data的空间？增加如下patch重新编译内核，设置skb池子里的skb->fclone = SKB_FCLONE_USER即可。</li>
+</ol>
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+</span><span class='line'>index 2742528..cd240a9 100644
+</span><span class='line'>--- a/include/linux/skbuff.h
+</span><span class='line'>+++ b/include/linux/skbuff.h
+</span><span class='line'>@@ -532,6 +532,7 @@ enum {
+</span><span class='line'>  SKB_FCLONE_UNAVAILABLE, /* skb has no fclone (from head_cache) */
+</span><span class='line'>  SKB_FCLONE_ORIG,    /* orig skb (from fclone_cache) */
+</span><span class='line'>  SKB_FCLONE_CLONE,   /* companion fclone skb (from fclone_cache) */
+</span><span class='line'>+ SKB_FCLONE_USER,
+</span><span class='line'> };
+</span><span class='line'> 
+</span><span class='line'> enum {
+</span><span class='line'>diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+</span><span class='line'>index cac95aa..b8fb200 100644
+</span><span class='line'>--- a/net/core/skbuff.c
+</span><span class='line'>+++ b/net/core/skbuff.c
+</span><span class='line'>@@ -585,6 +585,8 @@ static void kfree_skbmem(struct sk_buff *skb)
+</span><span class='line'>  case SKB_FCLONE_UNAVAILABLE:
+</span><span class='line'>      kmem_cache_free(skbuff_head_cache, skb);
+</span><span class='line'>      return;
+</span><span class='line'>+ case SKB_FCLONE_USER:
+</span><span class='line'>+     return;
+</span><span class='line'> 
+</span><span class='line'>  case SKB_FCLONE_ORIG:
+</span><span class='line'>      fclones = container_of(skb, struct sk_buff_fclones, skb1);
+</span><span class='line'>@@ -627,7 +629,7 @@ void skb_release_head_state(struct sk_buff *skb)
+</span><span class='line'> static void skb_release_all(struct sk_buff *skb)
+</span><span class='line'> {
+</span><span class='line'>  skb_release_head_state(skb);
+</span><span class='line'>- if (likely(skb-&gt;head))
+</span><span class='line'>+ if (likely(skb-&gt;head) && skb-&gt;fclone != SKB_FCLONE_USER)
+</span><span class='line'>      skb_release_data(skb);
+</span><span class='line'> }</span></code></pre></td></tr></table></div></figure>
+
+
+<p>优化后：
+单独优化skb申请释放：
+发送14.2Mpps 每个cpu 50%</p>
+
+<p>qdisc优化和skb申请释放优化：
+发送14.2Mpps 每个cpu 20%</p>
+
+<p>只用1个cpu：发送9.6Mpps, cpu 100%
+用2个cpu：发送14.2Mpps, 每个cpu 80%</p>
+
+<p>相比netmap单cpu 60%发送14.3Mpps, 两轮优化后还略差些，不过perf看热点已经在ixgbe里了</p>
+
+<h3>参考</h3>
+
+<p><a href="http://launchpadlibrarian.net/443052277/linux-source-4.15.0_4.15.0-65.74_all.deb">linux-source-4.15.0_4.15.0-65.74_all.deb</a></p>
+
+<p><a href="https://blog.csdn.net/one_clouder/article/details/52685249">二层报文发送之qdisc实现分析</a></p>
+
+<p><a href="https://www.cnblogs.com/ne-liqian/p/9294757.html">netmap配置</a></p>
+
+<p><a href="https://tqr.ink/2017/04/16/intel-82599-receive-packet/">基于82599网卡的二层网络数据包接收</a></p>
+
+<p><a href="https://tqr.ink/2017/05/01/intel-82599-transmit-packet/">基于82599网卡的二层网络数据包发送</a></p>
+
+<p><a href="https://www.ichenfu.com/2019/03/10/how-to-drop-10-million-packets-per-second/">如何在一秒之内丢弃1000万个网络数据包</a></p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
       <h2 class="entry-title"><a href="/blog/2019/10/31/10Gb-test/">X520-T1 Linux内核收发包14Mpps</a></h2>
     
     
@@ -352,108 +560,6 @@ var ss360Config = {
 
     </article>
   
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2019/08/22/ubuntu-kernel/">ubuntu 编译内核、模块</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2019-08-22T11:33:00+08:00'><span class='date'>2019-08-22</span> <span class='time'>11:33:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="https://launchpad.net/ubuntu/+source/linux/+changelog">https://launchpad.net/ubuntu/+source/linux/+changelog</a></p>
-
-<h4>4.15.0</h4>
-
-<p><a href="https://launchpad.net/ubuntu/bionic/+source/linux/+changelog">https://launchpad.net/ubuntu/bionic/+source/linux/+changelog</a></p>
-
-<p><a href="https://packages.ubuntu.com/xenial/linux-source-4.15.0">https://packages.ubuntu.com/xenial/linux-source-4.15.0</a><br/>
-<a href="http://security.ubuntu.com/ubuntu/pool/main/l/linux-hwe/linux-source-4.15.0_4.15.0-58.64~16.04.1_all.deb">http://security.ubuntu.com/ubuntu/pool/main/l/linux-hwe/linux-source-4.15.0_4.15.0-58.64~16.04.1_all.deb</a></p>
-
-<p><a href="https://launchpad.net/ubuntu/xenial/amd64/linux-image-unsigned-4.15.0-58-generic-dbgsym">https://launchpad.net/ubuntu/xenial/amd64/linux-image-unsigned-4.15.0-58-generic-dbgsym</a><br/>
-<a href="http://launchpadlibrarian.net/436393485/linux-image-unsigned-4.15.0-58-generic-dbgsym_4.15.0-58.64~16.04.1_amd64.ddeb">http://launchpadlibrarian.net/436393485/linux-image-unsigned-4.15.0-58-generic-dbgsym_4.15.0-58.64~16.04.1_amd64.ddeb</a></p>
-
-<p><a href="https://launchpad.net/ubuntu/bionic/amd64/linux-image-unsigned-4.15.0-58-generic-dbgsym">https://launchpad.net/ubuntu/bionic/amd64/linux-image-unsigned-4.15.0-58-generic-dbgsym</a><br/>
-<a href="http://launchpadlibrarian.net/436226708/linux-image-unsigned-4.15.0-58-generic-dbgsym_4.15.0-58.64_amd64.ddeb">http://launchpadlibrarian.net/436226708/linux-image-unsigned-4.15.0-58-generic-dbgsym_4.15.0-58.64_amd64.ddeb</a></p>
-
-<h4>4.18.0</h4>
-
-<p><a href="https://launchpad.net/ubuntu/xenial/+source/linux/+changelog">https://launchpad.net/ubuntu/xenial/+source/linux/+changelog</a></p>
-
-<p><a href="https://packages.ubuntu.com/bionic/linux-source-4.18.0">https://packages.ubuntu.com/bionic/linux-source-4.18.0</a><br/>
-<a href="http://security.ubuntu.com/ubuntu/pool/main/l/linux-hwe/linux-source-4.18.0_4.18.0-25.26~18.04.1_all.deb">http://security.ubuntu.com/ubuntu/pool/main/l/linux-hwe/linux-source-4.18.0_4.18.0-25.26~18.04.1_all.deb</a></p>
-
-<p><a href="https://launchpad.net/ubuntu/bionic/amd64/linux-image-4.18.0-25-generic-dbgsym">https://launchpad.net/ubuntu/bionic/amd64/linux-image-4.18.0-25-generic-dbgsym</a><br/>
-<a href="http://launchpadlibrarian.net/430863032/linux-image-4.18.0-25-generic-dbgsym_4.18.0-25.26~18.04.1_amd64.ddeb">http://launchpadlibrarian.net/430863032/linux-image-4.18.0-25-generic-dbgsym_4.18.0-25.26~18.04.1_amd64.ddeb</a></p>
-
-<h4>gcc 7 编译内核模块时无法找到 stdarg.h 的问题</h4>
-
-<p><a href="https://blog.gloriousdays.pw/2018/09/09/cannot-find-stdarg-h-on-linux-kernel-4-15-with-gcc-7-3/">https://blog.gloriousdays.pw/2018/09/09/cannot-find-stdarg-h-on-linux-kernel-4-15-with-gcc-7-3/</a></p>
-
-<p>这是一个非常奇怪的错误，出现在 Ubuntu 18.04 上，默认安装的内核版本是 4.15，gcc 是 7.3，在编译内核模块时报错：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>In file included from ./include/linux/list.h:9:0,
-</span><span class='line'>                 from ./include/linux/module.h:9,
-</span><span class='line'>                 from /root/Software/newbbr/tcp_tsunami.c:59:
-</span><span class='line'>./include/linux/kernel.h:6:10: fatal error: stdarg.h: No such file or directory
-</span><span class='line'> #include &lt;stdarg.h&gt;
-</span><span class='line'>          ^~~~~~~~~~
-</span><span class='line'>compilation terminated.</span></code></pre></td></tr></table></div></figure>
-
-
-<p>gcc 认为找不到 stdarg.h。看这个错误的位置，个人认为应该不是我配置的问题或者是我代码的问题，搜索了一下，也有很多在 4.15 内核上出现的同样错误。目前没有什么很好的解决方案，暂时性的方案是在编译的 Makefile 里面加一行：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>ccflags-y=-I/usr/lib/gcc/x86_64-linux-gnu/7/include</span></code></pre></td></tr></table></div></figure>
-
-
-<p>如果是 gcc 8，就相应把版本改成 8 就可以了</p>
-
-<h4>编译内核</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>sudo apt-get install libncurses-dev flex bison openssl-dev libssl-dev dkms libelf-dev
-</span><span class='line'>
-</span><span class='line'>make bindeb-pkg -j8</span></code></pre></td></tr></table></div></figure>
-
-
-<p>按这里没成功 <a href="https://wiki.ubuntu.com/Kernel/BuildYourOwnKernel">https://wiki.ubuntu.com/Kernel/BuildYourOwnKernel</a></p>
-
-<h4>编译perf</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>cd tools/perf
-</span><span class='line'>make</span></code></pre></td></tr></table></div></figure>
-
-</div>
-  
-  
-
-
-    </article>
-  
   <div class="pagination">
     
       <a class="prev" href="/posts/139">&larr; Older</a>
@@ -468,7 +574,7 @@ var ss360Config = {
   
     <section>
 <h1>Categories
-<span class='right_span'>(969)</span>
+<span class='right_span'>(970)</span>
 
 </h1>
 <head>
@@ -797,8 +903,8 @@ if (!document.getElementById('kernel~tcp')) document.getElementById('aexp_kernel
 if (!document.getElementById('kernel')) document.getElementById('aexp_kernel').style.visibility = 'hidden';
 if (!document.getElementById('kernel~vpn')) document.getElementById('aexp_kernel~vpn').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/network/'>network</a><a href='##' onmousedown=showDiv('network') id='aexp_network'><span class='exp_style' id='exp_network'>[+]</span></a><span class='right_span'>(9)</span></li>
-<div id='network' class='catsub'><li><a href='/blog/cats/network~base/?opendiv=network'>base</a><a href='##' onmousedown=showDiv('network~base') id='aexp_network~base'><span class='exp_style' id='exp_network~base'>[+]</span></a><span class='right_span'>9</span></li>
+<li class='catclass'><a href='/blog/cats/network/'>network</a><a href='##' onmousedown=showDiv('network') id='aexp_network'><span class='exp_style' id='exp_network'>[+]</span></a><span class='right_span'>(10)</span></li>
+<div id='network' class='catsub'><li><a href='/blog/cats/network~base/?opendiv=network'>base</a><a href='##' onmousedown=showDiv('network~base') id='aexp_network~base'><span class='exp_style' id='exp_network~base'>[+]</span></a><span class='right_span'>10</span></li>
 </div><script language='javascript' type='text/javascript'>
 if (!document.getElementById('network')) document.getElementById('aexp_network').style.visibility = 'hidden';
 if (!document.getElementById('network~base')) document.getElementById('aexp_network~base').style.visibility = 'hidden';
@@ -910,7 +1016,7 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 
 <section>
 <h1>Date Categories
-<span class='right_span'>(969)</span>
+<span class='right_span'>(970)</span>
 
 </h1>
 <head>
@@ -918,7 +1024,9 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(89)</span></li>
+<li class='catclass'><a href='/blog/cats/2025/'>2025</a><a href='##' onmousedown=showDiv('2025')><span class='exp_style' id='exp_2025'>[+]</span></a><span class='right_span'>(1)</span></li>
+<div id='2025' class='catsub'><li><a href='/blog/cats/2025~01/?opendiv=2025'>2025-01</a><span class='right_span'>1</span></li>
+</div><li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(89)</span></li>
 <div id='2024' class='catsub'><li><a href='/blog/cats/2024~12/?opendiv=2024'>2024-12</a><span class='right_span'>2</span></li>
 <li><a href='/blog/cats/2024~10/?opendiv=2024'>2024-10</a><span class='right_span'>5</span></li>
 <li><a href='/blog/cats/2024~09/?opendiv=2024'>2024-09</a><span class='right_span'>15</span></li>
@@ -1092,6 +1200,10 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
   <ul id="recent_posts">
     
       <li class="post">
+        <a href="/blog/2025/01/16/network-ac-ap/">如何在ac上telnet到ap</a>
+      </li>
+    
+      <li class="post">
         <a href="/blog/2024/12/12/tools-mysql-bin/">删除MySQL下的bin</a>
       </li>
     
@@ -1125,10 +1237,6 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
     
       <li class="post">
         <a href="/blog/2024/09/20/ffmpeg-mp3/">ffmpeg分离MP3文件报错</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/09/20/sqlserver-_/">`_` 通配符 -- 匹配一个字符</a>
       </li>
     
   </ul>
@@ -1228,7 +1336,7 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 
     </div>
   </div>
-  <footer role="contentinfo">  Copyright &copy; 2024 - kk -
+  <footer role="contentinfo">  Copyright &copy; 2025 - kk -
   <span class="credit">Powered by <a href="http://octopress.org">Octopress</a></span>
   <a title="Top" href="#" id="scroll2top" style="position: fixed; height: 50px; bottom: 30px; right: 25px; cursor: pointer; z-index: 9999; display: block; opacity: 1;"><img src="/images/scrollup.png"></a>
   <script src="/javascripts/scroll2top.js"></script>

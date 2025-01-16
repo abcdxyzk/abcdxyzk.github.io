@@ -131,6 +131,181 @@ var ss360Config = {
       
   <header>
     
+      <h2 class="entry-title"><a href="/blog/2020/07/19/kernel-mptcp-establish/">MPTCP pre_established fully_established</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2020-07-19T01:37:00+08:00'><span class='date'>2020-07-19</span> <span class='time'>01:37:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><h3>一、pre_established</h3>
+
+<p>只在subflow的客户端起作用，在收到synack时置为1，收到第4个ack时置为0，防止在synack到第四个ack期间发送数据包。</p>
+
+<p>因为服务端要用第三个ack建连，客户端收到第四个ack表示建连成功，成功之后才能发数据</p>
+
+<h4>mptcp_ack_timer</h4>
+
+<p>所以客户端需要 mptcp_ack_timer，不停的发送第三个ack，直到收到第四个ack</p>
+
+<h3>二、fully_established</h3>
+
+<p>fully_established 和 pre_established 互不相关</p>
+
+<p>mptcp需要四次握手，四次握手完成后 fully_established=1, 再之后才能建立subflow</p>
+
+<p>tcp三次握手后，client和server两边的 fully_established = 0, 进入fully_established的条件如下：</p>
+
+<ol>
+<li>本端没发送数据包，但一直收到对端的mptcp数据包，见 mptcp_prevalidate_skb()</li>
+</ol>
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (!tp-&gt;mptcp-&gt;fully_established) {
+</span><span class='line'>&#9;tp-&gt;mptcp-&gt;init_rcv_wnd -= skb-&gt;len;
+</span><span class='line'>&#9;if (tp-&gt;mptcp-&gt;init_rcv_wnd &lt; 0)
+</span><span class='line'>&#9;&#9;mptcp_become_fully_estab(sk);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<ol>
+<li>本端发出去的mptcp数据包被mptcp_ack了，见 mptcp_process_data_ack</li>
+</ol>
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (unlikely(!tp-&gt;mptcp-&gt;fully_established) && tp-&gt;mptcp-&gt;snt_isn + 1 != TCP_SKB_CB(skb)-&gt;ack_seq)
+</span><span class='line'>&#9;mptcp_become_fully_estab(sk);</span></code></pre></td></tr></table></div></figure>
+
+
+<ol>
+<li>如果收到非mptcp数据包，则回退普通tcp，回退也会设置fully_established=1，见mptcp_prevalidate_skb()</li>
+</ol>
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (!tp-&gt;mptcp-&gt;fully_established && !mptcp_is_data_seq(skb) &&
+</span><span class='line'>&#9;!tp-&gt;mptcp-&gt;mapping_present && !mpcb-&gt;infinite_mapping_rcv) {
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;if (!is_master_tp(tp)) { // subflow reset，master才回退
+</span><span class='line'>&#9;&#9;MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_FBDATASUB);
+</span><span class='line'>&#9;&#9;mptcp_send_reset(sk);
+</span><span class='line'>&#9;&#9;return 1;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;...
+</span><span class='line'>&#9;tp-&gt;mptcp-&gt;fully_established = 1;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<ol>
+<li>如果本端发出去的数据包被不带mptcp的ack ack了，那么大概率是对端没建立mptcp连接。那么本端回退到普通tcp，回退也会设置fully_established=1。</li>
+</ol>
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>tcp_ack() {
+</span><span class='line'>&#9;mptcp_fallback_infinite() {
+</span><span class='line'>&#9;&#9;if (likely(tp-&gt;mptcp-&gt;fully_established))
+</span><span class='line'>&#9;&#9;&#9;return false;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (!(flag & MPTCP_FLAG_DATA_ACKED)) // 被ack的包一定是mptcp数据包
+</span><span class='line'>&#9;&#9;&#9;return false;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (!is_master_tp(tp)) { // subflow reset，master才回退
+</span><span class='line'>&#9;&#9;&#9;MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_FBACKSUB);
+</span><span class='line'>&#9;&#9;&#9;return true;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;...
+</span><span class='line'>&#9;}
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>因为 fully_established = 0 时刚完成3次握手，所以上面说的数据包基本都是第一个数据包</p>
+
+<p>以上条件对于client和server都适用，因为3次握手后谁先发包都是正常的。</p>
+
+<h3>mptcp 连接在 fully_established=1 之后再收到 不含mptcp option的包</h3>
+
+<ol>
+<li>不会进行mapping，见mptcp_detect_mapping()</li>
+</ol>
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (!mptcp_is_data_seq(skb)) {
+</span><span class='line'>&#9;if (!tp-&gt;mptcp-&gt;mapping_present && tp-&gt;rcv_nxt - tp-&gt;copied_seq &gt; 65536) {
+</span><span class='line'>&#9;&#9;mptcp_send_reset(sk);
+</span><span class='line'>&#9;&#9;return 1;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;return 0;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<ol>
+<li>对于一个map_data_len包，可能被差成了多个包传输：</li>
+</ol>
+
+
+<p>如果多个包全不是mptcp包，则mapping_present=0，那么mptcp_queue_skb() 会直接return，然后 tp->rcv_nxt - tp->copied_seq > 65536, 然后被reset</p>
+
+<p>如果前一部分是mptcp的包，后一部分不是mptcp包，则mapping_present=1，然后会被mptcp_verif_dss_csum() reset</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
       <h2 class="entry-title"><a href="/blog/2020/07/09/kernel-tcp-icmp/">TCP包增一个ICMP头</a></h2>
     
     
@@ -736,129 +911,6 @@ var ss360Config = {
 
     </article>
   
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2020/07/09/kernel-mptcp-bug/">MPTCP 回复一样的option</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2020-07-09T01:39:00+08:00'><span class='date'>2020-07-09</span> <span class='time'>01:39:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p>对方回复一模一样的option</p>
-
-<h4>例如</h4>
-
-<p>curl ksurl.cn</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>01:42:57.092471 IP 192.168.8.162.34366 &gt; 103.102.200.3.80: Flags [S], seq 846976861, win 64240, options [mss 1460,nop,nop,sackOK,nop,wscale 7,mptcp capable csum {0xc7c6d84045bd8248}], length 0
-</span><span class='line'>01:42:57.130413 IP 103.102.200.3.80 &gt; 192.168.8.162.34366: Flags [S.], seq 668917669, ack 846976862, win 0, options [mss 1452,nop,nop,sackOK,nop,nop,nop,nop,mptcp capable csum {0xc7c6d84045bd8248}], length 0
-</span><span class='line'>01:42:57.130498 IP 192.168.8.162.34366 &gt; 103.102.200.3.80: Flags [.], ack 1, win 64240, options [mptcp capable csum {0xc7c6d84045bd8248,0xc7c6d84045bd8248},mptcp dss ack 1200875982], length 0
-</span><span class='line'>01:42:57.130525 IP 192.168.8.162.34366 &gt; 103.102.200.3.80: Flags [.], ack 1, win 64240, options [mptcp add-addr id 3 11.0.0.1,mptcp dss ack 1200875982], length 0
-</span><span class='line'>01:42:57.616370 IP 192.168.8.162.34366 &gt; 103.102.200.3.80: Flags [.], ack 1, win 64240, options [mptcp dss ack 1200875982], length 0
-</span><span class='line'>01:42:57.654157 IP 103.102.200.3.80 &gt; 192.168.8.162.34366: Flags [.], ack 1, win 29200, length 0
-</span><span class='line'>01:42:58.612344 IP 192.168.8.162.34366 &gt; 103.102.200.3.80: Flags [.], ack 1, win 64240, options [mptcp dss ack 1200875982], length 0
-</span><span class='line'>01:42:58.650740 IP 103.102.200.3.80 &gt; 192.168.8.162.34366: Flags [.], ack 1, win 29200, length 0
-</span><span class='line'>01:43:00.560359 IP 192.168.8.162.34366 &gt; 103.102.200.3.80: Flags [.], ack 1, win 64240, options [mptcp dss ack 1200875982], length 0
-</span><span class='line'>01:43:00.598942 IP 103.102.200.3.80 &gt; 192.168.8.162.34366: Flags [.], ack 1, win 29200, length 0
-</span><span class='line'>...</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>修复</h4>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>diff --git a/src/4.15.18/tcp_input.c b/src/4.15.18/tcp_input.c
-</span><span class='line'>index 1c36791..397cb89 100644
-</span><span class='line'>--- a/src/4.15.18/tcp_input.c
-</span><span class='line'>+++ b/src/4.15.18/tcp_input.c
-</span><span class='line'>@@ -5845,6 +5845,11 @@ static int tcp_rcv_synsent_state_process(struct sock *sk, struct sk_buff *skb,
-</span><span class='line'>                if (tp-&gt;request_mptcp || mptcp(tp)) {
-</span><span class='line'>                        int ret;
-</span><span class='line'> 
-</span><span class='line'>+                       if (!mptcp(tp) && mopt.saw_mpc) {
-</span><span class='line'>+                               struct tcp_sock *meta_tp = tcp_sk(sk);
-</span><span class='line'>+                               if (meta_tp-&gt;mptcp_loc_key == mopt.mptcp_sender_key)
-</span><span class='line'>+                                       mopt.saw_mpc = 0;
-</span><span class='line'>+                       }
-</span><span class='line'>                        rcu_read_lock();
-</span><span class='line'>                        local_bh_disable();
-</span><span class='line'>                        ret = mptcp_rcv_synsent_state_process(sk, &sk,</span></code></pre></td></tr></table></div></figure>
-
-
-<h3>修复后</h3>
-
-<p>curl ksurl.cn</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>01:48:11.136480 IP 192.168.8.162.34388 &gt; 103.102.200.3.80: Flags [S], seq 1334883078, win 65320, options [mss 1420,nop,nop,sackOK,nop,wscale 7,mptcp capable csum {0xa48a1610f304b3a}], length 0
-</span><span class='line'>01:48:11.174632 IP 103.102.200.3.80 &gt; 192.168.8.162.34388: Flags [S.], seq 2018132645, ack 1334883079, win 0, options [mss 1420,nop,nop,sackOK,nop,nop,nop,nop,mptcp capable csum {0xa48a1610f304b3a}], length 0
-</span><span class='line'>01:48:11.174720 IP 192.168.8.162.34388 &gt; 103.102.200.3.80: Flags [.], ack 1, win 65320, length 0
-</span><span class='line'>01:48:11.213236 IP 103.102.200.3.80 &gt; 192.168.8.162.34388: Flags [.], ack 1, win 29200, length 0
-</span><span class='line'>01:48:11.213283 IP 192.168.8.162.34388 &gt; 103.102.200.3.80: Flags [P.], seq 1:73, ack 1, win 65320, length 72: HTTP: GET / HTTP/1.1
-</span><span class='line'>01:48:11.252192 IP 103.102.200.3.80 &gt; 192.168.8.162.34388: Flags [.], ack 73, win 29200, length 0
-</span><span class='line'>01:48:11.253261 IP 103.102.200.3.80 &gt; 192.168.8.162.34388: Flags [P.], seq 1:397, ack 73, win 29200, length 396: HTTP: HTTP/1.1 302 Moved Temporarily
-</span><span class='line'>01:48:11.253300 IP 192.168.8.162.34388 &gt; 103.102.200.3.80: Flags [.], ack 397, win 64924, length 0
-</span><span class='line'>01:48:11.253541 IP 192.168.8.162.34388 &gt; 103.102.200.3.80: Flags [F.], seq 73, ack 397, win 64924, length 0
-</span><span class='line'>01:48:11.292118 IP 103.102.200.3.80 &gt; 192.168.8.162.34388: Flags [F.], seq 397, ack 74, win 29200, length 0
-</span><span class='line'>01:48:11.292182 IP 192.168.8.162.34388 &gt; 103.102.200.3.80: Flags [.], ack 398, win 64923, length 0</span></code></pre></td></tr></table></div></figure>
-
-
-
-</div>
-  
-  
-
-
-    </article>
-  
   <div class="pagination">
     
       <a class="prev" href="/posts/127">&larr; Older</a>
@@ -873,7 +925,7 @@ var ss360Config = {
   
     <section>
 <h1>Categories
-<span class='right_span'>(969)</span>
+<span class='right_span'>(970)</span>
 
 </h1>
 <head>
@@ -1202,8 +1254,8 @@ if (!document.getElementById('kernel~tcp')) document.getElementById('aexp_kernel
 if (!document.getElementById('kernel')) document.getElementById('aexp_kernel').style.visibility = 'hidden';
 if (!document.getElementById('kernel~vpn')) document.getElementById('aexp_kernel~vpn').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/network/'>network</a><a href='##' onmousedown=showDiv('network') id='aexp_network'><span class='exp_style' id='exp_network'>[+]</span></a><span class='right_span'>(9)</span></li>
-<div id='network' class='catsub'><li><a href='/blog/cats/network~base/?opendiv=network'>base</a><a href='##' onmousedown=showDiv('network~base') id='aexp_network~base'><span class='exp_style' id='exp_network~base'>[+]</span></a><span class='right_span'>9</span></li>
+<li class='catclass'><a href='/blog/cats/network/'>network</a><a href='##' onmousedown=showDiv('network') id='aexp_network'><span class='exp_style' id='exp_network'>[+]</span></a><span class='right_span'>(10)</span></li>
+<div id='network' class='catsub'><li><a href='/blog/cats/network~base/?opendiv=network'>base</a><a href='##' onmousedown=showDiv('network~base') id='aexp_network~base'><span class='exp_style' id='exp_network~base'>[+]</span></a><span class='right_span'>10</span></li>
 </div><script language='javascript' type='text/javascript'>
 if (!document.getElementById('network')) document.getElementById('aexp_network').style.visibility = 'hidden';
 if (!document.getElementById('network~base')) document.getElementById('aexp_network~base').style.visibility = 'hidden';
@@ -1315,7 +1367,7 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 
 <section>
 <h1>Date Categories
-<span class='right_span'>(969)</span>
+<span class='right_span'>(970)</span>
 
 </h1>
 <head>
@@ -1323,7 +1375,9 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(89)</span></li>
+<li class='catclass'><a href='/blog/cats/2025/'>2025</a><a href='##' onmousedown=showDiv('2025')><span class='exp_style' id='exp_2025'>[+]</span></a><span class='right_span'>(1)</span></li>
+<div id='2025' class='catsub'><li><a href='/blog/cats/2025~01/?opendiv=2025'>2025-01</a><span class='right_span'>1</span></li>
+</div><li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(89)</span></li>
 <div id='2024' class='catsub'><li><a href='/blog/cats/2024~12/?opendiv=2024'>2024-12</a><span class='right_span'>2</span></li>
 <li><a href='/blog/cats/2024~10/?opendiv=2024'>2024-10</a><span class='right_span'>5</span></li>
 <li><a href='/blog/cats/2024~09/?opendiv=2024'>2024-09</a><span class='right_span'>15</span></li>
@@ -1497,6 +1551,10 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
   <ul id="recent_posts">
     
       <li class="post">
+        <a href="/blog/2025/01/16/network-ac-ap/">如何在ac上telnet到ap</a>
+      </li>
+    
+      <li class="post">
         <a href="/blog/2024/12/12/tools-mysql-bin/">删除MySQL下的bin</a>
       </li>
     
@@ -1530,10 +1588,6 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
     
       <li class="post">
         <a href="/blog/2024/09/20/ffmpeg-mp3/">ffmpeg分离MP3文件报错</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/09/20/sqlserver-_/">`_` 通配符 -- 匹配一个字符</a>
       </li>
     
   </ul>
@@ -1633,7 +1687,7 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 
     </div>
   </div>
-  <footer role="contentinfo">  Copyright &copy; 2024 - kk -
+  <footer role="contentinfo">  Copyright &copy; 2025 - kk -
   <span class="credit">Powered by <a href="http://octopress.org">Octopress</a></span>
   <a title="Top" href="#" id="scroll2top" style="position: fixed; height: 50px; bottom: 30px; right: 25px; cursor: pointer; z-index: 9999; display: block; opacity: 1;"><img src="/images/scrollup.png"></a>
   <script src="/javascripts/scroll2top.js"></script>

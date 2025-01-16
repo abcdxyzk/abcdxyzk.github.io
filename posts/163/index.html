@@ -131,6 +131,537 @@ var ss360Config = {
       
   <header>
     
+      <h2 class="entry-title"><a href="/blog/2017/07/23/kernel-clock-5/">Linux时间子系统之五：低分辨率定时器的原理和实现</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2017-07-23T16:38:00+08:00'><span class='date'>2017-07-23</span> <span class='time'>16:38:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="http://blog.csdn.net/DroidPhone/article/details/8051405">http://blog.csdn.net/DroidPhone/article/details/8051405</a></p>
+
+<p>利用定时器，我们可以设定在未来的某一时刻，触发一个特定的事件。所谓低分辨率定时器，是指这种定时器的计时单位基于jiffies值的计数，也就是说，它的精度只有1/HZ，假如你的内核配置的HZ是1000，那意味着系统中的低分辨率定时器的精度就是1ms。早期的内核版本中，内核并不支持高精度定时器，理所当然只能使用这种低分辨率定时器，我们有时候把这种基于HZ的定时器机制成为时间轮：time wheel。虽然后来出现了高分辨率定时器，但它只是内核的一个可选配置项，所以直到目前最新的内核版本，这种低分辨率定时器依然被大量地使用着。</p>
+
+<h4>1. 定时器的使用方法</h4>
+
+<p>在讨论定时器的实现原理之前，我们先看看如何使用定时器。要在内核编程中使用定时器，首先我们要定义一个time_list结构，该结构在include/Linux/timer.h中定义：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct timer_list {
+</span><span class='line'>&#9;/* 
+</span><span class='line'>&#9; * All fields that change during normal runtime grouped to the 
+</span><span class='line'>&#9; * same cacheline 
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;struct list_head entry;
+</span><span class='line'>&#9;unsigned long expires;
+</span><span class='line'>&#9;struct tvec_base *base;
+</span><span class='line'>
+</span><span class='line'>&#9;void (*function)(unsigned long);
+</span><span class='line'>&#9;unsigned long data;
+</span><span class='line'>
+</span><span class='line'>&#9;int slack;
+</span><span class='line'>&#9;&#9;......
+</span><span class='line'>};
+</span><span class='line'>
+</span><span class='line'>entry  字段用于把一组定时器组成一个链表，至于内核如何对定时器进行分组，我们会在后面进行解释。
+</span><span class='line'>
+</span><span class='line'>expires  字段指出了该定时器的到期时刻，也就是期望定时器到期时刻的jiffies计数值。
+</span><span class='line'>
+</span><span class='line'>base  每个cpu拥有一个自己的用于管理定时器的tvec_base结构，该字段指向该定时器所属的cpu所对应tvec_base结构。
+</span><span class='line'>
+</span><span class='line'>function  字段是一个函数指针，定时器到期时，系统将会调用该回调函数，用于响应该定时器的到期事件。
+</span><span class='line'>
+</span><span class='line'>data  该字段用于上述回调函数的参数。
+</span><span class='line'>
+</span><span class='line'>slack  对有些对到期时间精度不太敏感的定时器，到期时刻允许适当地延迟一小段时间，该字段用于计算每次延迟的HZ数。</span></code></pre></td></tr></table></div></figure>
+
+
+<p>要定义一个timer_list，我们可以使用静态和动态两种办法，静态方法使用DEFINE_TIMER宏：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define DEFINE_TIMER(_name, _function, _expires, _data)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>该宏将得到一个名字为<em>name，并分别用</em>function,<em>expires,</em>data参数填充timer_list的相关字段。</p>
+
+<p>如果要使用动态的方法，则可以自己声明一个timer_list结构，然后手动初始化它的各个字段：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct timer_list timer;
+</span><span class='line'>......
+</span><span class='line'>init_timer(&timer);
+</span><span class='line'>timer.function = _function;
+</span><span class='line'>timer.expires = _expires;
+</span><span class='line'>timer.data = _data;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>要激活一个定时器，我们只要调用add_timer即可：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>add_timer(&timer);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>要修改定时器的到期时间，我们只要调用mod_timer即可：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>mod_timer(&timer, jiffies+50);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>要移除一个定时器，我们只要调用del_timer即可：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>del_timer(&timer);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>定时器系统还提供了以下这些API供我们使用：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void add_timer_on(struct timer_list *timer, int cpu);  // 在指定的cpu上添加定时器
+</span><span class='line'>int mod_timer_pending(struct timer_list *timer, unsigned long expires);  //  只有当timer已经处在激活状态时，才修改timer的到期时刻
+</span><span class='line'>int mod_timer_pinned(struct timer_list *timer, unsigned long expires);  //  当
+</span><span class='line'>void set_timer_slack(struct timer_list *time, int slack_hz);  //  设定timer允许的到期时刻的最大延迟，用于对精度不敏感的定时器
+</span><span class='line'>int del_timer_sync(struct timer_list *timer);  //  如果该timer正在被处理中，则等待timer处理完成才移除该timer</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>2. 定时器的软件架构</h4>
+
+<p>低分辨率定时器是基于HZ来实现的，也就是说，每个tick周期，都有可能有定时器到期，关于tick如何产生，请参考：Linux时间子系统之四：定时器的引擎：clock_event_device。系统中有可能有成百上千个定时器，难道在每个tick中断中遍历一下所有的定时器，检查它们是否到期？内核当然不会使用这么笨的办法，它使用了一个更聪明的办法：按定时器的到期时间对定时器进行分组。因为目前的多核处理器使用越来越广泛，连智能手机的处理器动不动就是4核心，内核对多核处理器有较好的支持，低分辨率定时器在实现时也充分地考虑了多核处理器的支持和优化。为了较好地利用cache line，也为了避免cpu之间的互锁，内核为多核处理器中的每个cpu单独分配了管理定时器的相关数据结构和资源，每个cpu独立地管理属于自己的定时器。</p>
+
+<h5>2.1  定时器的分组</h5>
+
+<p>首先，内核为每个cpu定义了一个tvec_base结构指针：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static DEFINE_PER_CPU(struct tvec_base *, tvec_bases) = &boot_tvec_bases;</span></code></pre></td></tr></table></div></figure>
+
+
+<p>tvec_base结构的定义如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct tvec_base {
+</span><span class='line'>&#9;spinlock_t lock;
+</span><span class='line'>&#9;struct timer_list *running_timer;
+</span><span class='line'>&#9;unsigned long timer_jiffies;
+</span><span class='line'>&#9;unsigned long next_timer;
+</span><span class='line'>&#9;struct tvec_root tv1;
+</span><span class='line'>&#9;struct tvec tv2;
+</span><span class='line'>&#9;struct tvec tv3;
+</span><span class='line'>&#9;struct tvec tv4;
+</span><span class='line'>&#9;struct tvec tv5;
+</span><span class='line'>} ____cacheline_aligned;
+</span><span class='line'>
+</span><span class='line'>running_timer  该字段指向当前cpu正在处理的定时器所对应的timer_list结构。
+</span><span class='line'>
+</span><span class='line'>timer_jiffies  该字段表示当前cpu定时器所经历过的jiffies数，大多数情况下，该值和jiffies计数值相等，当cpu的idle状态连续持续了多个jiffies时间时，当退出idle状态时，jiffies计数值就会大于该字段，在接下来的tick中断后，定时器系统会让该字段的值追赶上jiffies值。
+</span><span class='line'>
+</span><span class='line'>next_timer  该字段指向该cpu下一个即将到期的定时器。
+</span><span class='line'>
+</span><span class='line'>tv1--tv5  这5个字段用于对定时器进行分组，实际上，tv1--tv5都是一个链表数组，其中tv1的数组大小为TVR_SIZE， tv2 tv3 tv4 tv5的数组大小为TVN_SIZE，根据CONFIG_BASE_SMALL配置项的不同，它们有不同的大小：</span></code></pre></td></tr></table></div></figure>
+
+
+
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define TVN_BITS (CONFIG_BASE_SMALL ? 4 : 6)
+</span><span class='line'>#define TVR_BITS (CONFIG_BASE_SMALL ? 6 : 8)
+</span><span class='line'>#define TVN_SIZE (1 &lt;&lt; TVN_BITS)
+</span><span class='line'>#define TVR_SIZE (1 &lt;&lt; TVR_BITS)
+</span><span class='line'>#define TVN_MASK (TVN_SIZE - 1)
+</span><span class='line'>#define TVR_MASK (TVR_SIZE - 1)
+</span><span class='line'>
+</span><span class='line'>struct tvec {
+</span><span class='line'>&#9;struct list_head vec[TVN_SIZE];
+</span><span class='line'>};
+</span><span class='line'>
+</span><span class='line'>struct tvec_root {
+</span><span class='line'>&#9;struct list_head vec[TVR_SIZE];
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>默认情况下，没有使能CONFIG_BASE_SMALL，TVR_SIZE的大小是256，TVN_SIZE的大小则是64，当需要节省内存空间时，也可以使能CONFIG_BASE_SMALL，这时TVR_SIZE的大小是64，TVN_SIZE的大小则是16，以下的讨论我都是基于没有使能CONFIG_BASE_SMALL的情况。当有一个新的定时器要加入时，系统根据定时器到期的jiffies值和timer_jiffies字段的差值来决定该定时器被放入tv1至tv5中的哪一个数组中，最终，系统中所有的定时器的组织结构如下图所示：</p>
+
+<p><img src="/images/kernel/2017-07-23-4.png" alt="" /></p>
+
+<p>图 2.1.1  定时器在系统中的组织结构</p>
+
+<h5>2.2  定时器的添加</h5>
+
+<p>要加入一个新的定时器，我们可以通过api函数add_timer或mod_timer来完成，最终的工作会交由internal_add_timer函数来处理。该函数按以下步骤进行处理：</p>
+
+<p>计算定时器到期时间和所属cpu的tvec_base结构中的timer_jiffies字段的差值，记为idx；</p>
+
+<p>根据idx的值，选择该定时器应该被放到tv1&ndash;tv5中的哪一个链表数组中，可以认为tv1-tv5分别占据一个32位数的不同比特位，tv1占据最低的8位，tv2占据紧接着的6位，然后tv3再占位，以此类推，最高的6位分配给tv5。最终的选择规则如下表所示：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>链表数组     idx范围
+</span><span class='line'>tv1   0-255(2^8)
+</span><span class='line'>tv2   256--16383(2^14)
+</span><span class='line'>tv3   16384--1048575(2^20)
+</span><span class='line'>tv4   1048576--67108863(2^26)
+</span><span class='line'>tv5   67108864--4294967295(2^32)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>确定链表数组后，接着要确定把该定时器放入数组中的哪一个链表中，如果时间差idx小于256，按规则要放入tv1中，因为tv1包含了256个链表，所以可以简单地使用timer_list.expires的低8位作为数组的索引下标，把定时器链接到tv1中相应的链表中即可。如果时间差idx的值在256&ndash;18383之间，则需要把定时器放入tv2中，同样的，使用timer_list.expires的8&ndash;14位作为数组的索引下标，把定时器链接到tv2中相应的链表中,。定时器要加入tv3 tv4 tv5使用同样的原理。经过这样分组后的定时器，在后续的tick事件中，系统可以很方便地定位并取出相应的到期定时器进行处理。以上的讨论都体现在internal_add_timer的代码中：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void internal_add_timer(struct tvec_base *base, struct timer_list *timer)
+</span><span class='line'>{
+</span><span class='line'>&#9;unsigned long expires = timer-&gt;expires;
+</span><span class='line'>&#9;unsigned long idx = expires - base-&gt;timer_jiffies;
+</span><span class='line'>&#9;struct list_head *vec;
+</span><span class='line'>
+</span><span class='line'>&#9;if (idx &lt; TVR_SIZE) {
+</span><span class='line'>&#9;&#9;int i = expires & TVR_MASK;
+</span><span class='line'>&#9;&#9;vec = base-&gt;tv1.vec + i;
+</span><span class='line'>&#9;} else if (idx &lt; 1 &lt;&lt; (TVR_BITS + TVN_BITS)) {
+</span><span class='line'>&#9;&#9;int i = (expires &gt;&gt; TVR_BITS) & TVN_MASK;
+</span><span class='line'>&#9;&#9;vec = base-&gt;tv2.vec + i;
+</span><span class='line'>&#9;} else if (idx &lt; 1 &lt;&lt; (TVR_BITS + 2 * TVN_BITS)) {
+</span><span class='line'>&#9;&#9;int i = (expires &gt;&gt; (TVR_BITS + TVN_BITS)) & TVN_MASK;
+</span><span class='line'>&#9;&#9;vec = base-&gt;tv3.vec + i;
+</span><span class='line'>&#9;} else if (idx &lt; 1 &lt;&lt; (TVR_BITS + 3 * TVN_BITS)) {
+</span><span class='line'>&#9;&#9;int i = (expires &gt;&gt; (TVR_BITS + 2 * TVN_BITS)) & TVN_MASK;
+</span><span class='line'>&#9;&#9;vec = base-&gt;tv4.vec + i;
+</span><span class='line'>&#9;} else if ((signed long) idx &lt; 0) {
+</span><span class='line'>&#9;&#9;&#9;&#9;......
+</span><span class='line'>&#9;} else {
+</span><span class='line'>&#9;&#9;&#9;&#9;......
+</span><span class='line'>&#9;&#9;i = (expires &gt;&gt; (TVR_BITS + 3 * TVN_BITS)) & TVN_MASK;
+</span><span class='line'>&#9;&#9;vec = base-&gt;tv5.vec + i;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;list_add_tail(&timer-&gt;entry, vec);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>2.2  定时器的到期处理</h5>
+
+<p>经过2.1节的处理后，系统中的定时器按到期时间有规律地放置在tv1&ndash;tv5各个链表数组中，其中tv1中放置着在接下来的256个jiffies即将到期的定时器列表，需要注意的是，并不是tv1.vec[0]中放置着马上到期的定时器列表，tv1.vec[1]中放置着将在jiffies+1到期的定时器列表。因为base.timer_jiffies的值一直在随着系统的运行而动态地增加，原则上是每个tick事件会加1，base.timer_jiffies代表者该cpu定时器系统当前时刻，定时器也是动态地加入头256个链表tv1中，按2.1节的讨论，定时器加入tv1中使用的下标索引是定时器到期时间expires的低8位，所以假设当前的base.timer_jiffies值是0x34567826，则马上到期的定时器是在tv1.vec[0x26]中，如果这时候系统加入一个在jiffies值0x34567828到期的定时器，他将会加入到tv1.vec[0x28]中，运行两个tick后，base.timer_jiffies的值会变为0x34567828，很显然，在每次tick事件中，定时器系统只要以base.timer_jiffies的低8位作为索引，取出tv1中相应的链表，里面正好包含了所有在该jiffies值到期的定时器列表。</p>
+
+<p>那什么时候处理tv2&ndash;tv5中的定时器？每当base.timer_jiffies的低8位为0值时，这表明base.timer_jiffies的第8-13位有进位发生，这6位正好代表着tv2，这时只要按base.timer_jiffies的第8-13位的值作为下标，移出tv2中对应的定时器链表，然后用internal_add_timer把它们从新加入到定时器系统中来，因为这些定时器一定会在接下来的256个tick期间到期，所以它们肯定会被加入到tv1数组中，这样就完成了tv2往tv1迁移的过程。同样地，当base.timer_jiffies的第8-13位为0时，这表明base.timer_jiffies的第14-19位有进位发生，这6位正好代表着tv3，按base.timer_jiffies的第14-19位的值作为下标，移出tv3中对应的定时器链表，然后用internal_add_timer把它们从新加入到定时器系统中来，显然它们会被加入到tv2中，从而完成tv3到tv2的迁移，tv4，tv5的处理可以以此作类推。具体迁移的代码如下，参数index为事先计算好的高一级tv的需要迁移的数组索引：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static int cascade(struct tvec_base *base, struct tvec *tv, int index)
+</span><span class='line'>{
+</span><span class='line'>&#9;/* cascade all the timers from tv up one level */
+</span><span class='line'>&#9;struct timer_list *timer, *tmp;
+</span><span class='line'>&#9;struct list_head tv_list;
+</span><span class='line'>
+</span><span class='line'>&#9;list_replace_init(tv-&gt;vec + index, &tv_list);  //  移除需要迁移的链表
+</span><span class='line'>
+</span><span class='line'>&#9;/* 
+</span><span class='line'>&#9; * We are removing _all_ timers from the list, so we 
+</span><span class='line'>&#9; * don't have to detach them individually. 
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;list_for_each_entry_safe(timer, tmp, &tv_list, entry) {
+</span><span class='line'>&#9;&#9;BUG_ON(tbase_get_base(timer-&gt;base) != base);
+</span><span class='line'>&#9;&#9;&#9;&#9;//  重新加入到定时器系统中，实际上将会迁移到下一级的tv数组中
+</span><span class='line'>&#9;&#9;internal_add_timer(base, timer);  
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;return index;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>每个tick事件到来时，内核会在tick定时中断处理期间激活定时器软中断：TIMER_SOFTIRQ，关于软件中断，请参考另一篇博文：Linux中断（interrupt）子系统之五：软件中断（softIRQ。TIMER_SOFTIRQ的执行函数是<code>__run_timers</code>，它实现了本节讨论的逻辑，取出tv1中到期的定时器，执行定时器的回调函数，由此可见，低分辨率定时器的回调函数是执行在软件中断上下文中的，这点在写定时器的回调函数时需要注意。<code>__run_timers</code>的代码如下：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static inline void __run_timers(struct tvec_base *base)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct timer_list *timer;
+</span><span class='line'>
+</span><span class='line'>&#9;spin_lock_irq(&base-&gt;lock);
+</span><span class='line'>&#9;&#9;/* 同步jiffies，在NO_HZ情况下，base-&gt;timer_jiffies可能落后不止一个tick  */
+</span><span class='line'>&#9;while (time_after_eq(jiffies, base-&gt;timer_jiffies)) {  
+</span><span class='line'>&#9;&#9;struct list_head work_list;
+</span><span class='line'>&#9;&#9;struct list_head *head = &work_list;
+</span><span class='line'>&#9;&#9;&#9;&#9;/*  计算到期定时器链表在tv1中的索引  */
+</span><span class='line'>&#9;&#9;int index = base-&gt;timer_jiffies & TVR_MASK;  
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;/* 
+</span><span class='line'>&#9;&#9; * /*  tv2--tv5定时器列表迁移处理  */
+</span><span class='line'>&#9;&#9; */
+</span><span class='line'>&#9;&#9;if (!index &&
+</span><span class='line'>&#9;&#9;&#9;(!cascade(base, &base-&gt;tv2, INDEX(0))) &&              
+</span><span class='line'>&#9;&#9;&#9;&#9;(!cascade(base, &base-&gt;tv3, INDEX(1))) &&      
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;!cascade(base, &base-&gt;tv4, INDEX(2)))  
+</span><span class='line'>&#9;&#9;&#9;cascade(base, &base-&gt;tv5, INDEX(3));  
+</span><span class='line'>&#9;&#9;&#9;&#9;/*  该cpu定时器系统运行时间递增一个tick  */                 
+</span><span class='line'>&#9;&#9;++base-&gt;timer_jiffies;  
+</span><span class='line'>&#9;&#9;&#9;&#9;/*  取出到期的定时器链表  */                                       
+</span><span class='line'>&#9;&#9;list_replace_init(base-&gt;tv1.vec + index, &work_list);
+</span><span class='line'>&#9;&#9;&#9;&#9;/*  遍历所有的到期定时器  */          
+</span><span class='line'>&#9;&#9;while (!list_empty(head)) {                                    
+</span><span class='line'>&#9;&#9;&#9;void (*fn)(unsigned long);
+</span><span class='line'>&#9;&#9;&#9;unsigned long data;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;timer = list_first_entry(head, struct timer_list,entry);
+</span><span class='line'>&#9;&#9;&#9;fn = timer-&gt;function;
+</span><span class='line'>&#9;&#9;&#9;data = timer-&gt;data;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;timer_stats_account_timer(timer);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;base-&gt;running_timer = timer;    /*  标记正在处理的定时器  */
+</span><span class='line'>&#9;&#9;&#9;detach_timer(timer, 1);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;spin_unlock_irq(&base-&gt;lock);
+</span><span class='line'>&#9;&#9;&#9;call_timer_fn(timer, fn, data);  /*  调用定时器的回调函数  */
+</span><span class='line'>&#9;&#9;&#9;spin_lock_irq(&base-&gt;lock);
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;base-&gt;running_timer = NULL;
+</span><span class='line'>&#9;spin_unlock_irq(&base-&gt;lock);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>通过上面的讨论，我们可以发现，内核的低分辨率定时器的实现非常精妙，既实现了大量定时器的管理，又实现了快速的O(1)查找到期定时器的能力，利用巧妙的数组结构，使得只需在间隔256个tick时间才处理一次迁移操作，5个数组就好比是5个齿轮，它们随着base->timer_jifffies的增长而不停地转动，每次只需处理第一个齿轮的某一个齿节，低一级的齿轮转动一圈，高一级的齿轮转动一个齿，同时自动把即将到期的定时器迁移到上一个齿轮中，所以低分辨率定时器通常又被叫做时间轮：time wheel。事实上，它的实现是一个很好的空间换时间软件算法。</p>
+
+<h4>3. 定时器软件中断</h4>
+
+<p>系统初始化时，start_kernel会调用定时器系统的初始化函数init_timers：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void __init init_timers(void)
+</span><span class='line'>{      
+</span><span class='line'>&#9;int err = timer_cpu_notify(&timers_nb, (unsigned long)CPU_UP_PREPARE, 
+</span><span class='line'>&#9;&#9;&#9;&#9;(void *)(long)smp_processor_id());
+</span><span class='line'>
+</span><span class='line'>&#9;init_timer_stats();
+</span><span class='line'>
+</span><span class='line'>&#9;BUG_ON(err != NOTIFY_OK);
+</span><span class='line'>&#9;register_cpu_notifier(&timers_nb);  /* 注册cpu notify，以便在hotplug时在cpu之间进行定时器的迁移 */
+</span><span class='line'>&#9;open_softirq(TIMER_SOFTIRQ, run_timer_softirq);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>可见，open_softirq把run_timer_softirq注册为TIMER_SOFTIRQ的处理函数，另外，当cpu的每个tick事件到来时，在事件处理中断中，update_process_times会被调用，该函数会进一步调用run_local_timers，run_local_timers会触发TIMER_SOFTIRQ软中断：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void run_local_timers(void)
+</span><span class='line'>{
+</span><span class='line'>&#9;hrtimer_run_queues();
+</span><span class='line'>&#9;raise_softirq(TIMER_SOFTIRQ);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>TIMER_SOFTIRQ的处理函数是run_timer_softirq：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void run_timer_softirq(struct softirq_action *h)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct tvec_base *base = __this_cpu_read(tvec_bases);
+</span><span class='line'>
+</span><span class='line'>&#9;hrtimer_run_pending();
+</span><span class='line'>
+</span><span class='line'>&#9;if (time_after_eq(jiffies, base-&gt;timer_jiffies))
+</span><span class='line'>&#9;&#9;__run_timers(base);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>好啦，终于看到<code>__run_timers</code>函数了，2.2节已经介绍过，正是这个函数完成了对到期定时器的处理工作，也完成了时间轮的不停转动。</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
       <h2 class="entry-title"><a href="/blog/2017/07/23/kernel-clock-4/">Linux时间子系统之四：定时器的引擎：clock_event_device</a></h2>
     
     
@@ -1135,213 +1666,6 @@ var ss360Config = {
 
     </article>
   
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2017/07/23/kernel-clock-2/">Linux时间子系统之二：表示时间的单位和结构</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2017-07-23T13:11:00+08:00'><span class='date'>2017-07-23</span> <span class='time'>13:11:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://blog.csdn.net/droidphone/article/details/7979295">http://blog.csdn.net/droidphone/article/details/7979295</a></p>
-
-<h4>1. jiffies</h4>
-
-<p>内核用jiffies变量记录系统启动以来经过的时钟滴答数，它的声明如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>extern u64 __jiffy_data jiffies_64;
-</span><span class='line'>extern unsigned long volatile __jiffy_data jiffies;</span></code></pre></td></tr></table></div></figure>
-
-
-<p>可见，在32位的系统上，jiffies是一个32位的无符号数，系统每过1/HZ秒，jiffies的值就会加1，最终该变量可能会溢出，所以内核同时又定义了一个64位的变量jiffies_64，链接的脚本保证jiffies变量和jiffies_64变量的内存地址是相同的，通常，我们可以直接访问jiffies变量，但是要获得jiffies_64变量，必须通过辅助函数get_jiffies_64来实现。jiffies是内核的低精度定时器的计时单位，所以内核配置的HZ数决定了低精度定时器的精度，如果HZ数被设定为1000，那么，低精度定时器（timer_list）的精度就是1ms=1/1000秒。因为jiffies变量可能存在溢出的问题，所以在用基于jiffies进行比较时，应该使用以下辅助宏来实现：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>time_after(a,b)
-</span><span class='line'>time_before(a,b)
-</span><span class='line'>time_after_eq(a,b)
-</span><span class='line'>time_before_eq(a,b)
-</span><span class='line'>time_in_range(a,b,c)</span></code></pre></td></tr></table></div></figure>
-
-
-<p>同时，内核还提供了一些辅助函数用于jiffies和毫秒以及纳秒之间的转换：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>unsigned int jiffies_to_msecs(const unsigned long j);
-</span><span class='line'>unsigned int jiffies_to_usecs(const unsigned long j);
-</span><span class='line'>unsigned long msecs_to_jiffies(const unsigned int m);
-</span><span class='line'>unsigned long usecs_to_jiffies(const unsigned int u);</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>2. struct timeval</h4>
-
-<p>timeval由秒和微秒组成，它的定义如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct timeval {
-</span><span class='line'>&#9;__kernel_time_t    tv_sec;         /* seconds */
-</span><span class='line'>&#9;__kernel_suseconds_t  tv_usec; /* microseconds */
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
-
-
-<p><code>__kernel_time_t</code> 和<code>__kernel_suseconds_t</code> 实际上都是long型的整数。gettimeofday和settimeofday使用timeval作为时间单位。</p>
-
-<h3>3. struct timespec</h3>
-
-<p>timespec由秒和纳秒组成，它的定义如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct timespec {
-</span><span class='line'>&#9;__kernel_time_t tv_sec;          /* seconds */
-</span><span class='line'>&#9;long      tv_nsec;         /* nanoseconds */
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
-
-
-<p>同样地，内核也提供了一些辅助函数用于jiffies、timeval、timespec之间的转换：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static inline int timespec_equal(const struct timespec *a, const struct timespec *b);
-</span><span class='line'>static inline int timespec_compare(const struct timespec *lhs, const struct timespec *rhs);
-</span><span class='line'>static inline int timeval_compare(const struct timeval *lhs, const struct timeval *rhs);
-</span><span class='line'>extern unsigned long mktime(const unsigned int year, const unsigned int mon,
-</span><span class='line'>&#9;&#9;&#9;&#9;const unsigned int day, const unsigned int hour,
-</span><span class='line'>&#9;&#9;&#9;&#9;const unsigned int min, const unsigned int sec);
-</span><span class='line'>extern void set_normalized_timespec(struct timespec *ts, time_t sec, s64 nsec);
-</span><span class='line'>static inline struct timespec timespec_add(struct timespec lhs, struct timespec rhs);
-</span><span class='line'>static inline struct timespec timespec_sub(struct timespec lhs, struct timespec rhs);
-</span><span class='line'>
-</span><span class='line'>static inline s64 timespec_to_ns(const struct timespec *ts);
-</span><span class='line'>static inline s64 timeval_to_ns(const struct timeval *tv);
-</span><span class='line'>extern struct timespec ns_to_timespec(const s64 nsec);
-</span><span class='line'>extern struct timeval ns_to_timeval(const s64 nsec);
-</span><span class='line'>static __always_inline void timespec_add_ns(struct timespec *a, u64 ns);</span></code></pre></td></tr></table></div></figure>
-
-
-
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>unsigned long timespec_to_jiffies(const struct timespec *value);
-</span><span class='line'>void jiffies_to_timespec(const unsigned long jiffies, struct timespec *value);
-</span><span class='line'>unsigned long timeval_to_jiffies(const struct timeval *value);
-</span><span class='line'>void jiffies_to_timeval(const unsigned long jiffies, struct timeval *value);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>timekeeper中的xtime字段用timespec作为时间单位。</p>
-
-<h4>4. struct ktime</h4>
-
-<p>linux的通用时间架构用ktime来表示时间，为了兼容32位和64位以及big-little endian系统，ktime结构被定义如下：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>union ktime {
-</span><span class='line'>&#9;s64 tv64;
-</span><span class='line'>#if BITS_PER_LONG != 64 && !defined(CONFIG_KTIME_SCALAR)
-</span><span class='line'>&#9;struct {
-</span><span class='line'># ifdef __BIG_ENDIAN
-</span><span class='line'>&#9;s32 sec, nsec;
-</span><span class='line'># else
-</span><span class='line'>&#9;s32 nsec, sec;
-</span><span class='line'># endif
-</span><span class='line'>&#9;} tv;
-</span><span class='line'>#endif
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
-
-
-<p>64位的系统可以直接访问tv64字段，单位是纳秒，32位的系统则被拆分为两个字段：sec和nsec，并且照顾了大小端的不同。高精度定时器通常用ktime作为计时单位。下面是一些辅助函数用于计算和转换：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>ktime_t ktime_set(const long secs, const unsigned long nsecs); 
-</span><span class='line'>ktime_t ktime_sub(const ktime_t lhs, const ktime_t rhs); 
-</span><span class='line'>ktime_t ktime_add(const ktime_t add1, const ktime_t add2); 
-</span><span class='line'>ktime_t ktime_add_ns(const ktime_t kt, u64 nsec); 
-</span><span class='line'>ktime_t ktime_sub_ns(const ktime_t kt, u64 nsec); 
-</span><span class='line'>ktime_t timespec_to_ktime(const struct timespec ts); 
-</span><span class='line'>ktime_t timeval_to_ktime(const struct timeval tv); 
-</span><span class='line'>struct timespec ktime_to_timespec(const ktime_t kt); 
-</span><span class='line'>struct timeval ktime_to_timeval(const ktime_t kt); 
-</span><span class='line'>s64 ktime_to_ns(const ktime_t kt); 
-</span><span class='line'>int ktime_equal(const ktime_t cmp1, const ktime_t cmp2); 
-</span><span class='line'>s64 ktime_to_us(const ktime_t kt); 
-</span><span class='line'>s64 ktime_to_ms(const ktime_t kt);
-</span><span class='line'>ktime_t ns_to_ktime(u64 ns);</span></code></pre></td></tr></table></div></figure>
-
-
-
-</div>
-  
-  
-
-
-    </article>
-  
   <div class="pagination">
     
       <a class="prev" href="/posts/164">&larr; Older</a>
@@ -1356,7 +1680,7 @@ var ss360Config = {
   
     <section>
 <h1>Categories
-<span class='right_span'>(969)</span>
+<span class='right_span'>(970)</span>
 
 </h1>
 <head>
@@ -1685,8 +2009,8 @@ if (!document.getElementById('kernel~tcp')) document.getElementById('aexp_kernel
 if (!document.getElementById('kernel')) document.getElementById('aexp_kernel').style.visibility = 'hidden';
 if (!document.getElementById('kernel~vpn')) document.getElementById('aexp_kernel~vpn').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/network/'>network</a><a href='##' onmousedown=showDiv('network') id='aexp_network'><span class='exp_style' id='exp_network'>[+]</span></a><span class='right_span'>(9)</span></li>
-<div id='network' class='catsub'><li><a href='/blog/cats/network~base/?opendiv=network'>base</a><a href='##' onmousedown=showDiv('network~base') id='aexp_network~base'><span class='exp_style' id='exp_network~base'>[+]</span></a><span class='right_span'>9</span></li>
+<li class='catclass'><a href='/blog/cats/network/'>network</a><a href='##' onmousedown=showDiv('network') id='aexp_network'><span class='exp_style' id='exp_network'>[+]</span></a><span class='right_span'>(10)</span></li>
+<div id='network' class='catsub'><li><a href='/blog/cats/network~base/?opendiv=network'>base</a><a href='##' onmousedown=showDiv('network~base') id='aexp_network~base'><span class='exp_style' id='exp_network~base'>[+]</span></a><span class='right_span'>10</span></li>
 </div><script language='javascript' type='text/javascript'>
 if (!document.getElementById('network')) document.getElementById('aexp_network').style.visibility = 'hidden';
 if (!document.getElementById('network~base')) document.getElementById('aexp_network~base').style.visibility = 'hidden';
@@ -1798,7 +2122,7 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 
 <section>
 <h1>Date Categories
-<span class='right_span'>(969)</span>
+<span class='right_span'>(970)</span>
 
 </h1>
 <head>
@@ -1806,7 +2130,9 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(89)</span></li>
+<li class='catclass'><a href='/blog/cats/2025/'>2025</a><a href='##' onmousedown=showDiv('2025')><span class='exp_style' id='exp_2025'>[+]</span></a><span class='right_span'>(1)</span></li>
+<div id='2025' class='catsub'><li><a href='/blog/cats/2025~01/?opendiv=2025'>2025-01</a><span class='right_span'>1</span></li>
+</div><li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(89)</span></li>
 <div id='2024' class='catsub'><li><a href='/blog/cats/2024~12/?opendiv=2024'>2024-12</a><span class='right_span'>2</span></li>
 <li><a href='/blog/cats/2024~10/?opendiv=2024'>2024-10</a><span class='right_span'>5</span></li>
 <li><a href='/blog/cats/2024~09/?opendiv=2024'>2024-09</a><span class='right_span'>15</span></li>
@@ -1980,6 +2306,10 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
   <ul id="recent_posts">
     
       <li class="post">
+        <a href="/blog/2025/01/16/network-ac-ap/">如何在ac上telnet到ap</a>
+      </li>
+    
+      <li class="post">
         <a href="/blog/2024/12/12/tools-mysql-bin/">删除MySQL下的bin</a>
       </li>
     
@@ -2013,10 +2343,6 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
     
       <li class="post">
         <a href="/blog/2024/09/20/ffmpeg-mp3/">ffmpeg分离MP3文件报错</a>
-      </li>
-    
-      <li class="post">
-        <a href="/blog/2024/09/20/sqlserver-_/">`_` 通配符 -- 匹配一个字符</a>
       </li>
     
   </ul>
@@ -2116,7 +2442,7 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 
     </div>
   </div>
-  <footer role="contentinfo">  Copyright &copy; 2024 - kk -
+  <footer role="contentinfo">  Copyright &copy; 2025 - kk -
   <span class="credit">Powered by <a href="http://octopress.org">Octopress</a></span>
   <a title="Top" href="#" id="scroll2top" style="position: fixed; height: 50px; bottom: 30px; right: 25px; cursor: pointer; z-index: 9999; display: block; opacity: 1;"><img src="/images/scrollup.png"></a>
   <script src="/javascripts/scroll2top.js"></script>
