@@ -131,7 +131,7 @@ var ss360Config = {
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2015/08/07/cgroup-7/">ns子系统</a></h2>
+      <h2 class="entry-title"><a href="/blog/2015/08/27/kernel-net-napi/">NAPI机制分析</a></h2>
     
     
       <p class="meta">
@@ -140,233 +140,124 @@ var ss360Config = {
 
 
 
-<time class='entry-date' datetime='2015-08-07T17:20:00+08:00'><span class='date'>2015-08-07</span> <span class='time'>17:20:00</span></time>
+<time class='entry-date' datetime='2015-08-27T01:29:00+08:00'><span class='date'>2015-08-27</span> <span class='time'>01:29:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><p><a href="http://www.cnblogs.com/lisperl/archive/2012/04/26/2471776.html">http://www.cnblogs.com/lisperl/archive/2012/04/26/2471776.html</a></p>
+  <div class="entry-content"><p><a href="http://blog.csdn.net/shanshanpt/article/details/20564845">http://blog.csdn.net/shanshanpt/article/details/20564845</a></p>
 
-<p>ns子系统是一个比较特殊的子系统。特殊在哪儿呢，首先ns子系统没有自己的控制文件，其次ns子系统没有属于自己的状态信息，这点从ns子系统的ns_cgroup的定义可以看出：</p>
+<p>NAPI 的核心在于：在一个繁忙网络，每次有网络数据包到达时，不需要都引发中断，因为高频率的中断可能会影响系统的整体效率，假象一个场景，我们此时使用标准的 100M 网卡，可能实际达到的接收速率为 80MBits/s，而此时数据包平均长度为 1500Bytes，则每秒产生的中断数目为：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>80M bits/s / (8 Bits/Byte * 1500 Byte) = 6667 个中断 /s</span></code></pre></td></tr></table></div></figure>
+
+
+<p>每秒 6667 个中断，对于系统是个很大的压力，此时其实可以转为使用轮询 (polling) 来处理，而不是中断;但轮询在网络流量较小的时没有效率，因此低流量时，基于中断的方式则比较合适，这就是 NAPI 出现的原因，在低流量时候使用中断接收数据包，而在高流量时候则使用基于轮询的方式接收。</p>
+
+<p>现在内核中 NIC 基本上已经全部支持 NAPI 功能，由前面的叙述可知，NAPI 适合处理高速率数据包的处理，而带来的好处则是：</p>
+
+<p>  1、中断缓和 (Interrupt mitigation)，由上面的例子可以看到，在高流量下，网卡产生的中断可能达到每秒几千次，而如果每次中断都需要系统来处理，是一个很大的压力，而 NAPI 使用轮询时是禁止了网卡的接收中断的，这样会减小系统处理中断的压力；</p>
+
+<p>  2、数据包节流 (Packet throttling)，NAPI 之前的 Linux NIC 驱动总在接收到数据包之后产生一个 IRQ，接着在中断服务例程里将这个 skb 加入本地的 softnet，然后触发本地 NET_RX_SOFTIRQ 软中断后续处理。如果包速过高，因为 IRQ 的优先级高于 SoftIRQ，导致系统的大部分资源都在响应中断，但 softnet 的队列大小有限，接收到的超额数据包也只能丢掉，所以这时这个模型是在用宝贵的系统资源做无用功。而 NAPI 则在这样的情况下，直接把包丢掉，不会继续将需要丢掉的数据包扔给内核去处理，这样，网卡将需要丢掉的数据包尽可能的早丢弃掉，内核将不可见需要丢掉的数据包，这样也减少了内核的压力。</p>
+
+<p>对NAPI 的使用，一般包括以下的几个步骤：</p>
+
+<p>  1、在中断处理函数中，先禁止接收中断，且告诉网络子系统，将以轮询方式快速收包，其中禁止接收中断完全由硬件功能决定，而告诉内核将以轮询方式处理包则是使用函数 netif_rx_schedule()，也可以使用下面的方式，其中的 netif_rx_schedule_prep 是为了判定现在是否已经进入了轮询模式：</p>
+
+<p>将网卡预定为轮询模式</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void netif_rx_schedule(struct net_device *dev);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>或者</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct ns_cgroup {
-</span><span class='line'>&#9;struct cgroup_subsys_state css;
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (netif_rx_schedule_prep(dev))
+</span><span class='line'>&#9;__netif_rx_schedule(dev);</span></code></pre></td></tr></table></div></figure>
 
 
-<p>它只有一个cgroup_subsys_state成员。</p>
+<p>  2、在驱动中创建轮询函数，它的工作是从网卡获取数据包并将其送入到网络子系统，其原型是：</p>
 
-<p>最后ns子系统的实现也比较简单，只是提供了一个ns_cgroup_clone函数，在copy_process和unshare_nsproxy_namespaces被调用。而ns_cgroup_clone函数本身的实现也很简单，只是在当前的cgroup下创建了一个子cgroup，该子cgroup完全clone了当前cgroup的信息，然后将当前的进程移到新建立的cgroup中。</p>
+<p>NAPI 的轮询方法</p>
 
-<p>这样看来，好像ns子系统没什么意义，其实不然。要想了解ns子系统的意义，就要分析一下ns_cgroup_clone被调用的时机了。我们来看copy_process中的代码：</p>
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int (*poll)(struct net_device *dev, int *budget);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>这里的轮询函数用于在将网卡切换为轮询模式之后，用 poll() 方法处理接收队列中的数据包，如队列为空，则重新切换为中断模式。切换回中断模式需要先关闭轮询模式，使用的是函数 netif_rx_complete ()，接着开启网卡接收中断 .。</p>
+
+<p>退出轮询模式</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void netif_rx_complete(struct net_device *dev);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  3、在驱动中创建轮询函数，需要和实际的网络设备 struct net_device 关联起来，这一般在网卡的初始化时候完成，示例代码如下：</p>
+
+<p>设置网卡支持轮询模式</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if (current-&gt;nsproxy != p-&gt;nsproxy) {
-</span><span class='line'>&#9;retval = ns_cgroup_clone(p, pid);
-</span><span class='line'>&#9;if (retval)
-</span><span class='line'>&#9;&#9;goto bad_fork_free_pid;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>dev-&gt;poll = my_poll;
+</span><span class='line'>dev-&gt;weight = 64;</span></code></pre></td></tr></table></div></figure>
 
 
-<p>copy_process是在do_fork中被调用的，作用在于为子进程复制父进程的相关信息。这段意思就是当前进程（即父进程）和子进程的命名空间不同时，调用ns_cgroup_clone。这样以来，ns子系统的作用就清楚了，ns子系统实际上是提供了一种同命名空间的进程聚类的机制。具有相同命名空间的进程会在相同cgroup中。</p>
+<p>里面另外一个字段为权重 (weight)，该值并没有一个非常严格的要求，实际上是个经验数据，一般 10Mb 的网卡，我们设置为 16，而更快的网卡，我们则设置为 64。</p>
 
-<p>那什么时候，父进程fork出的子进程会拥有不同的命名空间呢，这就设计到了Linux的命名空间的机制了，在这里就不详细讲了。简单说来就是，在调用fork时，加入了特殊flag（比如NEWPID,NEWNS）时，内核会为子进程创建不同的命令空间。</p>
+<p>NAPI的一些相关Interface</p>
 
-<p>除了这种情况外，ns_cgroup_clone在unshare_nsproxy_namespaces用到了。unshare_nsproxy_namespaces函数被sys_unshare调用，实际上是对unshare系统调用的实现。当指定相应标记时，unshare系统调用会为调用的进程创建不同的命名空间，因此调用ns_cgroup_clone为其创建新的cgroup。</p>
-</div>
-  
-  
-
-
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2015/08/07/cgroup-6/">freezer子系统</a></h2>
-    
-    
-      <p class="meta">
-        
-
-
-
-
-<time class='entry-date' datetime='2015-08-07T17:15:00+08:00'><span class='date'>2015-08-07</span> <span class='time'>17:15:00</span></time>
-        
-      </p>
-    
-  </header>
-
-
-  <div class="entry-content"><p><a href="http://www.cnblogs.com/lisperl/archive/2012/04/25/2469587.html">http://www.cnblogs.com/lisperl/archive/2012/04/25/2469587.html</a></p>
-
-<p>freezer子系统用于挂起和恢复cgroup中的进程。freezer有一个控制文件：freezer.state，将FROZEN写入该文件，可以将cgroup中的进程挂起，将THAWED写入该文件，可以将已挂起的进程恢复。该文件可能读出的值有三种，其中两种就是前面已提到的FROZEN和THAWED，分别代表进程已挂起和已恢复（正常运行），还有一种可能的值为FREEZING，显示该值表示该cgroup中有些进程现在不能被frozen。当这些不能被frozen的进程从该cgroup中消失的时候，FREEZING会变成FROZEN，或者手动将FROZEN或THAWED写入一次。</p>
-
-<p>Freezer子系统用来管理cgroup状态的数据结构：</p>
+<p>下面是 NAPI 功能的一些接口，在前面都基本有涉及，我们简单看看：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct freezer {
-</span><span class='line'>&#9;struct cgroup_subsys_state css;
-</span><span class='line'>&#9;enum freezer_state state;
-</span><span class='line'>&#9;spinlock_t lock; /* protects _writes_ to state */
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>netif_rx_schedule(dev)</span></code></pre></td></tr></table></div></figure>
 
 
-<p>其中内嵌一个cgroup_subsys_state，便于从cgroup或task获得freezer结构，另一个字段存储cgroup当前的状态。</p>
-
-<p>Freezer子系统是通过对freezer.state文件进行写入来控制进程的，那我们就从这个文件的cftype定义出发。</p>
+<p>在网卡的中断处理函数中调用，用于将网卡的接收模式切换为轮询</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static struct cftype files[] = {
-</span><span class='line'>&#9;{
-</span><span class='line'>&#9;&#9;.name = "state",
-</span><span class='line'>&#9;&#9;.read_seq_string = freezer_read,
-</span><span class='line'>&#9;&#9;.write_string = freezer_write,
-</span><span class='line'>&#9;},
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>netif_rx_schedule_prep(dev)</span></code></pre></td></tr></table></div></figure>
 
 
-<p>从文件读取是freezer_read实现的，该函数比较简单，主要就是从freezer结构体从读出状态，但是对FREEZING状态做了特殊处理：</p>
+<p>在网卡是 Up 且运行状态时，将该网卡设置为准备将其加入到轮询列表的状态，可以将该函数看做是 netif_rx_schedule(dev) 的前半部分</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>state = freezer-&gt;state;
-</span><span class='line'>if (state == CGROUP_FREEZING) {
-</span><span class='line'>&#9;/* We change from FREEZING to FROZEN lazily if the cgroup was
-</span><span class='line'>&#9; * only partially frozen when we exitted write. */
-</span><span class='line'>&#9;update_freezer_state(cgroup, freezer);
-</span><span class='line'>&#9;state = freezer-&gt;state;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>__netif_rx_schedule(dev)</span></code></pre></td></tr></table></div></figure>
 
 
-<p>如果是FREEZING状态，则需要更新状态（因为之前不能frozen的进程可能已经不在了）。我们来看update_freezer_state：</p>
+<p>将设备加入轮询列表，前提是需要 netif_schedule_prep(dev) 函数已经返回了 1</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>cgroup_iter_start(cgroup, &it);
-</span><span class='line'>while ((task = cgroup_iter_next(cgroup, &it))) {
-</span><span class='line'>&#9;ntotal++;
-</span><span class='line'>&#9;if (is_task_frozen_enough(task))
-</span><span class='line'>&#9;&#9;nfrozen++;
-</span><span class='line'>}
-</span><span class='line'> 
-</span><span class='line'>/*
-</span><span class='line'> * Transition to FROZEN when no new tasks can be added ensures
-</span><span class='line'> * that we never exist in the FROZEN state while there are unfrozen
-</span><span class='line'> * tasks.
-</span><span class='line'> */
-</span><span class='line'>if (nfrozen == ntotal)
-</span><span class='line'>&#9;freezer-&gt;state = CGROUP_FROZEN;
-</span><span class='line'>else if (nfrozen &gt; 0)
-</span><span class='line'>&#9;freezer-&gt;state = CGROUP_FREEZING;
-</span><span class='line'>else
-</span><span class='line'>&#9;freezer-&gt;state = CGROUP_THAWED;
-</span><span class='line'>cgroup_iter_end(cgroup, &it);</span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>__netif_rx_schedule_prep(dev)</span></code></pre></td></tr></table></div></figure>
 
 
-<p>这里对该cgroup所有的进程迭代了一遍，分别统计进程数和已经frozen的进程数，然后根据统计结果改变状态。</p>
-
-<p>下面我们来看对freezer.state写入的情况，该情况由freezer_write来处理，该函数中从写入值获取目标状态，然后调用freezer_change_state(cgroup, goal_state)来完成操作。在freezer_change_state中，根据goal_state分别调用不同的实现函数：</p>
+<p>与 netif_rx_schedule_prep(dev) 相似，但是没有判断网卡设备是否 Up 及运行，不建议使用</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>switch (goal_state) {
-</span><span class='line'>case CGROUP_THAWED:
-</span><span class='line'>&#9;unfreeze_cgroup(cgroup, freezer);
-</span><span class='line'>&#9;break;
-</span><span class='line'>case CGROUP_FROZEN:
-</span><span class='line'>&#9;retval = try_to_freeze_cgroup(cgroup, freezer);
-</span><span class='line'>&#9;break;
-</span><span class='line'>default:
-</span><span class='line'>&#9;BUG();
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>netif_rx_complete(dev)</span></code></pre></td></tr></table></div></figure>
 
 
-<p>我们先来看frozen的情况，该情况由try_to_freeze_cgroup来处理，该函数中有：</p>
+<p>用于将网卡接口从轮询列表中移除，一般在轮询函数完成之后调用该函数。</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>freezer-&gt;state = CGROUP_FREEZING;
-</span><span class='line'>cgroup_iter_start(cgroup, &it);
-</span><span class='line'>while ((task = cgroup_iter_next(cgroup, &it))) {
-</span><span class='line'>&#9;if (!freeze_task(task, true))
-</span><span class='line'>&#9;&#9;continue;
-</span><span class='line'>&#9;if (is_task_frozen_enough(task))
-</span><span class='line'>&#9;&#9;continue;
-</span><span class='line'>&#9;if (!freezing(task) && !freezer_should_skip(task))
-</span><span class='line'>&#9;&#9;num_cant_freeze_now++;
-</span><span class='line'>}
-</span><span class='line'>cgroup_iter_end(cgroup, &it);
-</span><span class='line'> 
-</span><span class='line'>return num_cant_freeze_now ? -EBUSY : 0;</span></code></pre></td></tr></table></div></figure>
+</pre></td><td class='code'><pre><code class=''><span class='line'>__netif_rx_complete(dev)</span></code></pre></td></tr></table></div></figure>
 
 
-<p>首先将当前状态设成CGROUP_FREEZING，然后对cgroup中的进程进行迭代，while循环中对进程进行freeze操作，如果成功直接进行下一次迭代，如果不成功则进行进一步的判断，如果是进程已经frozen了，那也直接进行下一次迭代，如果不是，则进行计数。最后根据计数结果进行返回，如果所有进程都顺利frozen，则返回0，否则返回-EBUSY表示有进程不能被frozen。</p>
+<h4>Newer newer NAPI</h4>
 
-<p>下面我们来看free_task这个函数，在这个函数中对task进行freeze操作。</p>
+<p>其实之前的 NAPI(New API) 这样的命名已经有点让人忍俊不禁了，可见 Linux 的内核极客们对名字的掌控，比对代码的掌控差太多，于是乎，连续的两次对 NAPI 的重构，被戏称为 Newer newer NAPI 了。</p>
+
+<p>与 netif_rx_complete(dev) 类似，但是需要确保本地中断被禁止</p>
+
+<p>Newer newer NAPI</p>
+
+<p>在最初实现的 NAPI 中，有 2 个字段在结构体 net_device 中，分别为轮询函数 poll() 和权重 weight，而所谓的 Newer newer NAPI，是在 2.6.24 版内核之后，对原有的 NAPI 实现的几次重构，其核心是将 NAPI 相关功能和 net_device 分离，这样减少了耦合，代码更加的灵活，因为 NAPI 的相关信息已经从特定的网络设备剥离了，不再是以前的一对一的关系了。例如有些网络适配器，可能提供了多个 port，但所有的 port 却是共用同一个接受数据包的中断，这时候，分离的 NAPI 信息只用存一份，同时被所有的 port 来共享，这样，代码框架上更好地适应了真实的硬件能力。Newer newer NAPI 的中心结构体是napi_struct:</p>
+
+<p>NAPI 结构体</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -389,112 +280,96 @@ var ss360Config = {
 <span class='line-number'>19</span>
 <span class='line-number'>20</span>
 <span class='line-number'>21</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if (!freezing(p)) {
-</span><span class='line'>&#9;rmb();
-</span><span class='line'>&#9;if (frozen(p))
-</span><span class='line'>&#9;&#9;return false;
-</span><span class='line'> 
-</span><span class='line'>&#9;if (!sig_only || should_send_signal(p))
-</span><span class='line'>&#9;&#9;set_freeze_flag(p);
-</span><span class='line'>&#9;else
-</span><span class='line'>&#9;&#9;return false;
-</span><span class='line'>}
-</span><span class='line'> 
-</span><span class='line'>if (should_send_signal(p)) {
-</span><span class='line'>&#9;if (!signal_pending(p))
-</span><span class='line'>&#9;&#9;fake_signal_wake_up(p);
-</span><span class='line'>} else if (sig_only) {
-</span><span class='line'>&#9;return false;
-</span><span class='line'>} else {
-</span><span class='line'>&#9;wake_up_state(p, TASK_INTERRUPTIBLE);
-</span><span class='line'>}
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>/* 
+</span><span class='line'> * Structure for NAPI scheduling similar to tasklet but with weighting 
+</span><span class='line'>*/ 
+</span><span class='line'>struct napi_struct { 
+</span><span class='line'>&#9;/* The poll_list must only be managed by the entity which 
+</span><span class='line'>&#9; * changes the state of the NAPI_STATE_SCHED bit.  This means 
+</span><span class='line'>&#9; * whoever atomically sets that bit can add this napi_struct 
+</span><span class='line'>&#9; * to the per-cpu poll_list, and whoever clears that bit 
+</span><span class='line'>&#9; * can remove from the list right before clearing the bit. 
+</span><span class='line'>&#9; */ 
+</span><span class='line'>&#9;struct list_head      poll_list; 
 </span><span class='line'>
-</span><span class='line'>return true;</span></code></pre></td></tr></table></div></figure>
-
-
-<p>首先检查进程是不是已经被标记为正在freezing，如果不是再做判断。如果进程已经被frozen，则返回false。如果进程不是sig_only的或者可以发送信号（即进程无PF_FREEZER_NOSIG 标记），则设置进程的TIF_FREEZE标记。</p>
-
-<p>然后根据进程是否有PF_FREEZER_NOSIG 标记进行进一步处理，如果无这个标记，则给进程发送一个信号，唤醒进程，让进程处理TIF_FREEZE，即进行freeze操作，如果有这个标记，则如果进程是sig_only的，返回false（即不能完成free操作），否则直接唤醒进程去处理TIF_FREEZE。</p>
-
-<p>总结一下，对于我们这个freezer子系统的调用来说，sig_only=true，那么能成功的执行过程就是set_freeze_flag(p)->fake_signal_wake_up(p)。</p>
-
-<p>下面我们来看thaw 进程的情况，该情况由unfreeze_cgroup处理，在unfreeze_cgroup中有</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>cgroup_iter_start(cgroup, &it);
-</span><span class='line'>while ((task = cgroup_iter_next(cgroup, &it))) {
-</span><span class='line'>&#9;thaw_process(task);
-</span><span class='line'>}
-</span><span class='line'>cgroup_iter_end(cgroup, &it);
-</span><span class='line'> 
-</span><span class='line'>freezer-&gt;state = CGROUP_THAWED;</span></code></pre></td></tr></table></div></figure>
-
-
-<p>对该cgroup中所有的进程调用thaw_process，我们来看thaw_process。该函数中有：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if (__thaw_process(p) == 1) {
-</span><span class='line'>&#9;task_unlock(p);
-</span><span class='line'>&#9;wake_up_process(p);
-</span><span class='line'>&#9;return 1;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<p>其中__thaw_process中</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>if (frozen(p)) {
-</span><span class='line'>&#9;p-&gt;flags &= ~PF_FROZEN;
-</span><span class='line'>&#9;return 1;
-</span><span class='line'>}
-</span><span class='line'>clear_freeze_flag(p);</span></code></pre></td></tr></table></div></figure>
-
-
-<p>如果进程已经frozen，则清掉其frozen标记，如果不是的话，说明进程已经设置了TIF_FREEZE，但还没有frozen，所以只需要清掉TIF_FREEZE即可。</p>
-
-<p>回到thaw_process中，清掉了相关标记后，只需要唤醒进程，然后内核会自动处理。</p>
-
-<p>最后，我们再来看看freezer子系统结构体的定义：</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct cgroup_subsys freezer_subsys = {
-</span><span class='line'>&#9;.name = "freezer",
-</span><span class='line'>&#9;.create = freezer_create,
-</span><span class='line'>&#9;.destroy = freezer_destroy,
-</span><span class='line'>&#9;.populate = freezer_populate,
-</span><span class='line'>&#9;.subsys_id = freezer_subsys_id,
-</span><span class='line'>&#9;.can_attach = freezer_can_attach,
-</span><span class='line'>&#9;.attach = NULL,
-</span><span class='line'>&#9;.fork = freezer_fork,
-</span><span class='line'>&#9;.exit = NULL,
+</span><span class='line'>&#9;unsigned long          state; 
+</span><span class='line'>&#9;int              weight; 
+</span><span class='line'>&#9;int              (*poll)(struct napi_struct *, int); 
+</span><span class='line'> #ifdef CONFIG_NETPOLL 
+</span><span class='line'>&#9;spinlock_t          poll_lock; 
+</span><span class='line'>&#9;int              poll_owner; 
+</span><span class='line'> #endif 
+</span><span class='line'>
+</span><span class='line'>&#9;unsigned int          gro_count; 
+</span><span class='line'>
+</span><span class='line'>&#9;struct net_device      *dev; 
+</span><span class='line'>&#9;struct list_head      dev_list; 
+</span><span class='line'>&#9;struct sk_buff          *gro_list; 
+</span><span class='line'>&#9;struct sk_buff          *skb; 
 </span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
 
 
-<p>这里说一下can_attach，can_attach是在一个进程加入到一个cgroup之前调用的，检查是否可以attach，freezer_can_attach中对cgroup当前的状态做了检查，如果是frozen就返回错误，这说明不能将一个进程加入到一个frozen的cgroup。</p>
+<p>熟悉老的 NAPI 接口实现的话，里面的字段 poll_list、state、weight、poll、dev、没什么好说的，gro_count 和 gro_list 会在后面讲述 GRO 时候会讲述。需要注意的是，与之前的 NAPI 实现的最大的区别是该结构体不再是 net_device 的一部分，事实上，现在希望网卡驱动自己单独分配与管理 napi 实例，通常将其放在了网卡驱动的私有信息，这样最主要的好处在于，如果驱动愿意，可以创建多个 napi_struct，因为现在越来越多的硬件已经开始支持多接收队列 (multiple receive queues)，这样，多个 napi_struct 的实现使得多队列的使用也更加的有效。</p>
+
+<p>与最初的 NAPI 相比较，轮询函数的注册有些变化，现在使用的新接口是：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void netif_napi_add(struct net_device *dev, struct napi_struct *napi, 
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;int (*poll)(struct napi_struct *, int), int weight)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>熟悉老的 NAPI 接口的话，这个函数也没什么好说的。</p>
+
+<p>值得注意的是，前面的轮询 poll() 方法原型也开始需要一些小小的改变：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int (*poll)(struct napi_struct *napi, int budget);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>大部分 NAPI 相关的函数也需要改变之前的原型，下面是打开轮询功能的 API：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void netif_rx_schedule(struct net_device *dev, 
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;struct napi_struct *napi); 
+</span><span class='line'>/* ...or... */ 
+</span><span class='line'>int netif_rx_schedule_prep(struct net_device *dev, 
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;struct napi_struct *napi); 
+</span><span class='line'>void __netif_rx_schedule(struct net_device *dev, 
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;struct napi_struct *napi);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>轮询功能的关闭则需要使用：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void netif_rx_complete(struct net_device *dev, 
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;struct napi_struct *napi);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>因为可能存在多个 napi_struct 的实例，要求每个实例能够独立的使能或者禁止，因此，需要驱动作者保证在网卡接口关闭时，禁止所有的 napi_struct 的实例。</p>
+
+<p>函数 netif_poll_enable() 和 netif_poll_disable() 不再需要，因为轮询管理不再和 net_device 直接管理，取而代之的是下面的两个函数：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void napi_enable(struct napi *napi); 
+</span><span class='line'>void napi_disable(struct napi *napi);</span></code></pre></td></tr></table></div></figure>
+
+
+
 </div>
   
   
@@ -507,7 +382,7 @@ var ss360Config = {
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2015/08/07/cgroup-5/">devices子系统</a></h2>
+      <h2 class="entry-title"><a href="/blog/2015/08/25/kernel-net-ipv4/">linux下ip协议(V4)的实现</a></h2>
     
     
       <p class="meta">
@@ -516,44 +391,80 @@ var ss360Config = {
 
 
 
-<time class='entry-date' datetime='2015-08-07T16:54:00+08:00'><span class='date'>2015-08-07</span> <span class='time'>16:54:00</span></time>
+<time class='entry-date' datetime='2015-08-25T23:34:00+08:00'><span class='date'>2015-08-25</span> <span class='time'>23:34:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><p><a href="http://www.cnblogs.com/lisperl/archive/2012/04/24/2468170.html">http://www.cnblogs.com/lisperl/archive/2012/04/24/2468170.html</a></p>
+  <div class="entry-content"><p>这次主要介绍的是ip层的切片与组包的实现。</p>
 
-<p>使用devices 子系统可以允许或者拒绝cgroup中的进程访问设备。devices子系统有三个控制文件：devices.allow,devices.deny,devices.list。devices.allow用于指定cgroup中的进程可以访问的设备,devices.deny用于指定cgroup中的进程不能访问的设备，devices.list用于报告cgroup中的进程访问的设备。devices.allow文件中包含若干条目，每个条目有四个字段：type、major、minor 和 access。type、major 和 minor 字段中使用的值对应 Linux 分配的设备。</p>
+<p>首先来看一下分片好的帧的一些概念：</p>
 
-<p>type指定设备类型：<br/>
-a - 应用所有设备，可以是字符设备，也可以是块设备<br/>
-b- 指定块设备<br/>
-c - 指定字符设备</p>
+<p>1 第一个帧的offset位非0并且MF位为1</p>
 
-<p>major和minor指定设备的主次设备号。</p>
+<p>2 所有的在第一个帧和最后一个帧之间的帧都拥有长度大于0的域</p>
 
-<p>access 则指定相应的权限：<br/>
-r - 允许任务从指定设备中读取<br/>
-w - 允许任务写入指定设备<br/>
-m - 允许任务生成还不存在的设备文件</p>
+<p>3 最后一个帧MF位为0 并且offset位非0。(这样就能判断是否是最后一个帧了).</p>
 
-<p>devices子系统是通过提供device whilelist 来实现的。与其他子系统一样，devices子系统也有一个内嵌了cgroup_subsystem_state的结构来管理资源。在devices子系统中，这个结构是：</p>
+<p>这里要注意在linux中，ip头的frag_off域包含了 rfcip头的定义中的nf,df,以及offset域，因此我们每次需要按位与来取得相应的域的值,看下面</p>
+
+<p>ip_local_deliver的代码片段就清楚了：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
 <span class='line-number'>3</span>
 <span class='line-number'>4</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct dev_cgroup {
-</span><span class='line'>&#9;struct cgroup_subsys_state css;
-</span><span class='line'>&#9;struct list_head whitelist;
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>&#9;// 取出mf位和offset域，从而决定是否要组包。
+</span><span class='line'>&#9;if (ip_hdr(skb)-&gt;frag_off & htons(IP_MF | IP_OFFSET)) {
+</span><span class='line'>&#9;&#9;if (ip_defrag(skb, IP_DEFRAG_LOCAL_DELIVER))
+</span><span class='line'>&#9;&#9;&#9;return 0;
+</span><span class='line'>&#9;}</span></code></pre></td></tr></table></div></figure>
 
 
-<p>这个结构体除了通用的cgroup_subsystem_state之外，就只有一个链表指针，而这个链表指针指向了该cgroup中的进程可以访问的devices whilelist。</p>
+<p>而fragmentation/defragmentation 子系统的初始化是通过ipfrag_init来实现了，而它是被inet_init来调用的。它主要做的是注册sys文件系统节点，并开启一个定时器，以及初始化一些相关的变量.这个函数的初始化以及相关的数据结构的详细介绍，我们会在后面的组包小节中介绍。现在我们先来看切片的处理。</p>
 
-<p>下面我们来看一下devices子系统如何管理whilelist。在devices子系统中，定义了一个叫dev_whitelist_item的结构来管理可以访问的device，对应于devices.allow中的一个条目。这个结构体的定义如下：</p>
+<p>相对于组包，切片逻辑什么的都比较简单。切片的主要函数是ip_fragment.它的输入包包括下面几种：</p>
+
+<p>1 要被转发的包(没有切片的)。</p>
+
+<p>2 要被转发的包(已经被路由器或者源主机切片了的).</p>
+
+<p>3 被本地函数所创建的buffer，简而言之也就是本地所要传输的数据包(还未加包头)，但是需要被切片的。</p>
+
+<p>而ip_fragment所必须处理下面几种情况：</p>
+
+<p>1 一大块数据需要被分割为更小的部分。</p>
+
+<p>2 一堆数据片段(我的上篇blog有介绍，也就是ip_append_data已经切好的数据包，或者tcp已经切好的数据包)不需要再被切片。</p>
+
+<p>上面的两种情况其实就是看高层(4层)协议有没有做切片工作(按照PMTU）了。如果已经被切片(其实也算不上切片(4层不能处理ip头)，只能说i4层为了ip层更好的处理数据包，从而帮ip层做了一部分工作)，则ip层所做的很简单，就是给每个包加上ip头就可以了。</p>
+
+<p>切片分为两种类型，一种是fast (或者说 efficient)切片，这种也就是4层已经切好片，这里只需要加上ip头就可以了，一种是slow切片，也就是需要现在切片。</p>
+
+<p>下来来看切片的主要任务：</p>
+
+<p>1 将数据包切片为MTU大小(通过ptmu).</p>
+
+<p>2 初始化每一个fragment的ip 头。还要判断一些option的copy位，因为并不是每一种option都要放在所有已切片的fragment 的ip头中的。</p>
+
+<p>3 计算ip层的校验值。</p>
+
+<p>4 通过netfilter过滤。</p>
+
+<p>5 update 一些kernel 域以及snmp 统计值。</p>
+
+<p>接下来来看ip_fragment的具体实现：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int ip_fragment(struct sk_buff *skb, int (*output)(struct sk_buff*))</span></code></pre></td></tr></table></div></figure>
+
+
+<p>第一个参数skb表示将要被切片的ip包，第二个参数是一个传输切片的输出函数(切片完毕后就交给这个函数处理)。比如ip_finish_output2类似的。</p>
+
+<p>这个函数我们来分段看，首先来看它进行切片前的一些准备工作：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -562,42 +473,97 @@ m - 允许任务生成还不存在的设备文件</p>
 <span class='line-number'>5</span>
 <span class='line-number'>6</span>
 <span class='line-number'>7</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct dev_whitelist_item {
-</span><span class='line'>&#9;u32 major, minor;
-</span><span class='line'>&#9;short type;
-</span><span class='line'>&#9;short access;
-</span><span class='line'>&#9;struct list_head list;
-</span><span class='line'>&#9;struct rcu_head rcu;
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>&#9;// 先是取出了一些下面将要使用的变量。
+</span><span class='line'>&#9;struct iphdr *iph;
+</span><span class='line'>&#9;int raw = 0;
+</span><span class='line'>&#9;int ptr;
+</span><span class='line'>&#9;struct net_device *dev;
+</span><span class='line'>&#9;struct sk_buff *skb2;
+</span><span class='line'>&#9;unsigned int mtu, hlen, left, len, ll_rs, pad;
+</span><span class='line'>&#9;int offset;
+</span><span class='line'>&#9;__be16 not_last_frag;
+</span><span class='line'>&#9;// 路由表
+</span><span class='line'>&#9;struct rtable *rt = skb-&gt;rtable;
+</span><span class='line'>&#9;int err = 0;
+</span><span class='line'>&#9;// 网络设备
+</span><span class='line'>&#9;dev = rt-&gt;u.dst.dev;
+</span><span class='line'>
+</span><span class='line'>&#9;// ip头
+</span><span class='line'>&#9;iph = ip_hdr(skb);
+</span><span class='line'>&#9;// 判断DF位，我们知道如果df位被设置了话就表示不要被切片，这时ip_fragment将会发送一个icmp豹纹返回到源主机。这里主要是为forward数据所判断。
+</span><span class='line'>&#9;if (unlikely((iph-&gt;frag_off & htons(IP_DF)) && !skb-&gt;local_df)) {
+</span><span class='line'>&#9;&#9;IP_INC_STATS(dev_net(dev), IPSTATS_MIB_FRAGFAILS);
+</span><span class='line'>&#9;&#9;icmp_send(skb, ICMP_DEST_UNREACH, ICMP_FRAG_NEEDED,
+</span><span class='line'>&#9;&#9;&#9;  htonl(ip_skb_dst_mtu(skb)));
+</span><span class='line'>&#9;&#9;kfree_skb(skb);
+</span><span class='line'>&#9;&#9;return -EMSGSIZE;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;// 得到ip头的长度
+</span><span class='line'>&#9;hlen = iph-&gt;ihl * 4;
+</span><span class='line'>&#9;// 得到mtu的大小。这里要注意，他的大小减去了hlen，也就是ip头的大小。
+</span><span class='line'>&#9;mtu = dst_mtu(&rt-&gt;u.dst) - hlen;    /* Size of data space */
+</span><span class='line'>&#9;IPCB(skb)-&gt;flags |= IPSKB_FRAG_COMPLETE;</span></code></pre></td></tr></table></div></figure>
 
 
-<p>major，minor用于指定设备的主次设备号，type用于指定设备类型，type取值可以是：</p>
+<p>不管是slow还是fast 被切片的任何一个帧如果传输失败，ip_fragment都会立即返回一个错误给4层，并且紧跟着的帧也不会再被传输，然后将处理方法交给4层去做。</p>
+
+<p>接下来我们来看fast 切片。 一般用fast切片的都是经由4层的ip_append_data和ip_push_pending函数(udp)将数据包已经切片好的，或者是tcp层已经切片好的数据包，才会用fast切片.</p>
+
+<p>这里要主要几个问题：<br/>
+1 每一个切片的大小都不能超过PMTU。<br/>
+2 只有最后一个切片才会有3层的整个数据包的大小。<br/>
+3 每一个切片都必须有足够的大小来允许2层加上自己的头。</p>
+
+<p>我们先看一下skb_pagelen这个函数(下面的处理会用到),这个函数用来得到当前skb的len，首先我们要知道(我前面的blog有介绍)在sk_write_queue的sk_buff队列中，每一个sk_buff的len = x(也就是么一个第一个切片的包的l4 payload的长度) + S1 (这里表示所有的frags域的数据的总大小，也就是data_len的长度)。可以先看下面的图：</p>
+
+<p><img src="/images/kernel/2015-08-25-21.jpg" alt="" /></p>
+
+<p>很容易一目了然。</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
 <span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#define DEV_BLOCK 1
-</span><span class='line'>#define DEV_CHAR  2
-</span><span class='line'>#define DEV_ALL   4 </span></code></pre></td></tr></table></div></figure>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static inline int skb_pagelen(const struct sk_buff *skb)
+</span><span class='line'>{
+</span><span class='line'>&#9;int i, len = 0;
+</span><span class='line'>&#9;// 我们知道如果设备支持S/G IO的话，nr_frags会包含一些L4 payload，因此我们需要先遍历nr_frags.然后加入它的长度。
+</span><span class='line'>&#9;for (i = (int)skb_shinfo(skb)-&gt;nr_frags - 1; i &gt;= 0; i--)
+</span><span class='line'>&#9;&#9;len += skb_shinfo(skb)-&gt;frags[i].size;
+</span><span class='line'>&#9;// 最后加上skb_headlen,而skb_headlen = skb-&gt;len - skb-&gt;data_len;因此这里就会返回这个数据包的len。
+</span><span class='line'>&#9;return len + skb_headlen(skb);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
-<p>对应于之前devices.allow文件中三种情况。</p>
 
-<p>access用于相应的访问权限,access取值可以是:</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>#define ACC_MKNOD 1
-</span><span class='line'>#define ACC_READ  2
-</span><span class='line'>#define ACC_WRITE 4</span></code></pre></td></tr></table></div></figure>
-
-
-<p>也和之前devices.allow文件中的情况对应。</p>
-
-<p>List字段用于将该结构体连到相应的dev_cgroup中whitelist指向的链表。</p>
-
-<p>通过以上数据结构，devices子系统就能管理一个cgroup的进程可以访问的devices了。 光有数据结构还不行，还要有具体实现才行。devices子系统通过实现两个函数供内核调用来实现控制cgroup中的进程能够访问的devices。首先我们来第一个函数：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -639,51 +605,190 @@ m - 允许任务生成还不存在的设备文件</p>
 <span class='line-number'>38</span>
 <span class='line-number'>39</span>
 <span class='line-number'>40</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>int devcgroup_inode_permission(struct inode *inode, int mask)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct dev_cgroup *dev_cgroup;
-</span><span class='line'>&#9;struct dev_whitelist_item *wh;
-</span><span class='line'> 
-</span><span class='line'>&#9;dev_t device = inode-&gt;i_rdev;
-</span><span class='line'>&#9;if (!device)
-</span><span class='line'>&#9;&#9;return 0;
-</span><span class='line'>&#9;if (!S_ISBLK(inode-&gt;i_mode) && !S_ISCHR(inode-&gt;i_mode))
-</span><span class='line'>&#9;&#9;return 0;
-</span><span class='line'> 
-</span><span class='line'>&#9;rcu_read_lock();
-</span><span class='line'> 
-</span><span class='line'>&#9;dev_cgroup = task_devcgroup(current);
-</span><span class='line'> 
-</span><span class='line'>&#9;list_for_each_entry_rcu(wh, &dev_cgroup-&gt;whitelist, list) {
-</span><span class='line'>&#9;&#9;if (wh-&gt;type & DEV_ALL)
-</span><span class='line'>&#9;&#9;&#9;goto found;
-</span><span class='line'>&#9;&#9;if ((wh-&gt;type & DEV_BLOCK) && !S_ISBLK(inode-&gt;i_mode))
-</span><span class='line'>&#9;&#9;&#9;continue;
-</span><span class='line'>&#9;&#9;if ((wh-&gt;type & DEV_CHAR) && !S_ISCHR(inode-&gt;i_mode))
-</span><span class='line'>&#9;&#9;&#9;continue;
-</span><span class='line'>&#9;&#9;if (wh-&gt;major != ~0 && wh-&gt;major != imajor(inode))
-</span><span class='line'>&#9;&#9;&#9;continue;
-</span><span class='line'>&#9;&#9;if (wh-&gt;minor != ~0 && wh-&gt;minor != iminor(inode))
-</span><span class='line'>&#9;&#9;&#9;continue;
-</span><span class='line'> 
-</span><span class='line'>&#9;&#9;if ((mask & MAY_WRITE) && !(wh-&gt;access & ACC_WRITE))
-</span><span class='line'>&#9;&#9;&#9;continue;
-</span><span class='line'>&#9;&#9;if ((mask & MAY_READ) && !(wh-&gt;access & ACC_READ))
-</span><span class='line'>&#9;&#9;&#9;continue;
-</span><span class='line'>&#9;&#9;found:
-</span><span class='line'>&#9;&#9;&#9;rcu_read_unlock();
-</span><span class='line'>&#9;&#9;return 0;
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+<span class='line-number'>82</span>
+<span class='line-number'>83</span>
+<span class='line-number'>84</span>
+<span class='line-number'>85</span>
+<span class='line-number'>86</span>
+<span class='line-number'>87</span>
+<span class='line-number'>88</span>
+<span class='line-number'>89</span>
+<span class='line-number'>90</span>
+<span class='line-number'>91</span>
+<span class='line-number'>92</span>
+<span class='line-number'>93</span>
+<span class='line-number'>94</span>
+<span class='line-number'>95</span>
+<span class='line-number'>96</span>
+<span class='line-number'>97</span>
+<span class='line-number'>98</span>
+<span class='line-number'>99</span>
+<span class='line-number'>100</span>
+<span class='line-number'>101</span>
+<span class='line-number'>102</span>
+<span class='line-number'>103</span>
+<span class='line-number'>104</span>
+<span class='line-number'>105</span>
+<span class='line-number'>106</span>
+<span class='line-number'>107</span>
+<span class='line-number'>108</span>
+<span class='line-number'>109</span>
+<span class='line-number'>110</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>&#9;// 通过上一篇blog我们知道，如果4层将数据包分片了，那么就会把这些数据包放到skb的frag_list链表中，因此我们这里首先先判断frag_list链表是否为空，为空的话我们将会进行slow 切片。
+</span><span class='line'>&#9;if (skb_shinfo(skb)-&gt;frag_list) {
+</span><span class='line'>&#9;&#9;struct sk_buff *frag;
+</span><span class='line'>&#9;&#9;// 取得第一个数据报的len.我们知道当sk_write_queue队列被flush后，除了第一个切好包的另外的包都会加入到frag_list中，而这里我们我们需要得到的第一个包(也就是本身这个sk_buff）的长度。
+</span><span class='line'>&#9;&#9;int first_len = skb_pagelen(skb);
+</span><span class='line'>&#9;&#9;int truesizes = 0;
+</span><span class='line'>&#9;&#9;// 接下来的判断都是为了确定我们能进行fast切片。切片不能被共享，这是因为在fast path 中，我们需要加给每个切片不同的ip头(而并不会复制每个切片)。因此在fast path中是不可接受的。而在slow path中，就算有共享也无所谓，因为他会复制每一个切片，使用一个新的buff。
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;// 判断第一个包长度是否符合一些限制(包括mtu，mf位等一些限制).如果第一个数据报的len没有包含mtu的大小这里之所以要把第一个切好片的数据包单独拿出来检测，是因为一些域是第一个包所独有的(比如IP_MF要为1）。这里由于这个mtu是不包括hlen的mtu，因此我们需要减去一个hlen。
+</span><span class='line'>&#9;&#9;if (first_len - hlen &gt; mtu ||
+</span><span class='line'>&#9;&#9;&#9;((first_len - hlen) & 7) ||
+</span><span class='line'>&#9;&#9;&#9;(iph-&gt;frag_off & htons(IP_MF|IP_OFFSET)) ||
+</span><span class='line'>&#9;&#9;&#9;skb_cloned(skb))
+</span><span class='line'>&#9;&#9;&#9;goto slow_path;
+</span><span class='line'>&#9;&#9;// 遍历剩余的frag。
+</span><span class='line'>&#9;&#9;for (frag = skb_shinfo(skb)-&gt;frag_list; frag; frag = frag-&gt;next) {
+</span><span class='line'>&#9;&#9;&#9;/* Correct geometry. */
+</span><span class='line'>&#9;&#9;&#9;// 判断每个帧的mtu，以及相关的东西，如果不符合条件则要进行slow path,基本和上面的第一个skb的判断类似。
+</span><span class='line'>&#9;&#9;&#9;if (frag-&gt;len &gt; mtu ||
+</span><span class='line'>&#9;&#9;&#9;&#9;((frag-&gt;len & 7) && frag-&gt;next) ||
+</span><span class='line'>&#9;&#9;&#9;&#9;skb_headroom(frag) &lt; hlen)
+</span><span class='line'>&#9;&#9;&#9;&#9;goto slow_path;
+</span><span class='line'>&#9;&#9;&#9;// 判断是否共享。
+</span><span class='line'>&#9;&#9;&#9;/* Partially cloned skb? */
+</span><span class='line'>&#9;&#9;&#9;if (skb_shared(frag))
+</span><span class='line'>&#9;&#9;&#9;&#9;goto slow_path;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;BUG_ON(frag-&gt;sk);
+</span><span class='line'>&#9;&#9;&#9;// 进行socket的一些操作。
+</span><span class='line'>&#9;&#9;&#9;if (skb-&gt;sk) {
+</span><span class='line'>&#9;&#9;&#9;&#9;sock_hold(skb-&gt;sk);
+</span><span class='line'>&#9;&#9;&#9;&#9;frag-&gt;sk = skb-&gt;sk;
+</span><span class='line'>&#9;&#9;&#9;&#9;frag-&gt;destructor = sock_wfree;
+</span><span class='line'>&#9;&#9;&#9;&#9;truesizes += frag-&gt;truesize;
+</span><span class='line'>&#9;&#9;&#9;}
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;// 通过上面的检测，都通过了，因此我们可以进行fast path切片了。
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;// 先是设置一些将要处理的变量的值。
+</span><span class='line'>&#9;&#9;err = 0;
+</span><span class='line'>&#9;&#9;offset = 0;
+</span><span class='line'>&#9;&#9;// 取得frag_list列表
+</span><span class='line'>&#9;&#9;frag = skb_shinfo(skb)-&gt;frag_list;
+</span><span class='line'>&#9;&#9;skb_shinfo(skb)-&gt;frag_list = NULL;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;// 得到数据(不包括头)的大小。
+</span><span class='line'>&#9;&#9;skb-&gt;data_len = first_len - skb_headlen(skb);
+</span><span class='line'>&#9;&#9;skb-&gt;truesize -= truesizes;
+</span><span class='line'>&#9;&#9;// 得到
+</span><span class='line'>&#9;&#9;skb-&gt;len = first_len;
+</span><span class='line'>&#9;&#9;iph-&gt;tot_len = htons(first_len);
+</span><span class='line'>&#9;&#9;// 设置mf位
+</span><span class='line'>&#9;&#9;iph-&gt;frag_off = htons(IP_MF);
+</span><span class='line'>&#9;&#9;// 执行校验
+</span><span class='line'>&#9;&#9;ip_send_check(iph);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;for (;;) {
+</span><span class='line'>&#9;&#9;&#9;// 开始进行发送。
+</span><span class='line'>&#9;&#9;&#9;if (frag) {
+</span><span class='line'>&#9;&#9;&#9;&#9;// 设置校验位
+</span><span class='line'>&#9;&#9;&#9;&#9;frag-&gt;ip_summed = CHECKSUM_NONE;
+</span><span class='line'>&#9;&#9;&#9;&#9;// 设置相应的头部。
+</span><span class='line'>&#9;&#9;&#9;&#9;skb_reset_transport_header(frag);
+</span><span class='line'>&#9;&#9;&#9;&#9;__skb_push(frag, hlen);
+</span><span class='line'>&#9;&#9;&#9;&#9;skb_reset_network_header(frag);
+</span><span class='line'>&#9;&#9;&#9;&#9;// 复制ip头。
+</span><span class='line'>&#9;&#9;&#9;&#9;memcpy(skb_network_header(frag), iph, hlen);
+</span><span class='line'>&#9;&#9;&#9;&#9;// 修改每个切片的ip头的一些属性。
+</span><span class='line'>&#9;&#9;&#9;&#9;iph = ip_hdr(frag);
+</span><span class='line'>&#9;&#9;&#9;&#9;iph-&gt;tot_len = htons(frag-&gt;len);
+</span><span class='line'>&#9;&#9;&#9;&#9;// 将当前skb的一些属性付给将要传递的切片好的帧。
+</span><span class='line'>&#9;&#9;&#9;&#9;ip_copy_metadata(frag, skb);
+</span><span class='line'>&#9;&#9;&#9;&#9;if (offset == 0)
+</span><span class='line'>&#9;&#9;&#9;&#9;// 处理ip_option
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;ip_options_fragment(frag);
+</span><span class='line'>&#9;&#9;&#9;&#9;offset += skb-&gt;len - hlen;
+</span><span class='line'>&#9;&#9;&#9;&#9;// 设置位移。
+</span><span class='line'>&#9;&#9;&#9;&#9;iph-&gt;frag_off = htons(offset&gt;&gt;3);
+</span><span class='line'>&#9;&#9;&#9;&#9;if (frag-&gt;next != NULL)
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;iph-&gt;frag_off |= htons(IP_MF);
+</span><span class='line'>&#9;&#9;&#9;&#9;/* Ready, complete checksum */
+</span><span class='line'>&#9;&#9;&#9;&#9;ip_send_check(iph);
+</span><span class='line'>&#9;&#9;&#9;}
+</span><span class='line'>&#9;&#9;&#9;// 调用输出函数。
+</span><span class='line'>&#9;&#9;&#9;err = output(skb);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;if (!err)
+</span><span class='line'>&#9;&#9;&#9;&#9;IP_INC_STATS(dev_net(dev), IPSTATS_MIB_FRAGCREATES);
+</span><span class='line'>&#9;&#9;&#9;if (err || !frag)
+</span><span class='line'>&#9;&#9;&#9;&#9;break;
+</span><span class='line'>&#9;&#9;&#9;// 处理链表中下一个buf。
+</span><span class='line'>&#9;&#9;&#9;skb = frag;
+</span><span class='line'>&#9;&#9;&#9;frag = skb-&gt;next;
+</span><span class='line'>&#9;&#9;&#9;skb-&gt;next = NULL;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (err == 0) {
+</span><span class='line'>&#9;&#9;&#9;IP_INC_STATS(dev_net(dev), IPSTATS_MIB_FRAGOKS);
+</span><span class='line'>&#9;&#9;&#9;return 0;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;// 释放内存。
+</span><span class='line'>&#9;&#9;while (frag) {
+</span><span class='line'>&#9;&#9;&#9;skb = frag-&gt;next;
+</span><span class='line'>&#9;&#9;&#9;kfree_skb(frag);
+</span><span class='line'>&#9;&#9;&#9;frag = skb;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;IP_INC_STATS(dev_net(dev), IPSTATS_MIB_FRAGFAILS);
+</span><span class='line'>&#9;&#9;return err;
 </span><span class='line'>&#9;}
-</span><span class='line'> 
-</span><span class='line'>&#9;rcu_read_unlock();
-</span><span class='line'> 
-</span><span class='line'>&#9;return -EPERM;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+</span></code></pre></td></tr></table></div></figure>
 
 
-<p>我们来简单分析一下这个函数，首先如果该inode对应的不是devices，直接返回0，如果既不是块设备也不是字符设备，也返回0，因为devices只控制块设备和字符设备的访问，其他情况不管。接着获得当前进程的dev_cgroup，然后在dev_cgroup中whitelist指针的链表中查找，如果找到对应设备而且mask指定的权限和设备的权限一致就返回0，如果没有找到就返回错误。</p>
-
-<p>这个函数是针对inode节点存在的情况，通过对比权限来控制cgroup中的进程能够访问的devices。还有一个情况是inode不存在，在这种情况下，一个进程要访问一个设备就必须通过mknod建立相应的设备文件。为了达到对这种情况的控制，devices子系统导出了第二个函数：</p>
+<p>再接下来我们来看slow fragmentation：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -720,66 +825,138 @@ m - 允许任务生成还不存在的设备文件</p>
 <span class='line-number'>33</span>
 <span class='line-number'>34</span>
 <span class='line-number'>35</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>int devcgroup_inode_mknod(int mode, dev_t dev)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct dev_cgroup *dev_cgroup;
-</span><span class='line'>&#9;struct dev_whitelist_item *wh;
-</span><span class='line'> 
-</span><span class='line'>&#9;if (!S_ISBLK(mode) && !S_ISCHR(mode))
-</span><span class='line'>&#9;&#9;return 0;
-</span><span class='line'> 
-</span><span class='line'>&#9;rcu_read_lock();
-</span><span class='line'> 
-</span><span class='line'>&#9;dev_cgroup = task_devcgroup(current);
-</span><span class='line'> 
-</span><span class='line'>&#9;list_for_each_entry_rcu(wh, &dev_cgroup-&gt;whitelist, list) {
-</span><span class='line'>&#9;&#9;if (wh-&gt;type & DEV_ALL)
-</span><span class='line'>&#9;&#9;&#9;goto found;
-</span><span class='line'>&#9;&#9;if ((wh-&gt;type & DEV_BLOCK) && !S_ISBLK(mode))
-</span><span class='line'>&#9;&#9;&#9;continue;
-</span><span class='line'>&#9;&#9;if ((wh-&gt;type & DEV_CHAR) && !S_ISCHR(mode))
-</span><span class='line'>&#9;&#9;&#9;continue;
-</span><span class='line'>&#9;&#9;if (wh-&gt;major != ~0 && wh-&gt;major != MAJOR(dev))
-</span><span class='line'>&#9;&#9;&#9;continue;
-</span><span class='line'>&#9;&#9;if (wh-&gt;minor != ~0 && wh-&gt;minor != MINOR(dev))
-</span><span class='line'>&#9;&#9;&#9;continue;
-</span><span class='line'> 
-</span><span class='line'>&#9;&#9;if (!(wh-&gt;access & ACC_MKNOD))
-</span><span class='line'>&#9;&#9;&#9;continue;
-</span><span class='line'>&#9;&#9;found:
-</span><span class='line'>&#9;&#9;&#9;rcu_read_unlock();
-</span><span class='line'>&#9;&#9;return 0;
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>&#9;// 切片开始的位移
+</span><span class='line'>&#9;left = skb-&gt;len - hlen;      /* Space per frame */
+</span><span class='line'>&#9;// 而ptr就是切片开始的指针。
+</span><span class='line'>&#9;ptr = raw + hlen;       /* Where to start from */
+</span><span class='line'>
+</span><span class='line'>&#9;/* for bridged IP traffic encapsulated inside f.e. a vlan header,
+</span><span class='line'>&#9; * we need to make room for the encapsulating header
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;// 处理桥接的相关操作。
+</span><span class='line'>&#9;pad = nf_bridge_pad(skb);
+</span><span class='line'>&#9;ll_rs = LL_RESERVED_SPACE_EXTRA(rt-&gt;u.dst.dev, pad);
+</span><span class='line'>&#9;mtu -= pad;
+</span><span class='line'>
+</span><span class='line'>&#9;// 其实也就是取出取出ip offset域。
+</span><span class='line'>&#9;offset = (ntohs(iph-&gt;frag_off) & IP_OFFSET) &lt;&lt; 3;
+</span><span class='line'>&#9;// not_last_frag，顾名思义，其实也就是表明这个帧是否是最后一个切片。
+</span><span class='line'>&#9;not_last_frag = iph-&gt;frag_off & htons(IP_MF);
+</span><span class='line'>
+</span><span class='line'>
+</span><span class='line'>&#9;// 开始为循环处理，每一个切片创建一个skb buffer。
+</span><span class='line'>&#9;while (left &gt; 0) {
+</span><span class='line'>&#9;&#9;len = left;
+</span><span class='line'>&#9;&#9;// 如果len大于mtu，我们设置当前的将要切片的数据大小为mtu。
+</span><span class='line'>&#9;&#9;if (len &gt; mtu)
+</span><span class='line'>&#9;&#9;&#9;len = mtu;
+</span><span class='line'>&#9;&#9;// 长度也必须位对齐。
+</span><span class='line'>&#9;&#9;if (len &lt; left)  {
+</span><span class='line'>&#9;&#9;&#9;len &= ~7;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;// malloc一个新的buff。它的大小包括ip payload,ip head,以及L2 head.
+</span><span class='line'>&#9;&#9;if ((skb2 = alloc_skb(len+hlen+ll_rs, GFP_ATOMIC)) == NULL) {
+</span><span class='line'>&#9;&#9;&#9;NETDEBUG(KERN_INFO "IP: frag: no memory for new fragment!\n");
+</span><span class='line'>&#9;&#9;&#9;err = -ENOMEM;
+</span><span class='line'>&#9;&#9;&#9;goto fail;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;// 调用ip_copy_metadata复制一些相同的值的域。
+</span><span class='line'>&#9;&#9;ip_copy_metadata(skb2, skb);
+</span><span class='line'>&#9;&#9;// 进行skb的相关操作。为了加上ip头。
+</span><span class='line'>&#9;&#9;skb_reserve(skb2, ll_rs);
+</span><span class='line'>&#9;&#9;skb_put(skb2, len + hlen);
+</span><span class='line'>&#9;&#9;skb_reset_network_header(skb2);
+</span><span class='line'>&#9;&#9;skb2-&gt;transport_header = skb2-&gt;network_header + hlen;
+</span><span class='line'>&#9;&#9;// 将每一个分片的ip包都关联到源包的socket上。
+</span><span class='line'>&#9;&#9;if (skb-&gt;sk)
+</span><span class='line'>&#9;&#9;&#9;skb_set_owner_w(skb2, skb-&gt;sk);
+</span><span class='line'>&#9;&#9;// 开始填充新的ip包的数据。
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;// 先拷贝包头。
+</span><span class='line'>&#9;&#9;skb_copy_from_linear_data(skb, skb_network_header(skb2), hlen);
+</span><span class='line'>&#9;&#9;// 拷贝数据部分，这个函数实现的比较复杂。
+</span><span class='line'>&#9;&#9;if (skb_copy_bits(skb, ptr, skb_transport_header(skb2), len))
+</span><span class='line'>&#9;&#9;&#9;BUG();
+</span><span class='line'>&#9;&#9;left -= len;
+</span><span class='line'>&#9;&#9;// 填充相应的ip头。
+</span><span class='line'>&#9;&#9;iph = ip_hdr(skb2);
+</span><span class='line'>&#9;&#9;iph-&gt;frag_off = htons((offset &gt;&gt; 3));
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;// 第一个包，因此进行ip_option处理。
+</span><span class='line'>&#9;&#9;if (offset == 0)
+</span><span class='line'>&#9;&#9;&#9;ip_options_fragment(skb);
+</span><span class='line'>&#9;&#9;// 不是最后一个包，因此设置mf位。
+</span><span class='line'>&#9;&#9;if (left &gt; 0 || not_last_frag)
+</span><span class='line'>&#9;&#9;&#9;iph-&gt;frag_off |= htons(IP_MF);
+</span><span class='line'>&#9;&#9;// 移动指针以及更改位移大小。
+</span><span class='line'>&#9;&#9;ptr += len;
+</span><span class='line'>&#9;&#9;offset += len;
+</span><span class='line'>&#9;&#9;// update包头的大小。
+</span><span class='line'>&#9;&#9;iph-&gt;tot_len = htons(len + hlen);
+</span><span class='line'>&#9;&#9;// 重新计算校验。
+</span><span class='line'>&#9;&#9;ip_send_check(iph);
+</span><span class='line'>&#9;&#9;//最终输出。
+</span><span class='line'>&#9;&#9;err = output(skb2);
+</span><span class='line'>&#9;&#9;if (err)
+</span><span class='line'>&#9;&#9;&#9;goto fail;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;IP_INC_STATS(dev_net(dev), IPSTATS_MIB_FRAGCREATES);
 </span><span class='line'>&#9;}
-</span><span class='line'> 
-</span><span class='line'>&#9;rcu_read_unlock();
-</span><span class='line'> 
-</span><span class='line'>&#9;return -EPERM;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+</span><span class='line'>&#9;kfree_skb(skb);
+</span><span class='line'>&#9;IP_INC_STATS(dev_net(dev), IPSTATS_MIB_FRAGOKS);
+</span><span class='line'>&#9;return err;</span></code></pre></td></tr></table></div></figure>
 
 
-<p>这个函数的实现跟第一个函数类似，这里就不赘述了。</p>
+<p>接下来来看ip组包的实现。首先要知道每一个切片(属于同一个源包的)的ip包 id都是相同的。</p>
 
-<p>下面我们再来看一下devices子系统本身的一些东西。跟其他子系统一样，devices同样实现了一个cgroup_subsys：</p>
+<p>首先来看相应的数据结构。在内核中，每一个ip包(切片好的)都是一个struct ipq链表。而不同的数据包(这里指不是属于同一个源包的数据包)都保</p>
 
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>struct cgroup_subsys devices_subsys = {
-</span><span class='line'>&#9;.name = "devices",
-</span><span class='line'>&#9;.can_attach = devcgroup_can_attach,
-</span><span class='line'>&#9;.create = devcgroup_create,
-</span><span class='line'>&#9;.destroy = devcgroup_destroy,
-</span><span class='line'>&#9;.populate = devcgroup_populate,
-</span><span class='line'>&#9;.subsys_id = devices_subsys_id,
-</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
-
-
-<p>devices相应的三个控制文件：</p>
+<p>存在一个hash表中。也就是ip4_frags这个变量：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -798,26 +975,120 @@ m - 允许任务生成还不存在的设备文件</p>
 <span class='line-number'>15</span>
 <span class='line-number'>16</span>
 <span class='line-number'>17</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static struct cftype dev_cgroup_files[] = {
-</span><span class='line'>&#9;{
-</span><span class='line'>&#9;&#9;.name = "allow",
-</span><span class='line'>&#9;&#9;.write_string  = devcgroup_access_write,
-</span><span class='line'>&#9;&#9;.private = DEVCG_ALLOW,
-</span><span class='line'>&#9;},
-</span><span class='line'>&#9;{
-</span><span class='line'>&#9;&#9;.name = "deny",
-</span><span class='line'>&#9;&#9;.write_string = devcgroup_access_write,
-</span><span class='line'>&#9;&#9;.private = DEVCG_DENY,
-</span><span class='line'>&#9;},
-</span><span class='line'>&#9;{
-</span><span class='line'>&#9;&#9;.name = "list",
-</span><span class='line'>&#9;&#9;.read_seq_string = devcgroup_seq_read,
-</span><span class='line'>&#9;&#9;.private = DEVCG_LIST,
-</span><span class='line'>&#9;},
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static struct inet_frags ip4_frags;
+</span><span class='line'>
+</span><span class='line'>#define INETFRAGS_HASHSZ        64
+</span><span class='line'>
+</span><span class='line'>struct inet_frags {
+</span><span class='line'>&#9;struct hlist_head   hash[INETFRAGS_HASHSZ];
+</span><span class='line'>&#9;rwlock_t        lock;
+</span><span class='line'>&#9;// 随机值，它被用在计算hash值上面，下面会介绍到，过一段时间，内核就会更新这个值。
+</span><span class='line'>&#9;u32         rnd;
+</span><span class='line'>&#9;int         qsize;
+</span><span class='line'>&#9;int         secret_interval;
+</span><span class='line'>&#9;struct timer_list   secret_timer;
+</span><span class='line'>&#9;// hash函数
+</span><span class='line'>&#9;unsigned int        (*hashfn)(struct inet_frag_queue *);
+</span><span class='line'>&#9;void            (*constructor)(struct inet_frag_queue *q,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;void *arg);
+</span><span class='line'>&#9;void            (*destructor)(struct inet_frag_queue *);
+</span><span class='line'>&#9;void            (*skb_free)(struct sk_buff *);
+</span><span class='line'>&#9;int         (*match)(struct inet_frag_queue *q,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;void *arg);
+</span><span class='line'>&#9;void            (*frag_expire)(unsigned long data);
+</span><span class='line'>};
+</span><span class='line'>
+</span><span class='line'>struct ipq {
+</span><span class='line'>&#9;struct inet_frag_queue q;
+</span><span class='line'>&#9;u32     user;
+</span><span class='line'>&#9;// 都是ip头相关的一些域。
+</span><span class='line'>&#9;__be32      saddr;
+</span><span class='line'>&#9;__be32      daddr;
+</span><span class='line'>&#9;__be16      id;
+</span><span class='line'>&#9;u8      protocol;
+</span><span class='line'>&#9;int             iif;
+</span><span class='line'>&#9;unsigned int    rid;
+</span><span class='line'>&#9;struct inet_peer *peer;
+</span><span class='line'>};
+</span><span class='line'>
+</span><span class='line'>struct inet_frag_queue {
+</span><span class='line'>&#9;struct hlist_node   list;
+</span><span class='line'>&#9;struct netns_frags  *net;
+</span><span class='line'>&#9;// 基于LRU算法，主要用在GC上。
+</span><span class='line'>&#9;struct list_head    lru_list;   /* lru list member */
+</span><span class='line'>&#9;spinlock_t      lock;
+</span><span class='line'>&#9;atomic_t        refcnt;
+</span><span class='line'>&#9;// 属于同一个源的数据包的定时器，当定时器到期，切片还没到达，此时就会drop掉所有的数据切片。
+</span><span class='line'>&#9;struct timer_list   timer;      /* when will this queue expire? */
+</span><span class='line'>&#9;// 保存有所有的切片链表(从属于同一个ip包)
+</span><span class='line'>&#9;struct sk_buff      *fragments; /* list of received fragments */
+</span><span class='line'>&#9;ktime_t         stamp;
+</span><span class='line'>&#9;int         len;        /* total length of orig datagram */
+</span><span class='line'>&#9;// 表示从源ip包已经接收的字节数。
+</span><span class='line'>&#9;int         meat;
+</span><span class='line'>&#9;// 这个域主要可以设置为下面的3种值。
+</span><span class='line'>&#9;__u8            last_in;    /* first/last segment arrived? */
+</span><span class='line'>
+</span><span class='line'>// 完成，第一个帧以及最后一个帧。
+</span><span class='line'>#define INET_FRAG_COMPLETE  4
+</span><span class='line'>#define INET_FRAG_FIRST_IN  2
+</span><span class='line'>#define INET_FRAG_LAST_IN   1
 </span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
 
 
-<p>其中allow和deny都是通过devcgroup_access_write实现的，只是通过private字段区分，因为二者的实现逻辑有相同的地方。devcgroup_access_write最终通过调用devcgroup_update_access来实现。在devcgroup_update_access根据写入的内容构造一个dev_whitelist_item ，然后根据文件类型做不同的处理：</p>
+<p>看下面的图就一目了然了：</p>
+
+<p><img src="/images/kernel/2015-08-25-22.jpg" alt="" /></p>
+
+<p>首先来看组包要解决的一些问题：</p>
+
+<p>1 fragment必须存储在内存中，知道他们全部都被网络子系统处理。才会释放，因此内存会是个巨大的浪费。</p>
+
+<p>2 这里虽然使用了hash表，可是假设恶意攻击者得到散列算法并且伪造数据包来尝试着降低一些hash表中的元素的比重，从而使执行变得缓慢。这里linux使用一个定时器通过制造的随机数来使hash值的生成不可预测。</p>
+
+<p>这个定时器的初始化是通过ipfrag_init(它会初始化上面提到的ip4_frags全局变量)调用inet_frags_init进行的：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -830,20 +1101,1545 @@ m - 允许任务生成还不存在的设备文件</p>
 <span class='line-number'>9</span>
 <span class='line-number'>10</span>
 <span class='line-number'>11</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>switch (filetype) {
-</span><span class='line'>&#9;case DEVCG_ALLOW:
-</span><span class='line'>&#9;&#9;if (!parent_has_perm(devcgroup, &wh))
-</span><span class='line'>&#9;&#9;&#9;return -EPERM;
-</span><span class='line'>&#9;&#9;return dev_whitelist_add(devcgroup, &wh);
-</span><span class='line'>&#9;case DEVCG_DENY:
-</span><span class='line'>&#9;&#9;dev_whitelist_rm(devcgroup, &wh);
-</span><span class='line'>&#9;&#9;break;
-</span><span class='line'>&#9;default:
-</span><span class='line'>&#9;&#9;return -EINVAL;
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void inet_frags_init(struct inet_frags *f)
+</span><span class='line'>{
+</span><span class='line'>&#9;int i;
+</span><span class='line'>
+</span><span class='line'>&#9;for (i = 0; i &lt; INETFRAGS_HASHSZ; i++)
+</span><span class='line'>&#9;&#9;INIT_HLIST_HEAD(&f-&gt;hash[i]);
+</span><span class='line'>
+</span><span class='line'>&#9;rwlock_init(&f-&gt;lock);
+</span><span class='line'>
+</span><span class='line'>&#9;f-&gt;rnd = (u32) ((num_physpages ^ (num_physpages&gt;&gt;7)) ^
+</span><span class='line'>&#9;&#9;&#9;&#9;   (jiffies ^ (jiffies &gt;&gt; 6)));
+</span><span class='line'>&#9;// 安装定时器，当定时器到期就会调用inet_frag_secret_rebuild方法。
+</span><span class='line'>&#9;setup_timer(&f-&gt;secret_timer, inet_frag_secret_rebuild,
+</span><span class='line'>&#9;&#9;&#9;(unsigned long)f);
+</span><span class='line'>&#9;f-&gt;secret_timer.expires = jiffies + f-&gt;secret_interval;
+</span><span class='line'>&#9;add_timer(&f-&gt;secret_timer);
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>static void inet_frag_secret_rebuild(unsigned long dummy)
+</span><span class='line'>{
+</span><span class='line'>................................................
+</span><span class='line'>
+</span><span class='line'>&#9;write_lock(&f-&gt;lock);
+</span><span class='line'>&#9;// 得到随机值
+</span><span class='line'>&#9;get_random_bytes(&f-&gt;rnd, sizeof(u32));
+</span><span class='line'>
+</span><span class='line'>&#9;// 然后通过这个随机值重新计算整个hash表的hash值。
+</span><span class='line'>&#9;for (i = 0; i &lt; INETFRAGS_HASHSZ; i++) {
+</span><span class='line'>&#9;&#9;struct inet_frag_queue *q;
+</span><span class='line'>&#9;&#9;struct hlist_node *p, *n;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;hlist_for_each_entry_safe(q, p, n, &f-&gt;hash[i], list) {
+</span><span class='line'>&#9;&#9;&#9;unsigned int hval = f-&gt;hashfn(q);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;if (hval != i) {
+</span><span class='line'>&#9;&#9;&#9;&#9;hlist_del(&q-&gt;list);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;&#9;/* Relink to new hash chain. */
+</span><span class='line'>&#9;&#9;&#9;&#9;hlist_add_head(&q-&gt;list, &f-&gt;hash[hval]);
+</span><span class='line'>&#9;&#9;&#9;}
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;}
+</span><span class='line'>..............................................
 </span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
-<p>allow的话，就将item加入whitelist，deny的话，就将item从whitelist中删去。</p>
+<p>3 ip协议是不可靠的，因此切片有可能被丢失。内核处理这个，是使用了一个定时器(每个数据包(也就是这个切片从属于的那个数据包)).当定时器到期，而切片没有到达，就会丢弃这个包。</p>
+
+<p>4 由于ip协议是无连接的，因此当高层决定重传数据包的时候，组包时有可能会出现多个重复分片的情况。这是因为ip包是由4个域来判断的，源和目的地址，包id以及4层的协议类型。而最主要的是包id。可是包id只有16位，因此一个gigabit网卡几乎在半秒时间就能用完这个id一次。而第二次重传的数据包有可能走的和第一个第一次时不同的路径，因此内核必须每个切片都要检测和前面接受的切片的重叠情况的发生。</p>
+
+<p>先来看ip_defrag用到的几个函数：</p>
+
+<p>inet_frag_create: 创建一个新的ipq实例</p>
+
+<p>ip_evitor: remove掉所有的未完成的数据包。它每次都会update一个LRU链表。每次都会把一个新的ipq数据结构加到ipq_lru_list的结尾。</p>
+
+<p>ip_find: 发现切片所从属的数据包的切片链表。</p>
+
+<p>ip_frag_queue: 排队一个给定的切片刀一个切片列表。这个经常和上一个方法一起使用。</p>
+
+<p>ip_frag_reasm: 当所有的切片都到达后，build一个ip数据包。</p>
+
+<p>ip_frag_destroy: remove掉传进来的ipq数据结构。包括和他有联系的所有的ip切片。</p>
+
+<p>ipq_put: 将引用计数减一，如果为0，则直接调用ip_frag_destroy.</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static inline void inet_frag_put(struct inet_frag_queue *q, struct inet_frags *f)
+</span><span class='line'>{
+</span><span class='line'>&#9;if (atomic_dec_and_test(&q-&gt;refcnt))
+</span><span class='line'>&#9;&#9;inet_frag_destroy(q, f, NULL);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>ipq_kill: 主要用在gc上，标记一个ipq数据结构可以被remove，由于一些帧没有按时到达。</p>
+
+<p>接下来来看ip_defrag的实现。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int ip_defrag(struct sk_buff *skb, u32 user)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct ipq *qp;
+</span><span class='line'>&#9;struct net *net;
+</span><span class='line'>
+</span><span class='line'>&#9;net = skb-&gt;dev ? dev_net(skb-&gt;dev) : dev_net(skb-&gt;dst-&gt;dev);
+</span><span class='line'>&#9;IP_INC_STATS_BH(net, IPSTATS_MIB_REASMREQDS);
+</span><span class='line'>
+</span><span class='line'>&#9;// 如果内存不够，则依据lru算法进行清理。
+</span><span class='line'>&#9;if (atomic_read(&net-&gt;ipv4.frags.mem) &gt; net-&gt;ipv4.frags.high_thresh)
+</span><span class='line'>&#9;&#9;ip_evictor(net);
+</span><span class='line'>
+</span><span class='line'>&#9;// 查找相应的iqp，如果不存在则会新创建一个(这些都在ip_find里面实现)
+</span><span class='line'>&#9;if ((qp = ip_find(net, ip_hdr(skb), user)) != NULL) {
+</span><span class='line'>&#9;&#9;int ret;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;spin_lock(&qp-&gt;q.lock);
+</span><span class='line'>&#9;&#9;// 排队进队列。
+</span><span class='line'>&#9;&#9;ret = ip_frag_queue(qp, skb);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;spin_unlock(&qp-&gt;q.lock);
+</span><span class='line'>&#9;&#9;ipq_put(qp);
+</span><span class='line'>&#9;&#9;return ret;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;IP_INC_STATS_BH(net, IPSTATS_MIB_REASMFAILS);
+</span><span class='line'>&#9;kfree_skb(skb);
+</span><span class='line'>&#9;return -ENOMEM;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>我们可以看到这里最重要的一个函数其实是ip_frag_queue,它主要任务是：</p>
+
+<p>1 发现输入帧在源包的位置。<br/>
+2 基于blog刚开始所描述的，判断是否是最后一个切片。<br/>
+3 插入切片到切片列表(从属于相同的ip包)<br/>
+4 update 垃圾回收所用到的ipq的一些相关域。<br/>
+5 校验l4层的校验值(在硬件计算).</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+<span class='line-number'>82</span>
+<span class='line-number'>83</span>
+<span class='line-number'>84</span>
+<span class='line-number'>85</span>
+<span class='line-number'>86</span>
+<span class='line-number'>87</span>
+<span class='line-number'>88</span>
+<span class='line-number'>89</span>
+<span class='line-number'>90</span>
+<span class='line-number'>91</span>
+<span class='line-number'>92</span>
+<span class='line-number'>93</span>
+<span class='line-number'>94</span>
+<span class='line-number'>95</span>
+<span class='line-number'>96</span>
+<span class='line-number'>97</span>
+<span class='line-number'>98</span>
+<span class='line-number'>99</span>
+<span class='line-number'>100</span>
+<span class='line-number'>101</span>
+<span class='line-number'>102</span>
+<span class='line-number'>103</span>
+<span class='line-number'>104</span>
+<span class='line-number'>105</span>
+<span class='line-number'>106</span>
+<span class='line-number'>107</span>
+<span class='line-number'>108</span>
+<span class='line-number'>109</span>
+<span class='line-number'>110</span>
+<span class='line-number'>111</span>
+<span class='line-number'>112</span>
+<span class='line-number'>113</span>
+<span class='line-number'>114</span>
+<span class='line-number'>115</span>
+<span class='line-number'>116</span>
+<span class='line-number'>117</span>
+<span class='line-number'>118</span>
+<span class='line-number'>119</span>
+<span class='line-number'>120</span>
+<span class='line-number'>121</span>
+<span class='line-number'>122</span>
+<span class='line-number'>123</span>
+<span class='line-number'>124</span>
+<span class='line-number'>125</span>
+<span class='line-number'>126</span>
+<span class='line-number'>127</span>
+<span class='line-number'>128</span>
+<span class='line-number'>129</span>
+<span class='line-number'>130</span>
+<span class='line-number'>131</span>
+<span class='line-number'>132</span>
+<span class='line-number'>133</span>
+<span class='line-number'>134</span>
+<span class='line-number'>135</span>
+<span class='line-number'>136</span>
+<span class='line-number'>137</span>
+<span class='line-number'>138</span>
+<span class='line-number'>139</span>
+<span class='line-number'>140</span>
+<span class='line-number'>141</span>
+<span class='line-number'>142</span>
+<span class='line-number'>143</span>
+<span class='line-number'>144</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>// 其中qp是源ip包的所有切片链表，而skb是将要加进来切片。
+</span><span class='line'>static int ip_frag_queue(struct ipq *qp, struct sk_buff *skb)
+</span><span class='line'>{
+</span><span class='line'>&#9;.............................
+</span><span class='line'>&#9;//  INET_FRAG_COMPLETE表示所有的切片包都已经抵达，这个时侯就不需要再组包了，因此这里就是校验函数有没有被错误的调用。
+</span><span class='line'>&#9;if (qp-&gt;q.last_in & INET_FRAG_COMPLETE)
+</span><span class='line'>&#9;&#9;goto err;
+</span><span class='line'>&#9;.................................................
+</span><span class='line'>&#9;// 将offset 8字节对齐、
+</span><span class='line'>&#9;offset = ntohs(ip_hdr(skb)-&gt;frag_off);
+</span><span class='line'>&#9;flags = offset & ~IP_OFFSET;
+</span><span class='line'>&#9;offset &= IP_OFFSET;
+</span><span class='line'>&#9;offset &lt;&lt;= 3;     /* offset is in 8-byte chunks */
+</span><span class='line'>&#9;ihl = ip_hdrlen(skb);
+</span><span class='line'>
+</span><span class='line'>&#9;// 计算这个新的切片包的结束位置。
+</span><span class='line'>&#9;end = offset + skb-&gt;len - ihl;
+</span><span class='line'>&#9;err = -EINVAL;
+</span><span class='line'>
+</span><span class='line'>&#9;// MF没有设置，表明这个帧是最后一个帧。进入相关处理。
+</span><span class='line'>&#9;if ((flags & IP_MF) == 0) {
+</span><span class='line'>&#9;&#9;/* If we already have some bits beyond end
+</span><span class='line'>&#9;&#9; * or have different end, the segment is corrrupted.
+</span><span class='line'>&#9;&#9; */
+</span><span class='line'>&#9;// 设置相应的len位置，以及last_in域。
+</span><span class='line'>&#9;&#9;if (end &lt; qp-&gt;q.len ||
+</span><span class='line'>&#9;&#9;&#9;((qp-&gt;q.last_in & INET_FRAG_LAST_IN) && end != qp-&gt;q.len))
+</span><span class='line'>&#9;&#9;&#9;goto err;
+</span><span class='line'>&#9;&#9;qp-&gt;q.last_in |= INET_FRAG_LAST_IN;
+</span><span class='line'>&#9;&#9;qp-&gt;q.len = end;
+</span><span class='line'>&#9;} else {
+</span><span class='line'>&#9;&#9;// 除了最后一个切片，每个切片都必须是8字节的倍数。
+</span><span class='line'>&#9;&#9;if (end&7) {
+</span><span class='line'>&#9;&#9;&#9;// 不是8字节的倍数，kernel截断这个切片。此时就需要l4层的校验重新计算，因此设置ip_summed为 CHECKSUM_NONE
+</span><span class='line'>&#9;&#9;&#9;end &= ~7;
+</span><span class='line'>&#9;&#9;&#9;if (skb-&gt;ip_summed != CHECKSUM_UNNECESSARY)
+</span><span class='line'>&#9;&#9;&#9;&#9;skb-&gt;ip_summed = CHECKSUM_NONE;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;if (end &gt; qp-&gt;q.len) {
+</span><span class='line'>&#9;&#9;&#9;// 数据包太大，并且是最后一个包，则表明这个数据包出错，因此drop它。
+</span><span class='line'>&#9;&#9;&#9;/* Some bits beyond end -&gt; corruption. */
+</span><span class='line'>&#9;&#9;&#9;if (qp-&gt;q.last_in & INET_FRAG_LAST_IN)
+</span><span class='line'>&#9;&#9;&#9;&#9;goto err;
+</span><span class='line'>&#9;&#9;&#9;qp-&gt;q.len = end;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;// ip头不能被切片，因此end肯定会大于offset。
+</span><span class='line'>&#9;if (end == offset)
+</span><span class='line'>&#9;&#9;goto err;
+</span><span class='line'>
+</span><span class='line'>&#9;err = -ENOMEM;
+</span><span class='line'>&#9;// remove掉ip头。
+</span><span class='line'>&#9;if (pskb_pull(skb, ihl) == NULL)
+</span><span class='line'>&#9;&#9;goto err;
+</span><span class='line'>&#9;// trim掉一些padding，然后重新计算checksum。
+</span><span class='line'>&#9;err = pskb_trim_rcsum(skb, end - offset);
+</span><span class='line'>&#9;if (err)
+</span><span class='line'>&#9;&#9;goto err;
+</span><span class='line'>
+</span><span class='line'>&#9;// 接下来遍历并将切片(为了找出当前将要插入的切片的位置)，是以offset为基准。这里要合租要FRAG_CB宏是用来提取sk_buff-&gt;cb域。
+</span><span class='line'>&#9;prev = NULL;
+</span><span class='line'>&#9;for (next = qp-&gt;q.fragments; next != NULL; next = next-&gt;next) {
+</span><span class='line'>&#9;&#9;if (FRAG_CB(next)-&gt;offset &gt;= offset)
+</span><span class='line'>&#9;&#9;&#9;break;  /* bingo! */
+</span><span class='line'>&#9;&#9;prev = next;
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;// 当prev!=NULL时，说明这个切片要插入到列表当中。
+</span><span class='line'>&#9;if (prev) {
+</span><span class='line'>&#9;&#9;// 计算有没有重叠。
+</span><span class='line'>&#9;&#9;int i = (FRAG_CB(prev)-&gt;offset + prev-&gt;len) - offset;
+</span><span class='line'>&#9;&#9;// 大于0.证明有重叠，因此进行相关处理
+</span><span class='line'>&#9;&#9;if (i &gt; 0) {
+</span><span class='line'>&#9;&#9;&#9;// 将重叠部分用新的切片覆盖。
+</span><span class='line'>&#9;&#9;&#9;offset += i;
+</span><span class='line'>&#9;&#9;&#9;err = -EINVAL;
+</span><span class='line'>&#9;&#9;&#9;if (end &lt;= offset)
+</span><span class='line'>&#9;&#9;&#9;&#9;goto err;
+</span><span class='line'>&#9;&#9;&#9;err = -ENOMEM;
+</span><span class='line'>&#9;&#9;&#9;//移动i个位置。
+</span><span class='line'>&#9;&#9;&#9;if (!pskb_pull(skb, i))
+</span><span class='line'>&#9;&#9;&#9;&#9;goto err;
+</span><span class='line'>&#9;&#9;&#9;// 需要重新计算L4的校验。
+</span><span class='line'>&#9;&#9;&#9;if (skb-&gt;ip_summed != CHECKSUM_UNNECESSARY)
+</span><span class='line'>&#9;&#9;&#9;&#9;skb-&gt;ip_summed = CHECKSUM_NONE;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;err = -ENOMEM;
+</span><span class='line'>
+</span><span class='line'>&#9;while (next && FRAG_CB(next)-&gt;offset &lt; end) {
+</span><span class='line'>&#9;&#9;// 和上面的判断很类似，也是先计算重叠数。这里要注意重叠分为两种情况：1；一个或多个切片被新的切片完全覆盖。2；被部分覆盖，因此这里我们需要分两种情况进行处理。
+</span><span class='line'>&#9;&#9;int i = end - FRAG_CB(next)-&gt;offset; /* overlap is 'i' bytes */
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (i &lt; next-&gt;len) {
+</span><span class='line'>&#9;&#9;&#9;// 被部分覆盖的情况。将新的切片offset移动i字节，然后remove掉老的切片中的i个字节。
+</span><span class='line'>&#9;&#9;&#9;/* Eat head of the next overlapped fragment
+</span><span class='line'>&#9;&#9;&#9; * and leave the loop. The next ones cannot overlap.
+</span><span class='line'>&#9;&#9;&#9; */
+</span><span class='line'>&#9;&#9;&#9;if (!pskb_pull(next, i))
+</span><span class='line'>&#9;&#9;&#9;&#9;goto err;
+</span><span class='line'>&#9;&#9;&#9;FRAG_CB(next)-&gt;offset += i;
+</span><span class='line'>&#9;&#9;&#9;// 将接收到的源数据报的大小减去i，也就是remove掉不完全覆盖的那一部分。
+</span><span class='line'>&#9;&#9;&#9;qp-&gt;q.meat -= i;
+</span><span class='line'>&#9;&#9;&#9;// 重新计算l4层的校验。
+</span><span class='line'>&#9;&#9;&#9;if (next-&gt;ip_summed != CHECKSUM_UNNECESSARY)
+</span><span class='line'>&#9;&#9;&#9;&#9;next-&gt;ip_summed = CHECKSUM_NONE;
+</span><span class='line'>&#9;&#9;&#9;break;
+</span><span class='line'>&#9;&#9;} else {
+</span><span class='line'>&#9;&#9;&#9;// 老的切片完全被新的切片覆盖，此时只需要remove掉老的切片就可以了。
+</span><span class='line'>&#9;&#9;&#9;struct sk_buff *free_it = next;
+</span><span class='line'>&#9;&#9;&#9;next = next-&gt;next;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;if (prev)
+</span><span class='line'>&#9;&#9;&#9;&#9;prev-&gt;next = next;
+</span><span class='line'>&#9;&#9;&#9;else
+</span><span class='line'>&#9;&#9;&#9;&#9;qp-&gt;q.fragments = next;
+</span><span class='line'>&#9;&#9;&#9;// 将qp的接受字节数更新。
+</span><span class='line'>&#9;&#9;&#9;qp-&gt;q.meat -= free_it-&gt;len;
+</span><span class='line'>&#9;&#9;&#9;frag_kfree_skb(qp-&gt;q.net, free_it, NULL);
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;FRAG_CB(skb)-&gt;offset = offset;
+</span><span class='line'>
+</span><span class='line'>....................................................
+</span><span class='line'>&#9;atomic_add(skb-&gt;truesize, &qp-&gt;q.net-&gt;mem);
+</span><span class='line'>&#9;// offset为0说明是第一个切片，因此设置相应的位。
+</span><span class='line'>&#9;if (offset == 0)
+</span><span class='line'>&#9;&#9;qp-&gt;q.last_in |= INET_FRAG_FIRST_IN;
+</span><span class='line'>
+</span><span class='line'>&#9;if (qp-&gt;q.last_in == (INET_FRAG_FIRST_IN | INET_FRAG_LAST_IN) &&
+</span><span class='line'>&#9;&#9;qp-&gt;q.meat == qp-&gt;q.len)
+</span><span class='line'>&#9;&#9;// 所有条件的满足了，就开始buildip包。
+</span><span class='line'>&#9;&#9;return ip_frag_reasm(qp, prev, dev);
+</span><span class='line'>&#9;write_lock(&ip4_frags.lock);
+</span><span class='line'>&#9;// 从将此切片加入到lry链表中。
+</span><span class='line'>&#9;list_move_tail(&qp-&gt;q.lru_list, &qp-&gt;q.net-&gt;lru_list);
+</span><span class='line'>&#9;write_unlock(&ip4_frags.lock);
+</span><span class='line'>&#9;return -EINPROGRESS;
+</span><span class='line'>
+</span><span class='line'>err:
+</span><span class='line'>&#9;kfree_skb(skb);
+</span><span class='line'>&#9;return err;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>如果网络设备提供L4层的硬件校验的话，输入ip帧还会进行L4的校验计算。当帧通过ip_frag_reasm组合好，它会进行校验的重新计算。我们这里通过设置skb->ip_summed到CHECKSUM_NONE，来表示需要娇艳的标志。</p>
+
+<p>最后来看下GC。</p>
+
+<p>内核为ip切片数据包实现了两种类型的垃圾回收。</p>
+
+<p>1 系统内存使用限制。</p>
+
+<p>2 组包的定时器</p>
+
+<p>这里有一个全局的ip_frag_mem变量，来表示当前被切片所占用的内存数。每次一个新的切片被加入，这个值都会更新。而所能使用的最大内存可以在运行时改变，是通过/proc的sysctl_ipfrag_high_thresh来改变的，因此我们能看到当ip_defrag时，一开始会先判断内存的限制：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>if (atomic_read(&net-&gt;ipv4.frags.mem) &gt; net-&gt;ipv4.frags.high_thresh)
+</span><span class='line'>&#9;&#9;ip_evictor(net);</span></code></pre></td></tr></table></div></figure>
+
+
+<p>当一个切片数据包到达后，内核会启动一个组包定时器，他是为了避免一个数据包占据ipq_hash太长时间，因此当定时器到期后，它就会清理掉在hash表中的相应的qp结构(也就是所有的未完成切片包).这个处理函数就是ip_expire,它的初始化是在ipfrag_init进行的。:</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void ip_expire(unsigned long arg)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct ipq *qp;
+</span><span class='line'>&#9;struct net *net;
+</span><span class='line'>&#9;// 取出相应的qp，以及net域。
+</span><span class='line'>&#9;qp = container_of((struct inet_frag_queue *) arg, struct ipq, q);
+</span><span class='line'>&#9;net = container_of(qp-&gt;q.net, struct net, ipv4.frags);
+</span><span class='line'>
+</span><span class='line'>&#9;spin_lock(&qp-&gt;q.lock);
+</span><span class='line'>&#9;// 如果数据包已经传输完毕，则不进行任何处理，直接退出。
+</span><span class='line'>&#9;if (qp-&gt;q.last_in & INET_FRAG_COMPLETE)
+</span><span class='line'>&#9;&#9;goto out;
+</span><span class='line'>&#9;// 调用ipq_kill，这个函数主要是减少qp的引用计数，并从相关链表(比如LRU_LIST)中移除它。
+</span><span class='line'>&#9;ipq_kill(qp);
+</span><span class='line'>
+</span><span class='line'>&#9;IP_INC_STATS_BH(net, IPSTATS_MIB_REASMTIMEOUT);
+</span><span class='line'>&#9;IP_INC_STATS_BH(net, IPSTATS_MIB_REASMFAILS);
+</span><span class='line'>
+</span><span class='line'>&#9;// 如果是第一个切片，则发送一个ICMP给源主机。
+</span><span class='line'>&#9;if ((qp-&gt;q.last_in & INET_FRAG_FIRST_IN) && qp-&gt;q.fragments != NULL) {
+</span><span class='line'>&#9;&#9;struct sk_buff *head = qp-&gt;q.fragments;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;/* Send an ICMP "Fragment Reassembly Timeout" message. */
+</span><span class='line'>&#9;&#9;if ((head-&gt;dev = dev_get_by_index(net, qp-&gt;iif)) != NULL) {
+</span><span class='line'>&#9;&#9;&#9;icmp_send(head, ICMP_TIME_EXCEEDED, ICMP_EXC_FRAGTIME, 0);
+</span><span class='line'>&#9;&#9;&#9;dev_put(head-&gt;dev);
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;}
+</span><span class='line'>out:
+</span><span class='line'>&#9;spin_unlock(&qp-&gt;q.lock);
+</span><span class='line'>&#9;ipq_put(qp);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2015/08/25/kernel-net-dev_queue_xmit/">dev_queue_xmi函数详解</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2015-08-25T23:20:00+08:00'><span class='date'>2015-08-25</span> <span class='time'>23:20:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p>blog.chinaunix.net/uid-20788636-id-3181312.html</p>
+
+<p>前面在分析IPv6的数据流程时，当所有的信息都准备好了之后，例如，出口设备，下一跳的地址，以及链路层地址。就会调用dev.c文件中的dev_queue_xmin函数，该函数是设备驱动程序执行传输的接口。也就是所有的数据包在填充完成后，最终发送数据时，都会调用该函数。</p>
+
+<p>dev_queue_xmit函数只接收一个skb_buff结构作为输入的值。此数据结构包含了此函数所需要的一切信息。Skb->dev是出口设备，skb->data为有效的载荷的开头，其长度为skb->len.下面是2.6.37版本内核中的dev_queue_xmit函数，该版本的内核与之前的版本有了不少的区别。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+<span class='line-number'>82</span>
+<span class='line-number'>83</span>
+<span class='line-number'>84</span>
+<span class='line-number'>85</span>
+<span class='line-number'>86</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int dev_queue_xmit(struct sk_buff *skb)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct net_device *dev = skb-&gt;dev;
+</span><span class='line'>&#9;struct netdev_queue *txq;
+</span><span class='line'>&#9;struct Qdisc *q;
+</span><span class='line'>&#9;int rc = -ENOMEM;
+</span><span class='line'>
+</span><span class='line'>&#9;/* Disable soft irqs for various locks below. Also
+</span><span class='line'>&#9; * stops preemption for RCU.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;//关闭软中断 - __rcu_read_lock_bh()---&gt;local_bh_disable();
+</span><span class='line'>&#9;rcu_read_lock_bh();
+</span><span class='line'>&#9;// 选择一个发送队列，如果设备提供了select_queue回调函数就使用它，否则由内核选择一个队列,这里只是Linux内核多队列的实现，但是要真正的使用都队列，需要网卡支持多队列才可以，一般的网卡都只有一个队列。在调用alloc_etherdev分配net_device是，设置队列的个数
+</span><span class='line'>&#9;txq = dev_pick_tx(dev, skb);
+</span><span class='line'>&#9;//从netdev_queue结构上获取设备的qdisc
+</span><span class='line'>&#9;q = rcu_dereference_bh(txq-&gt;qdisc);
+</span><span class='line'>
+</span><span class='line'>#ifdef CONFIG_NET_CLS_ACT
+</span><span class='line'>&#9;skb-&gt;tc_verd = SET_TC_AT(skb-&gt;tc_verd, AT_EGRESS);
+</span><span class='line'>#endif
+</span><span class='line'>&#9;//如果硬件设备有队列可以使用，该函数由dev_queue_xmit函数直接调用或由dev_queue_xmit通过qdisc_run函数调用
+</span><span class='line'>&#9;trace_net_dev_queue(skb);
+</span><span class='line'>&#9;if (q-&gt;enqueue) {
+</span><span class='line'>&#9;&#9;rc = __dev_xmit_skb(skb, q, dev, txq); //使用流控对象发送数据包(包含入队和出队)
+</span><span class='line'>&#9;&#9;//更详细的内容参考说明3
+</span><span class='line'>&#9;&#9;goto out;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;//下面的处理是在没有发送队列的情况下
+</span><span class='line'>&#9;/* The device has no queue. Common case for software devices:
+</span><span class='line'>&#9; loopback, all the sorts of tunnels...
+</span><span class='line'>
+</span><span class='line'>&#9; Really, it is unlikely that netif_tx_lock protection is necessary
+</span><span class='line'>&#9; here. (f.e. loopback and IP tunnels are clean ignoring statistics
+</span><span class='line'>&#9; counters.)
+</span><span class='line'>&#9; However, it is possible, that they rely on protection
+</span><span class='line'>&#9; made by us here.
+</span><span class='line'>
+</span><span class='line'>&#9; Check this and shot the lock. It is not prone from deadlocks.
+</span><span class='line'>&#9; Either shot noqueue qdisc, it is even simpler 8)
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;//首先，确定设备是开启的，并且还要确定队列是运行的，启动和停止队列有驱动程序决定
+</span><span class='line'>&#9;//设备没有输出队列典型的是回环设备。这里需要做的就是直接调用dev_start_queue_xmit、、函数，经过驱动发送出去，如果发送失败，就直接丢弃，没有队列可以保存。
+</span><span class='line'>&#9;if (dev-&gt;flags & IFF_UP) {
+</span><span class='line'>&#9;&#9;int cpu = smp_processor_id(); /* ok because BHs are off */
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (txq-&gt;xmit_lock_owner != cpu) {
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;if (__this_cpu_read(xmit_recursion) &gt; RECURSION_LIMIT)
+</span><span class='line'>&#9;&#9;&#9;&#9;goto recursion_alert;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;HARD_TX_LOCK(dev, txq, cpu);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;if (!netif_tx_queue_stopped(txq)) {
+</span><span class='line'>&#9;&#9;&#9;&#9;__this_cpu_inc(xmit_recursion);
+</span><span class='line'>&#9;&#9;&#9;&#9;rc = dev_hard_start_xmit(skb, dev, txq);//见说明4
+</span><span class='line'>&#9;&#9;&#9;&#9;__this_cpu_dec(xmit_recursion);
+</span><span class='line'>&#9;&#9;&#9;&#9;if (dev_xmit_complete(rc)) {
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;HARD_TX_UNLOCK(dev, txq);
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;goto out;
+</span><span class='line'>&#9;&#9;&#9;&#9;}
+</span><span class='line'>&#9;&#9;&#9;}
+</span><span class='line'>&#9;&#9;&#9;HARD_TX_UNLOCK(dev, txq);
+</span><span class='line'>&#9;&#9;&#9;if (net_ratelimit())
+</span><span class='line'>&#9;&#9;&#9;&#9;printk(KERN_CRIT "Virtual device %s asks to "
+</span><span class='line'>&#9;&#9;&#9;&#9; "queue packet!\n", dev-&gt;name);
+</span><span class='line'>&#9;&#9;} else {
+</span><span class='line'>&#9;&#9;&#9;/* Recursion is It is possible,
+</span><span class='line'>&#9;&#9;&#9; * unfortunately
+</span><span class='line'>&#9;&#9;&#9; */
+</span><span class='line'>recursion_alert:
+</span><span class='line'>&#9;&#9;&#9;if (net_ratelimit())
+</span><span class='line'>&#9;&#9;&#9;&#9;printk(KERN_CRIT "Dead loop on virtual device "
+</span><span class='line'>&#9;&#9;&#9;&#9; "%s, fix it urgently!\n", dev-&gt;name);
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;rc = -ENETDOWN;
+</span><span class='line'>&#9;rcu_read_unlock_bh();
+</span><span class='line'>
+</span><span class='line'>&#9;kfree_skb(skb);
+</span><span class='line'>&#9;return rc;
+</span><span class='line'>out:
+</span><span class='line'>&#9;rcu_read_unlock_bh();
+</span><span class='line'>&#9;return rc;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>1. 下面是dev_pick_tx函数。</h5>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static struct netdev_queue *dev_pick_tx(struct net_device *dev,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;struct sk_buff *skb)
+</span><span class='line'>{
+</span><span class='line'>&#9;int queue_index;
+</span><span class='line'>&#9;const struct net_device_ops *ops = dev-&gt;netdev_ops;
+</span><span class='line'>
+</span><span class='line'>&#9;if (ops-&gt;ndo_select_queue) {
+</span><span class='line'>&#9;&#9;//选择一个索引，这个策略可以设置，比如优先选择视频和音频队列，而哪个队列邦定哪个策略也是设定的。
+</span><span class='line'>&#9;&#9;queue_index = ops-&gt;ndo_select_queue(dev, skb);
+</span><span class='line'>&#9;&#9;queue_index = dev_cap_txqueue(dev, queue_index);
+</span><span class='line'>&#9;} else {
+</span><span class='line'>&#9;&#9;struct sock *sk = skb-&gt;sk;
+</span><span class='line'>&#9;&#9;queue_index = sk_tx_queue_get(sk);
+</span><span class='line'>&#9;&#9;if (queue_index &lt; 0 || queue_index &gt;= dev-&gt;real_num_tx_queues) {
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;queue_index = 0;
+</span><span class='line'>&#9;&#9;&#9;if (dev-&gt;real_num_tx_queues &gt; 1)
+</span><span class='line'>&#9;&#9;&#9;&#9;queue_index = skb_tx_hash(dev, skb);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;if (sk) {
+</span><span class='line'>&#9;&#9;&#9;&#9;struct dst_entry *dst = rcu_dereference_check(sk-&gt;sk_dst_cache, 1);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;&#9;if (dst && skb_dst(skb) == dst)
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;sk_tx_queue_set(sk, queue_index);
+</span><span class='line'>&#9;&#9;&#9;}
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;skb_set_queue_mapping(skb, queue_index);
+</span><span class='line'>&#9;return netdev_get_tx_queue(dev, queue_index);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>2. 下面是其中的一种网卡类型调用函数alloc_etherdev时，</h5>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>dev = alloc_etherdev(sizeof(struct ether1_priv));</span></code></pre></td></tr></table></div></figure>
+
+
+<p>其实该函数是一个宏定义：其中第二参数表示的就是队列的数量，这里在Linux2.6.37内核中找到的一种硬件网卡的实现，可用的队列是1个。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define alloc_etherdev(sizeof_priv) alloc_etherdev_mq(sizeof_priv, 1)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>下面是alloc_etherdev_mq函数的定义实现。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct net_device *alloc_etherdev_mq(int sizeof_priv, unsigned int queue_count)
+</span><span class='line'>{
+</span><span class='line'>&#9;return alloc_netdev_mq(sizeof_priv, "eth%d", ether_setup, queue_count);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>3.</h5>
+
+<p>几乎所有的设备都会使用队列调度出口的流量，而内核可以使用对了规则的算法安排那个帧进行发送，使其以最优效率的次序进行传输。这里检查这个队列中是否有enqueue函数，如果有则说明设备会使用这个队列，否则需另外处理。关于enqueue函数的设置，我找到dev_open->dev_activate中调用了qdisc_create_dflt来设置，需要注意的是，这里并不是将传进来的skb直接发送，而是先入队，然后调度队列，具体发送哪个数据包由enqueue和dequeue函数决定，这体现了设备的排队规则</p>
+
+<p>Enqueue 把一个元素添加的队列</p>
+
+<p>Dequeue 从队列中提取一个元素</p>
+
+<p>Requeue 把一个原先已经提取的元素放回到队列，可以由于传输失败。</p>
+
+<p>if (q->enqueue)为真的话，表明这个设备有队列，可以进行相关的流控。调用__dev_xmit_skb函数进行处理。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static inline int __dev_xmit_skb(struct sk_buff *skb, struct Qdisc *q,
+</span><span class='line'>&#9;&#9;&#9;&#9; struct net_device *dev,
+</span><span class='line'>&#9;&#9;&#9;&#9; struct netdev_queue *txq)
+</span><span class='line'>{
+</span><span class='line'>&#9;spinlock_t *root_lock = qdisc_lock(q);
+</span><span class='line'>&#9;bool contended = qdisc_is_running(q);
+</span><span class='line'>&#9;int rc;
+</span><span class='line'>
+</span><span class='line'>&#9;/*
+</span><span class='line'>&#9; * Heuristic to force contended enqueues to serialize on a
+</span><span class='line'>&#9; * separate lock before trying to get qdisc main lock.
+</span><span class='line'>&#9; * This permits __QDISC_STATE_RUNNING owner to get the lock more often
+</span><span class='line'>&#9; * and dequeue packets faster.
+</span><span class='line'>&#9; */
+</span><span class='line'>&#9;if (unlikely(contended))
+</span><span class='line'>&#9;&#9;spin_lock(&q-&gt;busylock);
+</span><span class='line'>
+</span><span class='line'>&#9;spin_lock(root_lock);
+</span><span class='line'>&#9;if (unlikely(test_bit(__QDISC_STATE_DEACTIVATED, &q-&gt;state))) {
+</span><span class='line'>&#9;&#9;kfree_skb(skb);
+</span><span class='line'>&#9;&#9;rc = NET_XMIT_DROP;
+</span><span class='line'>&#9;} else if ((q-&gt;flags & TCQ_F_CAN_BYPASS) && !qdisc_qlen(q) &&
+</span><span class='line'>&#9;&#9; qdisc_run_begin(q)) {
+</span><span class='line'>&#9;&#9;/*
+</span><span class='line'>&#9;&#9; * This is a work-conserving queue; there are no old skbs
+</span><span class='line'>&#9;&#9; * waiting to be sent out; and the qdisc is not running -
+</span><span class='line'>&#9;&#9; * xmit the skb directly.
+</span><span class='line'>&#9;&#9; */
+</span><span class='line'>&#9;&#9;if (!(dev-&gt;priv_flags & IFF_XMIT_DST_RELEASE))
+</span><span class='line'>&#9;&#9;&#9;skb_dst_force(skb);
+</span><span class='line'>&#9;&#9;__qdisc_update_bstats(q, skb-&gt;len);
+</span><span class='line'>&#9;&#9;if (sch_direct_xmit(skb, q, dev, txq, root_lock)) {
+</span><span class='line'>&#9;&#9;&#9;if (unlikely(contended)) {
+</span><span class='line'>&#9;&#9;&#9;&#9;spin_unlock(&q-&gt;busylock);
+</span><span class='line'>&#9;&#9;&#9;&#9;contended = false;
+</span><span class='line'>&#9;&#9;&#9;}
+</span><span class='line'>&#9;&#9;&#9;__qdisc_run(q);
+</span><span class='line'>&#9;&#9;} else
+</span><span class='line'>&#9;&#9;&#9;qdisc_run_end(q);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;rc = NET_XMIT_SUCCESS;
+</span><span class='line'>&#9;} else {
+</span><span class='line'>&#9;&#9;skb_dst_force(skb);
+</span><span class='line'>&#9;&#9;rc = qdisc_enqueue_root(skb, q);
+</span><span class='line'>&#9;&#9;if (qdisc_run_begin(q)) {
+</span><span class='line'>&#9;&#9;&#9;if (unlikely(contended)) {
+</span><span class='line'>&#9;&#9;&#9;&#9;spin_unlock(&q-&gt;busylock);
+</span><span class='line'>&#9;&#9;&#9;&#9;contended = false;
+</span><span class='line'>&#9;&#9;&#9;}
+</span><span class='line'>&#9;&#9;&#9;__qdisc_run(q);
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;spin_unlock(root_lock);
+</span><span class='line'>&#9;if (unlikely(contended))
+</span><span class='line'>&#9;&#9;spin_unlock(&q-&gt;busylock);
+</span><span class='line'>&#9;return rc;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>_dev_xmit_skb函数主要做两件事情：<br/>
+ （1） 如果流控对象为空的，试图直接发送数据包。<br/>
+ （2） 如果流控对象不空，将数据包加入流控对象，并运行流控对象。</p>
+
+<p>当设备进入调度队列准备传输时，qdisc_run函数就会选出下一个要传输的帧，而该函数会间接的调用相关联的队列规则dequeue函数，从对了中取出数据进行传输。</p>
+
+<p>有两个时机将会调用qdisc_run()：<br/>
+  1.<code>__dev_xmit_skb()</code><br/>
+  2.软中断服务线程NET_TX_SOFTIRQ</p>
+
+<p>其实，真正的工作有qdisc_restart函数实现。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void __qdisc_run(struct Qdisc *q)
+</span><span class='line'>{
+</span><span class='line'>&#9;unsigned long start_time = jiffies;
+</span><span class='line'>
+</span><span class='line'>&#9;while (qdisc_restart(q)) { //返回值大于0，说明流控对象非空。
+</span><span class='line'>&#9;&#9;/*
+</span><span class='line'>&#9;&#9; * Postpone processing if
+</span><span class='line'>&#9;&#9; * 1. another process needs the CPU;
+</span><span class='line'>&#9;&#9; * 2. we've been doing it for too long.
+</span><span class='line'>&#9;&#9; */
+</span><span class='line'>&#9;&#9;if (need_resched() || jiffies != start_time) { //已经不允许继续运行本流控对象。
+</span><span class='line'>&#9;&#9;&#9;__netif_schedule(q); //将本队列加入软中断的output_queue链表中。
+</span><span class='line'>&#9;&#9;&#9;break;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;qdisc_run_end(q);
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>如果发现本队列运行的时间太长了，将会停止队列的运行，并将队列加入output_queue链表头。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static inline int qdisc_restart(struct Qdisc *q)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct netdev_queue *txq;
+</span><span class='line'>&#9;struct net_device *dev;
+</span><span class='line'>&#9;spinlock_t *root_lock;
+</span><span class='line'>&#9;struct sk_buff *skb;
+</span><span class='line'>
+</span><span class='line'>&#9;/* Dequeue packet */
+</span><span class='line'>&#9;skb = dequeue_skb(q);//一开始就调用dequeue函数。
+</span><span class='line'>&#9;if (unlikely(!skb))
+</span><span class='line'>&#9;&#9;return 0;
+</span><span class='line'>&#9;WARN_ON_ONCE(skb_dst_is_noref(skb));
+</span><span class='line'>&#9;root_lock = qdisc_lock(q);
+</span><span class='line'>&#9;dev = qdisc_dev(q);
+</span><span class='line'>&#9;txq = netdev_get_tx_queue(dev, skb_get_queue_mapping(skb));
+</span><span class='line'>
+</span><span class='line'>&#9;return sch_direct_xmit(skb, q, dev, txq, root_lock);//用于发送数据包
+</span><span class='line'>}
+</span><span class='line'>* Returns to the caller:
+</span><span class='line'> *                0 - queue is empty or throttled.
+</span><span class='line'> *                &gt;0 - queue is not empty.
+</span><span class='line'> */
+</span><span class='line'>int sch_direct_xmit(struct sk_buff *skb, struct Qdisc *q,
+</span><span class='line'>&#9;&#9; struct net_device *dev, struct netdev_queue *txq,
+</span><span class='line'>&#9;&#9; spinlock_t *root_lock)
+</span><span class='line'>{
+</span><span class='line'>&#9;int ret = NETDEV_TX_BUSY;
+</span><span class='line'>
+</span><span class='line'>&#9;/* And release qdisc */
+</span><span class='line'>&#9;spin_unlock(root_lock);
+</span><span class='line'>
+</span><span class='line'>&#9;HARD_TX_LOCK(dev, txq, smp_processor_id());
+</span><span class='line'>&#9;if (!netif_tx_queue_stopped(txq) && !netif_tx_queue_frozen(txq)) //设备没有被停止，且发送队列没有被冻结
+</span><span class='line'>&#9;&#9;ret = dev_hard_start_xmit(skb, dev, txq); //发送数据包
+</span><span class='line'>
+</span><span class='line'>&#9;HARD_TX_UNLOCK(dev, txq);
+</span><span class='line'>
+</span><span class='line'>&#9;spin_lock(root_lock);
+</span><span class='line'>
+</span><span class='line'>&#9;if (dev_xmit_complete(ret)) {
+</span><span class='line'>&#9;&#9;/* Driver sent out skb successfully or skb was consumed */
+</span><span class='line'>&#9;&#9;//发送成功，返回新的队列的长度
+</span><span class='line'>&#9;&#9;ret = qdisc_qlen(q);
+</span><span class='line'>&#9;} else if (ret == NETDEV_TX_LOCKED) {
+</span><span class='line'>&#9;&#9;/* Driver try lock failed */
+</span><span class='line'>&#9;&#9;ret = handle_dev_cpu_collision(skb, txq, q);
+</span><span class='line'>&#9;} else {
+</span><span class='line'>&#9;&#9;/* Driver returned NETDEV_TX_BUSY - requeue skb */
+</span><span class='line'>&#9;&#9;if (unlikely (ret != NETDEV_TX_BUSY && net_ratelimit()))
+</span><span class='line'>&#9;&#9;&#9;printk(KERN_WARNING "BUG %s code %d qlen %d\n",
+</span><span class='line'>&#9;&#9;&#9; dev-&gt;name, ret, q-&gt;q.qlen);
+</span><span class='line'>&#9;&#9; //设备繁忙，重新调度发送（利用softirq）
+</span><span class='line'>&#9;&#9;ret = dev_requeue_skb(skb, q);
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;if (ret && (netif_tx_queue_stopped(txq) ||
+</span><span class='line'>&#9;&#9; netif_tx_queue_frozen(txq)))
+</span><span class='line'>&#9;&#9;ret = 0;
+</span><span class='line'>
+</span><span class='line'>&#9;return ret;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>4. 我们看一下下面的发送函数。</h5>
+
+<p> 从此函数可以看出，当驱动使用发送队列的时候会循环从队列中取出包发送, 而不使用队列的时候只发送一次，如果没发送成功就直接丢弃</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+<span class='line-number'>65</span>
+<span class='line-number'>66</span>
+<span class='line-number'>67</span>
+<span class='line-number'>68</span>
+<span class='line-number'>69</span>
+<span class='line-number'>70</span>
+<span class='line-number'>71</span>
+<span class='line-number'>72</span>
+<span class='line-number'>73</span>
+<span class='line-number'>74</span>
+<span class='line-number'>75</span>
+<span class='line-number'>76</span>
+<span class='line-number'>77</span>
+<span class='line-number'>78</span>
+<span class='line-number'>79</span>
+<span class='line-number'>80</span>
+<span class='line-number'>81</span>
+<span class='line-number'>82</span>
+<span class='line-number'>83</span>
+<span class='line-number'>84</span>
+<span class='line-number'>85</span>
+<span class='line-number'>86</span>
+<span class='line-number'>87</span>
+<span class='line-number'>88</span>
+<span class='line-number'>89</span>
+<span class='line-number'>90</span>
+<span class='line-number'>91</span>
+<span class='line-number'>92</span>
+<span class='line-number'>93</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>struct netdev_queue *txq)
+</span><span class='line'>{
+</span><span class='line'>&#9;const struct net_device_ops *ops = dev-&gt;netdev_ops;//驱动程序的函数集
+</span><span class='line'>&#9;int rc = NETDEV_TX_OK;
+</span><span class='line'>
+</span><span class='line'>&#9;if (likely(!skb-&gt;next)) {
+</span><span class='line'>&#9;&#9;if (!list_empty(&ptype_all))
+</span><span class='line'>&#9;&#9;&#9;dev_queue_xmit_nit(skb, dev);//如果dev_add_pack加入的是ETH_P_ALL，那么就会复制一份给你的回调函数。
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;/*
+</span><span class='line'>&#9;&#9; * If device doesnt need skb-&gt;dst, release it right now while
+</span><span class='line'>&#9;&#9; * its hot in this cpu cache
+</span><span class='line'>&#9;&#9; */
+</span><span class='line'>&#9;&#9;if (dev-&gt;priv_flags & IFF_XMIT_DST_RELEASE)
+</span><span class='line'>&#9;&#9;&#9;skb_dst_drop(skb);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;skb_orphan_try(skb);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (vlan_tx_tag_present(skb) &&
+</span><span class='line'>&#9;&#9; !(dev-&gt;features & NETIF_F_HW_VLAN_TX)) {
+</span><span class='line'>&#9;&#9;&#9;skb = __vlan_put_tag(skb, vlan_tx_tag_get(skb));
+</span><span class='line'>&#9;&#9;&#9;if (unlikely(!skb))
+</span><span class='line'>&#9;&#9;&#9;&#9;goto out;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;skb-&gt;vlan_tci = 0;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;if (netif_needs_gso(dev, skb)) {
+</span><span class='line'>&#9;&#9;&#9;if (unlikely(dev_gso_segment(skb)))
+</span><span class='line'>&#9;&#9;&#9;&#9;goto out_kfree_skb;
+</span><span class='line'>&#9;&#9;&#9;if (skb-&gt;next)
+</span><span class='line'>&#9;&#9;&#9;&#9;goto gso;
+</span><span class='line'>&#9;&#9;} else {
+</span><span class='line'>&#9;&#9;&#9;if (skb_needs_linearize(skb, dev) &&
+</span><span class='line'>&#9;&#9;&#9; __skb_linearize(skb))
+</span><span class='line'>&#9;&#9;&#9;&#9;goto out_kfree_skb;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;/* If packet is not checksummed and device does not
+</span><span class='line'>&#9;&#9;&#9; * support checksumming for this protocol, complete
+</span><span class='line'>&#9;&#9;&#9; * checksumming here.
+</span><span class='line'>&#9;&#9;&#9; */
+</span><span class='line'>&#9;&#9;&#9;if (skb-&gt;ip_summed == CHECKSUM_PARTIAL) {
+</span><span class='line'>&#9;&#9;&#9;&#9;skb_set_transport_header(skb, skb-&gt;csum_start -
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9; skb_headroom(skb));
+</span><span class='line'>&#9;&#9;&#9;&#9;if (!dev_can_checksum(dev, skb) &&
+</span><span class='line'>&#9;&#9;&#9;&#9; skb_checksum_help(skb))
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;goto out_kfree_skb;
+</span><span class='line'>&#9;&#9;&#9;}
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;rc = ops-&gt;ndo_start_xmit(skb, dev);//调用网卡的驱动程序发送数据。不同的网络设备有不同的发送函数
+</span><span class='line'>&#9;&#9;trace_net_dev_xmit(skb, rc);
+</span><span class='line'>&#9;&#9;if (rc == NETDEV_TX_OK)
+</span><span class='line'>&#9;&#9;&#9;txq_trans_update(txq);
+</span><span class='line'>&#9;&#9;return rc;
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>gso:
+</span><span class='line'>&#9;do {
+</span><span class='line'>&#9;&#9;struct sk_buff *nskb = skb-&gt;next;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;skb-&gt;next = nskb-&gt;next;
+</span><span class='line'>&#9;&#9;nskb-&gt;next = NULL;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;/*
+</span><span class='line'>&#9;&#9; * If device doesnt need nskb-&gt;dst, release it right now while
+</span><span class='line'>&#9;&#9; * its hot in this cpu cache
+</span><span class='line'>&#9;&#9; */
+</span><span class='line'>&#9;&#9;if (dev-&gt;priv_flags & IFF_XMIT_DST_RELEASE)
+</span><span class='line'>&#9;&#9;&#9;skb_dst_drop(nskb);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;rc = ops-&gt;ndo_start_xmit(nskb, dev); //调用网卡的驱动程序发送数据。不同的网络设备有不同的发送函数
+</span><span class='line'>&#9;&#9;trace_net_dev_xmit(nskb, rc);
+</span><span class='line'>&#9;&#9;if (unlikely(rc != NETDEV_TX_OK)) {
+</span><span class='line'>&#9;&#9;&#9;if (rc & ~NETDEV_TX_MASK)
+</span><span class='line'>&#9;&#9;&#9;&#9;goto out_kfree_gso_skb;
+</span><span class='line'>&#9;&#9;&#9;nskb-&gt;next = skb-&gt;next;
+</span><span class='line'>&#9;&#9;&#9;skb-&gt;next = nskb;
+</span><span class='line'>&#9;&#9;&#9;return rc;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;&#9;txq_trans_update(txq);
+</span><span class='line'>&#9;&#9;if (unlikely(netif_tx_queue_stopped(txq) && skb-&gt;next))
+</span><span class='line'>&#9;&#9;&#9;return NETDEV_TX_BUSY;
+</span><span class='line'>&#9;} while (skb-&gt;next);
+</span><span class='line'>
+</span><span class='line'>out_kfree_gso_skb:
+</span><span class='line'>&#9;if (likely(skb-&gt;next == NULL))
+</span><span class='line'>&#9;&#9;skb-&gt;destructor = DEV_GSO_CB(skb)-&gt;destructor;
+</span><span class='line'>out_kfree_skb:
+</span><span class='line'>&#9;kfree_skb(skb);
+</span><span class='line'>out:
+</span><span class='line'>&#9;return rc;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>5.下面看一下dev_queue_xmit_nit函数。</h5>
+
+<p>对于通过socket(AF_PACKET,SOCK_RAW,htons(ETH_P_ALL))创建的原始套接口，不但可以接受从外部输入的数据包，而且对于由于本地输出的数据包，如果满足条件，也可以能接受。</p>
+
+<p>该函数就是用来接收由于本地输出的数据包，在链路层的输出过程中，会调用此函数，将满足条件的数据包输入到RAW套接口，</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+<span class='line-number'>45</span>
+<span class='line-number'>46</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void dev_queue_xmit_nit(struct sk_buff *skb, struct net_device *dev)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct packet_type *ptype;
+</span><span class='line'>
+</span><span class='line'>#ifdef CONFIG_NET_CLS_ACT
+</span><span class='line'>&#9;if (!(skb-&gt;tstamp.tv64 && (G_TC_FROM(skb-&gt;tc_verd) & AT_INGRESS)))
+</span><span class='line'>&#9;&#9;net_timestamp_set(skb);-----------------（1）
+</span><span class='line'>#else
+</span><span class='line'>&#9;net_timestamp_set(skb);
+</span><span class='line'>#endif
+</span><span class='line'>
+</span><span class='line'>&#9;rcu_read_lock();
+</span><span class='line'>&#9;list_for_each_entry_rcu(ptype, &ptype_all, list) {-----------------（2）
+</span><span class='line'>&#9;&#9;/* Never send packets back to the socket
+</span><span class='line'>&#9;&#9; * they originated from - MvS (miquels@drinkel.ow.org)
+</span><span class='line'>&#9;&#9; */
+</span><span class='line'>&#9;&#9;if ((ptype-&gt;dev == dev || !ptype-&gt;dev) &&
+</span><span class='line'>&#9;&#9; (ptype-&gt;af_packet_priv == NULL ||
+</span><span class='line'>&#9;&#9; (struct sock *)ptype-&gt;af_packet_priv != skb-&gt;sk)) {-----------------（3）
+</span><span class='line'>&#9;&#9;&#9;struct sk_buff *skb2 = skb_clone(skb, GFP_ATOMIC); -----------------（4）
+</span><span class='line'>&#9;&#9;&#9;if (!skb2)
+</span><span class='line'>&#9;&#9;&#9;&#9;break;
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;/* skb-&gt;nh should be correctly
+</span><span class='line'>&#9;&#9;&#9; set by sender, so that the second statement is
+</span><span class='line'>&#9;&#9;&#9; just protection against buggy protocols.
+</span><span class='line'>&#9;&#9;&#9; */
+</span><span class='line'>&#9;&#9;&#9;skb_reset_mac_header(skb2);
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;if (skb_network_header(skb2) &lt; skb2-&gt;data ||
+</span><span class='line'>&#9;&#9;&#9; skb2-&gt;network_header &gt; skb2-&gt;tail) {
+</span><span class='line'>&#9;&#9;&#9;&#9;if (net_ratelimit())
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;printk(KERN_CRIT "protocol %04x is "
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9; "buggy, dev %s\n",
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9; ntohs(skb2-&gt;protocol),
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9; dev-&gt;name);
+</span><span class='line'>&#9;&#9;&#9;&#9;skb_reset_network_header(skb2); -----------------（5）
+</span><span class='line'>&#9;&#9;&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;&#9;&#9;skb2-&gt;transport_header = skb2-&gt;network_header;
+</span><span class='line'>&#9;&#9;&#9;skb2-&gt;pkt_type = PACKET_OUTGOING;
+</span><span class='line'>&#9;&#9;&#9;ptype-&gt;func(skb2, skb-&gt;dev, ptype, skb-&gt;dev); -----------------（6）
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;rcu_read_unlock();
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>说明：<br/>
+（1） 记录该数据包输入的时间戳<br/>
+（2） 遍历ptype_all链表，查找所有符合输入条件的原始套接口，并循环将数据包输入到满足条件的套接口<br/>
+（3） 数据包的输出设备与套接口的输入设备相符或者套接口不指定输入设备，并且该数据包不是有当前用于比较的套接口输出，此时该套接口满足条件，数据包可以输入<br/>
+（4） 由于该数据包是额外输入到这个原始套接口的，因此需要克隆一个数据包<br/>
+（5） 校验数据包是否有效<br/>
+（6） 将数据包输入原始套接口</p>
+
+<h5>6. 对于lookback设备来说处理有些不同。它的hard_start_xmit函数是loopback_xmit</h5>
+
+<p>在net/lookback.c文件中，定义的struct net_device_ops loopback_ops结构体</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static const struct net_device_ops loopback_ops = {
+</span><span class='line'>&#9;.ndo_init = loopback_dev_init,
+</span><span class='line'>&#9;.ndo_start_xmit= loopback_xmit,
+</span><span class='line'>&#9;.ndo_get_stats64 = loopback_get_stats64,
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>从这里可以看到起发送函数为loopback_xmit函数。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static netdev_tx_t loopback_xmit(struct sk_buff *skb,
+</span><span class='line'>&#9;&#9;&#9;&#9; struct net_device *dev)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct pcpu_lstats *lb_stats;
+</span><span class='line'>&#9;int len;
+</span><span class='line'>
+</span><span class='line'>&#9;skb_orphan(skb);
+</span><span class='line'>
+</span><span class='line'>&#9;skb-&gt;protocol = eth_type_trans(skb, dev);
+</span><span class='line'>
+</span><span class='line'>&#9;/* it's OK to use per_cpu_ptr() because BHs are off */
+</span><span class='line'>&#9;lb_stats = this_cpu_ptr(dev-&gt;lstats);
+</span><span class='line'>
+</span><span class='line'>&#9;len = skb-&gt;len;
+</span><span class='line'>&#9;if (likely(netif_rx(skb) == NET_RX_SUCCESS)) {//直接调用了netif_rx进行了接收处理
+</span><span class='line'>&#9;&#9;u64_stats_update_begin(&lb_stats-&gt;syncp);
+</span><span class='line'>&#9;&#9;lb_stats-&gt;bytes += len;
+</span><span class='line'>&#9;&#9;lb_stats-&gt;packets++;
+</span><span class='line'>&#9;&#9;u64_stats_update_end(&lb_stats-&gt;syncp);
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;return NETDEV_TX_OK;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<h5>7. 已经有了dev_queue_xmit函数，为什么还需要软中断来发送呢？</h5>
+
+<p>dev_queue_xmit是对skb做些最后的处理并且第一次尝试发送,软中断是将前者发送失败或者没发完的包发送出去。</p>
+
+<p>主要参考文献：</p>
+
+<p>Linux发送函数dev_queue_xmit分析  <a href="http://shaojiashuai123456.iteye.com/blog/842236">http://shaojiashuai123456.iteye.com/blog/842236</a></p>
+
+<p>TC流量控制实现分析（初步）  <a href="http://blog.csdn.net/wwwlkk/article/details/5929308">http://blog.csdn.net/wwwlkk/article/details/5929308</a></p>
+
+<p>Linux内核源码剖析 TCP/IP实现</p>
 </div>
   
   
@@ -865,7 +2661,7 @@ m - 允许任务生成还不存在的设备文件</p>
   
     <section>
 <h1>Categories
-<span class='right_span'>(970)</span>
+<span class='right_span'>(983)</span>
 
 </h1>
 <head>
@@ -902,7 +2698,7 @@ if (!document.getElementById('blog~octopress')) document.getElementById('aexp_bl
 if (!document.getElementById('blog')) document.getElementById('aexp_blog').style.visibility = 'hidden';
 if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ruby').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(168)</span></li>
+<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(171)</span></li>
 <div id='language' class='catsub'><li><a href='/blog/cats/language~c/?opendiv=language'>c</a><a href='##' onmousedown=showDiv('language~c') id='aexp_language~c'><span class='exp_style' id='exp_language~c'>[+]</span></a><span class='right_span'>33</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~c')) document.getElementById('aexp_language~c').style.visibility = 'hidden';
@@ -919,7 +2715,7 @@ if (!document.getElementById('language~java')) document.getElementById('aexp_lan
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~jsp')) document.getElementById('aexp_language~jsp').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/language~php/?opendiv=language'>php</a><a href='##' onmousedown=showDiv('language~php') id='aexp_language~php'><span class='exp_style' id='exp_language~php'>[+]</span></a><span class='right_span'>53</span></li>
+<li><a href='/blog/cats/language~php/?opendiv=language'>php</a><a href='##' onmousedown=showDiv('language~php') id='aexp_language~php'><span class='exp_style' id='exp_language~php'>[+]</span></a><span class='right_span'>55</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~php')) document.getElementById('aexp_language~php').style.visibility = 'hidden';
 </script>
@@ -927,7 +2723,7 @@ if (!document.getElementById('language~php')) document.getElementById('aexp_lang
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~python')) document.getElementById('aexp_language~python').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/language~web/?opendiv=language'>web</a><a href='##' onmousedown=showDiv('language~web') id='aexp_language~web'><span class='exp_style' id='exp_language~web'>[+]</span></a><span class='right_span'>61</span></li>
+<li><a href='/blog/cats/language~web/?opendiv=language'>web</a><a href='##' onmousedown=showDiv('language~web') id='aexp_language~web'><span class='exp_style' id='exp_language~web'>[+]</span></a><span class='right_span'>62</span></li>
 </div><script language='javascript' type='text/javascript'>
 if (!document.getElementById('language')) document.getElementById('aexp_language').style.visibility = 'hidden';
 if (!document.getElementById('language~web')) document.getElementById('aexp_language~web').style.visibility = 'hidden';
@@ -956,7 +2752,7 @@ if (!document.getElementById('assembly~base')) document.getElementById('aexp_ass
 if (!document.getElementById('assembly')) document.getElementById('aexp_assembly').style.visibility = 'hidden';
 if (!document.getElementById('assembly~win')) document.getElementById('aexp_assembly~win').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(200)</span></li>
+<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(203)</span></li>
 <div id='tools' class='catsub'><li><a href='/blog/cats/tools~apache2/?opendiv=tools'>apache2</a><a href='##' onmousedown=showDiv('tools~apache2') id='aexp_tools~apache2'><span class='exp_style' id='exp_tools~apache2'>[+]</span></a><span class='right_span'>9</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~apache2')) document.getElementById('aexp_tools~apache2').style.visibility = 'hidden';
@@ -981,7 +2777,7 @@ if (!document.getElementById('tools~command')) document.getElementById('aexp_too
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~dns')) document.getElementById('aexp_tools~dns').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/tools~git/?opendiv=tools'>git</a><a href='##' onmousedown=showDiv('tools~git') id='aexp_tools~git'><span class='exp_style' id='exp_tools~git'>[+]</span></a><span class='right_span'>14</span></li>
+<li><a href='/blog/cats/tools~git/?opendiv=tools'>git</a><a href='##' onmousedown=showDiv('tools~git') id='aexp_tools~git'><span class='exp_style' id='exp_tools~git'>[+]</span></a><span class='right_span'>15</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~git')) document.getElementById('aexp_tools~git').style.visibility = 'hidden';
 </script>
@@ -1029,6 +2825,10 @@ if (!document.getElementById('tools~redis')) document.getElementById('aexp_tools
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~smb')) document.getElementById('aexp_tools~smb').style.visibility = 'hidden';
 </script>
+<li><a href='/blog/cats/tools~snmp/?opendiv=tools'>snmp</a><a href='##' onmousedown=showDiv('tools~snmp') id='aexp_tools~snmp'><span class='exp_style' id='exp_tools~snmp'>[+]</span></a><span class='right_span'>1</span></li>
+<script language='javascript' type='text/javascript'>
+if (!document.getElementById('tools~snmp')) document.getElementById('aexp_tools~snmp').style.visibility = 'hidden';
+</script>
 <li><a href='/blog/cats/tools~socksvpn/?opendiv=tools'>socksvpn</a><a href='##' onmousedown=showDiv('tools~socksvpn') id='aexp_tools~socksvpn'><span class='exp_style' id='exp_tools~socksvpn'>[+]</span></a><span class='right_span'>3</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~socksvpn')) document.getElementById('aexp_tools~socksvpn').style.visibility = 'hidden';
@@ -1037,7 +2837,7 @@ if (!document.getElementById('tools~socksvpn')) document.getElementById('aexp_to
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~sqlmap')) document.getElementById('aexp_tools~sqlmap').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/tools~sqlserver/?opendiv=tools'>sqlserver</a><a href='##' onmousedown=showDiv('tools~sqlserver') id='aexp_tools~sqlserver'><span class='exp_style' id='exp_tools~sqlserver'>[+]</span></a><span class='right_span'>12</span></li>
+<li><a href='/blog/cats/tools~sqlserver/?opendiv=tools'>sqlserver</a><a href='##' onmousedown=showDiv('tools~sqlserver') id='aexp_tools~sqlserver'><span class='exp_style' id='exp_tools~sqlserver'>[+]</span></a><span class='right_span'>13</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~sqlserver')) document.getElementById('aexp_tools~sqlserver').style.visibility = 'hidden';
 </script>
@@ -1062,8 +2862,8 @@ if (!document.getElementById('tools~vim')) document.getElementById('aexp_tools~v
 if (!document.getElementById('tools')) document.getElementById('aexp_tools').style.visibility = 'hidden';
 if (!document.getElementById('tools~wxwork')) document.getElementById('aexp_tools~wxwork').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/system/'>system</a><a href='##' onmousedown=showDiv('system') id='aexp_system'><span class='exp_style' id='exp_system'>[+]</span></a><span class='right_span'>(126)</span></li>
-<div id='system' class='catsub'><li><a href='/blog/cats/system~base/?opendiv=system'>base</a><a href='##' onmousedown=showDiv('system~base') id='aexp_system~base'><span class='exp_style' id='exp_system~base'>[+]</span></a><span class='right_span'>36</span></li>
+<li class='catclass'><a href='/blog/cats/system/'>system</a><a href='##' onmousedown=showDiv('system') id='aexp_system'><span class='exp_style' id='exp_system'>[+]</span></a><span class='right_span'>(128)</span></li>
+<div id='system' class='catsub'><li><a href='/blog/cats/system~base/?opendiv=system'>base</a><a href='##' onmousedown=showDiv('system~base') id='aexp_system~base'><span class='exp_style' id='exp_system~base'>[+]</span></a><span class='right_span'>38</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('system~base')) document.getElementById('aexp_system~base').style.visibility = 'hidden';
 </script>
@@ -1194,8 +2994,8 @@ if (!document.getElementById('kernel~tcp')) document.getElementById('aexp_kernel
 if (!document.getElementById('kernel')) document.getElementById('aexp_kernel').style.visibility = 'hidden';
 if (!document.getElementById('kernel~vpn')) document.getElementById('aexp_kernel~vpn').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/network/'>network</a><a href='##' onmousedown=showDiv('network') id='aexp_network'><span class='exp_style' id='exp_network'>[+]</span></a><span class='right_span'>(10)</span></li>
-<div id='network' class='catsub'><li><a href='/blog/cats/network~base/?opendiv=network'>base</a><a href='##' onmousedown=showDiv('network~base') id='aexp_network~base'><span class='exp_style' id='exp_network~base'>[+]</span></a><span class='right_span'>10</span></li>
+<li class='catclass'><a href='/blog/cats/network/'>network</a><a href='##' onmousedown=showDiv('network') id='aexp_network'><span class='exp_style' id='exp_network'>[+]</span></a><span class='right_span'>(15)</span></li>
+<div id='network' class='catsub'><li><a href='/blog/cats/network~base/?opendiv=network'>base</a><a href='##' onmousedown=showDiv('network~base') id='aexp_network~base'><span class='exp_style' id='exp_network~base'>[+]</span></a><span class='right_span'>15</span></li>
 </div><script language='javascript' type='text/javascript'>
 if (!document.getElementById('network')) document.getElementById('aexp_network').style.visibility = 'hidden';
 if (!document.getElementById('network~base')) document.getElementById('aexp_network~base').style.visibility = 'hidden';
@@ -1307,7 +3107,7 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 
 <section>
 <h1>Date Categories
-<span class='right_span'>(970)</span>
+<span class='right_span'>(983)</span>
 
 </h1>
 <head>
@@ -1315,8 +3115,10 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2025/'>2025</a><a href='##' onmousedown=showDiv('2025')><span class='exp_style' id='exp_2025'>[+]</span></a><span class='right_span'>(1)</span></li>
-<div id='2025' class='catsub'><li><a href='/blog/cats/2025~01/?opendiv=2025'>2025-01</a><span class='right_span'>1</span></li>
+<li class='catclass'><a href='/blog/cats/2025/'>2025</a><a href='##' onmousedown=showDiv('2025')><span class='exp_style' id='exp_2025'>[+]</span></a><span class='right_span'>(14)</span></li>
+<div id='2025' class='catsub'><li><a href='/blog/cats/2025~07/?opendiv=2025'>2025-07</a><span class='right_span'>12</span></li>
+<li><a href='/blog/cats/2025~02/?opendiv=2025'>2025-02</a><span class='right_span'>1</span></li>
+<li><a href='/blog/cats/2025~01/?opendiv=2025'>2025-01</a><span class='right_span'>1</span></li>
 </div><li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(89)</span></li>
 <div id='2024' class='catsub'><li><a href='/blog/cats/2024~12/?opendiv=2024'>2024-12</a><span class='right_span'>2</span></li>
 <li><a href='/blog/cats/2024~10/?opendiv=2024'>2024-10</a><span class='right_span'>5</span></li>
@@ -1491,43 +3293,43 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
   <ul id="recent_posts">
     
       <li class="post">
-        <a href="/blog/2025/01/16/network-ac-ap/">如何在ac上telnet到ap</a>
+        <a href="/blog/2025/07/21/lang-web-perf/">PerformanceObserver监测网页性能</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/12/12/tools-mysql-bin/">删除MySQL下的bin</a>
+        <a href="/blog/2025/07/21/sqlserver-logldf/">sqlserver的`_log.ldf`日志文件容量太大 如何删除</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/12/12/network-sfp/">光模块配置</a>
+        <a href="/blog/2025/07/21/2288H-JBOD/">华为2288H v5服务器配置JBOD（硬盘直通）</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/10/27/network-ap-ac/">无线AP与AC详解</a>
+        <a href="/blog/2025/07/21/snmp/">Snmp的基本概念</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/10/27/network-arp-mac/">为什么二层交换机上没有arp表项</a>
+        <a href="/blog/2025/07/21/network-telnet-err/">华为交换机telnet登录失败故障的排查方法</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/10/27/network-hybrid/">Hybrid端口模式详解</a>
+        <a href="/blog/2025/07/21/lang-phpexcel-wrap/">phpexcel单元格内换行</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/10/27/network-telnet-proto/">telnet 协议详解</a>
+        <a href="/blog/2025/07/21/tftp/">centos 下 TFTP服务器安装</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/10/27/network-php-telnet/">交换机php telnet</a>
+        <a href="/blog/2025/07/21/network-lldp/">LLDP协议与VLAN的关系</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/09/26/network-telnet/">交换机开启telnet</a>
+        <a href="/blog/2025/07/21/network-hwpow/">华为交换机设备节能管理配置教程</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/09/20/ffmpeg-mp3/">ffmpeg分离MP3文件报错</a>
+        <a href="/blog/2025/07/21/network-h3cmac/">华三000f-e207-f2e0</a>
       </li>
     
   </ul>

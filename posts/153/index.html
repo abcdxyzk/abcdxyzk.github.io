@@ -131,7 +131,7 @@ var ss360Config = {
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2018/03/23/android-G9300-crom/">G9300 CROM锁</a></h2>
+      <h2 class="entry-title"><a href="/blog/2018/07/09/kernel-tcp_defer_accept/">tcp选项TCP_DEFER_ACCEPT</a></h2>
     
     
       <p class="meta">
@@ -140,63 +140,169 @@ var ss360Config = {
 
 
 
-<time class='entry-date' datetime='2018-03-23T01:02:00+08:00'><span class='date'>2018-03-23</span> <span class='time'>01:02:00</span></time>
+<time class='entry-date' datetime='2018-07-09T00:24:00+08:00'><span class='date'>2018-07-09</span> <span class='time'>00:24:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><p>crom(BL)锁是管能不能刷第三方rom的，</p>
+  <div class="entry-content"><p><a href="http://www.pagefault.info/?p=346">http://www.pagefault.info/?p=346</a></p>
 
-<p>oem锁是管能不能重置刷机的，相当于防止你手机被偷了，小偷拿去刷机重新用。</p>
+<p>TCP_DEFER_ACCEPT这个选项可能大家都知道，不过我这里会从源码和数据包来详细的分析这个选项。要注意，这里我所使用的内核版本是3.0.</p>
 
-<p>港版机刷国行rom，只需要开发者选项里面解oem锁，这个也就是港版rom会有这一限制，国行rom好像没有。</p>
+<p>首先看man手册中的介绍(man 7 tcp):</p>
 
-<h4>1.解锁和关闭 激活锁定（已经操作过的忽略）</h4>
-
-<p>&ndash;解锁BL：<br/>
-  搜索CROM 1.0.4 ，下载安装解锁工具按照提示解锁</p>
-
-<p><a href="https://pan.baidu.com/s/1hqCdX1E">https://pan.baidu.com/s/1hqCdX1E</a></p>
-
-<p><a href="/download/android/CROM%20Service1.0.4.apk">CROM Service1.0.4.apk</a></p>
-
-<p>&ndash;关闭重新激活锁定（没的打开过的也忽略）：<br/>
-  设定，搜索重新激活锁定，然后登陆三星账号，关闭。</p>
-</div>
-  
-  
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>TCP_DEFER_ACCEPT (since Linux 2.4)
+</span><span class='line'>Allow a listener to be awakened only when data arrives on the socket. Takes an integer value (seconds), this can bound the maximum number of attempts TCP will make to complete the connection. This option should not be used in code intended to be portable. </span></code></pre></td></tr></table></div></figure>
 
 
-    </article>
-  
-  
-    <article>
-      
-  <header>
-    
-      <h2 class="entry-title"><a href="/blog/2018/03/23/alg-mdev/">遍历数组一次求方差</a></h2>
-    
-    
-      <p class="meta">
-        
+<p>  我先来简单介绍下，这个选项主要是针对server端的服务器，一般来说我们三次握手，当客户端发送syn，然后server端接收到，然后发送syn + ack,然后client接收到syn+ack之后，再次发送ack(client进入establish状态),最终server端收到最后一个ack，进入establish状态。</p>
+
+<p>  而当正确的设置了TCP_DEFER_ACCEPT选项之后，server端会在接收到最后一个ack之后，并不进入establish状态，而只是将这个socket标记为acked，然后丢掉这个ack。此时server端这个socket还是处于syn_recved，然后接下来就是等待client发送数据， 而由于这个socket还是处于syn_recved,因此此时就会被syn_ack定时器所控制，对syn ack进行重传,而重传次数是由我们设置TCP_DEFER_ACCEPT传进去的值以及TCP_SYNCNT选项，proc文件系统的tcp_synack_retries一起来决定的(后面分析源码会看到如何来计算这个值).而我们知道我们传递给TCP_DEFER_ACCEPT的是秒，而在内核里面会将这个东西转换为重传次数.</p>
+
+<p>这里要注意，当重传次数超过限制之后，并且当最后一个ack到达时，下一次导致超时的synack定时器还没启动，那么这个defer的连接将会被加入到establish队列，然后通知上层用户。这个也是符合man里面所说的(Takes an integer value (seconds), this can bound the maximum number of attempts TCP will make to complete the connection.) 也就是最终会完成这个连接.</p>
+
+<p>我们来看抓包，这里server端设置deffer accept，然后客户端connect并不发送数据，我们来看会发生什么:</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>//客户端发送syn
+</span><span class='line'>19:38:20.631611 IP T-diaoliang.60277 &gt; T-diaoliang.sunproxyadmin: Flags [S], seq 2500439144, win 32792, options [mss 16396,sackOK,TS val 9008384 ecr 0,nop,wscale 4], length 0
+</span><span class='line'>//server回了syn+ack
+</span><span class='line'>19:38:20.631622 IP T-diaoliang.sunproxyadmin &gt; T-diaoliang.60277: Flags [S.], seq 1342179593, ack 2500439145, win 32768, options [mss 16396,sackOK,TS val 9008384 ecr 9008384,nop,wscale 4], length 0
+</span><span class='line'> 
+</span><span class='line'>//client发送最后一个ack
+</span><span class='line'>19:38:20.631629 IP T-diaoliang.60277 &gt; T-diaoliang.sunproxyadmin: Flags [.], ack 1, win 2050, options [nop,nop,TS val 9008384 ecr 9008384], length 0
+</span><span class='line'> 
+</span><span class='line'>//这里注意时间，可以看到过了大概1分半之后，server重新发送了syn+ack
+</span><span class='line'>19:39:55.035893 IP T-diaoliang.sunproxyadmin &gt; T-diaoliang.60277: Flags [S.], seq 1342179593, ack 2500439145, win 32768, options [mss 16396,sackOK,TS val 9036706 ecr 9008384,nop,wscale 4], length 0
+</span><span class='line'>19:39:55.035899 IP T-diaoliang.60277 &gt; T-diaoliang.sunproxyadmin: Flags [.], ack 1, win 2050, options [nop,nop,TS val 9036706 ecr 9036706,nop,nop,sack 1 {0:1}], length 0
+</span><span class='line'> 
+</span><span class='line'>//再过了1分钟，server close掉这条连接。
+</span><span class='line'>19:40:55.063435 IP T-diaoliang.sunproxyadmin &gt; T-diaoliang.60277: Flags [F.], seq 1, ack 1, win 2048, options [nop,nop,TS val 9054714 ecr 9036706], length 0
+</span><span class='line'> 
+</span><span class='line'>19:40:55.063692 IP T-diaoliang.60277 &gt; T-diaoliang.sunproxyadmin: Flags [F.], seq 1, ack 2, win 2050, options [nop,nop,TS val 9054714 ecr 9054714], length 0
+</span><span class='line'> 
+</span><span class='line'>19:40:55.063701 IP T-diaoliang.sunproxyadmin &gt; T-diaoliang.60277: Flags [.], ack 2, win 2048, options [nop,nop,TS val 9054714 ecr 9054714], length 0</span></code></pre></td></tr></table></div></figure>
 
 
+<p>这里要注意，close的原因是当synack超时之后，nginx接收到了这条连接，然后读事件超时，最终导致close这条连接。</p>
+
+<p>接下来就来看内核的代码。</p>
+
+<p>先从设置TCP_DEFER_ACCEPT开始，设置TCP_DEFER_ACCEPT是通过setsockopt来做的，而传递给内核的值是秒，下面就是内核中对应的do_tcp_setsockopt函数，它用来设置tcp相关的option，下面我们能看到主要就是将传递进去的val转换为将要重传的次数。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>case TCP_DEFER_ACCEPT:
+</span><span class='line'>&#9;/* Translate value in seconds to number of retransmits */
+</span><span class='line'>&#9;//注意参数
+</span><span class='line'>&#9;icsk-&gt;icsk_accept_queue.rskq_defer_accept =
+</span><span class='line'>&#9;secs_to_retrans(val, TCP_TIMEOUT_INIT / HZ, TCP_RTO_MAX / HZ);
+</span><span class='line'>&#9;break;</span></code></pre></td></tr></table></div></figure>
 
 
-<time class='entry-date' datetime='2018-03-23T00:41:00+08:00'><span class='date'>2018-03-23</span> <span class='time'>00:41:00</span></time>
-        
-      </p>
-    
-  </header>
+<p>这里可以看到通过调用secs_to_retrans来将秒转换为重传次数。接下来就来看这个函数，它有三个参数，第一个是将要转换的秒，第二个是RTO的初始值，第三个是RTO的最大值。 可以看到这里都是依据RTO来计算的，这是因为这个重传次数是syn_ack的重传次数。</p>
+
+<p>这个函数实现很简单，就是一个定时器退避的计算过程(定时器退避可以看我前面的blog的介绍)，每次乘2，然后来计算重传次数。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+<span class='line-number'>19</span>
+<span class='line-number'>20</span>
+<span class='line-number'>21</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static u8 secs_to_retrans(int seconds, int timeout, int rto_max)
+</span><span class='line'>{
+</span><span class='line'>&#9;u8 res = 0;
+</span><span class='line'> 
+</span><span class='line'>&#9;if (seconds &gt; 0) {
+</span><span class='line'>&#9;&#9;int period = timeout;
+</span><span class='line'>&#9;&#9;//重传次数
+</span><span class='line'>&#9;&#9;res = 1;
+</span><span class='line'>&#9;&#9;//开始遍历
+</span><span class='line'>&#9;&#9;while (seconds &gt; period && res &lt; 255) {
+</span><span class='line'>&#9;&#9;&#9;res++;
+</span><span class='line'>&#9;&#9;&#9;//定时器退避
+</span><span class='line'>&#9;&#9;&#9;timeout &lt;&lt;= 1;
+</span><span class='line'>&#9;&#9;&#9;if (timeout &gt; rto_max)
+</span><span class='line'>&#9;&#9;&#9;&#9;timeout = rto_max;
+</span><span class='line'>&#9;&#9;&#9;//定时器的秒数
+</span><span class='line'>&#9;&#9;&#9;period += timeout;
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;return res;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
-  <div class="entry-content"><p><a href="http://cq520.iteye.com/blog/2020648">http://cq520.iteye.com/blog/2020648</a></p>
+<p>然后来看当server端接收到最后一个ack的处理，这里只关注defer_accept的部分,这个函数是tcp_check_req，它主要用来检测SYN_RECV状态接收到包的校验。</p>
 
-<p> 一个长度为X的数组，里面存有N个数，能否只遍历数组一次就求得数组的方差。</p>
+<p>req->retrans表示已经重传的次数。</p>
 
-<p>计算方差的第二个公式：DX<sup>2</sup>=EX<sup>2</sup>-(EX)<sup>2</sup>，代码如下：</p>
+<p>acked标记主要是为了syn_ack定时器来使用的。</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>//两个条件，一个是重传次数小于defer_accept，一个是序列号，这两个都必须满足。
+</span><span class='line'>if (req-&gt;retrans &lt; inet_csk(sk)-&gt;icsk_accept_queue.rskq_defer_accept &&
+</span><span class='line'>&#9;TCP_SKB_CB(skb)-&gt;end_seq == tcp_rsk(req)-&gt;rcv_isn + 1) {
+</span><span class='line'>&#9;//此时设置acked。
+</span><span class='line'>&#9;inet_rsk(req)-&gt;acked = 1;
+</span><span class='line'>&#9;NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_TCPDEFERACCEPTDROP);
+</span><span class='line'>&#9;return NULL;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>而当tcp_check_req返回之后，在tcp_v4_do_rcv中会丢掉这个包，让socket继续保存在半连接队列中。</p>
+
+<p>然后来看syn ack定时器，这个定时器我以前有分析过（<a href="http://simohayha.iteye.com/admin/blogs/481989">http://simohayha.iteye.com/admin/blogs/481989</a>)
+，因此我这里只是简要的再次分析下。如果需要更详细的分析，可以看我上面的链接,这个定时器会调用inet_csk_reqsk_queue_prune函数，在这个函数中做相关的处理。</p>
+
+<p>这里我们就主要关注重试次数。其中icsk_syn_retries是TCP_SYNCNT这个option设置的。这个值会比sysctl_tcp_synack_retries优先.然后是rskq_defer_accept，它又比icsk_syn_retries优先.</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -244,51 +350,77 @@ var ss360Config = {
 <span class='line-number'>44</span>
 <span class='line-number'>45</span>
 <span class='line-number'>46</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>public class Deviation {
-</span><span class='line'>&#9;/**
-</span><span class='line'>&#9; * 传统的利用平均数求方差的方法,需要遍历数组两次
-</span><span class='line'>&#9; * @param a 目标数组
-</span><span class='line'>&#9; * @return 方差
-</span><span class='line'>&#9; */
-</span><span class='line'>&#9;private static double ComputeVariance(double a[]){
-</span><span class='line'>&#9;&#9;double variance=0;//方差
-</span><span class='line'>&#9;&#9;double average=0;//平均数
-</span><span class='line'>&#9;&#9;int i,len=a.length;
-</span><span class='line'>&#9;&#9;double sum=0,sum2=0;
-</span><span class='line'>&#9;&#9;for(i=0;i&lt;len;i++){
-</span><span class='line'>&#9;&#9;&#9;sum+=a[i];
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>void inet_csk_reqsk_queue_prune(struct sock *parent,
+</span><span class='line'>&#9;&#9;&#9;&#9;const unsigned long interval,
+</span><span class='line'>&#9;&#9;&#9;&#9;const unsigned long timeout,
+</span><span class='line'>&#9;&#9;&#9;&#9;const unsigned long max_rto)
+</span><span class='line'>{
+</span><span class='line'>&#9;........................
+</span><span class='line'>&#9;//最大的重试次数
+</span><span class='line'>&#9;int max_retries = icsk-&gt;icsk_syn_retries ? : sysctl_tcp_synack_retries;
+</span><span class='line'>&#9;int thresh = max_retries;
+</span><span class='line'>&#9;unsigned long now = jiffies;
+</span><span class='line'>&#9;struct request_sock **reqp, *req;
+</span><span class='line'>&#9;int i, budget;
+</span><span class='line'> 
+</span><span class='line'>&#9;....................................
+</span><span class='line'>&#9;//更新设置最大的重试次数。
+</span><span class='line'>&#9;if (queue-&gt;rskq_defer_accept)
+</span><span class='line'>&#9;&#9;max_retries = queue-&gt;rskq_defer_accept;
+</span><span class='line'> 
+</span><span class='line'>&#9;budget = 2 * (lopt-&gt;nr_table_entries / (timeout / interval));
+</span><span class='line'>&#9;i = lopt-&gt;clock_hand;
+</span><span class='line'> 
+</span><span class='line'>&#9;do {
+</span><span class='line'>&#9;&#9;reqp=&lopt-&gt;syn_table[i];
+</span><span class='line'>&#9;&#9;while ((req = *reqp) != NULL) {
+</span><span class='line'>&#9;&#9;&#9;if (time_after_eq(now, req-&gt;expires)) {
+</span><span class='line'>&#9;&#9;&#9;&#9;int expire = 0, resend = 0;
+</span><span class='line'>&#9;&#9;&#9;&#9;//这个函数主要是判断超时和是否重新发送syn ack，然后保存在expire和resend这个变量中。
+</span><span class='line'>&#9;&#9;&#9;&#9;syn_ack_recalc(req, thresh, max_retries,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;   queue-&gt;rskq_defer_accept,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;   &expire, &resend);
+</span><span class='line'>&#9;&#9;&#9;&#9;....................................................
+</span><span class='line'>&#9;&#9;&#9;&#9;if (!expire &&
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;(!resend ||
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9; !req-&gt;rsk_ops-&gt;rtx_syn_ack(parent, req, NULL) ||
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9; inet_rsk(req)-&gt;acked)) {
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;unsigned long timeo;
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;//更新重传次数。
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;if (req-&gt;retrans++ == 0)
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9;lopt-&gt;qlen_young--;
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;timeo = min((timeout &lt;&lt; req-&gt;retrans), max_rto);
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;req-&gt;expires = now + timeo;
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;reqp = &req-&gt;dl_next;
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;continue;
+</span><span class='line'>&#9;&#9;&#9;&#9;}
+</span><span class='line'>&#9;&#9;&#9;&#9;//如果超时，则丢掉这个请求，并对应的关闭连接.
+</span><span class='line'>&#9;&#9;&#9;&#9;/* Drop this request */
+</span><span class='line'>&#9;&#9;&#9;&#9;inet_csk_reqsk_queue_unlink(parent, req, reqp);
+</span><span class='line'>&#9;&#9;&#9;&#9;reqsk_queue_removed(queue, req);
+</span><span class='line'>&#9;&#9;&#9;&#9;reqsk_free(req);
+</span><span class='line'>&#9;&#9;&#9;&#9;continue;
+</span><span class='line'>&#9;&#9;&#9;}
+</span><span class='line'>&#9;&#9;&#9;reqp = &req-&gt;dl_next;
 </span><span class='line'>&#9;&#9;}
-</span><span class='line'>&#9;&#9;average=sum/len;
-</span><span class='line'>&#9;&#9;for(i=0;i&lt;len;i++){
-</span><span class='line'>&#9;&#9;&#9;sum2+=(a[i]-average)*(a[i]-average);
-</span><span class='line'>&#9;&#9;}
-</span><span class='line'>&#9;&#9;variance=sum2/len;
-</span><span class='line'>&#9;&#9;return variance;
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;/**
-</span><span class='line'>&#9; * 只遍历数组一次求方差，利用公式DX^2=EX^2-(EX)^2
-</span><span class='line'>&#9; * @param a
-</span><span class='line'>&#9; * @return
-</span><span class='line'>&#9; */
-</span><span class='line'>&#9;private static double ComputeVariance2(double a[]){
-</span><span class='line'>&#9;&#9;double variance=0;//方差
-</span><span class='line'>&#9;&#9;double sum=0,sum2=0;
-</span><span class='line'>&#9;&#9;int i=0,len=a.length;
-</span><span class='line'>&#9;&#9;for(;i&lt;len;i++){
-</span><span class='line'>&#9;&#9;&#9;sum+=a[i];
-</span><span class='line'>&#9;&#9;&#9;sum2+=a[i]*a[i];
-</span><span class='line'>&#9;&#9;}
-</span><span class='line'>&#9;&#9;variance=sum2/len-(sum/len)*(sum/len);
-</span><span class='line'>&#9;&#9;return variance;
-</span><span class='line'>&#9;}
-</span><span class='line'>
-</span><span class='line'>&#9;public static void main(String args[]){
-</span><span class='line'>&#9;&#9;double a[]={1,2,3,4,5};
-</span><span class='line'>&#9;&#9;System.out.println(ComputeVariance(a));
-</span><span class='line'>&#9;&#9;System.out.println(ComputeVariance2(a));
-</span><span class='line'>
-</span><span class='line'>&#9;}
+</span><span class='line'> 
+</span><span class='line'>&#9;&#9;i = (i + 1) & (lopt-&gt;nr_table_entries - 1);
+</span><span class='line'> 
+</span><span class='line'>&#9;} while (--budget &gt; 0);
+</span><span class='line'>&#9;...............................................
 </span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
@@ -305,7 +437,7 @@ var ss360Config = {
       
   <header>
     
-      <h2 class="entry-title"><a href="/blog/2018/03/23/kernel-tsq/">linux Tcp Small Queue(TSQ)实现</a></h2>
+      <h2 class="entry-title"><a href="/blog/2018/07/08/kernel-nodelay_cork/">TCP_CORK以及TCP_NODELAY</a></h2>
     
     
       <p class="meta">
@@ -314,109 +446,28 @@ var ss360Config = {
 
 
 
-<time class='entry-date' datetime='2018-03-23T00:29:00+08:00'><span class='date'>2018-03-23</span> <span class='time'>00:29:00</span></time>
+<time class='entry-date' datetime='2018-07-08T23:53:00+08:00'><span class='date'>2018-07-08</span> <span class='time'>23:53:00</span></time>
         
       </p>
     
   </header>
 
 
-  <div class="entry-content"><p><a href="http://www.cnhalo.net/2016/09/13/linux-tcp-small-queue/">http://www.cnhalo.net/2016/09/13/linux-tcp-small-queue/</a></p>
+  <div class="entry-content"><p>默认情况下 tp->nodelay = 0; 也就是delay=1</p>
 
-<h4>目的</h4>
+<hr />
 
-<p>考虑以下场景</p>
+<p><a href="https://blog.csdn.net/dog250/article/details/5941637">https://blog.csdn.net/dog250/article/details/5941637</a></p>
 
-<p>  有两个tcp，其中一个连接的cwnd非常大，应用程序尽可能地发包<br/>
-  或者有个应用程序一直往外无限制地发送udp包</p>
+<p>  所谓的cork就是塞子的意思，形象地理解就是用cork将连接塞住，使得数据先不发出去，等到拔去塞子后再发出去，而nodelay事实上是为了禁用Nagle算法，Nagle算法为了增加了网络的吞吐量而牺牲了响应时间体验，这在有些应用中是不合适的，比如交互式应用(终端登录或者远程X应用 etc.)，因此有必要提供一个选项将它禁用掉，Nagle算法在RFC1122中有提及，它的实现实际上很简单，利用了tcp本身的一些特性，在算法描述中，关键的一点是“什么时候真实的发送数据”，这个问题的解答也是很简单，原则上只要发出的包都被对端ack了就可以发送了，这实际上也是一种权衡，Nagle算法最初的目的在于解决大量小包存在于网络从而造成网络拥塞的问题(一个小包可能只有几个字节，比如ls，cat等等，然而为每个小包封装几个协议头，其大小就不可忽视了，大量此类小包存在于网络势必会使得网络带宽的利用率大大下降)，如果包被ack了，说明包已经离开了网络进入了对端主机，这样就可以发送数据了，此时无需再等，有多少数据发送多少(当然要考虑窗口大小和MTU)，如果很极端地等待更多的数据，那么响应度会更低，换句话简单的说Nagle算法只允许一个未被ack的包存在于网络，它并不管包的大小。</p>
 
-<p>  如果没有一种机制公平地限定各个连接的发送数量，底层的qdisc/网卡队列就会被高发包率的应用占用，同时造成上层tcp计算RTT和cwnd的偏差，以及bufferbloat问题。</p>
+<p>  可以看出，Nagle算法完全由tcp协议的ack机制决定，这会带来一些问题，比如如果对端ack回复很快的话，Nagle事实上不会拼接太多的数据包，虽然避免了网络拥塞，网络总体的利用率依然很低，Nagle真的做到了“只做好一件事”的原则，然而有没有另外一种算法，可以提高整体网络利用率呢？也就是说尽量以不能再多的数据发送，这里之所以说是尽量还是权衡导致的，某时可以发送数据的时候将会发送数据，即使当前数据再小也不再等待后续的可能拼接成更大包的数据的到来。</p>
 
-<p>  尤其对于默认采用pfifo_fast qdisc算法来说非常常见， 因为基本上只使用一个队列(大多数流的TOS=0)</p>
+<p>  实际上，这样的需求可以用TCP_CORK来实现，但是实现得可能并不像你想象的那么完美，cork并不会将连接完全塞住。内核其实并不知道应用层到底什么时候会发送第二批数据用于和第一批数据拼接以达到MTU的大小，因此内核会给出一个时间限制，在该时间内没有拼接成一个大包(努力接近MTU)的话，内核就会无条件发送，这里给出的只是一个大致的思想，真实的情况还要受到窗口大小以及拥塞情况的影响，因此tcp“何时发送数据”这个问题非常复杂。</p>
 
-<h4>解决及未解决</h4>
+<p>  Nagle算法主要避免网络因为太多的小包(协议头的比例非常之大)而拥塞，而CORK算法则是为了提高网络的利用率，使得总体上协议头占用的比例尽可能的小。如此看来这二者在避免发送小包上是一致的，在用户控制的层面上，Nagle算法完全不受用户socket的控制，你只能简单的设置TCP_NODELAY而禁用它，CORK算法同样也是通过设置或者清除TCP_cork使能或者禁用之，然而Nagle算法关心的是网络拥塞问题，只要所有的ack回来则发包，而CORK算法却可以关心内容，在前后数据包发送间隔很短的前提下(很重要，否则内核会帮你将分散的包发出)，即使你是分散发送多个小数据包，你也可以通过使能CORK算法将这些内容拼接在一个包内，如果此时用Nagle算法的话，则可能做不到这一点。</p>
 
-<p>  因此在qdisc队列长度一定的情况下，让不同的流拥有相等的配额<br/>
-  当达到配额后就不允许该流继续发包， 此时包存在在上层协议的缓存中，不往qdisc上发<br/>
-  如果网卡发包完成后，释放skb的时候，如果发现该流达到配额了，就通过回调机制通知上层可以往qdisc上发了</p>
-
-<p>Tcp Small Queue(TSQ)也由此而来。但是只解决了tcp流之间的公平问题，并没有在udp等其他协议上实现。
-如果udp发满了qdisc，还是会对其他流造成影响。</p>
-
-<p>因此在有很多非tcp业务的机器上，需要配置使用其他qdisc算法结合tc命令配置</p>
-
-<h4>配置</h4>
-
-<h4>qdisc队列长度</h4>
-
-<p>  通过ifconfig eth0查看，其中的txqueuelen就是qdisc的队列长度, 默认1000个skb， 这时候GSO/TSO还没开始，因此如果开启GSO/TSO数据只会更多</p>
-
-<p>  通过ifconfig eth0 txqueuelen 1500可以设置该长度，设置过长会导致bufferbloat问题</p>
-
-<p>因此对于默认qfifo_fast算法，qdisc的长度是以GSO包为单位， 超过该长度在qdisc层就会丢弃该包</p>
-
-<h4>每个流的配额</h4>
-
-<p>在linux 4.9上，默认是4个TSO的大小，256KB</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/* Default TSQ limit of four TSO segments */
-</span><span class='line'>net.ipv4.tcp_limit_output_bytes = 262144</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>判断是否超过限制</h4>
-
-<p>在tcp_write_xmit()中，会调用tcp_small_queue_check()来判断该tcp是否达到配额
-tcp_small_queue_check()返回true的话则不发送，让skb继续留在发送队列中.
-并且会在该sock中设置TSQ_THROTTLED标记，表示上层数据在等待qdisc空间</p>
-
-<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
-<span class='line-number'>2</span>
-<span class='line-number'>3</span>
-<span class='line-number'>4</span>
-<span class='line-number'>5</span>
-<span class='line-number'>6</span>
-<span class='line-number'>7</span>
-<span class='line-number'>8</span>
-<span class='line-number'>9</span>
-<span class='line-number'>10</span>
-<span class='line-number'>11</span>
-<span class='line-number'>12</span>
-<span class='line-number'>13</span>
-<span class='line-number'>14</span>
-<span class='line-number'>15</span>
-<span class='line-number'>16</span>
-<span class='line-number'>17</span>
-<span class='line-number'>18</span>
-<span class='line-number'>19</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static bool tcp_small_queue_check(struct sock *sk, const struct sk_buff *skb,
-</span><span class='line'>&#9;&#9;&#9;&#9;  unsigned int factor)
-</span><span class='line'>{
-</span><span class='line'>&#9;unsigned int limit;
-</span><span class='line'>&#9;limit = max(2 * skb-&gt;truesize, sk-&gt;sk_pacing_rate &gt;&gt; 10); //每毫秒的速率，或者两个当前包的大小
-</span><span class='line'>&#9;limit = min_t(u32, limit, sysctl_tcp_limit_output_bytes); //默认最大256K
-</span><span class='line'>&#9;limit &lt;&lt;= factor;   //在重传的话*2
-</span><span class='line'>&#9;if (atomic_read(&sk-&gt;sk_wmem_alloc) &gt; limit) {  //qdisc中的数据超过限制
-</span><span class='line'>&#9;&#9;set_bit(TSQ_THROTTLED, &tcp_sk(sk)-&gt;tsq_flags);    //设置标记，标记当前sock没通过tsq检测
-</span><span class='line'>&#9;&#9;/* It is possible TX completion already happened
-</span><span class='line'>&#9;&#9; * before we set TSQ_THROTTLED, so we must
-</span><span class='line'>&#9;&#9; * test again the condition.
-</span><span class='line'>&#9;&#9; */
-</span><span class='line'>&#9;&#9;smp_mb__after_atomic();
-</span><span class='line'>&#9;&#9;if (atomic_read(&sk-&gt;sk_wmem_alloc) &gt; limit)
-</span><span class='line'>&#9;&#9;&#9;return true;
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;return false;
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
-
-
-<h4>发送完成释放skb</h4>
-
-<p>在达到qdisc配额前，tcp_transmit_skb会为所有的数据包设置skb->destructor=tcp_wfree,
-在设备发送完数据释放skb的时候，tcp_wfree()被调用，并根据TSQ_THROTTLED来判断，是否有数据正在等待qdisc空间。
-如果有数据包在等待，则把该数据包的sock，加入到percpu的列表中。
-并设置tasklet任务，在下一个软中断中发送该sock中的数据包</p>
+<p>  接下来看一下内核代码，然后给出一个测试程序来感性感受这些选项。tcp的发送函数是tcp_sendmsg，这个函数中存在一个大循环，用于将用户数据置入skb中，它的形式如下：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -463,56 +514,116 @@ tcp_small_queue_check()返回true的话则不发送，让skb继续留在发送�
 <span class='line-number'>43</span>
 <span class='line-number'>44</span>
 <span class='line-number'>45</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static int tcp_transmit_skb(struct sock *sk, struct sk_buff *skb, int clone_it,
-</span><span class='line'>&#9;&#9;&#9;    gfp_t gfp_mask)
+<span class='line-number'>46</span>
+<span class='line-number'>47</span>
+<span class='line-number'>48</span>
+<span class='line-number'>49</span>
+<span class='line-number'>50</span>
+<span class='line-number'>51</span>
+<span class='line-number'>52</span>
+<span class='line-number'>53</span>
+<span class='line-number'>54</span>
+<span class='line-number'>55</span>
+<span class='line-number'>56</span>
+<span class='line-number'>57</span>
+<span class='line-number'>58</span>
+<span class='line-number'>59</span>
+<span class='line-number'>60</span>
+<span class='line-number'>61</span>
+<span class='line-number'>62</span>
+<span class='line-number'>63</span>
+<span class='line-number'>64</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int tcp_sendmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
+</span><span class='line'>&#9;&#9;size_t size)
 </span><span class='line'>{
-</span><span class='line'>&#9;...
-</span><span class='line'>&#9;skb-&gt;destructor = skb_is_tcp_pure_ack(skb) ? __sock_wfree : tcp_wfree;
-</span><span class='line'>&#9;...
-</span><span class='line'>}
-</span><span class='line'>/*
-</span><span class='line'> * Write buffer destructor automatically called from kfree_skb.
-</span><span class='line'> * We can't xmit new skbs from this context, as we might already
-</span><span class='line'> * hold qdisc lock.
-</span><span class='line'> */
-</span><span class='line'>void tcp_wfree(struct sk_buff *skb)
-</span><span class='line'>{
-</span><span class='line'>&#9;struct sock *sk = skb-&gt;sk;
-</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
-</span><span class='line'>&#9;int wmem;
-</span><span class='line'>&#9;/* Keep one reference on sk_wmem_alloc.
-</span><span class='line'>&#9; * Will be released by sk_free() from here or tcp_tasklet_func()
-</span><span class='line'>&#9; */
-</span><span class='line'>&#9;wmem = atomic_sub_return(skb-&gt;truesize - 1, &sk-&gt;sk_wmem_alloc);
-</span><span class='line'>&#9;/* If this softirq is serviced by ksoftirqd, we are likely under stress.
-</span><span class='line'>&#9; * Wait until our queues (qdisc + devices) are drained.
-</span><span class='line'>&#9; * This gives :
-</span><span class='line'>&#9; * - less callbacks to tcp_write_xmit(), reducing stress (batches)
-</span><span class='line'>&#9; * - chance for incoming ACK (processed by another cpu maybe)
-</span><span class='line'>&#9; *   to migrate this flow (skb-&gt;ooo_okay will be eventually set)
-</span><span class='line'>&#9; */
-</span><span class='line'>&#9;if (wmem &gt;= SKB_TRUESIZE(1) && this_cpu_ksoftirqd() == current)
-</span><span class='line'>&#9;&#9;goto out;
-</span><span class='line'>&#9;if (test_and_clear_bit(TSQ_THROTTLED, &tp-&gt;tsq_flags) &&   //判断并清除成功, 避免重复插入队列
-</span><span class='line'>&#9;    !test_and_set_bit(TSQ_QUEUED, &tp-&gt;tsq_flags)) {// 设置TSQ_QUEUED
-</span><span class='line'>&#9;&#9;unsigned long flags;
-</span><span class='line'>&#9;&#9;struct tsq_tasklet *tsq;
-</span><span class='line'>&#9;&#9;/* queue this socket to tasklet queue */
-</span><span class='line'>&#9;&#9;local_irq_save(flags);
-</span><span class='line'>&#9;&#9;tsq = this_cpu_ptr(&tsq_tasklet);
-</span><span class='line'>&#9;&#9;list_add(&tp-&gt;tsq_node, &tsq-&gt;head); //添加sock到percpu列表
-</span><span class='line'>&#9;&#9;tasklet_schedule(&tsq-&gt;tasklet);   //等待在softirq中被调度
-</span><span class='line'>&#9;&#9;local_irq_restore(flags);
-</span><span class='line'>&#9;&#9;return;
+</span><span class='line'>
+</span><span class='line'>&#9;while (--iovlen &gt;= 0) {
+</span><span class='line'>&#9;&#9;0.更新数据结构元数据；
+</span><span class='line'>&#9;&#9;while (seglen &gt; 0) {
+</span><span class='line'>&#9;&#9;&#9;int copy;
+</span><span class='line'>&#9;&#9;&#9;skb = sk-&gt;sk_write_queue.prev;
+</span><span class='line'>&#9;&#9;&#9;1.如果既有skb的长度过大或者根本还没有一个skb则分配一个skb；
+</span><span class='line'>&#9;&#9;&#9;2.将数据拷贝到既有的skb或者新的skb中；
+</span><span class='line'>&#9;&#9;&#9;3.更新skb和用户数据的元数据；
+</span><span class='line'>&#9;&#9;&#9;//如果数据还没有达到mss，则继续，换句话就是如果数据已经达到mss了就接着往下走来权衡是否马上发送。
+</span><span class='line'>&#9;&#9;&#9;if (skb-&gt;len != mss_now || (flags & MSG_OOB))
+</span><span class='line'>&#9;&#9;&#9;&#9;continue;
+</span><span class='line'>&#9;&#9;&#9;4.权衡发送与否
+</span><span class='line'>&#9;&#9;&#9;continue;
+</span><span class='line'>&#9;&#9;}
 </span><span class='line'>&#9;}
 </span><span class='line'>out:
-</span><span class='line'>&#9;sk_free(sk);
+</span><span class='line'>&#9;//如果循环完成，所有数据都进入了skb，调用tcp_push来权衡是否发送
+</span><span class='line'>&#9;tcp_push(sk, tp, flags, mss_now, tp-&gt;nonagle);
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>tcp_push很短但是很复杂，
+</span><span class='line'>static inline void tcp_push(struct sock *sk, struct tcp_opt *tp, int flags,
+</span><span class='line'>&#9;&#9;&#9;&#9;int mss_now, int nonagle)
+</span><span class='line'>{
+</span><span class='line'>&#9;if (sk-&gt;sk_send_head) {
+</span><span class='line'>&#9;&#9;struct sk_buff *skb = sk-&gt;sk_write_queue.prev;
+</span><span class='line'>&#9;&#9;...
+</span><span class='line'>&#9;&#9;//如果有MSG_MORE，则当作cork来处理
+</span><span class='line'>&#9;&#9;__tcp_push_pending_frames(sk, tp, mss_now,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;  (flags & MSG_MORE) ? TCP_NAGLE_CORK : nonagle);
+</span><span class='line'>&#9;}
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>static __inline__ void __tcp_push_pending_frames(struct sock *sk,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9; struct tcp_opt *tp,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9; unsigned cur_mss,
+</span><span class='line'>&#9;&#9;&#9;&#9;&#9;&#9; int nonagle)
+</span><span class='line'>{
+</span><span class='line'>&#9;struct sk_buff *skb = sk-&gt;sk_send_head;
+</span><span class='line'>&#9;if (skb) {
+</span><span class='line'>&#9;&#9;if (!tcp_skb_is_last(sk, skb)) //如果已经有了很多的skb，则尽量马上发送
+</span><span class='line'>&#9;&#9;&#9;nonagle = TCP_NAGLE_PUSH;
+</span><span class='line'>&#9;&#9;//只有tcp_snd_test返回1才会发送数据，该函数很复杂
+</span><span class='line'>&#9;&#9;if (!tcp_snd_test(tp, skb, cur_mss, nonagle) ||
+</span><span class='line'>&#9;&#9;&#9;tcp_write_xmit(sk, nonagle))
+</span><span class='line'>&#9;&#9;&#9;tcp_check_probe_timer(sk, tp);
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;tcp_cwnd_validate(sk, tp);
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>static __inline__ int tcp_snd_test(struct tcp_opt *tp, struct sk_buff *skb,
+</span><span class='line'>&#9;&#9;&#9;&#9;   unsigned cur_mss, int nonagle)
+</span><span class='line'>{
+</span><span class='line'>&#9;//如果有TCP_NAGLE_PUSH标志(或者tcp_nagle_check同意发送)且未ack的数据够少且...则可以发送
+</span><span class='line'>&#9;return (((nonagle&TCP_NAGLE_PUSH) || tp-&gt;urg_mode
+</span><span class='line'>&#9;&#9; || !tcp_nagle_check(tp, skb, cur_mss, nonagle)) &&
+</span><span class='line'>&#9;&#9;((tcp_packets_in_flight(tp) &lt; tp-&gt;snd_cwnd) ||
+</span><span class='line'>&#9;&#9; (TCP_SKB_CB(skb)-&gt;flags & TCPCB_FLAG_FIN)) &&
+</span><span class='line'>&#9;&#9;!after(TCP_SKB_CB(skb)-&gt;end_seq, tp-&gt;snd_una + tp-&gt;snd_wnd));
 </span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
-<h4>tasklet</h4>
+<p>tcp_nagle_check函数是一个很重要的函数，它基本决定了数据是否可以发送的80%，内核源码中对该函数有一条注释：<br/>
+-3. Or TCP_NODELAY was set.<br/>
+-4. Or TCP_CORK is not set, and all sent packets are ACKed.</p>
 
-<p>在系统初始化的时候会初始化percpu的tsq tasklet列表</p>
+<p>就是说如果TCP_NODELAY值为1就可以直接发送，或者cork被禁用的情况下所有发出的包都被ack了也可以发送数据，这里体现的就是Nagle算法和CORK算法的区别了，Nagle算法只要求所有的出发包都ack就可以发送，而不管当前包是否足够大(虽然它通过tcp_minshall_check保证了包不太小)，而如果启用cork的话，可能仅仅数据被ack就不够了，这就是为何在代码注释中说cork要比Nagle更stronger的原因，同时这段代码也说明了为何TCP_CORK和TCP_NODELAY不能一起使用的原因，它们有共同的东西，却在做着不同的事情。看看tcp_nagle_check：</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static __inline__ int
+</span><span class='line'>tcp_nagle_check(struct tcp_opt *tp, struct sk_buff *skb, unsigned mss_now, int nonagle)
+</span><span class='line'>{
+</span><span class='line'>&#9;return (skb-&gt;len &lt; mss_now &&
+</span><span class='line'>&#9;&#9;!(TCP_SKB_CB(skb)-&gt;flags & TCPCB_FLAG_FIN) &&
+</span><span class='line'>&#9;&#9;((nonagle & TCP_NAGLE_CORK) ||
+</span><span class='line'>&#9;&#9;&#9;(!nonagle && tp-&gt;packets_out && tcp_minshall_check(tp))));
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>看看<code>__tcp_push_pending_frames</code>的最后，有一个tcp_check_probe_timer调用，就是说在没有数据被发送的时候会调用这个函数。这个函数有两个作用，第一个是防止0窗口导致的死锁，另一个作用就是定时发送由于使能了CORK算法或者Nagle算法一直等待新数据拼接而没有机会发送的数据包。这个timer内置在重传timer之中，其时间间隔和rtt有关，一旦触发则会发送数据包或者窗口探测包。反过来可以理解，如果没有这个timer的话，启用cork的连接将几乎(可能根据实现的不同还会受别的因素影响，太复杂了)每次都发送mtu大小的数据包。该timer调用tcp_probe_timer函数：</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -532,65 +643,171 @@ tcp_small_queue_check()返回true的话则不发送，让skb继续留在发送�
 <span class='line-number'>16</span>
 <span class='line-number'>17</span>
 <span class='line-number'>18</span>
-<span class='line-number'>19</span>
-<span class='line-number'>20</span>
-<span class='line-number'>21</span>
-<span class='line-number'>22</span>
-<span class='line-number'>23</span>
-<span class='line-number'>24</span>
-<span class='line-number'>25</span>
-<span class='line-number'>26</span>
-<span class='line-number'>27</span>
-<span class='line-number'>28</span>
-<span class='line-number'>29</span>
-<span class='line-number'>30</span>
-<span class='line-number'>31</span>
-<span class='line-number'>32</span>
-<span class='line-number'>33</span>
-<span class='line-number'>34</span>
-<span class='line-number'>35</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/* TCP SMALL QUEUES (TSQ)
-</span><span class='line'> *
-</span><span class='line'> * TSQ goal is to keep small amount of skbs per tcp flow in tx queues (qdisc+dev)
-</span><span class='line'> * to reduce RTT and bufferbloat.
-</span><span class='line'> * We do this using a special skb destructor (tcp_wfree).
-</span><span class='line'> *
-</span><span class='line'> * Its important tcp_wfree() can be replaced by sock_wfree() in the event skb
-</span><span class='line'> * needs to be reallocated in a driver.
-</span><span class='line'> * The invariant being skb-&gt;truesize subtracted from sk-&gt;sk_wmem_alloc
-</span><span class='line'> *
-</span><span class='line'> * Since transmit from skb destructor is forbidden, we use a tasklet
-</span><span class='line'> * to process all sockets that eventually need to send more skbs.
-</span><span class='line'> * We use one tasklet per cpu, with its own queue of sockets.
-</span><span class='line'> */
-</span><span class='line'>struct tsq_tasklet {
-</span><span class='line'>&#9;struct tasklet_struct tasklet;
-</span><span class='line'>&#9;struct list_head  head; /* queue of tcp sockets */
-</span><span class='line'>};
-</span><span class='line'>static DEFINE_PER_CPU(struct tsq_tasklet, tsq_tasklet);
-</span><span class='line'>void __init tcp_tasklet_init(void)
+</pre></td><td class='code'><pre><code class=''><span class='line'>static void tcp_probe_timer(struct sock *sk)
 </span><span class='line'>{
-</span><span class='line'>&#9;int i;
-</span><span class='line'>&#9;for_each_possible_cpu(i) {
-</span><span class='line'>&#9;&#9;struct tsq_tasklet *tsq = &per_cpu(tsq_tasklet, i);
-</span><span class='line'>&#9;&#9;INIT_LIST_HEAD(&tsq-&gt;head);
-</span><span class='line'>&#9;&#9;tasklet_init(&tsq-&gt;tasklet,
-</span><span class='line'>&#9;&#9;&#9;     tcp_tasklet_func,
-</span><span class='line'>&#9;&#9;&#9;     (unsigned long)tsq);
+</span><span class='line'>&#9;struct tcp_opt *tp = tcp_sk(sk);
+</span><span class='line'>&#9;int max_probes;
+</span><span class='line'>&#9;//1.如果有数据在网络上，则期望马上回来ack，ack中会通告对端窗口
+</span><span class='line'>&#9;//2.如果没有数据要发送，则无需关注对端窗口，即使为0也无所谓
+</span><span class='line'>&#9;if (tp-&gt;packets_out || !sk-&gt;sk_send_head) {
+</span><span class='line'>&#9;&#9;tp-&gt;probes_out = 0;
+</span><span class='line'>&#9;&#9;return;
 </span><span class='line'>&#9;}
-</span><span class='line'>}
-</span><span class='line'>void __init tcp_init(void)
-</span><span class='line'>{
-</span><span class='line'>&#9;...
-</span><span class='line'>&#9;tcp_tasklet_init();
+</span><span class='line'>&#9;//这个sysctl_tcp_retries2是可以调整的
+</span><span class='line'>&#9;max_probes = sysctl_tcp_retries2;
+</span><span class='line'>&#9;if (tp-&gt;probes_out &gt; max_probes) {
+</span><span class='line'>&#9;&#9;tcp_write_err(sk);
+</span><span class='line'>&#9;} else {
+</span><span class='line'>&#9;&#9;tcp_send_probe0(sk);
+</span><span class='line'>&#9;}
 </span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
-<h4>tcp_tasklet_func</h4>
+<p>tcp_send_probe0会调用tcp_write_wakeup函数，该函数会要么发送可以发送的数据，如果由于发送队列越过了发送窗口导致不能发送，则发送一个窗口探测包：</p>
 
-<p>tcp_tasklet_func是实际的tasklet在softirq中被执行的函数
-如果应用程序没有持有该sock锁， 则直接调用tcp_tsq_handler来发送等待的skb。
-否则就在应用程序release_sock()的时候调用tcp_release_cb()，再用tcp_tsq_handler()发送skb</p>
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+<span class='line-number'>15</span>
+<span class='line-number'>16</span>
+<span class='line-number'>17</span>
+<span class='line-number'>18</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int tcp_write_wakeup(struct sock *sk)
+</span><span class='line'>{
+</span><span class='line'>&#9;if (sk-&gt;sk_state != TCP_CLOSE) {
+</span><span class='line'>&#9;&#9;struct tcp_opt *tp = tcp_sk(sk);
+</span><span class='line'>&#9;&#9;struct sk_buff *skb;
+</span><span class='line'>&#9;&#9;if ((skb = sk-&gt;sk_send_head) != NULL &&
+</span><span class='line'>&#9;&#9;&#9;before(TCP_SKB_CB(skb)-&gt;seq, tp-&gt;snd_una+tp-&gt;snd_wnd)) {
+</span><span class='line'>&#9;&#9;&#9;...//在sk_send_head队列上取出一个发送出去，其ack会带回对端通告窗口的大小
+</span><span class='line'>&#9;&#9;&#9;err = tcp_transmit_skb(sk, skb_clone(skb, GFP_ATOMIC));
+</span><span class='line'>&#9;&#9;&#9;...
+</span><span class='line'>&#9;&#9;&#9;return err;
+</span><span class='line'>&#9;&#9;} else {
+</span><span class='line'>&#9;&#9;&#9;...
+</span><span class='line'>&#9;&#9;&#9;return tcp_xmit_probe_skb(sk, 0);
+</span><span class='line'>&#9;&#9;}
+</span><span class='line'>&#9;}
+</span><span class='line'>&#9;return -1;
+</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+
+
+<p>  这个probe timer虽然一定程度阻碍了cork的满载发送，然而它却是必要的，这是由于tcp并不为纯的ack包(不带数据的ack包)提供确认，因此一旦这种ack包丢失，那么就有可能死锁，发送端的窗口无法更新，接收端由于已经发送了ack而等待接收数据，两端就这样僵持起来，因此需要一个timer，定期发送一个探测包，一个ack丢失，不能所有的ack都丢失吧，在timer到期时，如果本来发送队列上有数据要发送，则直接发送这些数据而不再发送探测包，因为发送了这些数据，所以它“破坏”了cork的承诺，不过也因此增强了响应度。</p>
+
+<p>  udp没有连接，没有确认，因此也就不需要什么timer之类的复杂机制，也因此，它是真正承诺的cork，除非你在应用层手工拔掉塞子，否则数据将不会发出。</p>
+</div>
+  
+  
+
+
+    </article>
+  
+  
+    <article>
+      
+  <header>
+    
+      <h2 class="entry-title"><a href="/blog/2018/06/12/kernel-nf_socket/">nf_socket</a></h2>
+    
+    
+      <p class="meta">
+        
+
+
+
+
+<time class='entry-date' datetime='2018-06-12T02:04:00+08:00'><span class='date'>2018-06-12</span> <span class='time'>02:04:00</span></time>
+        
+      </p>
+    
+  </header>
+
+
+  <div class="entry-content"><p><a href="https://blog.csdn.net/jk110333/article/details/8642261">https://blog.csdn.net/jk110333/article/details/8642261</a></p>
+
+<p>用户态与内核态交互通信的方法不止一种，sockopt是比较方便的一个，写法也简单. ipvsadm的两种通信方式之一</p>
+
+<p>缺点就是使用 copy_from_user()/copy_to_user()完成内核和用户的通信， 效率其实不高， 多用在传递控制 选项 信息，不适合做大量的数据传输</p>
+
+<h4>用户态函数：</h4>
+
+<p>发送：int setsockopt( int sockfd, int proto, int cmd, void *data, int datelen);</p>
+
+<p>接收：int getsockopt(int sockfd, int proto, int cmd, void *data, int datalen);</p>
+
+<p>第一个参数是socket描述符；</p>
+
+<p>第二个参数proto是sock协议，IP RAW的就用SOL_SOCKET/SOL_IP等，TCP/UDP socket的可用SOL_SOCKET/SOL_IP/SOL_TCP/SOL_UDP等，即高层的socket是都可以使用低层socket的命令字 的，IPPROTO_IP；</p>
+
+<p>第三个参数cmd是操作命令字，由自己定义；</p>
+
+<p>第四个参数是数据缓冲区起始位置指针，set操作时是将缓冲区数据写入内核，get的时候是将内核中的数 据读入该缓冲区；</p>
+
+<p>第五个参数数据长度</p>
+
+<h4>内核态函数</h4>
+
+<p>注册：nf_register_sockopt(struct nf_sockopt_ops *sockops);</p>
+
+<p>注销：nf_unregister_sockopt(struct nf_sockopt_ops *sockops);</p>
+
+<p>结构体 nf_sockopt_ops test_sockops</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>static struct nf_sockopt_ops nso = {
+</span><span class='line'>&#9;.pf  = PF_INET,       // 协议族
+</span><span class='line'>&#9;.set_optmin = 常数, // 定义最小set命令字
+</span><span class='line'>&#9;.set_optmax = 常数+N,   // 定义最大set命令字
+</span><span class='line'>&#9;.set  = recv_msg, // 定义set处理函数
+</span><span class='line'>&#9;.get_optmin = 常数, // 定义最小get命令字
+</span><span class='line'>&#9;.get_optmax = 常数+N,   // 定义最大get命令字
+</span><span class='line'>&#9;.get  = send_msg, // 定义set处理函数
+</span><span class='line'>};</span></code></pre></td></tr></table></div></figure>
+
+
+<p>其中命令字不能和内核已有的重复，宜大不宜小。命令字很重要，是用来做标识符的。而且用户态和内核态要定义的相同，</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#define SOCKET_OPS_BASE      128
+</span><span class='line'>#define SOCKET_OPS_SET        (SOCKET_OPS_BASE)
+</span><span class='line'>#define SOCKET_OPS_GET        (SOCKET_OPS_BASE)
+</span><span class='line'>#define SOCKET_OPS_MAX        (SOCKET_OPS_BASE + 1)</span></code></pre></td></tr></table></div></figure>
+
+
+<p>set/get处理函数是直接由用户空间的 set/getsockopt函数调用的。 setsockopt函数向内核写数据，用getsockopt向内核读数据。
+另外set和get的处理函数的参数应该是这样的</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>int recv_msg(struct sock *sk, int cmd, void __user *user, unsigned int len);
+</span><span class='line'>int send_msg(struct sock *sk, int cmd, void __user *user, unsigned int *len);</span></code></pre></td></tr></table></div></figure>
+
+
+<h4>用户态 setsockopt/getsockopt 调内核态 ipv4_specific.get/setsockopt -> ip_setsockopt -> nf_setsockopt -> nf_sockopt</h4>
+
+<p>内核态的module.c</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -663,128 +880,80 @@ tcp_small_queue_check()返回true的话则不发送，让skb继续留在发送�
 <span class='line-number'>69</span>
 <span class='line-number'>70</span>
 <span class='line-number'>71</span>
-<span class='line-number'>72</span>
-<span class='line-number'>73</span>
-<span class='line-number'>74</span>
-<span class='line-number'>75</span>
-<span class='line-number'>76</span>
-<span class='line-number'>77</span>
-<span class='line-number'>78</span>
-<span class='line-number'>79</span>
-<span class='line-number'>80</span>
-<span class='line-number'>81</span>
-<span class='line-number'>82</span>
-<span class='line-number'>83</span>
-<span class='line-number'>84</span>
-<span class='line-number'>85</span>
-<span class='line-number'>86</span>
-<span class='line-number'>87</span>
-<span class='line-number'>88</span>
-<span class='line-number'>89</span>
-<span class='line-number'>90</span>
-<span class='line-number'>91</span>
-<span class='line-number'>92</span>
-<span class='line-number'>93</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>/*
-</span><span class='line'> * One tasklet per cpu tries to send more skbs.
-</span><span class='line'> * We run in tasklet context but need to disable irqs when
-</span><span class='line'> * transferring tsq-&gt;head because tcp_wfree() might
-</span><span class='line'> * interrupt us (non NAPI drivers)
-</span><span class='line'> */
-</span><span class='line'>static void tcp_tasklet_func(unsigned long data)
+</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;linux/module.h&gt;
+</span><span class='line'>#include &lt;linux/kernel.h&gt;
+</span><span class='line'>#include &lt;linux/types.h&gt;
+</span><span class='line'>#include &lt;linux/string.h&gt;
+</span><span class='line'>#include &lt;linux/netfilter_ipv4.h&gt;
+</span><span class='line'>#include &lt;linux/init.h&gt;
+</span><span class='line'>#include &lt;asm/uaccess.h&gt;
+</span><span class='line'>
+</span><span class='line'>#define SOCKET_OPS_BASE       (128+10000)
+</span><span class='line'>#define SOCKET_OPS_SET        (SOCKET_OPS_BASE)
+</span><span class='line'>#define SOCKET_OPS_GET        (SOCKET_OPS_BASE)
+</span><span class='line'>#define SOCKET_OPS_MAX        (SOCKET_OPS_BASE + 1)
+</span><span class='line'>
+</span><span class='line'>#define KMSG          "--------kernel---------"
+</span><span class='line'>#define KMSG_LEN      sizeof("--------kernel---------")
+</span><span class='line'>
+</span><span class='line'>
+</span><span class='line'>static int recv_msg(struct sock *sk, int cmd, void __user *user, unsigned int len)
 </span><span class='line'>{
-</span><span class='line'>&#9;struct tsq_tasklet *tsq = (struct tsq_tasklet *)data;
-</span><span class='line'>&#9;LIST_HEAD(list);
-</span><span class='line'>&#9;unsigned long flags;
-</span><span class='line'>&#9;struct list_head *q, *n;
-</span><span class='line'>&#9;struct tcp_sock *tp;
-</span><span class='line'>&#9;struct sock *sk;
-</span><span class='line'>&#9;local_irq_save(flags);
-</span><span class='line'>&#9;list_splice_init(&tsq-&gt;head, &list);   //tsq-&gt;head中的所有成员移动到list中
-</span><span class='line'>&#9;local_irq_restore(flags); //调用前关中断，现在恢复
-</span><span class='line'>&#9;list_for_each_safe(q, n, &list) { //遍历所有list成员
-</span><span class='line'>&#9;&#9;tp = list_entry(q, struct tcp_sock, tsq_node);
-</span><span class='line'>&#9;&#9;list_del(&tp-&gt;tsq_node);
-</span><span class='line'>&#9;&#9;sk = (struct sock *)tp;
-</span><span class='line'>&#9;&#9;bh_lock_sock(sk);
-</span><span class='line'>&#9;&#9;if (!sock_owned_by_user(sk)) {
-</span><span class='line'>&#9;&#9;&#9;tcp_tsq_handler(sk);
-</span><span class='line'>&#9;&#9;} else {
-</span><span class='line'>&#9;&#9;&#9;/* defer the work to tcp_release_cb() */
-</span><span class='line'>&#9;&#9;&#9;set_bit(TCP_TSQ_DEFERRED, &tp-&gt;tsq_flags);
-</span><span class='line'>&#9;&#9;}
-</span><span class='line'>&#9;&#9;bh_unlock_sock(sk);
-</span><span class='line'>&#9;&#9;clear_bit(TSQ_QUEUED, &tp-&gt;tsq_flags);
-</span><span class='line'>&#9;&#9;sk_free(sk);
+</span><span class='line'>&#9;int ret = 0;
+</span><span class='line'>&#9;printk(KERN_INFO "sockopt: recv_msg()\n");
+</span><span class='line'>
+</span><span class='line'>&#9;if (cmd == SOCKET_OPS_SET) {
+</span><span class='line'>&#9;&#9;char umsg[64];
+</span><span class='line'>&#9;&#9;int len = sizeof(char)*64;
+</span><span class='line'>&#9;&#9;memset(umsg, 0, len);
+</span><span class='line'>&#9;&#9;ret = copy_from_user(umsg, user, len);
+</span><span class='line'>&#9;&#9;printk("recv_msg: umsg = %s. ret = %d\n", umsg, ret);
 </span><span class='line'>&#9;}
+</span><span class='line'>&#9;return 0;
 </span><span class='line'>}
-</span><span class='line'>static void tcp_tsq_handler(struct sock *sk)
+</span><span class='line'>
+</span><span class='line'>static int send_msg(struct sock *sk, int cmd, void __user *user, int *len)
 </span><span class='line'>{
-</span><span class='line'>&#9;if ((1 &lt;&lt; sk-&gt;sk_state) &
-</span><span class='line'>&#9;    (TCPF_ESTABLISHED | TCPF_FIN_WAIT1 | TCPF_CLOSING |
-</span><span class='line'>&#9;     TCPF_CLOSE_WAIT  | TCPF_LAST_ACK)) {
-</span><span class='line'>&#9;&#9;struct tcp_sock *tp = tcp_sk(sk);
-</span><span class='line'>&#9;&#9;if (tp-&gt;lost_out &gt; tp-&gt;retrans_out &&    //有丢的包还没重传
-</span><span class='line'>&#9;&#9;    tp-&gt;snd_cwnd &gt; tcp_packets_in_flight(tp))   //拥塞窗口还有配额
-</span><span class='line'>&#9;&#9;&#9;tcp_xmit_retransmit_queue(sk);    //重传
-</span><span class='line'>&#9;&#9;tcp_write_xmit(sk, tcp_current_mss(sk), tp-&gt;nonagle,   //发送
-</span><span class='line'>&#9;&#9;&#9;       0, GFP_ATOMIC);
+</span><span class='line'>&#9;int ret = 0;
+</span><span class='line'>&#9;printk(KERN_INFO "sockopt: send_msg()\n");
+</span><span class='line'>&#9;if (cmd == SOCKET_OPS_GET) {
+</span><span class='line'>&#9;&#9;ret = copy_to_user(user, KMSG, KMSG_LEN);
+</span><span class='line'>&#9;&#9;printk("send_msg: umsg = %s. ret = %d. success\n", KMSG, ret);
 </span><span class='line'>&#9;}
+</span><span class='line'>&#9;return 0;
+</span><span class='line'>
 </span><span class='line'>}
-</span><span class='line'>#define TCP_DEFERRED_ALL ((1UL &lt;&lt; TCP_TSQ_DEFERRED) |       \
-</span><span class='line'>&#9;&#9;&#9;  (1UL &lt;&lt; TCP_WRITE_TIMER_DEFERRED) |   \
-</span><span class='line'>&#9;&#9;&#9;  (1UL &lt;&lt; TCP_DELACK_TIMER_DEFERRED) |  \
-</span><span class='line'>&#9;&#9;&#9;  (1UL &lt;&lt; TCP_MTU_REDUCED_DEFERRED))
-</span><span class='line'>/**
-</span><span class='line'> * tcp_release_cb - tcp release_sock() callback
-</span><span class='line'> * @sk: socket
-</span><span class='line'> *
-</span><span class='line'> * called from release_sock() to perform protocol dependent
-</span><span class='line'> * actions before socket release.
-</span><span class='line'> */
-</span><span class='line'>void tcp_release_cb(struct sock *sk)
+</span><span class='line'>
+</span><span class='line'>static struct nf_sockopt_ops test_sockops =
 </span><span class='line'>{
-</span><span class='line'>&#9;struct tcp_sock *tp = tcp_sk(sk);
-</span><span class='line'>&#9;unsigned long flags, nflags;
-</span><span class='line'>&#9;/* perform an atomic operation only if at least one flag is set */
-</span><span class='line'>&#9;do {
-</span><span class='line'>&#9;&#9;flags = tp-&gt;tsq_flags;
-</span><span class='line'>&#9;&#9;if (!(flags & TCP_DEFERRED_ALL))
-</span><span class='line'>&#9;&#9;&#9;return;
-</span><span class='line'>&#9;&#9;nflags = flags & ~TCP_DEFERRED_ALL;
-</span><span class='line'>&#9;} while (cmpxchg(&tp-&gt;tsq_flags, flags, nflags) != flags);
-</span><span class='line'>&#9;if (flags & (1UL &lt;&lt; TCP_TSQ_DEFERRED))
-</span><span class='line'>&#9;&#9;tcp_tsq_handler(sk);
-</span><span class='line'>&#9;/* Here begins the tricky part :
-</span><span class='line'>&#9; * We are called from release_sock() with :
-</span><span class='line'>&#9; * 1) BH disabled
-</span><span class='line'>&#9; * 2) sk_lock.slock spinlock held
-</span><span class='line'>&#9; * 3) socket owned by us (sk-&gt;sk_lock.owned == 1)
-</span><span class='line'>&#9; *
-</span><span class='line'>&#9; * But following code is meant to be called from BH handlers,
-</span><span class='line'>&#9; * so we should keep BH disabled, but early release socket ownership
-</span><span class='line'>&#9; */
-</span><span class='line'>&#9;sock_release_ownership(sk);
-</span><span class='line'>&#9;if (flags & (1UL &lt;&lt; TCP_WRITE_TIMER_DEFERRED)) {
-</span><span class='line'>&#9;&#9;tcp_write_timer_handler(sk);
-</span><span class='line'>&#9;&#9;__sock_put(sk);
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;if (flags & (1UL &lt;&lt; TCP_DELACK_TIMER_DEFERRED)) {
-</span><span class='line'>&#9;&#9;tcp_delack_timer_handler(sk);
-</span><span class='line'>&#9;&#9;__sock_put(sk);
-</span><span class='line'>&#9;}
-</span><span class='line'>&#9;if (flags & (1UL &lt;&lt; TCP_MTU_REDUCED_DEFERRED)) {
-</span><span class='line'>&#9;&#9;inet_csk(sk)-&gt;icsk_af_ops-&gt;mtu_reduced(sk);
-</span><span class='line'>&#9;&#9;__sock_put(sk);
-</span><span class='line'>&#9;}
-</span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
+</span><span class='line'>&#9;.pf = PF_INET,
+</span><span class='line'>&#9;.set_optmin = SOCKET_OPS_SET,
+</span><span class='line'>&#9;.set_optmax = SOCKET_OPS_MAX,
+</span><span class='line'>&#9;.set = recv_msg,
+</span><span class='line'>&#9;.get_optmin = SOCKET_OPS_GET,
+</span><span class='line'>&#9;.get_optmax = SOCKET_OPS_MAX,
+</span><span class='line'>&#9;.get = send_msg,
+</span><span class='line'>&#9;.owner = THIS_MODULE,
+</span><span class='line'>};
+</span><span class='line'>
+</span><span class='line'>static int __init init_sockopt(void)
+</span><span class='line'>{
+</span><span class='line'>&#9;printk(KERN_INFO "sockopt: init_sockopt()\n");
+</span><span class='line'>&#9;return nf_register_sockopt(&test_sockops);
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>static void __exit exit_sockopt(void)
+</span><span class='line'>{
+</span><span class='line'>&#9;printk(KERN_INFO "sockopt: fini_sockopt()\n");
+</span><span class='line'>&#9;nf_unregister_sockopt(&test_sockops);
+</span><span class='line'>}
+</span><span class='line'>
+</span><span class='line'>module_init(init_sockopt);
+</span><span class='line'>module_exit(exit_sockopt);
+</span><span class='line'>MODULE_LICENSE("GPL");</span></code></pre></td></tr></table></div></figure>
 
 
-<p>tcp_tsq_handler最终还是会调用tcp_write_xmit来发送， 还是需要通过tcp_small_queue_check()检测</p>
-
-<h4>其他</h4>
-
-<p>另外tcp auto cork也使用tsq机制来实现延后发送</p>
+<p>用户态的user.c</p>
 
 <figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
 <span class='line-number'>2</span>
@@ -807,29 +976,105 @@ tcp_small_queue_check()返回true的话则不发送，让skb继续留在发送�
 <span class='line-number'>19</span>
 <span class='line-number'>20</span>
 <span class='line-number'>21</span>
-</pre></td><td class='code'><pre><code class=''><span class='line'>static void tcp_push(struct sock *sk, int flags, int mss_now,
-</span><span class='line'>&#9;&#9;     int nonagle, int size_goal)
+<span class='line-number'>22</span>
+<span class='line-number'>23</span>
+<span class='line-number'>24</span>
+<span class='line-number'>25</span>
+<span class='line-number'>26</span>
+<span class='line-number'>27</span>
+<span class='line-number'>28</span>
+<span class='line-number'>29</span>
+<span class='line-number'>30</span>
+<span class='line-number'>31</span>
+<span class='line-number'>32</span>
+<span class='line-number'>33</span>
+<span class='line-number'>34</span>
+<span class='line-number'>35</span>
+<span class='line-number'>36</span>
+<span class='line-number'>37</span>
+<span class='line-number'>38</span>
+<span class='line-number'>39</span>
+<span class='line-number'>40</span>
+<span class='line-number'>41</span>
+<span class='line-number'>42</span>
+<span class='line-number'>43</span>
+<span class='line-number'>44</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>#include &lt;unistd.h&gt;
+</span><span class='line'>#include &lt;stdio.h&gt;
+</span><span class='line'>#include &lt;sys/socket.h&gt;
+</span><span class='line'>#include &lt;linux/in.h&gt;
+</span><span class='line'>#include &lt;string.h&gt;
+</span><span class='line'>#include &lt;errno.h&gt;
+</span><span class='line'>
+</span><span class='line'>#define SOCKET_OPS_BASE       (128+10000)
+</span><span class='line'>#define SOCKET_OPS_SET        (SOCKET_OPS_BASE)
+</span><span class='line'>#define SOCKET_OPS_GET        (SOCKET_OPS_BASE)
+</span><span class='line'>#define SOCKET_OPS_MAX        (SOCKET_OPS_BASE + 1)
+</span><span class='line'>
+</span><span class='line'>#define UMSG          "----------user------------"
+</span><span class='line'>#define UMSG_LEN      sizeof("----------user------------")
+</span><span class='line'>
+</span><span class='line'>char kmsg[64];
+</span><span class='line'>
+</span><span class='line'>int main(void)
 </span><span class='line'>{
-</span><span class='line'>&#9;...
-</span><span class='line'>&#9;if (tcp_should_autocork(sk, skb, size_goal)) {
-</span><span class='line'>&#9;&#9;//不发了，设置tsq标记后返回
-</span><span class='line'>&#9;&#9;/* avoid atomic op if TSQ_THROTTLED bit is already set */
-</span><span class='line'>&#9;&#9;if (!test_bit(TSQ_THROTTLED, &tp-&gt;tsq_flags)) {
-</span><span class='line'>&#9;&#9;&#9;NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPAUTOCORKING);
-</span><span class='line'>&#9;&#9;&#9;set_bit(TSQ_THROTTLED, &tp-&gt;tsq_flags);
-</span><span class='line'>&#9;&#9;}
-</span><span class='line'>&#9;&#9;/* It is possible TX completion already happened
-</span><span class='line'>&#9;&#9; * before we set TSQ_THROTTLED.
-</span><span class='line'>&#9;&#9; */
-</span><span class='line'>&#9;&#9;if (atomic_read(&sk-&gt;sk_wmem_alloc) &gt; skb-&gt;truesize)
-</span><span class='line'>&#9;&#9;&#9;return;
+</span><span class='line'>&#9;int sockfd;
+</span><span class='line'>&#9;int len;
+</span><span class='line'>&#9;int ret;
+</span><span class='line'>
+</span><span class='line'>&#9;sockfd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+</span><span class='line'>&#9;if (sockfd &lt; 0) {
+</span><span class='line'>&#9;&#9;printf("can not create a socket\n");
+</span><span class='line'>&#9;&#9;return -1;
 </span><span class='line'>&#9;}
-</span><span class='line'>&#9;if (flags & MSG_MORE) //应用程序标记了很快有新的数据到来，则标记cork，不发送小包
-</span><span class='line'>&#9;&#9;nonagle = TCP_NAGLE_CORK;
-</span><span class='line'>&#9;__tcp_push_pending_frames(sk, mss_now, nonagle);  //最终调用tcp_write_xmit
+</span><span class='line'>
+</span><span class='line'>&#9;/*call function recv_msg()*/
+</span><span class='line'>&#9;ret = setsockopt(sockfd, IPPROTO_IP, SOCKET_OPS_SET, UMSG, UMSG_LEN);
+</span><span class='line'>&#9;printf("setsockopt: ret = %d, msg = %s\n", ret, UMSG);
+</span><span class='line'>&#9;len = sizeof(char)*64;
+</span><span class='line'>
+</span><span class='line'>&#9;/*call function send_msg()*/
+</span><span class='line'>&#9;ret = getsockopt(sockfd, IPPROTO_IP, SOCKET_OPS_GET, kmsg, &len);
+</span><span class='line'>&#9;printf("getsockopt: ret = %d, msg = %s\n", ret, kmsg);
+</span><span class='line'>&#9;if (ret != 0) {
+</span><span class='line'>&#9;&#9;printf("getsockopt error: errno = %d, errstr = %s\n", errno, strerror(errno));
+</span><span class='line'>&#9;}
+</span><span class='line'>
+</span><span class='line'>&#9;close(sockfd);
+</span><span class='line'>&#9;return 0;
 </span><span class='line'>}</span></code></pre></td></tr></table></div></figure>
 
 
+<p>Makefile</p>
+
+<figure class='code'><div class="highlight"><table><tr><td class="gutter"><pre class="line-numbers"><span class='line-number'>1</span>
+<span class='line-number'>2</span>
+<span class='line-number'>3</span>
+<span class='line-number'>4</span>
+<span class='line-number'>5</span>
+<span class='line-number'>6</span>
+<span class='line-number'>7</span>
+<span class='line-number'>8</span>
+<span class='line-number'>9</span>
+<span class='line-number'>10</span>
+<span class='line-number'>11</span>
+<span class='line-number'>12</span>
+<span class='line-number'>13</span>
+<span class='line-number'>14</span>
+</pre></td><td class='code'><pre><code class=''><span class='line'>TARGET = socketopt
+</span><span class='line'>OBJS = module.o
+</span><span class='line'>
+</span><span class='line'>KDIR = /lib/modules/`uname -r`/build
+</span><span class='line'>PWD = $(shell pwd)
+</span><span class='line'>
+</span><span class='line'>obj-m := $(TARGET).o
+</span><span class='line'>
+</span><span class='line'>$(TARGET)-objs := $(OBJS)
+</span><span class='line'>
+</span><span class='line'>default:
+</span><span class='line'>&#9;make -C $(KDIR) SUBDIRS=$(PWD) modules
+</span><span class='line'>clean:
+</span><span class='line'>&#9;-rm -rf *.o *.ko .$(TARGET).ko.cmd .*.flags *.mod.c modules.order  Module.symvers .tmp_versions</span></code></pre></td></tr></table></div></figure>
 
 </div>
   
@@ -852,7 +1097,7 @@ tcp_small_queue_check()返回true的话则不发送，让skb继续留在发送�
   
     <section>
 <h1>Categories
-<span class='right_span'>(970)</span>
+<span class='right_span'>(983)</span>
 
 </h1>
 <head>
@@ -889,7 +1134,7 @@ if (!document.getElementById('blog~octopress')) document.getElementById('aexp_bl
 if (!document.getElementById('blog')) document.getElementById('aexp_blog').style.visibility = 'hidden';
 if (!document.getElementById('blog~ruby')) document.getElementById('aexp_blog~ruby').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(168)</span></li>
+<li class='catclass'><a href='/blog/cats/language/'>language</a><a href='##' onmousedown=showDiv('language') id='aexp_language'><span class='exp_style' id='exp_language'>[+]</span></a><span class='right_span'>(171)</span></li>
 <div id='language' class='catsub'><li><a href='/blog/cats/language~c/?opendiv=language'>c</a><a href='##' onmousedown=showDiv('language~c') id='aexp_language~c'><span class='exp_style' id='exp_language~c'>[+]</span></a><span class='right_span'>33</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~c')) document.getElementById('aexp_language~c').style.visibility = 'hidden';
@@ -906,7 +1151,7 @@ if (!document.getElementById('language~java')) document.getElementById('aexp_lan
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~jsp')) document.getElementById('aexp_language~jsp').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/language~php/?opendiv=language'>php</a><a href='##' onmousedown=showDiv('language~php') id='aexp_language~php'><span class='exp_style' id='exp_language~php'>[+]</span></a><span class='right_span'>53</span></li>
+<li><a href='/blog/cats/language~php/?opendiv=language'>php</a><a href='##' onmousedown=showDiv('language~php') id='aexp_language~php'><span class='exp_style' id='exp_language~php'>[+]</span></a><span class='right_span'>55</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~php')) document.getElementById('aexp_language~php').style.visibility = 'hidden';
 </script>
@@ -914,7 +1159,7 @@ if (!document.getElementById('language~php')) document.getElementById('aexp_lang
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('language~python')) document.getElementById('aexp_language~python').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/language~web/?opendiv=language'>web</a><a href='##' onmousedown=showDiv('language~web') id='aexp_language~web'><span class='exp_style' id='exp_language~web'>[+]</span></a><span class='right_span'>61</span></li>
+<li><a href='/blog/cats/language~web/?opendiv=language'>web</a><a href='##' onmousedown=showDiv('language~web') id='aexp_language~web'><span class='exp_style' id='exp_language~web'>[+]</span></a><span class='right_span'>62</span></li>
 </div><script language='javascript' type='text/javascript'>
 if (!document.getElementById('language')) document.getElementById('aexp_language').style.visibility = 'hidden';
 if (!document.getElementById('language~web')) document.getElementById('aexp_language~web').style.visibility = 'hidden';
@@ -943,7 +1188,7 @@ if (!document.getElementById('assembly~base')) document.getElementById('aexp_ass
 if (!document.getElementById('assembly')) document.getElementById('aexp_assembly').style.visibility = 'hidden';
 if (!document.getElementById('assembly~win')) document.getElementById('aexp_assembly~win').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(200)</span></li>
+<li class='catclass'><a href='/blog/cats/tools/'>tools</a><a href='##' onmousedown=showDiv('tools') id='aexp_tools'><span class='exp_style' id='exp_tools'>[+]</span></a><span class='right_span'>(203)</span></li>
 <div id='tools' class='catsub'><li><a href='/blog/cats/tools~apache2/?opendiv=tools'>apache2</a><a href='##' onmousedown=showDiv('tools~apache2') id='aexp_tools~apache2'><span class='exp_style' id='exp_tools~apache2'>[+]</span></a><span class='right_span'>9</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~apache2')) document.getElementById('aexp_tools~apache2').style.visibility = 'hidden';
@@ -968,7 +1213,7 @@ if (!document.getElementById('tools~command')) document.getElementById('aexp_too
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~dns')) document.getElementById('aexp_tools~dns').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/tools~git/?opendiv=tools'>git</a><a href='##' onmousedown=showDiv('tools~git') id='aexp_tools~git'><span class='exp_style' id='exp_tools~git'>[+]</span></a><span class='right_span'>14</span></li>
+<li><a href='/blog/cats/tools~git/?opendiv=tools'>git</a><a href='##' onmousedown=showDiv('tools~git') id='aexp_tools~git'><span class='exp_style' id='exp_tools~git'>[+]</span></a><span class='right_span'>15</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~git')) document.getElementById('aexp_tools~git').style.visibility = 'hidden';
 </script>
@@ -1016,6 +1261,10 @@ if (!document.getElementById('tools~redis')) document.getElementById('aexp_tools
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~smb')) document.getElementById('aexp_tools~smb').style.visibility = 'hidden';
 </script>
+<li><a href='/blog/cats/tools~snmp/?opendiv=tools'>snmp</a><a href='##' onmousedown=showDiv('tools~snmp') id='aexp_tools~snmp'><span class='exp_style' id='exp_tools~snmp'>[+]</span></a><span class='right_span'>1</span></li>
+<script language='javascript' type='text/javascript'>
+if (!document.getElementById('tools~snmp')) document.getElementById('aexp_tools~snmp').style.visibility = 'hidden';
+</script>
 <li><a href='/blog/cats/tools~socksvpn/?opendiv=tools'>socksvpn</a><a href='##' onmousedown=showDiv('tools~socksvpn') id='aexp_tools~socksvpn'><span class='exp_style' id='exp_tools~socksvpn'>[+]</span></a><span class='right_span'>3</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~socksvpn')) document.getElementById('aexp_tools~socksvpn').style.visibility = 'hidden';
@@ -1024,7 +1273,7 @@ if (!document.getElementById('tools~socksvpn')) document.getElementById('aexp_to
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~sqlmap')) document.getElementById('aexp_tools~sqlmap').style.visibility = 'hidden';
 </script>
-<li><a href='/blog/cats/tools~sqlserver/?opendiv=tools'>sqlserver</a><a href='##' onmousedown=showDiv('tools~sqlserver') id='aexp_tools~sqlserver'><span class='exp_style' id='exp_tools~sqlserver'>[+]</span></a><span class='right_span'>12</span></li>
+<li><a href='/blog/cats/tools~sqlserver/?opendiv=tools'>sqlserver</a><a href='##' onmousedown=showDiv('tools~sqlserver') id='aexp_tools~sqlserver'><span class='exp_style' id='exp_tools~sqlserver'>[+]</span></a><span class='right_span'>13</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('tools~sqlserver')) document.getElementById('aexp_tools~sqlserver').style.visibility = 'hidden';
 </script>
@@ -1049,8 +1298,8 @@ if (!document.getElementById('tools~vim')) document.getElementById('aexp_tools~v
 if (!document.getElementById('tools')) document.getElementById('aexp_tools').style.visibility = 'hidden';
 if (!document.getElementById('tools~wxwork')) document.getElementById('aexp_tools~wxwork').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/system/'>system</a><a href='##' onmousedown=showDiv('system') id='aexp_system'><span class='exp_style' id='exp_system'>[+]</span></a><span class='right_span'>(126)</span></li>
-<div id='system' class='catsub'><li><a href='/blog/cats/system~base/?opendiv=system'>base</a><a href='##' onmousedown=showDiv('system~base') id='aexp_system~base'><span class='exp_style' id='exp_system~base'>[+]</span></a><span class='right_span'>36</span></li>
+<li class='catclass'><a href='/blog/cats/system/'>system</a><a href='##' onmousedown=showDiv('system') id='aexp_system'><span class='exp_style' id='exp_system'>[+]</span></a><span class='right_span'>(128)</span></li>
+<div id='system' class='catsub'><li><a href='/blog/cats/system~base/?opendiv=system'>base</a><a href='##' onmousedown=showDiv('system~base') id='aexp_system~base'><span class='exp_style' id='exp_system~base'>[+]</span></a><span class='right_span'>38</span></li>
 <script language='javascript' type='text/javascript'>
 if (!document.getElementById('system~base')) document.getElementById('aexp_system~base').style.visibility = 'hidden';
 </script>
@@ -1181,8 +1430,8 @@ if (!document.getElementById('kernel~tcp')) document.getElementById('aexp_kernel
 if (!document.getElementById('kernel')) document.getElementById('aexp_kernel').style.visibility = 'hidden';
 if (!document.getElementById('kernel~vpn')) document.getElementById('aexp_kernel~vpn').style.visibility = 'hidden';
 </script>
-<li class='catclass'><a href='/blog/cats/network/'>network</a><a href='##' onmousedown=showDiv('network') id='aexp_network'><span class='exp_style' id='exp_network'>[+]</span></a><span class='right_span'>(10)</span></li>
-<div id='network' class='catsub'><li><a href='/blog/cats/network~base/?opendiv=network'>base</a><a href='##' onmousedown=showDiv('network~base') id='aexp_network~base'><span class='exp_style' id='exp_network~base'>[+]</span></a><span class='right_span'>10</span></li>
+<li class='catclass'><a href='/blog/cats/network/'>network</a><a href='##' onmousedown=showDiv('network') id='aexp_network'><span class='exp_style' id='exp_network'>[+]</span></a><span class='right_span'>(15)</span></li>
+<div id='network' class='catsub'><li><a href='/blog/cats/network~base/?opendiv=network'>base</a><a href='##' onmousedown=showDiv('network~base') id='aexp_network~base'><span class='exp_style' id='exp_network~base'>[+]</span></a><span class='right_span'>15</span></li>
 </div><script language='javascript' type='text/javascript'>
 if (!document.getElementById('network')) document.getElementById('aexp_network').style.visibility = 'hidden';
 if (!document.getElementById('network~base')) document.getElementById('aexp_network~base').style.visibility = 'hidden';
@@ -1294,7 +1543,7 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 
 <section>
 <h1>Date Categories
-<span class='right_span'>(970)</span>
+<span class='right_span'>(983)</span>
 
 </h1>
 <head>
@@ -1302,8 +1551,10 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
 <body>
 <div id="menu">
 <ul>
-<li class='catclass'><a href='/blog/cats/2025/'>2025</a><a href='##' onmousedown=showDiv('2025')><span class='exp_style' id='exp_2025'>[+]</span></a><span class='right_span'>(1)</span></li>
-<div id='2025' class='catsub'><li><a href='/blog/cats/2025~01/?opendiv=2025'>2025-01</a><span class='right_span'>1</span></li>
+<li class='catclass'><a href='/blog/cats/2025/'>2025</a><a href='##' onmousedown=showDiv('2025')><span class='exp_style' id='exp_2025'>[+]</span></a><span class='right_span'>(14)</span></li>
+<div id='2025' class='catsub'><li><a href='/blog/cats/2025~07/?opendiv=2025'>2025-07</a><span class='right_span'>12</span></li>
+<li><a href='/blog/cats/2025~02/?opendiv=2025'>2025-02</a><span class='right_span'>1</span></li>
+<li><a href='/blog/cats/2025~01/?opendiv=2025'>2025-01</a><span class='right_span'>1</span></li>
 </div><li class='catclass'><a href='/blog/cats/2024/'>2024</a><a href='##' onmousedown=showDiv('2024')><span class='exp_style' id='exp_2024'>[+]</span></a><span class='right_span'>(89)</span></li>
 <div id='2024' class='catsub'><li><a href='/blog/cats/2024~12/?opendiv=2024'>2024-12</a><span class='right_span'>2</span></li>
 <li><a href='/blog/cats/2024~10/?opendiv=2024'>2024-10</a><span class='right_span'>5</span></li>
@@ -1478,43 +1729,43 @@ if (!document.getElementById('algorithm~ipsec')) document.getElementById('aexp_a
   <ul id="recent_posts">
     
       <li class="post">
-        <a href="/blog/2025/01/16/network-ac-ap/">如何在ac上telnet到ap</a>
+        <a href="/blog/2025/07/21/lang-web-perf/">PerformanceObserver监测网页性能</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/12/12/tools-mysql-bin/">删除MySQL下的bin</a>
+        <a href="/blog/2025/07/21/sqlserver-logldf/">sqlserver的`_log.ldf`日志文件容量太大 如何删除</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/12/12/network-sfp/">光模块配置</a>
+        <a href="/blog/2025/07/21/2288H-JBOD/">华为2288H v5服务器配置JBOD（硬盘直通）</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/10/27/network-ap-ac/">无线AP与AC详解</a>
+        <a href="/blog/2025/07/21/snmp/">Snmp的基本概念</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/10/27/network-arp-mac/">为什么二层交换机上没有arp表项</a>
+        <a href="/blog/2025/07/21/network-telnet-err/">华为交换机telnet登录失败故障的排查方法</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/10/27/network-hybrid/">Hybrid端口模式详解</a>
+        <a href="/blog/2025/07/21/lang-phpexcel-wrap/">phpexcel单元格内换行</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/10/27/network-telnet-proto/">telnet 协议详解</a>
+        <a href="/blog/2025/07/21/tftp/">centos 下 TFTP服务器安装</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/10/27/network-php-telnet/">交换机php telnet</a>
+        <a href="/blog/2025/07/21/network-lldp/">LLDP协议与VLAN的关系</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/09/26/network-telnet/">交换机开启telnet</a>
+        <a href="/blog/2025/07/21/network-hwpow/">华为交换机设备节能管理配置教程</a>
       </li>
     
       <li class="post">
-        <a href="/blog/2024/09/20/ffmpeg-mp3/">ffmpeg分离MP3文件报错</a>
+        <a href="/blog/2025/07/21/network-h3cmac/">华三000f-e207-f2e0</a>
       </li>
     
   </ul>
